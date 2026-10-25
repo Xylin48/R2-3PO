@@ -151,20 +151,33 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         return False
 
     options: dict[str, Any] = {
-        "temperature": 0,
-        "num_predict": 128,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0,
         "num_batch": 128,
     }
     configured_context = os.environ.get("R2_OLLAMA_NUM_CTX", "").strip()
+    context_tokens = 4096
     if configured_context:
         try:
-            context_tokens = int(configured_context, 10)
+            requested_context = int(configured_context, 10)
         except ValueError:
-            context_tokens = 0
-        # Mirror the core's accepted override range. Invalid values are ignored
-        # by both paths so preflight does not test a context R2 will not use.
-        if 2048 <= context_tokens <= 16384:
-            options["num_ctx"] = context_tokens
+            requested_context = 0
+        # Mirror r2_ollama_context_tokens(): only accepted explicit overrides
+        # replace the default adaptive tier.
+        if 2048 <= requested_context <= 16384:
+            context_tokens = requested_context
+    options["num_ctx"] = context_tokens
+    # Exercise the reasoning-enabled foreground path with the same context-
+    # dependent maximum as r2.c, rather than a 128-token non-thinking probe.
+    max_predict = (8192 if context_tokens >= 16384 else
+                   6144 if context_tokens >= 12288 else
+                   4096 if context_tokens >= 8192 else
+                   2048 if context_tokens >= 4096 else 512)
+    options["num_predict"] = min(max_predict, max(256, context_tokens - 1536))
     if gpu_layers != 0:
         options["num_gpu"] = gpu_layers
 
@@ -179,7 +192,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
                     "content": "Reply with exactly this token and no other text: R2_READY",
                 }],
                 "stream": False,
-                "think": False,
+                "think": True,
                 "keep_alive": "10m",
                 "options": options,
             },
