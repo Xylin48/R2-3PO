@@ -38,7 +38,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
         self.assertIs(payload["think"], True)
-        self.assertEqual(payload["options"]["num_predict"], 2560 if payload["options"]["num_ctx"] == 4096 else min(8192 if payload["options"]["num_ctx"] >= 16384 else 6144 if payload["options"]["num_ctx"] >= 12288 else 4096 if payload["options"]["num_ctx"] >= 8192 else 2048, max(256, payload["options"]["num_ctx"] - 1536)))
+        self.assertEqual(payload["options"]["num_predict"], min(8192 if payload["options"]["num_ctx"] >= 16384 else 6144 if payload["options"]["num_ctx"] >= 12288 else 4096 if payload["options"]["num_ctx"] >= 8192 else 2048 if payload["options"]["num_ctx"] >= 4096 else 512, max(256, payload["options"]["num_ctx"] - 1536)))
         self.assertEqual(payload["options"]["temperature"], 1.0)
         self.assertEqual(payload["options"]["top_p"], 0.95)
         self.assertEqual(payload["options"]["num_batch"], 128)
