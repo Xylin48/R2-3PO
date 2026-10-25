@@ -22,9 +22,15 @@ assert 'export R2_OLLAMA_NUM_GPU="$GPU_LAYERS"' in launcher
 assert 'export R2_OLLAMA_NUM_CTX="$CONTEXT_TOKENS"' in launcher
 
 assert '"$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&' in runner
-assert '"$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then' in runner
-assert "export R2_OLLAMA_NUM_GPU=12" in runner
-assert "export R2_OLLAMA_NUM_CTX=4096" in runner
+assert '"$R2_NVIDIA_QUERY_OK" == "1" ]]' in runner
+assert "GPU_LAYER_CANDIDATES=(\"$R2_OLLAMA_NUM_GPU_INITIAL\" 12 8 4)" in runner
+assert "CONTEXT_CANDIDATES=(4096 2048)" in runner
+assert "CONTEXT_CANDIDATES=(8192 4096 2048)" in runner
+assert 'export R2_OLLAMA_NUM_GPU="$GPU_LAYERS"' in runner
+assert 'export R2_OLLAMA_NUM_CTX="$CONTEXT_TOKENS"' in runner
+assert 'R2_OLLAMA_NUM_CTX_DEFAULTED" == "1' in runner
+assert "explicitly configured context" in runner
+assert 'break 2' in runner
 assert "without overriding explicit operator settings" in launcher
 assert "Never silently override an explicit operator policy" in runner
 assert 'R2_OLLAMA_NUM_CTX_DEFAULTED="${R2_OLLAMA_NUM_CTX_DEFAULTED:-0}"' in runner
