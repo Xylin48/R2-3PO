@@ -34,7 +34,7 @@ budget_end = core.find("\n}\n", budget_start)
 if budget_start < 0 or budget_end < 0:
     raise SystemExit("Could not locate the prompt-budget allocator.")
 budget = core[budget_start:budget_end + 3]
-require("budget.retrieval_reserve = system_budget / 8;" in budget,
+require("budget.retrieval_reserve = share + (remainder > 2 ? 1 : 0);" in budget,
         "the serializer explicitly reserves a share for current-turn retrieval")
 require("budget.capabilities_reserve = system_budget / 16;" in budget,
         "the serializer reserves space for capability instructions after active-turn evidence")
