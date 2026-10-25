@@ -4413,57 +4413,65 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     if (!ingredient_copy) return -1;
 
     /*
-     * A rating is one logical update across the experience, aggregate food
-     * preference, and every ingredient preference. Keep all database writes
-     * in one SQLite transaction so an error cannot leave a partially rated
-     * experience or silently omit ingredient learning.
+     * One rating updates the experience and both levels of learned preference.
+     * These writes must commit or roll back together: returning an error after
+     * only part of the learning has been stored would corrupt future averages.
      */
     pthread_mutex_lock(&reality_lock);
     int rc = sqlite3_exec(reality_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     sqlite3_stmt *st = NULL;
     sqlite3_int64 experience_id = 0;
-    if (rc == SQLITE_OK &&
-        sqlite3_prepare_v2(reality_db,
+
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(reality_db,
             "SELECT id FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1",
-            -1, &st, NULL) == SQLITE_OK) {
-        if (bind_text(st, 1, food) == SQLITE_OK &&
-            sqlite3_step(st) == SQLITE_ROW)
+            -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = bind_text(st, 1, food);
+    if (rc == SQLITE_OK) {
+        int step_rc = sqlite3_step(st);
+        if (step_rc == SQLITE_ROW) {
             experience_id = sqlite3_column_int64(st, 0);
-        else
-            rc = sqlite3_errcode(reality_db);
-    } else if (rc == SQLITE_OK) {
-        rc = sqlite3_errcode(reality_db);
+        } else if (step_rc == SQLITE_DONE) {
+            rc = SQLITE_NOTFOUND;
+        } else {
+            rc = step_rc;
+        }
     }
     if (st) { sqlite3_finalize(st); st = NULL; }
     if (rc == SQLITE_OK && experience_id == 0) rc = SQLITE_NOTFOUND;
 
-    if (rc == SQLITE_OK) {
+    if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(reality_db,
             "UPDATE r2_food_experiences SET satisfaction=?,notes=?,rated_at=? WHERE id=? AND satisfaction IS NULL",
             -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int(st, 1, satisfaction);
-            bind_text(st, 2, notes ? notes : "");
-            sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
-            sqlite3_bind_int64(st, 4, experience_id);
-            rc = sqlite3_step(st);
-            if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
-                rc = SQLITE_NOTFOUND;
-        }
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int(st, 1, satisfaction);
+    if (rc == SQLITE_OK)
+        rc = bind_text(st, 2, notes ? notes : "");
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 4, experience_id);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
+            rc = SQLITE_NOTFOUND;
     }
     if (st) { sqlite3_finalize(st); st = NULL; }
 
-    if (rc == SQLITE_DONE) {
+    if (rc == SQLITE_DONE)
         rc = sqlite3_prepare_v2(reality_db,
             "INSERT INTO r2_food_preferences(food_name,satisfaction_sum,rating_count,updated_at) VALUES(?,?,1,?) ON CONFLICT(food_name) DO UPDATE SET satisfaction_sum=satisfaction_sum+excluded.satisfaction_sum,rating_count=rating_count+1,updated_at=excluded.updated_at",
             -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            bind_text(st, 1, food);
-            sqlite3_bind_double(st, 2, (double)satisfaction);
-            sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
-            rc = sqlite3_step(st);
-        }
-    }
+    if (rc == SQLITE_OK)
+        rc = bind_text(st, 1, food);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_double(st, 2, (double)satisfaction);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+    if (rc == SQLITE_OK)
+        rc = sqlite3_step(st);
     if (st) { sqlite3_finalize(st); st = NULL; }
 
     if (rc == SQLITE_DONE) {
@@ -4476,15 +4484,18 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
             while (len && isspace((unsigned char)part[len - 1]))
                 part[--len] = '\0';
             if (!*part) continue;
+
             rc = sqlite3_prepare_v2(reality_db,
                 "INSERT INTO r2_food_ingredient_preferences(ingredient,satisfaction_sum,rating_count,updated_at) VALUES(?,?,1,?) ON CONFLICT(ingredient) DO UPDATE SET satisfaction_sum=satisfaction_sum+excluded.satisfaction_sum,rating_count=rating_count+1,updated_at=excluded.updated_at",
                 -1, &st, NULL);
-            if (rc == SQLITE_OK) {
-                bind_text(st, 1, part);
-                sqlite3_bind_double(st, 2, (double)satisfaction);
-                sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+            if (rc == SQLITE_OK)
+                rc = bind_text(st, 1, part);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_double(st, 2, (double)satisfaction);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+            if (rc == SQLITE_OK)
                 rc = sqlite3_step(st);
-            }
             if (st) { sqlite3_finalize(st); st = NULL; }
         }
     }
@@ -4492,15 +4503,18 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     if (rc == SQLITE_DONE) {
         rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
         if (rc != SQLITE_OK)
-            sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+            (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
     } else {
-        sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+        (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
     }
+    char error_message[256] = {0};
+    if (rc != SQLITE_OK)
+        snprintf(error_message, sizeof(error_message), "%s", sqlite3_errmsg(reality_db));
     pthread_mutex_unlock(&reality_lock);
     free(ingredient_copy);
-    if (rc != SQLITE_OK && rc != SQLITE_DONE) {
+    if (rc != SQLITE_OK) {
         fprintf(stderr, "[R2 Reality] Food rating transaction failed: %s\n",
-                sqlite3_errmsg(reality_db));
+                error_message[0] ? error_message : "unknown SQLite error");
         return -1;
     }
 
