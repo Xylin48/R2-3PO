@@ -55,7 +55,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
         self.assertIs(payload["think"], True)
-        self.assertEqual(payload["options"]["num_predict"], min(8192 if payload["options"]["num_ctx"] >= 16384 else 6144 if payload["options"]["num_ctx"] >= 12288 else 4096 if payload["options"]["num_ctx"] >= 8192 else 2048 if payload["options"]["num_ctx"] >= 4096 else 512, max(256, payload["options"]["num_ctx"] - 1536)))
+        self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
         self.assertEqual(payload["options"]["temperature"], 1.0)
         self.assertEqual(payload["options"]["top_p"], 0.95)
         self.assertEqual(payload["options"]["num_batch"], 128)
@@ -145,7 +145,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
                  returncode=0, stdout="NVIDIA GeForce GTX 1050 Ti, 4096 MiB, 128 MiB", stderr=""
              )):
             self.assertTrue(probe.preflight(timeout=1, require_gpu_offload=True))
-        self.assertEqual(read.call_args_list[1].kwargs["payload"]["options"]["num_gpu"], 0)
+        self.assertNotIn("num_gpu", read.call_args_list[1].kwargs["payload"]["options"])
         self.assertEqual(read.call_args_list[2].kwargs["payload"]["options"]["num_predict"], 512)
 
     def test_unapproved_non_loopback_endpoint_is_rejected(self) -> None:
