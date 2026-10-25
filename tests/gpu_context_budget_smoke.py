@@ -32,7 +32,7 @@ assert 'R2_OLLAMA_NUM_CTX_DEFAULTED" == "1' in runner
 assert "explicitly configured context" in runner
 assert 'break 2' in runner
 assert "without overriding explicit operator settings" in launcher
-assert "Never silently override an explicit operator policy" in runner
+assert "never alter an explicit context" in runner
 assert 'R2_OLLAMA_NUM_CTX_DEFAULTED="${R2_OLLAMA_NUM_CTX_DEFAULTED:-0}"' in runner
 assert 'R2_OLLAMA_NUM_GPU_DEFAULTED="${R2_OLLAMA_NUM_GPU_DEFAULTED:-0}"' in runner
 assert "export R2_OLLAMA_NUM_CTX_DEFAULTED" in runner
