@@ -24,9 +24,9 @@ for label, source in (("interactive launcher", launcher), ("overnight service", 
     assert 'R2_OLLAMA_NUM_CTX_DEFAULTED" == "1' in source, label
     assert "explicitly configured context" in source, label
     assert "break 2" in source, label
-    assert "export R2_OLLAMA_NUM_CTX_DEFAULTED" in source, label
-    assert "export R2_OLLAMA_NUM_GPU_DEFAULTED" in source, label
 
+assert "export R2_OLLAMA_NUM_CTX_DEFAULTED" in runner
+assert "export R2_OLLAMA_NUM_GPU_DEFAULTED" in runner
 assert '"R2_OLLAMA_NUM_CTX=${R2_OLLAMA_NUM_CTX:-}"' in runner
 assert "without overriding explicit operator settings" in launcher
 assert "never alter an explicit context" in runner
