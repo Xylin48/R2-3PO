@@ -23,6 +23,19 @@ class OllamaPreflightSmoke(unittest.TestCase):
         with patch("builtins.open", side_effect=OSError("simulated unavailable memory metrics")):
             self.assertEqual(probe._adaptive_context_tokens(), 4096)
 
+    def test_unreadable_cgroup_usage_uses_conservative_context_tier(self) -> None:
+        def fake_open(path: str, mode: str = "r", encoding: str = "ascii"):
+            if path == "/proc/meminfo":
+                return io.StringIO("MemAvailable: 16777216 kB\\n")
+            if path == "/sys/fs/cgroup/memory.max":
+                return io.StringIO(str(4 * 1024 ** 3))
+            if path == "/sys/fs/cgroup/memory.current":
+                raise OSError("simulated unreadable cgroup usage")
+            raise OSError("path unavailable")
+
+        with patch("builtins.open", side_effect=fake_open):
+            self.assertEqual(probe._adaptive_context_tokens(), 2048)
+
     def test_model_and_real_chat_completion_are_required(self) -> None:
         replies = [
             {"models": [{"name": "qwen3.5:9b"}]},
