@@ -128,7 +128,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
                  returncode=0, stdout="NVIDIA GeForce GTX 1050 Ti, 4096 MiB, 128 MiB", stderr=""
              )):
             self.assertTrue(probe.preflight(timeout=1, require_gpu_offload=True))
-        self.assertNotIn("num_gpu", read.call_args_list[1].kwargs["payload"]["options"])
+        self.assertEqual(read.call_args_list[1].kwargs["payload"]["options"]["num_gpu"], 0)
         self.assertEqual(read.call_args_list[2].kwargs["payload"]["options"]["num_predict"], 512)
 
     def test_unapproved_non_loopback_endpoint_is_rejected(self) -> None:
