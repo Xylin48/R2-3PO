@@ -63,7 +63,7 @@ require(
 )
 for phrase in (
     "if (!reports_r2_output_problem && words < 5)",
-    "Keep legitimate audio/transcription discussions out of this guard",
+    "Keep legitimate audio/transcription discussions out of the remaining",
     "reports_r2_output_problem",
     "\"your message\"",
     "\"garbled\"",
