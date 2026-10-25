@@ -812,6 +812,8 @@ int64_t r2_log_event_with_memory(
 
     if (r2_save_memory(memory, "experience") == 0) {
         sqlite3_stmt *statement = NULL;
+        int update_rc = SQLITE_ERROR;
+        int updated_rows = 0;
 
         pthread_mutex_lock(&log_lock);
         if (log_initialized && log_db &&
@@ -820,11 +822,25 @@ int64_t r2_log_event_with_memory(
                 "UPDATE r2_log_events SET memory_saved=1 WHERE id=?;",
                 -1, &statement, NULL
             ) == SQLITE_OK) {
-            sqlite3_bind_int64(statement, 1, event_id);
-            sqlite3_step(statement);
+            if (sqlite3_bind_int64(statement, 1, event_id) == SQLITE_OK) {
+                update_rc = sqlite3_step(statement);
+                if (update_rc == SQLITE_DONE)
+                    updated_rows = sqlite3_changes(log_db);
+            } else {
+                update_rc = sqlite3_errcode(log_db);
+            }
+        } else if (log_initialized && log_db) {
+            update_rc = sqlite3_errcode(log_db);
         }
         sqlite3_finalize(statement);
         pthread_mutex_unlock(&log_lock);
+
+        if (update_rc != SQLITE_DONE || updated_rows != 1) {
+            fprintf(stderr,
+                    "[R2 Life Log] Memory pointer was saved, but event %lld "
+                    "could not be marked memory_saved (sqlite rc=%d, rows=%d).\n",
+                    (long long)event_id, update_rc, updated_rows);
+        }
     }
 
     return event_id;
