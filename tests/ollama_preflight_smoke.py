@@ -232,7 +232,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         errors = io.StringIO()
         with patch.object(probe, "_read_json", side_effect=[
             {"models": [{"name": "qwen3.5:9b"}]},
-            {"done": True, "message": {"role": "assistant", "content": "I am ready."}},
+            {"done": True, "message": {"role": "assistant", "content": "I am ready. R2_READY"}},
         ]) as read, contextlib.redirect_stderr(errors):
             self.assertFalse(probe.preflight(timeout=1))
         self.assertEqual(read.call_count, 2)
