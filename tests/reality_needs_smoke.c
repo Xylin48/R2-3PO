@@ -1134,8 +1134,15 @@ int main(void)
     if (sqlite3_open(path, &db) != SQLITE_OK)
         fail("could not open Reality DB for food-rating rollback trigger");
     if (sqlite3_exec(db,
+        "UPDATE r2_food_experiences SET ingredients='historical-only-ingredient' "
+        "WHERE id=(SELECT id FROM r2_food_experiences "
+        "WHERE food_name='burger' AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1)",
+        NULL, NULL, NULL) != SQLITE_OK || sqlite3_changes(db) != 1)
+        fail("could not set historical ingredients for rating regression");
+    if (sqlite3_exec(db,
         "CREATE TRIGGER smoke_fail_food_rating_ingredient "
         "BEFORE INSERT ON r2_food_ingredient_preferences "
+        "WHEN NEW.ingredient='historical-only-ingredient' "
         "BEGIN SELECT RAISE(ABORT,'intentional food-rating rollback test'); END",
         NULL, NULL, NULL) != SQLITE_OK)
         fail("could not install food-rating rollback trigger");
