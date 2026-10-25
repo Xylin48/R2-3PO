@@ -42,7 +42,6 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(payload["options"]["temperature"], 1.0)
         self.assertEqual(payload["options"]["top_p"], 0.95)
         self.assertEqual(payload["options"]["num_batch"], 128)
-        self.assertEqual(payload["options"]["num_batch"], 128)
         self.assertTrue(read.call_args_list[2].args[0].endswith("/api/chat"))
         vision_payload = read.call_args_list[2].kwargs["payload"]
         png_bytes = base64.b64decode(vision_payload["messages"][1]["images"][0])
@@ -51,7 +50,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(int.from_bytes(png_bytes[20:24], "big"), 480)
         self.assertEqual(vision_payload["format"], "json")
         self.assertEqual(vision_payload["messages"][0]["role"], "system")
-        self.assertEqual(vision_payload["options"]["num_predict"], 256)
+        self.assertEqual(vision_payload["options"]["num_predict"], 512 if vision_payload["options"]["num_ctx"] >= 8192 else 256)
         self.assertEqual(vision_payload["options"]["temperature"], payload["options"]["temperature"])
         self.assertTrue(read.call_args_list[3].args[0].endswith("/api/ps"))
         self.assertEqual(gpu.call_count, 1)
