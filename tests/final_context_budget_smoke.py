@@ -44,7 +44,8 @@ require("message_add_system_prompt_sections_locked() != 0" in core,
         "the static identity and capability prompts are split before runtime budgeting")
 require("capability_context=%d" in core and "audit_capability_context = 1" in core,
         "prompt audit reports whether capability instructions survived serialization")
-require("length > reality_reserve" in core,
+require("size_t category_remaining = reality_reserve > reality_used" in core
+        and "reality_used += length;" in core,
         "live Reality cannot consume more than its allocated prompt share")
 require("The actual user" in body and "message is stored separately" in body,
         "retrieval cap explicitly preserves the user's actual message")
