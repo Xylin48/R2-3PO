@@ -1127,6 +1127,44 @@ int main(void)
         fail("could not remove transaction rollback test trigger");
     sqlite3_close(db);
 
+    /* A rating must roll back its experience and aggregate preference if
+       any ingredient-preference write fails later in the same transaction. */
+    if (r2_reality_eat("burger", -1.0) != 0)
+        fail("could not create a food experience for the rating transaction test");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not open Reality DB for food-rating rollback trigger");
+    if (sqlite3_exec(db,
+        "CREATE TRIGGER smoke_fail_food_rating_ingredient "
+        "BEFORE INSERT ON r2_food_ingredient_preferences "
+        "BEGIN SELECT RAISE(ABORT,'intentional food-rating rollback test'); END",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not install food-rating rollback trigger");
+    sqlite3_close(db);
+
+    if (r2_reality_rate_food("burger", 2, "transaction rollback regression") == 0)
+        fail("injected ingredient preference failure must reject the whole food rating");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB after food-rating rollback");
+    if (sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM r2_food_experiences "
+        "WHERE food_name='burger' AND satisfaction IS NULL",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query food experience after rating rollback");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 1)
+        fail("failed food rating must leave the eating experience unrated");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM r2_food_preferences WHERE food_name='burger'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query aggregate preference after rating rollback");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 0)
+        fail("failed food rating must roll back its aggregate food preference");
+    sqlite3_finalize(st);
+    if (sqlite3_exec(db, "DROP TRIGGER smoke_fail_food_rating_ingredient",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not remove food-rating rollback trigger");
+    sqlite3_close(db);
+
     if (r2_reality_remove_item("burger") != 0) fail("could not remove remaining regression-test food");
     if (r2_reality_remove_item("zero_fullness") != 0) fail("could not remove zero-fullness regression item");
     if (r2_reality_remove_item("unlisted_food") != 0) fail("could not remove unlisted-object regression item");
