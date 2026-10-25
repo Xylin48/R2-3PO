@@ -1205,6 +1205,44 @@ int main(void)
         sqlite3_column_int(st, 1) != 1)
         fail("rating did not learn from the ingredients recorded at eating time");
     sqlite3_finalize(st);
+
+    /* Two unrated experiences can share a second-resolution timestamp. The
+       highest ID is the most recently inserted and must receive the rating. */
+    if (sqlite3_exec(db,
+        "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) "
+        "VALUES('burger','tie-older-ingredient',100,10,42)",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not insert older tied-timestamp food experience");
+    sqlite3_int64 older_tied_id = sqlite3_last_insert_rowid(db);
+    if (sqlite3_exec(db,
+        "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) "
+        "VALUES('burger','tie-newer-ingredient',100,10,42)",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not insert newer tied-timestamp food experience");
+    sqlite3_int64 newer_tied_id = sqlite3_last_insert_rowid(db);
+    sqlite3_close(db);
+    if (r2_reality_rate_food("burger", -1, "same timestamp tie-breaker regression") != 0)
+        fail("could not rate the newest tied-timestamp food experience");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB to verify tied-timestamp food rating");
+    if (sqlite3_prepare_v2(db,
+        "SELECT ingredients,satisfaction FROM r2_food_experiences WHERE id=?",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query newer tied-timestamp food experience");
+    sqlite3_bind_int64(st, 1, newer_tied_id);
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "tie-newer-ingredient") != 0 ||
+        sqlite3_column_int(st, 1) != -1)
+        fail("rating did not select the newest experience when timestamps tied");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction FROM r2_food_experiences WHERE id=?",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query older tied-timestamp food experience");
+    sqlite3_bind_int64(st, 1, older_tied_id);
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_type(st, 0) != SQLITE_NULL)
+        fail("rating incorrectly selected the older experience when timestamps tied");
+    sqlite3_finalize(st);
     sqlite3_close(db);
 
     if (r2_reality_remove_item("burger") != 0) fail("could not remove remaining regression-test food");
