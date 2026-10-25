@@ -3407,21 +3407,22 @@ static R2SystemContextBudget r2_compute_system_context_budget(
     R2SystemContextBudget budget = {0};
 
     /*
-     * Keep the complete live conversation contract first. Divide the actual
-     * remaining character budget evenly among identity, Reality, retrieval,
-     * and capabilities; integer remainder is assigned in priority order.
-     * Any unused share remains available to the lower-priority context pass.
+     * Reserve space for the robot's identity and live evidence before fitting
+     * the conversation-contract override. The override must not consume the
+     * entire system budget and leave identity, Reality, and retrieval with zero
+     * capacity. Unused reserved capacity is available to the override.
      */
-    budget.override_budget = override_length < system_budget
-        ? override_length : system_budget;
-    size_t remaining = system_budget - budget.override_budget;
-    size_t share = remaining / 4;
-    size_t remainder = remaining % 4;
+    budget.reality_reserve = system_budget / 8;
+    budget.identity_budget = system_budget / 3;
+    budget.retrieval_reserve = system_budget / 8;
+    budget.capabilities_reserve = system_budget / 16;
 
-    budget.identity_budget = share + (remainder > 0 ? 1 : 0);
-    budget.reality_reserve = share + (remainder > 1 ? 1 : 0);
-    budget.retrieval_reserve = share + (remainder > 2 ? 1 : 0);
-    budget.capabilities_reserve = share;
+    size_t reserved = budget.reality_reserve + budget.identity_budget +
+                      budget.retrieval_reserve + budget.capabilities_reserve;
+    size_t available_for_override = system_budget > reserved
+        ? system_budget - reserved : system_budget / 4;
+    budget.override_budget = override_length < available_for_override
+        ? override_length : available_for_override;
     return budget;
 }
 
