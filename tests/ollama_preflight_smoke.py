@@ -19,6 +19,10 @@ import preflight_ollama_model as probe  # noqa: E402
 
 
 class OllamaPreflightSmoke(unittest.TestCase):
+    def test_context_falls_back_when_memory_cannot_be_measured(self) -> None:
+        with patch("builtins.open", side_effect=OSError("simulated unavailable memory metrics")):
+            self.assertEqual(probe._adaptive_context_tokens(), 4096)
+
     def test_model_and_real_chat_completion_are_required(self) -> None:
         replies = [
             {"models": [{"name": "qwen3.5:9b"}]},
