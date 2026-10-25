@@ -218,6 +218,26 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 self.assertFalse(probe.preflight(timeout=1))
         self.assertIn("chat generation produced no usable final answer", errors.getvalue())
 
+    def test_thinking_without_final_text_reports_the_actual_reasoning_mode(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "", "thinking": "internal reasoning only"}},
+        ]), contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(timeout=1))
+        self.assertIn("despite the reasoning-enabled foreground probe", errors.getvalue())
+        self.assertNotIn("even with think=false", errors.getvalue())
+
+    def test_nonmatching_foreground_reply_does_not_pass_preflight(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "I am ready."}},
+        ]) as read, contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(timeout=1))
+        self.assertEqual(read.call_count, 2)
+        self.assertIn("did not return its expected R2_READY marker", errors.getvalue())
+
     def test_incomplete_text_turn_does_not_pass_preflight(self) -> None:
         errors = io.StringIO()
         with patch.object(probe, "_read_json", side_effect=[
