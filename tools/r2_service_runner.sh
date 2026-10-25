@@ -170,17 +170,44 @@ fi
     fail "shared Ollama inference preflight is missing: $R2_SOURCE/tools/preflight_ollama_model.py"
 log "Waiting for local Qwen 3.5 model availability and a real chat completion..."
 if ! python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
-    # The target GTX 1050 Ti has only 4 GiB VRAM. If the default 20-layer /
-    # 8192-context probe fails, retry once with less GPU offload and half the
-    # KV-cache context. Never silently override an explicit operator policy.
+    # Keep overnight recovery aligned with the interactive launcher. Retry only
+    # when GPU placement was selected by R2, and never alter an explicit context.
     if [[ "$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&
-          "$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then
-        log "Default GPU/context preflight failed; retrying with 12 GPU layers and 4096 context tokens."
-        export R2_OLLAMA_NUM_GPU=12
-        export R2_OLLAMA_NUM_CTX=4096
-        log "Fallback Ollama policy: R2_OLLAMA_NUM_GPU=$R2_OLLAMA_NUM_GPU R2_OLLAMA_NUM_CTX=$R2_OLLAMA_NUM_CTX"
-        python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 30 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}" ||
-            fail "Ollama preflight failed with both default and conservative GPU/context policies. Check model/server logs; systemd will retry automatically."
+          "$R2_NVIDIA_QUERY_OK" == "1" ]] &&
+       printf '%s\\n' "$R2_NVIDIA_GPU_NAMES" | grep -qi 'GTX 1050 Ti'; then
+        R2_OLLAMA_PREFLIGHT_OK=0
+        if [[ "$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then
+            R2_OLLAMA_NUM_GPU_INITIAL="$R2_OLLAMA_NUM_GPU"
+            GPU_LAYER_CANDIDATES=("$R2_OLLAMA_NUM_GPU_INITIAL" 12 8 4)
+        else
+            GPU_LAYER_CANDIDATES=(12 8 4)
+        fi
+        for GPU_LAYERS in "${GPU_LAYER_CANDIDATES[@]}"; do
+            export R2_OLLAMA_NUM_GPU="$GPU_LAYERS"
+            if [[ "$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then
+                if [[ "$GPU_LAYERS" == "$R2_OLLAMA_NUM_GPU_INITIAL" ]]; then
+                    CONTEXT_CANDIDATES=(4096 2048)
+                else
+                    CONTEXT_CANDIDATES=(8192 4096 2048)
+                fi
+                for CONTEXT_TOKENS in "${CONTEXT_CANDIDATES[@]}"; do
+                    export R2_OLLAMA_NUM_CTX="$CONTEXT_TOKENS"
+                    log "Retrying Ollama preflight with ${GPU_LAYERS} GPU layers and ${CONTEXT_TOKENS} context tokens."
+                    if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 30 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
+                        R2_OLLAMA_PREFLIGHT_OK=1
+                        break 2
+                    fi
+                done
+            else
+                log "Retrying Ollama preflight with ${GPU_LAYERS} GPU layers and explicitly configured context ${R2_OLLAMA_NUM_CTX}."
+                if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 30 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
+                    R2_OLLAMA_PREFLIGHT_OK=1
+                    break
+                fi
+            fi
+        done
+        [[ "$R2_OLLAMA_PREFLIGHT_OK" == "1" ]] ||
+            fail "Ollama preflight failed for every permitted GPU/context combination. Check model/server logs; systemd will retry automatically."
     else
         fail "Ollama did not complete a real qwen3.5:9b chat preflight with the explicitly configured GPU/context policy. Check the local model/server; systemd will retry automatically."
     fi
