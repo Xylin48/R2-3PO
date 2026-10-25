@@ -3002,7 +3002,7 @@ int r2_ollama_context_tokens(void)
     const unsigned long long GiB = 1024ULL * 1024ULL * 1024ULL;
     unsigned long long available = available_memory_bytes();
     /* Conservative fallback if /proc is unavailable. */
-    int safe_max = !available ? 8192 :
+    int safe_max = !available ? 4096 :
                    available >= 8ULL * GiB ? 16384 :
                    available >= 5ULL * GiB ? 12288 :
                    available >= 3ULL * GiB ? 8192 :
