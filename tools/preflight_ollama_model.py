@@ -221,7 +221,9 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
                    4096 if context_tokens >= 8192 else
                    2048 if context_tokens >= 4096 else 512)
     options["num_predict"] = min(max_predict, max(256, context_tokens - 1536))
-    if gpu_layers != 0:
+    # Match r2.c exactly: an unset variable omits num_gpu, while an explicit
+    # value (including 0 for automatic placement) is sent to Ollama.
+    if "R2_OLLAMA_NUM_GPU" in os.environ and os.environ["R2_OLLAMA_NUM_GPU"].strip():
         options["num_gpu"] = gpu_layers
 
     try:
