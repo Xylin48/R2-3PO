@@ -36,7 +36,7 @@ if budget_start < 0 or budget_end < 0:
 budget = core[budget_start:budget_end + 3]
 require("budget.retrieval_reserve = share + (remainder > 2 ? 1 : 0);" in budget,
         "the serializer explicitly reserves a share for current-turn retrieval")
-require("budget.capabilities_reserve = system_budget / 16;" in budget,
+require("budget.capabilities_reserve = share;" in budget,
         "the serializer reserves space for capability instructions after active-turn evidence")
 require("r2_compute_system_context_budget(system_budget)" in core,
         "the actual Ollama serializer uses the tested prompt-budget allocator")
