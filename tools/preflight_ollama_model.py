@@ -226,16 +226,14 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         if 2048 <= requested_context <= 16384:
             context_tokens = requested_context
     options["num_ctx"] = context_tokens
-    # Exercise the reasoning-enabled foreground path with the same context-
-    # dependent maximum as r2.c, rather than a 128-token non-thinking probe.
-    max_predict = (8192 if context_tokens >= 16384 else
-                   6144 if context_tokens >= 12288 else
-                   4096 if context_tokens >= 8192 else
-                   2048 if context_tokens >= 4096 else 512)
-    options["num_predict"] = min(max_predict, max(256, context_tokens - 1536))
-    # Match r2.c exactly: an unset variable omits num_gpu, while an explicit
-    # value (including 0 for automatic placement) is sent to Ollama.
-    if "R2_OLLAMA_NUM_GPU" in os.environ and os.environ["R2_OLLAMA_NUM_GPU"].strip():
+    # Exercise reasoning-enabled foreground generation with the real maximum
+    # answer budget. r2.c permits at most 2048 output tokens for a live reply;
+    # its larger context-dependent ceiling is not itself the requested budget.
+    options["num_predict"] = min(2048, max(256, context_tokens - 1536))
+    # Match r2.c exactly: unset and explicit zero both use Ollama's automatic
+    # placement. Only a nonzero explicit layer count becomes a num_gpu option.
+    if ("R2_OLLAMA_NUM_GPU" in os.environ and
+            os.environ["R2_OLLAMA_NUM_GPU"].strip() and gpu_layers != 0):
         options["num_gpu"] = gpu_layers
 
     try:
