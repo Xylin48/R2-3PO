@@ -38,7 +38,7 @@ require("budget.retrieval_reserve = share + (remainder > 2 ? 1 : 0);" in budget,
         "the serializer explicitly reserves a share for current-turn retrieval")
 require("budget.capabilities_reserve = share;" in budget,
         "the serializer reserves space for capability instructions after active-turn evidence")
-require("r2_compute_system_context_budget(system_budget)" in core,
+require("r2_compute_system_context_budget(system_budget, override_length)" in core,
         "the actual Ollama serializer uses the tested prompt-budget allocator")
 require("message_add_system_prompt_sections_locked() != 0" in core,
         "the static identity and capability prompts are split before runtime budgeting")
