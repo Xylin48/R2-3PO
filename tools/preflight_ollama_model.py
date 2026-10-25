@@ -287,6 +287,10 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     # image-encoder/KV-cache OOMs that text-only readiness can miss.
     vision_context = int(options.get("num_ctx", 4096))
     vision_options = dict(options)
+    # Match Visual.c's non-thinking sampler rather than carrying the
+    # foreground reasoning sampler into the image-bearing readiness probe.
+    vision_options["temperature"] = 0.7
+    vision_options["top_p"] = 0.8
     vision_options["num_predict"] = 512 if vision_context >= 8192 else 256
     try:
         vision_reply = _read_json(
