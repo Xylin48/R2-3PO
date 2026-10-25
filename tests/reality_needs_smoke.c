@@ -1172,6 +1172,41 @@ int main(void)
         fail("could not remove food-rating rollback trigger");
     sqlite3_close(db);
 
+    /* After the injected failure is removed, the same experience must rate
+       successfully and update both aggregate and historical-ingredient data. */
+    if (r2_reality_rate_food("burger", 1, "successful rating regression") != 0)
+        fail("food rating did not succeed after the injected failure was removed");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB to verify successful food rating");
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction FROM r2_food_experiences "
+        "WHERE food_name='burger' ORDER BY eaten_at DESC LIMIT 1",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successfully rated food experience");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 1)
+        fail("successful rating was not persisted on the eating experience");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction_sum,rating_count FROM r2_food_preferences WHERE food_name='burger'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successful aggregate food preference");
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_double(st, 0) != 1.0 ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("successful rating did not update aggregate food preference exactly once");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction_sum,rating_count FROM r2_food_ingredient_preferences "
+        "WHERE ingredient='historical-only-ingredient'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successful historical ingredient preference");
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_double(st, 0) != 1.0 ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("rating did not learn from the ingredients recorded at eating time");
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+
     if (r2_reality_remove_item("burger") != 0) fail("could not remove remaining regression-test food");
     if (r2_reality_remove_item("zero_fullness") != 0) fail("could not remove zero-fullness regression item");
     if (r2_reality_remove_item("unlisted_food") != 0) fail("could not remove unlisted-object regression item");
