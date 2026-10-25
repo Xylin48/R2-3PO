@@ -56,12 +56,12 @@ for required in (
     "size_t max_user_reserve = input_budget > 1500",
     "current_user_reserve > max_user_reserve",
     "static R2SystemContextBudget r2_compute_system_context_budget(",
-    "budget.reality_reserve = system_budget / 8;",
-    "budget.identity_budget = system_budget / 3;",
-    "budget.retrieval_reserve = system_budget / 8;",
-    "budget.capabilities_reserve = system_budget / 16;",
-    "budget.override_budget = system_budget > reserved",
-    "r2_compute_system_context_budget(system_budget)",
+    "budget.reality_reserve = share + (remainder > 1 ? 1 : 0);",
+    "budget.identity_budget = share + (remainder > 0 ? 1 : 0);",
+    "budget.retrieval_reserve = share + (remainder > 2 ? 1 : 0);",
+    "budget.capabilities_reserve = share;",
+    "budget.override_budget = override_length < system_budget",
+    "r2_compute_system_context_budget(system_budget, override_length)",
     "message_add_system_prompt_sections_locked() != 0",
     "static const char *const section_markers[]",
     "const char *section_start = starts[i];",
@@ -72,13 +72,13 @@ for required in (
     "ollama_authoritative_user_query",
     "capabilities_used += length",
     "Prefer a complete sentence boundary when the cap falls inside the",
-    "message_priority == 0 && length > identity_budget",
-    "message_priority == 1 && length > reality_reserve",
-    "message_priority == 2 && length > retrieval_reserve",
+    "size_t category_remaining = identity_budget > identity_used",
+    "size_t category_remaining = reality_reserve > reality_used",
+    "size_t category_remaining = retrieval_reserve > retrieval_used",
     "message_priority == 3 || message_priority == 4",
-    "r2_safe_prompt_prefix_length(content, identity_budget, 0)",
-    "r2_safe_prompt_prefix_length(content, reality_reserve, 1)",
-    "r2_safe_prompt_prefix_length(content, retrieval_reserve, 1)",
+    "r2_safe_prompt_prefix_length(content, category_remaining, 0)",
+    "r2_safe_prompt_prefix_length(content, category_remaining, 1)",
+    "r2_safe_prompt_prefix_length(content, category_remaining, 1)",
     'json_object_object_add(override_message, "content",',
     'bounded_override) != 0',
     'json_object_put(bounded_override);',
@@ -102,7 +102,7 @@ if boundary_choice < 0 or utf8_alignment <= boundary_choice:
     raise SystemExit("System-override clipping can split a multibyte UTF-8 character")
 
 def allocation_for_context(num_ctx: int, num_predict: int, override_length: int,
-                           current_user_reserve: int = 1500) -> tuple[int, int, int, int, int, int, int, int, int]:
+                           current_user_reserve: int = 1500) -> tuple[int, int, int, int, int, int, int, int]:
     input_budget = (num_ctx - num_predict - 512) * 32 // 10
     input_budget = min(input_budget, history_total)
     max_user_reserve = (
@@ -114,52 +114,37 @@ def allocation_for_context(num_ctx: int, num_predict: int, override_length: int,
         if input_budget > current_user_reserve + 500 else 0
     )
     system_budget = min(system_budget, system_total, input_budget)
-    reality_reserve = min(system_budget // 8, 3000)
-    identity_minimum = system_budget // 3
-    if identity_minimum < 1000 and system_budget > reality_reserve + 2000:
-        identity_minimum = 1000
-    retrieval_reserve = system_budget // 8
-    capabilities_reserve = system_budget // 16
-    identity_budget = min(identity_minimum, system_budget - reality_reserve)
-    reserved = (reality_reserve + identity_budget + retrieval_reserve
-                + capabilities_reserve)
-    override_budget = (
-        system_budget - reserved if system_budget > reserved
-        else system_budget // 4
-    )
-    bounded_override = min(override_length, override_budget)
-    return (system_budget, bounded_override, identity_budget, reality_reserve,
-            retrieval_reserve, capabilities_reserve, current_user_reserve,
-            input_budget, identity_minimum)
+    bounded_override = min(override_length, system_budget)
+    remaining = system_budget - bounded_override
+    share, remainder = divmod(remaining, 4)
+    identity = share + (1 if remainder > 0 else 0)
+    reality = share + (1 if remainder > 1 else 0)
+    retrieval = share + (1 if remainder > 2 else 0)
+    capabilities = share
+    return (system_budget, bounded_override, identity, reality, retrieval,
+            capabilities, current_user_reserve, input_budget)
 
-# Exercise low-memory, normal, and long-user-message paths. The allocator must
-# leave a system budget and a bounded current-turn reservation at every size.
 for num_ctx, num_predict, override_length, requested_user_reserve in (
-    (2048, 384, 12000, 1500),
-    (2048, 384, 12000, 12000),
-    (4096, 384, 12000, 12000),
-    (8192, 768, 12000, 1500),
-    (16384, 3072, 12000, 12000),
+    (2048, 384, 300, 1500),
+    (2048, 384, 300, 12000),
+    (4096, 384, 600, 12000),
+    (8192, 768, 1200, 1500),
+    (16384, 3072, 3000, 12000),
 ):
-    system_budget, override, identity, reality, retrieval, capabilities, user_reserve, input_budget, identity_minimum = (
+    system_budget, override, identity, reality, retrieval, capabilities, user_reserve, input_budget = (
         allocation_for_context(num_ctx, num_predict, override_length,
                               requested_user_reserve)
     )
-    if system_budget <= 0 or override > system_budget:
+    if system_budget <= 0 or override != min(override_length, system_budget):
         raise SystemExit(f"Invalid override allocation at context={num_ctx}")
-    if identity < identity_minimum or reality <= 0 or retrieval <= 0 or capabilities <= 0:
+    if identity <= 0 or reality <= 0 or retrieval <= 0 or capabilities <= 0:
         raise SystemExit(
             f"Identity/Reality/retrieval/capability context starved at context={num_ctx}: "
             f"system={system_budget}, override={override}, identity={identity}, "
             f"reality={reality}, retrieval={retrieval}, capabilities={capabilities}"
         )
-    if system_budget > 3000 and override < system_budget // 6:
-        raise SystemExit(
-            f"Conversation contract received too little budget at context={num_ctx}: "
-            f"system={system_budget}, override={override}"
-        )
-    if override + identity + reality + retrieval + capabilities > system_budget:
-        raise SystemExit(f"Prompt allocations exceed system budget at context={num_ctx}")
+    if override + identity + reality + retrieval + capabilities != system_budget:
+        raise SystemExit(f"Prompt allocations do not account for system budget at context={num_ctx}")
     if system_budget - (override + identity + reality) < retrieval + capabilities:
         raise SystemExit(f"Retrieved memory/capability shares were consumed by higher-priority blocks at context={num_ctx}")
     if system_budget + user_reserve + 500 > input_budget:
@@ -169,6 +154,13 @@ for num_ctx, num_predict, override_length, requested_user_reserve in (
     if input_budget > 1500 and system_budget < 1000:
         raise SystemExit(f"Long current turn starved system context at context={num_ctx}")
 
+# An oversized override is clipped to the available system budget; no allocation
+# may exceed the context even when the override is longer than the whole budget.
+system_budget, override, identity, reality, retrieval, capabilities, _, _ = (
+    allocation_for_context(2048, 384, 12000, 1500)
+)
+if override != system_budget or any((identity, reality, retrieval, capabilities)):
+    raise SystemExit("Oversized conversation contract must be clipped to the system budget")
 print(
     f"system prompt budget smoke passed: prompt={len(prompt)} chars, "
     f"per-message={per_message}, aggregate-system={system_total}, history={history_total}"
