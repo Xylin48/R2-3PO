@@ -273,7 +273,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         print(f"ERROR: Ollama listed {MODEL} but chat generation produced no usable final answer. {detail}", file=sys.stderr)
         return False
 
-    if "R2_READY" not in content:
+    if content.strip() != "R2_READY":
         print(
             f"ERROR: Ollama listed {MODEL} but the foreground probe did not return its expected R2_READY marker.",
             file=sys.stderr,
