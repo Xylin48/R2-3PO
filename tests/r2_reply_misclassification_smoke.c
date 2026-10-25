@@ -245,7 +245,7 @@ int main(void)
                 "a constrained retrieved-memory block is clipped at a record boundary");
 
     R2SystemContextBudget context_budget =
-        r2_compute_system_context_budget(9468);
+        r2_compute_system_context_budget(9468, 1000);
     ok &= check(context_budget.override_budget > 0 &&
                     context_budget.identity_budget > 0 &&
                     context_budget.reality_reserve > 0 &&
@@ -258,7 +258,7 @@ int main(void)
                         context_budget.capabilities_reserve == 9468,
                 "the constrained 8k-context prompt budget reserves identity, Reality, retrieved memory, and capability guidance");
     R2SystemContextBudget small_context_budget =
-        r2_compute_system_context_budget(1276);
+        r2_compute_system_context_budget(1276, 100);
     ok &= check(small_context_budget.override_budget +
                     small_context_budget.identity_budget +
                     small_context_budget.reality_reserve +
