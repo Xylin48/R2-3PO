@@ -24,6 +24,49 @@ ALLOWED_API_BASES = {
 MODEL = "qwen3.5:9b"
 
 
+def _adaptive_context_tokens() -> int:
+    """Mirror r2_ollama_context_tokens() when no explicit context is set."""
+    gib = 1024 ** 3
+    available = 0
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        available = 0
+
+    # Respect cgroup memory headroom where it is exposed, matching the core's
+    # use of the tighter host/cgroup estimate.
+    for current_path, limit_path in (
+        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ):
+        try:
+            with open(current_path, "r", encoding="ascii") as stream:
+                used = int(stream.read().strip())
+            with open(limit_path, "r", encoding="ascii") as stream:
+                raw_limit = stream.read().strip()
+            if raw_limit == "max":
+                continue
+            limit = int(raw_limit)
+            if 0 < limit < (1 << 60):
+                cgroup_available = max(1, limit - used)
+                available = min(available, cgroup_available) if available else cgroup_available
+        except (OSError, ValueError):
+            continue
+
+    # This mirrors the core's context tiers, including its conservative
+    # fallback when memory cannot be measured.
+    return (16384 if available >= 8 * gib else
+            12288 if available >= 5 * gib else
+            8192 if available >= 3 * gib else
+            4096 if available >= 2 * gib else
+            2048 if available else 4096)
+
+
 def _configured_api_base() -> str:
     """Return only an explicitly approved loopback Ollama endpoint."""
     base = os.environ.get("R2_OLLAMA_BASE_URL", DEFAULT_API_BASE)
@@ -160,7 +203,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         "num_batch": 128,
     }
     configured_context = os.environ.get("R2_OLLAMA_NUM_CTX", "").strip()
-    context_tokens = 4096
+    context_tokens = _adaptive_context_tokens()
     if configured_context:
         try:
             requested_context = int(configured_context, 10)
