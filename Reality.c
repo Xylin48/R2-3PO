@@ -4423,7 +4423,7 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
 
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(reality_db,
-            "SELECT id,ingredients FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1",
+            "SELECT id,ingredients FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC,id DESC LIMIT 1",
             -1, &st, NULL);
     if (rc == SQLITE_OK)
         rc = bind_text(st, 1, food);
