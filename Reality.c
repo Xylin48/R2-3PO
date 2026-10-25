@@ -4409,8 +4409,7 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
 
     char ingredients[1024] = {0}, taste[1024] = {0};
     food_attributes(food, ingredients, sizeof(ingredients), taste, sizeof(taste));
-    char *ingredient_copy = strdup(ingredients);
-    if (!ingredient_copy) return -1;
+    char *ingredient_copy = NULL;
 
     /*
      * One rating updates the experience and both levels of learned preference.
@@ -4424,7 +4423,7 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
 
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(reality_db,
-            "SELECT id FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1",
+            "SELECT id,ingredients FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1",
             -1, &st, NULL);
     if (rc == SQLITE_OK)
         rc = bind_text(st, 1, food);
@@ -4432,6 +4431,10 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
         int step_rc = sqlite3_step(st);
         if (step_rc == SQLITE_ROW) {
             experience_id = sqlite3_column_int64(st, 0);
+            const unsigned char *recorded_ingredients = sqlite3_column_text(st, 1);
+            if (recorded_ingredients && *recorded_ingredients)
+                snprintf(ingredients, sizeof(ingredients), "%s",
+                         (const char *)recorded_ingredients);
         } else if (step_rc == SQLITE_DONE) {
             rc = SQLITE_NOTFOUND;
         } else {
@@ -4440,6 +4443,10 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     }
     if (st) { sqlite3_finalize(st); st = NULL; }
     if (rc == SQLITE_OK && experience_id == 0) rc = SQLITE_NOTFOUND;
+    if (rc == SQLITE_OK) {
+        ingredient_copy = strdup(ingredients);
+        if (!ingredient_copy) rc = SQLITE_NOMEM;
+    }
 
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(reality_db,
