@@ -37,26 +37,38 @@ def _adaptive_context_tokens() -> int:
     except (OSError, ValueError, IndexError):
         available = 0
 
-    # Respect cgroup memory headroom where it is exposed, matching the core's
-    # use of the tighter host/cgroup estimate.
-    for current_path, limit_path in (
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
-        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
-         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    ):
+    def read_uint(path: str) -> int | None:
         try:
-            with open(current_path, "r", encoding="ascii") as stream:
-                used = int(stream.read().strip())
-            with open(limit_path, "r", encoding="ascii") as stream:
-                raw_limit = stream.read().strip()
-            if raw_limit == "max":
-                continue
-            limit = int(raw_limit)
-            if 0 < limit < (1 << 60):
-                cgroup_available = max(1, limit - used)
-                available = min(available, cgroup_available) if available else cgroup_available
+            with open(path, "r", encoding="ascii") as stream:
+                raw = stream.read().strip()
+            value = int(raw, 10)
+            return value if value >= 0 else None
         except (OSError, ValueError):
-            continue
+            return None
+
+    # Match the core's cgroup precedence: use v2 when its limit is numeric;
+    # otherwise try v1. A known limit with unreadable usage means headroom is
+    # unknown, so the core deliberately selects the smallest positive tier.
+    cgroup_max = read_uint("/sys/fs/cgroup/memory.max")
+    if cgroup_max is not None:
+        if cgroup_max > 0:
+            cgroup_used = read_uint("/sys/fs/cgroup/memory.current")
+            cgroup_available = (
+                max(1, cgroup_max - cgroup_used)
+                if cgroup_used is not None and cgroup_used < cgroup_max
+                else 1
+            )
+            available = min(available, cgroup_available) if available else cgroup_available
+    else:
+        v1_max = read_uint("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if v1_max is not None and 0 < v1_max < (1 << 60):
+            v1_used = read_uint("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            v1_available = (
+                max(1, v1_max - v1_used)
+                if v1_used is not None and v1_used < v1_max
+                else 1
+            )
+            available = min(available, v1_available) if available else v1_available
 
     # This mirrors the core's context tiers, including its conservative
     # fallback when memory cannot be measured.
