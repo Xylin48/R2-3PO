@@ -1895,34 +1895,34 @@ static int inventory_transfer_journal_begin_locked(const char *operation,
         "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')", -1, &st, NULL);
     if (rc == SQLITE_OK) {
         int i = 1;
-        sqlite3_bind_text(st, i++, operation, -1, SQLITE_TRANSIENT);
-        bind_text(st, i++, snapshot->name);
-        sqlite3_bind_int(st, i++, snapshot->reality_exists);
-        bind_text(st, i++, snapshot->reality_description);
-        sqlite3_bind_int(st, i++, snapshot->reality_quantity);
-        bind_text(st, i++, snapshot->reality_container);
-        bind_text(st, i++, snapshot->reality_owner);
-        sqlite3_bind_int64(st, i++, snapshot->item_memory_max_id);
-        sqlite3_bind_int(st, i++, snapshot->fridge_exists);
-        bind_text(st, i++, snapshot->fridge_description);
-        sqlite3_bind_int(st, i++, snapshot->fridge_quantity);
-        sqlite3_bind_double(st, i++, snapshot->fridge_fullness);
-        sqlite3_bind_double(st, i++, snapshot->fridge_energy);
-        bind_text(st, i++, snapshot->fridge_ingredients);
-        bind_text(st, i++, snapshot->fridge_taste);
-        sqlite3_bind_int(st, i++, snapshot->self_snapshot_valid);
-        sqlite3_bind_double(st, i++, snapshot->self_hunger);
-        sqlite3_bind_double(st, i++, snapshot->self_satisfaction);
-        sqlite3_bind_double(st, i++, snapshot->self_seconds_since_meal);
-        sqlite3_bind_double(st, i++, snapshot->self_sleepiness);
-        sqlite3_bind_double(st, i++, snapshot->self_energy);
-        sqlite3_bind_int64(st, i++, snapshot->self_last_tick);
-        bind_text(st, i++, snapshot->self_updated_at);
-        sqlite3_bind_int(st, i++, snapshot->starvation_fact_exists);
-        bind_text(st, i++, snapshot->starvation_fact_value);
-        bind_text(st, i++, snapshot->starvation_fact_evidence);
-        sqlite3_bind_int64(st, i++, snapshot->food_experience_max_id);
-        rc = sqlite3_step(st);
+        rc = sqlite3_bind_text(st, i++, operation, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->reality_exists);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->reality_description) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->reality_quantity);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->reality_container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->reality_owner) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, i++, snapshot->item_memory_max_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->fridge_exists);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->fridge_description) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->fridge_quantity);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->fridge_fullness);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->fridge_energy);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->fridge_ingredients) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->fridge_taste) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->self_snapshot_valid);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->self_hunger);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->self_satisfaction);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->self_seconds_since_meal);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->self_sleepiness);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, snapshot->self_energy);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, i++, snapshot->self_last_tick);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->self_updated_at) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, snapshot->starvation_fact_exists);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->starvation_fact_value) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, snapshot->starvation_fact_evidence) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, i++, snapshot->food_experience_max_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
@@ -1988,10 +1988,8 @@ static int inventory_transfer_restore_fridge_locked(const InventoryTransferSnaps
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(fridge_db,
             "DELETE FROM r2_fridge_items WHERE name=? COLLATE NOCASE", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, snapshot->name);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK)
+        rc = bind_text(st, 1, snapshot->name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE && snapshot->fridge_exists) {
         rc = fridge_insert_item_compat(snapshot->name, snapshot->fridge_description,
@@ -2025,23 +2023,19 @@ static int inventory_transfer_restore_reality_locked(const InventoryTransferSnap
             "VALUES(?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET description=excluded.description,"
             "quantity=excluded.quantity,container=excluded.container,owner=excluded.owner,"
             "updated_at=CURRENT_TIMESTAMP", -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            bind_text(st, 1, snapshot->name);
-            bind_text(st, 2, snapshot->reality_description);
-            sqlite3_bind_int(st, 3, snapshot->reality_quantity);
-            bind_text(st, 4, snapshot->reality_container);
-            bind_text(st, 5, snapshot->reality_owner);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK) rc = bind_text(st, 1, snapshot->name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, 2, snapshot->reality_description) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, snapshot->reality_quantity);
+        if (rc == SQLITE_OK) rc = bind_text(st, 4, snapshot->reality_container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, 5, snapshot->reality_owner) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (st) sqlite3_finalize(st);
         st = NULL;
     } else if (rc == SQLITE_OK) {
         rc = sqlite3_prepare_v2(reality_db,
             "DELETE FROM r2_reality_objects WHERE name=? COLLATE NOCASE", -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            bind_text(st, 1, snapshot->name);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK)
+            rc = bind_text(st, 1, snapshot->name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
         if (st) sqlite3_finalize(st);
         st = NULL;
     }
@@ -2049,11 +2043,9 @@ static int inventory_transfer_restore_reality_locked(const InventoryTransferSnap
         rc = sqlite3_prepare_v2(reality_db,
             "DELETE FROM r2_reality_item_memory WHERE id>? AND item_name=? COLLATE NOCASE",
             -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, snapshot->item_memory_max_id);
-            bind_text(st, 2, snapshot->name);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, snapshot->item_memory_max_id);
+        if (rc == SQLITE_OK) rc = bind_text(st, 2, snapshot->name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (st) sqlite3_finalize(st);
         st = NULL;
     }
@@ -2064,16 +2056,14 @@ static int inventory_transfer_restore_reality_locked(const InventoryTransferSnap
             "satisfaction=excluded.satisfaction,seconds_since_meal=excluded.seconds_since_meal,"
             "sleepiness=excluded.sleepiness,energy=excluded.energy,last_tick=excluded.last_tick,"
             "updated_at=excluded.updated_at", -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_double(st, 1, snapshot->self_hunger);
-            sqlite3_bind_double(st, 2, snapshot->self_satisfaction);
-            sqlite3_bind_double(st, 3, snapshot->self_seconds_since_meal);
-            sqlite3_bind_double(st, 4, snapshot->self_sleepiness);
-            sqlite3_bind_double(st, 5, snapshot->self_energy);
-            sqlite3_bind_int64(st, 6, snapshot->self_last_tick);
-            bind_text(st, 7, snapshot->self_updated_at);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 1, snapshot->self_hunger);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 2, snapshot->self_satisfaction);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, snapshot->self_seconds_since_meal);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 4, snapshot->self_sleepiness);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 5, snapshot->self_energy);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 6, snapshot->self_last_tick);
+        if (rc == SQLITE_OK) rc = bind_text(st, 7, snapshot->self_updated_at) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (st) sqlite3_finalize(st);
         st = NULL;
     }
@@ -2084,11 +2074,9 @@ static int inventory_transfer_restore_reality_locked(const InventoryTransferSnap
                 "VALUES('starvation_72h_logged',?,?) ON CONFLICT(key) DO UPDATE SET "
                 "value=excluded.value,evidence=excluded.evidence,updated_at=CURRENT_TIMESTAMP",
                 -1, &st, NULL);
-            if (rc == SQLITE_OK) {
-                bind_text(st, 1, snapshot->starvation_fact_value);
-                bind_text(st, 2, snapshot->starvation_fact_evidence);
-                rc = sqlite3_step(st);
-            }
+            if (rc == SQLITE_OK) rc = bind_text(st, 1, snapshot->starvation_fact_value) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = bind_text(st, 2, snapshot->starvation_fact_evidence) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
         } else {
             rc = sqlite3_prepare_v2(reality_db,
                 "DELETE FROM r2_reality_self_facts WHERE key='starvation_72h_logged'",
@@ -2102,11 +2090,9 @@ static int inventory_transfer_restore_reality_locked(const InventoryTransferSnap
         rc = sqlite3_prepare_v2(reality_db,
             "DELETE FROM r2_food_experiences WHERE id>? AND food_name=? COLLATE NOCASE",
             -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, snapshot->food_experience_max_id);
-            bind_text(st, 2, snapshot->name);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, snapshot->food_experience_max_id);
+        if (rc == SQLITE_OK) rc = bind_text(st, 2, snapshot->name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (st) sqlite3_finalize(st);
     }
     if (rc == SQLITE_DONE) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
