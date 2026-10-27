@@ -100,6 +100,14 @@ static sqlite3 *r2_diary_db = NULL;
 /* Serialize diary insert/link/mirror sequences across foreground and background workers. */
 static pthread_mutex_t r2_diary_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void r2_diary_close_failed_init(void)
+{
+    if (r2_diary_db) {
+        (void)sqlite3_close_v2(r2_diary_db);
+        r2_diary_db = NULL;
+    }
+}
+
 
 /* ============================================================
  * INTERNAL HELPERS
@@ -599,6 +607,9 @@ static int r2_diary_init_unlocked(void)
     int result;
     char *error_message = NULL;
 
+    if (r2_diary_db)
+        return 0;
+
     /*
      * R2's own kernel/code directory.
      */
@@ -665,136 +676,12 @@ static int r2_diary_init_unlocked(void)
         &r2_diary_db
     );
 
-    if (result != SQLITE_OK)
-    {
-        fprintf(
-            stderr,
-            "[R2 DIARY] SQLite error: %s\n",
-            r2_diary_db
-                ? sqlite3_errmsg(r2_diary_db)
-                : "unknown error"
-        );
-
-        if (r2_diary_db)
-        {
-            sqlite3_close(
-                r2_diary_db
-            );
-        }
-
-        r2_diary_db = NULL;
-
-        return -1;
-    }
-
-    /*
-     * The diary, memory kernel, and other learning subsystems can write to
-     * this same SQLite database from different threads/connections. WAL
-     * allows readers to coexist with a writer; a bounded busy timeout also
-     * lets a concurrent writer finish instead of dropping a memory/diary
-     * update immediately with SQLITE_BUSY.
-     */
-    result = sqlite3_busy_timeout(r2_diary_db, 5000);
-    if (result != SQLITE_OK)
-    {
-        fprintf(stderr, "[R2 DIARY] Could not configure SQLite busy timeout: %s\n",
-                sqlite3_errmsg(r2_diary_db));
-        sqlite3_close(r2_diary_db);
-        r2_diary_db = NULL;
-        return -1;
-    }
-
-    /*
-     * WAL improves behavior when the diary and R2 kernel
-     * access the same database.
-     */
-    sqlite3_exec(
-        r2_diary_db,
-        "PRAGMA journal_mode=WAL;",
-        NULL,
-        NULL,
-        NULL
-    );
-
-    sqlite3_exec(
-        r2_diary_db,
-        "PRAGMA synchronous=NORMAL;",
-        NULL,
-        NULL,
-        NULL
-    );
-
-    /*
-     * Diary table.
-     */
-    result = sqlite3_exec(
-        r2_diary_db,
-
-        "CREATE TABLE IF NOT EXISTS diary_entries ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "entry TEXT NOT NULL,"
-        "created_at TEXT NOT NULL"
-        ");",
-
-        NULL,
-        NULL,
-        &error_message
-    );
-
-    if (result != SQLITE_OK)
-    {
-        fprintf(
-            stderr,
-            "[R2 DIARY] Could not create diary table: %s\n",
-            error_message
-                ? error_message
-                : "unknown error"
-        );
-
-        sqlite3_free(
-            error_message
-        );
-
-        return -1;
-    }
-
-    if (diary_entries_migrate_schema() != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not migrate diary entry schema: %s\n",
-                sqlite3_errmsg(r2_diary_db));
-        return -1;
-    }
-
-    /*
-     * Index for chronological retrieval.
-     */
-    sqlite3_exec(
-        r2_diary_db,
-
-        "CREATE INDEX IF NOT EXISTS "
-        "idx_diary_created_at "
-        "ON diary_entries(created_at);",
-
-        NULL,
-        NULL,
-        NULL
-    );
-
-    /* Cross-reference private diary entries with the Life Log without
-       copying diary prose into the public/factual event stream. */
-    result = sqlite3_exec(
-        r2_diary_db,
-        "CREATE TABLE IF NOT EXISTS r2_diary_entry_links ("
-        " diary_entry_id INTEGER PRIMARY KEY,"
-        " log_event_id INTEGER,"
-        " relationship TEXT NOT NULL DEFAULT 'reflection',"
-        " linked_at TEXT NOT NULL,"
-        " memory_indexed INTEGER NOT NULL DEFAULT 0);",
-        NULL, NULL, &error_message
-    );
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\\n",
                 error_message ? error_message : "unknown error");
         sqlite3_free(error_message);
+        error_message = NULL;
+        r2_diary_close_failed_init();
         return -1;
     }
     if (diary_link_ensure_column("log_event_id", "INTEGER") != SQLITE_OK ||
