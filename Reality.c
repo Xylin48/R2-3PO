@@ -574,9 +574,12 @@ static int money_read_locked(sqlite3_int64 *cash, sqlite3_int64 *bank)
     int rc=sqlite3_prepare_v2(reality_db,
         "UPDATE r2_money_account SET cash_cents=?,bank_cents=?,updated_at=CURRENT_TIMESTAMP WHERE id=1",
         -1,&st,NULL);
-    if (rc==SQLITE_OK) { sqlite3_bind_int64(st,1,c); sqlite3_bind_int64(st,2,b); rc=sqlite3_step(st); }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, c);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, b);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
-    if (rc!=SQLITE_DONE) return -1;
+    if (rc != SQLITE_DONE) return -1;
     if (cash) *cash=c;
     if (bank) *bank=b;
     return 0;
@@ -599,14 +602,13 @@ static int money_journal_begin(sqlite3_int64 old_cash, sqlite3_int64 old_bank,
     int rc = sqlite3_prepare_v2(reality_db,
         "INSERT INTO r2_money_transfer_journal(id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,operation,phase) "
         "VALUES(1,?,?,?,?,?,'pending')", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, old_cash);
-        sqlite3_bind_int64(st, 2, old_bank);
-        sqlite3_bind_int64(st, 3, new_cash);
-        sqlite3_bind_int64(st, 4, new_bank);
-        sqlite3_bind_text(st, 5, operation ? operation : "transfer", -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, old_cash);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, old_bank);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, new_cash);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 4, new_bank);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 5, operation ? operation : "transfer", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -4780,18 +4782,16 @@ static int purchase_journal_begin(sqlite3_int64 old_cash, sqlite3_int64 old_bank
         "INSERT INTO r2_purchase_journal(id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,item_name,item_description,destination,pre_quantity,pre_container,phase) "
         "VALUES(1,?,?,?,?,?,?,?,?,?,'pending')",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, old_cash);
-        sqlite3_bind_int64(st, 2, old_bank);
-        sqlite3_bind_int64(st, 3, new_cash);
-        sqlite3_bind_int64(st, 4, new_bank);
-        bind_text(st, 5, name);
-        bind_text(st, 6, description);
-        bind_text(st, 7, destination);
-        sqlite3_bind_int64(st, 8, pre_quantity);
-        bind_text(st, 9, pre_container);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, old_cash);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, old_bank);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, new_cash);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 4, new_bank);
+    if (rc == SQLITE_OK && bind_text(st, 5, name) != 0) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK && bind_text(st, 6, description) != 0) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK && bind_text(st, 7, destination) != 0) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 8, pre_quantity);
+    if (rc == SQLITE_OK && bind_text(st, 9, pre_container) != 0) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -4808,10 +4808,8 @@ static int purchase_journal_set_phase(const char *phase)
     int rc = sqlite3_prepare_v2(reality_db,
         "UPDATE r2_purchase_journal SET phase=? WHERE id=1",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, phase);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK && bind_text(st, 1, phase) != 0) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE && sqlite3_changes(reality_db) == 1)
         rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
