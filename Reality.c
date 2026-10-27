@@ -4688,6 +4688,10 @@ int r2_reality_money_receive(double amount)
     pthread_mutex_lock(&reality_lock);
     sqlite3_int64 cash = 0, bank = 0;
     int rc = purchase_journal_recover();
+    /* A previous interrupted deposit/withdrawal must be resolved before a
+       new receipt changes the authoritative wallet files. Otherwise a later
+       recovery could restore the old balance and erase this receipt. */
+    if (rc == 0) rc = money_journal_recover(NULL);
     if (rc == 0) rc = money_read_locked(&cash, &bank);
     sqlite3_int64 old_cash = cash;
     int wallet_changed = 0;
