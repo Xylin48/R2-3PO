@@ -1375,6 +1375,39 @@ int main(void)
         sqlite3_close(money_db);
     }
 
+    /* Context generation must also recover an interrupted transfer before
+       presenting wallet balances as current reality. */
+    {
+        char *money_context = NULL;
+        sqlite3 *money_db = NULL;
+        sqlite3_stmt *money_st = NULL;
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not open Reality DB for money-context recovery test");
+        if (sqlite3_exec(money_db,
+            "INSERT OR REPLACE INTO r2_money_transfer_journal("
+            "id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,operation,phase) "
+            "VALUES(1,1000,2000,500,2500,'deposit','pending')",
+            NULL, NULL, NULL) != SQLITE_OK)
+            fail("could not seed interrupted transfer for money-context recovery");
+        sqlite3_close(money_db);
+
+        money_context = r2_reality_money_context();
+        if (!money_context ||
+            !strstr(money_context, "carried cash=$10.00; piggybank=$20.00"))
+            fail("money context exposed balances before recovering the interrupted transfer");
+        free(money_context);
+
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not reopen Reality DB after money-context recovery");
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT COUNT(*) FROM r2_money_transfer_journal",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int(money_st, 0) != 0)
+            fail("money-context generation left the interrupted transfer unresolved");
+        sqlite3_finalize(money_st);
+        sqlite3_close(money_db);
+    }
+
     /* At the 72-hour starvation marker, status must not still say only
        "very hungry" while the prolonged-starvation event is recorded. */
     if (sqlite3_open(path, &db) != SQLITE_OK) fail("could not reopen Reality database for starvation status");
