@@ -61,6 +61,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(payload["options"]["num_batch"], 128)
         self.assertTrue(read.call_args_list[2].args[0].endswith("/api/chat"))
         vision_payload = read.call_args_list[2].kwargs["payload"]
+        self.assertNotIn("num_batch", vision_payload["options"])
         png_bytes = base64.b64decode(vision_payload["messages"][1]["images"][0])
         self.assertEqual(png_bytes[:8], bytes((137, 80, 78, 71, 13, 10, 26, 10)))
         self.assertEqual(int.from_bytes(png_bytes[16:20], "big"), 640)
