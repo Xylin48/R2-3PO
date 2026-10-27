@@ -594,7 +594,7 @@ static int diary_link_ensure_column(const char *column, const char *definition)
     return sqlite3_exec(r2_diary_db, sql, NULL, NULL, NULL);
 }
 
-int r2_diary_init(void)
+static int r2_diary_init_unlocked(void)
 {
     int result;
     char *error_message = NULL;
@@ -834,13 +834,21 @@ int r2_diary_init(void)
     return 0;
 }
 
+int r2_diary_init(void)
+{
+    pthread_mutex_lock(&r2_diary_write_lock);
+    int rc = r2_diary_init_unlocked();
+    pthread_mutex_unlock(&r2_diary_write_lock);
+    return rc;
+}
+
 
 /* ============================================================
  * SHUTDOWN
  * ============================================================
  */
 
-void r2_diary_shutdown(void)
+static void r2_diary_shutdown_unlocked(void)
 {
     if (r2_diary_db)
     {
@@ -854,6 +862,13 @@ void r2_diary_shutdown(void)
     printf(
         "[R2 DIARY] Shutdown.\n"
     );
+}
+
+void r2_diary_shutdown(void)
+{
+    pthread_mutex_lock(&r2_diary_write_lock);
+    r2_diary_shutdown_unlocked();
+    pthread_mutex_unlock(&r2_diary_write_lock);
 }
 
 
