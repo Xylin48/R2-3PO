@@ -54,6 +54,12 @@ instead of pretending it understood audio.
 
 - `watch` or `watch start` starts a background coordinator after validating the
   local Whisper model, CLI, and default microphone.
+- Watch refuses to start while Ears already has an active source, because that
+  source could be a file or desktop monitor rather than the microphone. Stop
+  the existing Ears source first; Watch does not silently replace it.
+- While Watch is active, standalone `ears start`, `ears listen`, and
+  `ears stop` commands are refused so they cannot compete with the coordinator's
+  capture/transcription loop. `ears status` remains available.
 - Watch captures non-overlapping five-second microphone chunks. A usable
   transcript is sent through the same serialized shell chat path as typed
   text; silence does not create a turn.
