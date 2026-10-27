@@ -1378,9 +1378,11 @@ int main(void)
     /* Context generation must also recover an interrupted transfer before
        presenting wallet balances as current reality. */
     {
+        char money_path[1024];
         char *money_context = NULL;
         sqlite3 *money_db = NULL;
         sqlite3_stmt *money_st = NULL;
+        snprintf(money_path, sizeof(money_path), "%s/r2_reality.db", R2_HOME);
         if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
             fail("could not open Reality DB for money-context recovery test");
         if (sqlite3_exec(money_db,
