@@ -58,6 +58,10 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
         self.assertEqual(payload["options"]["temperature"], 1.0)
         self.assertEqual(payload["options"]["top_p"], 0.95)
+        self.assertEqual(payload["options"]["top_k"], 20)
+        self.assertEqual(payload["options"]["min_p"], 0.0)
+        self.assertEqual(payload["options"]["presence_penalty"], 1.5)
+        self.assertEqual(payload["options"]["repeat_penalty"], 1.0)
         self.assertEqual(payload["options"]["num_batch"], 128)
         self.assertTrue(read.call_args_list[2].args[0].endswith("/api/chat"))
         vision_payload = read.call_args_list[2].kwargs["payload"]
@@ -71,6 +75,10 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(vision_payload["options"]["num_predict"], 512 if vision_payload["options"]["num_ctx"] >= 8192 else 256)
         self.assertEqual(vision_payload["options"]["temperature"], 0.7)
         self.assertEqual(vision_payload["options"]["top_p"], 0.8)
+        self.assertEqual(vision_payload["options"]["top_k"], 20)
+        self.assertEqual(vision_payload["options"]["min_p"], 0.0)
+        self.assertEqual(vision_payload["options"]["presence_penalty"], 1.5)
+        self.assertEqual(vision_payload["options"]["repeat_penalty"], 1.0)
         self.assertTrue(read.call_args_list[3].args[0].endswith("/api/ps"))
         self.assertEqual(gpu.call_count, 1)
 
