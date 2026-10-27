@@ -385,9 +385,10 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "FROM reward_events WHERE target=? AND source=? LIMIT 1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            int step_rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            int step_rc = rc == SQLITE_OK ? sqlite3_step(st) : rc;
             if (step_rc == SQLITE_ROW) {
                 const unsigned char *saved_target = sqlite3_column_text(st, 1);
                 const unsigned char *saved_source = sqlite3_column_text(st, 2);
@@ -418,10 +419,12 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "INSERT OR IGNORE INTO reward_once_keys(target,source,created_at) VALUES(?,?,?);",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 3, now);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_int64(st, 3, now);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) rc = SQLITE_OK;
         }
         if (st) sqlite3_finalize(st);
@@ -433,14 +436,14 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at)"
             " VALUES(?,?,?,?,?,?,?)", -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 3, points);
-            sqlite3_bind_text(st, 4, reason, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 5, now);
-            sqlite3_bind_int(st, 6, modifier);
-            sqlite3_bind_int64(st, 7, expires);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, points);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, reason, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 6, modifier);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, expires);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) {
                 reward_id = sqlite3_last_insert_rowid(reward_db);
                 rc = SQLITE_OK;
@@ -455,10 +458,15 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "UPDATE reward_totals SET points=points+?,updated_at=? WHERE id=1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int(st, 1, points);
-            sqlite3_bind_int64(st, 2, now);
-            rc = sqlite3_step(st);
-            if (rc == SQLITE_DONE) rc = SQLITE_OK;
+            rc = sqlite3_bind_int(st, 1, points);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            if (rc == SQLITE_DONE) {
+                if (sqlite3_changes(reward_db) != 1)
+                    rc = SQLITE_NOTFOUND;
+                else
+                    rc = SQLITE_OK;
+            }
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
