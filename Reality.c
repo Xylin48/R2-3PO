@@ -1679,8 +1679,7 @@ int r2_fridge_add_item(const char *name, const char *description, int quantity,
         "SELECT quantity FROM r2_fridge_items WHERE name=? COLLATE NOCASE",
         -1, &st, NULL) : SQLITE_ERROR;
     if (rc == SQLITE_OK) {
-        bind_text(st, 1, name);
-        rc = sqlite3_step(st);
+        rc = bind_text(st, 1, name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             sqlite3_int64 existing_quantity = sqlite3_column_int64(st, 0);
             rc = existing_quantity > 0 &&
@@ -1751,8 +1750,7 @@ static int inventory_transfer_snapshot_locked(const char *name,
         "SELECT description,quantity,container,owner FROM r2_reality_objects "
         "WHERE name=? COLLATE NOCASE", -1, &st, NULL);
     if (rc == SQLITE_OK) {
-        bind_text(st, 1, name);
-        rc = sqlite3_step(st);
+        rc = bind_text(st, 1, name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             const unsigned char *description = sqlite3_column_text(st, 0);
             const unsigned char *container = sqlite3_column_text(st, 2);
