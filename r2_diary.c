@@ -1642,7 +1642,11 @@ static char *r2_diary_recent_life_log(int limit)
         free(out);
         return strdup("Life Log query unavailable; diary history remains available.");
     }
-    sqlite3_bind_int(st, 1, limit);
+    if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        free(out);
+        return strdup("Life Log query could not bind its row limit.");
+    }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         sqlite3_int64 id = sqlite3_column_int64(st, 0);
@@ -1700,9 +1704,9 @@ static char *r2_diary_recent_life_log(int limit)
         length += required - 1;
     }
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE && length == 0) {
+    if (rc != SQLITE_DONE) {
         free(out);
-        return strdup("Life Log query ended unexpectedly.");
+        return strdup("Life Log query ended unexpectedly; partial results were discarded.");
     }
     if (length == 0)
         snprintf(out, capacity, "No relevant Life Log events yet.\n");
