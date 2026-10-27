@@ -1604,16 +1604,16 @@ static int fridge_insert_item_compat(const char *name, const char *description,
     int rc = sqlite3_prepare_v2(fridge_db, sql, -1, &st, NULL);
     if (rc == SQLITE_OK) {
         int i = 1;
-        bind_text(st, i++, name);
-        bind_text(st, i++, description ? description : "");
-        sqlite3_bind_int(st, i++, quantity);
-        sqlite3_bind_double(st, i++, fullness);
-        sqlite3_bind_double(st, i++, energy);
-        bind_text(st, i++, ingredients ? ingredients : "");
-        bind_text(st, i++, taste ? taste : "");
-        if (has_qty) sqlite3_bind_int(st, i++, quantity);
-        if (has_amount) sqlite3_bind_int(st, i++, quantity);
-        rc = sqlite3_step(st);
+        rc = bind_text(st, i++, name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, description ? description : "") == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, i++, quantity);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, fullness);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, i++, energy);
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, ingredients ? ingredients : "") == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = bind_text(st, i++, taste ? taste : "") == 0 ? SQLITE_OK : SQLITE_ERROR;
+        if (rc == SQLITE_OK && has_qty) rc = sqlite3_bind_int(st, i++, quantity);
+        if (rc == SQLITE_OK && has_amount) rc = sqlite3_bind_int(st, i++, quantity);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     if (st) sqlite3_finalize(st);
     return rc;
