@@ -791,8 +791,11 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         "(diary_entry_id,log_event_id,relationship,linked_at,memory_indexed)"
         " VALUES(?,NULL,'reflection',?,0);", -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int64(st, 1, entry_id);
-    sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
+    if (sqlite3_bind_int64(st, 1, entry_id) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
     st = NULL;
@@ -807,7 +810,10 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         "FROM r2_diary_entry_links WHERE diary_entry_id=?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int64(st, 1, entry_id);
+    if (sqlite3_bind_int64(st, 1, entry_id) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     rc = sqlite3_step(st);
     if (rc != SQLITE_ROW) {
         sqlite3_finalize(st);
@@ -861,9 +867,12 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
             "WHERE diary_entry_id=? AND (log_event_id IS NULL OR log_event_id=0);",
             -1, &st, NULL);
         if (rc != SQLITE_OK) return -1;
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, entry_id);
+        if (sqlite3_bind_int64(st, 1, event_id) != SQLITE_OK ||
+            sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_int64(st, 3, entry_id) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
+        }
         rc = sqlite3_step(st);
         int changed = sqlite3_changes(r2_diary_db);
         sqlite3_finalize(st);
@@ -965,7 +974,11 @@ static int r2_diary_reconnect_history_unlocked(int limit)
         free(pending);
         return -1;
     }
-    sqlite3_bind_int(st, 1, limit);
+    if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        free(pending);
+        return -1;
+    }
     while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
         const unsigned char *created = sqlite3_column_text(st, 1);
         pending[count].id = sqlite3_column_int64(st, 0);
@@ -1028,12 +1041,18 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(r2_diary_db, sql, -1, &st, NULL) != SQLITE_OK)
         return -1;
-    sqlite3_bind_text(st, 1, entry, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
+    if (sqlite3_bind_text(st, 1, entry, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     int bind_index = 3;
     for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
         if (!diary_table_column_exists("diary_entries", aliases[i])) continue;
-        sqlite3_bind_text(st, bind_index++, timestamp, -1, SQLITE_TRANSIENT);
+        if (sqlite3_bind_text(st, bind_index++, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
+        }
     }
     int rc = sqlite3_step(st);
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(r2_diary_db) : -1;
