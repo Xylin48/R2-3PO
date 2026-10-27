@@ -611,21 +611,21 @@ static int r2_diary_init_unlocked(void)
         return 0;
 
     if (r2_mkdir_recursive(R2_HOME) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create R2 home: %s\\n", R2_HOME);
+        fprintf(stderr, "[R2 DIARY] Could not create R2 home: %s\n", R2_HOME);
         return -1;
     }
     if (r2_mkdir_recursive(R2_WORKSPACE) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create workspace: %s\\n", R2_WORKSPACE);
+        fprintf(stderr, "[R2 DIARY] Could not create workspace: %s\n", R2_WORKSPACE);
         return -1;
     }
     if (r2_mkdir_recursive(R2_DIARY_DIR) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary directory: %s\\n", R2_DIARY_DIR);
+        fprintf(stderr, "[R2 DIARY] Could not create diary directory: %s\n", R2_DIARY_DIR);
         return -1;
     }
 
     result = sqlite3_open(R2_DIARY_DATABASE, &r2_diary_db);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] SQLite open failed: %s\\n",
+        fprintf(stderr, "[R2 DIARY] SQLite open failed: %s\n",
                 r2_diary_db ? sqlite3_errmsg(r2_diary_db) : "unknown error");
         r2_diary_close_failed_init();
         return -1;
@@ -633,7 +633,7 @@ static int r2_diary_init_unlocked(void)
 
     result = sqlite3_busy_timeout(r2_diary_db, 5000);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not configure SQLite busy timeout: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not configure SQLite busy timeout: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -641,14 +641,14 @@ static int r2_diary_init_unlocked(void)
 
     result = sqlite3_exec(r2_diary_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not enable SQLite WAL mode: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not enable SQLite WAL mode: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
     }
     result = sqlite3_exec(r2_diary_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not configure SQLite synchronous mode: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not configure SQLite synchronous mode: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -662,7 +662,7 @@ static int r2_diary_init_unlocked(void)
         ");",
         NULL, NULL, &error_message);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary table: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary table: %s\n",
                 error_message ? error_message : "unknown error");
         sqlite3_free(error_message);
         error_message = NULL;
@@ -671,7 +671,7 @@ static int r2_diary_init_unlocked(void)
     }
 
     if (diary_entries_migrate_schema() != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not migrate diary entry schema: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not migrate diary entry schema: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -681,7 +681,7 @@ static int r2_diary_init_unlocked(void)
         "CREATE INDEX IF NOT EXISTS idx_diary_created_at ON diary_entries(created_at);",
         NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary chronology index: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary chronology index: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -696,7 +696,7 @@ static int r2_diary_init_unlocked(void)
         " memory_indexed INTEGER NOT NULL DEFAULT 0);",
         NULL, NULL, &error_message);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\n",
                 error_message ? error_message : "unknown error");
         sqlite3_free(error_message);
         error_message = NULL;
@@ -714,16 +714,16 @@ static int r2_diary_init_unlocked(void)
             "CREATE INDEX IF NOT EXISTS r2_diary_entry_links_event_idx "
             "ON r2_diary_entry_links(log_event_id);",
             NULL, NULL, NULL) != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not migrate diary linkage schema: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not migrate diary linkage schema: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
     }
 
-    printf("[R2 DIARY] Initialized.\\n");
-    printf("[R2 DIARY] Database: %s\\n", R2_DIARY_DATABASE);
-    printf("[R2 DIARY] Diary: %s\\n", R2_DIARY_DIR);
-    printf("[R2 DIARY] Workspace: %s\\n", R2_WORKSPACE);
+    printf("[R2 DIARY] Initialized.\n");
+    printf("[R2 DIARY] Database: %s\n", R2_DIARY_DATABASE);
+    printf("[R2 DIARY] Diary: %s\n", R2_DIARY_DIR);
+    printf("[R2 DIARY] Workspace: %s\n", R2_WORKSPACE);
     return 0;
 }
 int r2_diary_init(void)
@@ -791,8 +791,11 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         "(diary_entry_id,log_event_id,relationship,linked_at,memory_indexed)"
         " VALUES(?,NULL,'reflection',?,0);", -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int64(st, 1, entry_id);
-    sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
+    if (sqlite3_bind_int64(st, 1, entry_id) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
     st = NULL;
@@ -807,7 +810,10 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         "FROM r2_diary_entry_links WHERE diary_entry_id=?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int64(st, 1, entry_id);
+    if (sqlite3_bind_int64(st, 1, entry_id) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     rc = sqlite3_step(st);
     if (rc != SQLITE_ROW) {
         sqlite3_finalize(st);
@@ -861,9 +867,12 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
             "WHERE diary_entry_id=? AND (log_event_id IS NULL OR log_event_id=0);",
             -1, &st, NULL);
         if (rc != SQLITE_OK) return -1;
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, entry_id);
+        if (sqlite3_bind_int64(st, 1, event_id) != SQLITE_OK ||
+            sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_int64(st, 3, entry_id) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
+        }
         rc = sqlite3_step(st);
         int changed = sqlite3_changes(r2_diary_db);
         sqlite3_finalize(st);
@@ -965,7 +974,11 @@ static int r2_diary_reconnect_history_unlocked(int limit)
         free(pending);
         return -1;
     }
-    sqlite3_bind_int(st, 1, limit);
+    if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        free(pending);
+        return -1;
+    }
     while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
         const unsigned char *created = sqlite3_column_text(st, 1);
         pending[count].id = sqlite3_column_int64(st, 0);
@@ -1028,12 +1041,18 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(r2_diary_db, sql, -1, &st, NULL) != SQLITE_OK)
         return -1;
-    sqlite3_bind_text(st, 1, entry, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
+    if (sqlite3_bind_text(st, 1, entry, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     int bind_index = 3;
     for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
         if (!diary_table_column_exists("diary_entries", aliases[i])) continue;
-        sqlite3_bind_text(st, bind_index++, timestamp, -1, SQLITE_TRANSIENT);
+        if (sqlite3_bind_text(st, bind_index++, timestamp, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
+        }
     }
     int rc = sqlite3_step(st);
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(r2_diary_db) : -1;
@@ -1600,6 +1619,7 @@ static char *r2_diary_recent_life_log(int limit)
     char *out = NULL;
     size_t length = 0, capacity = 12288;
     int rc;
+    int intentionally_truncated = 0;
 
     if (!r2_diary_db || !r2_log_is_initialized())
         return strdup("Life Log is not initialized.");
@@ -1623,7 +1643,11 @@ static char *r2_diary_recent_life_log(int limit)
         free(out);
         return strdup("Life Log query unavailable; diary history remains available.");
     }
-    sqlite3_bind_int(st, 1, limit);
+    if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        free(out);
+        return strdup("Life Log query could not bind its row limit.");
+    }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         sqlite3_int64 id = sqlite3_column_int64(st, 0);
@@ -1657,7 +1681,10 @@ static char *r2_diary_recent_life_log(int limit)
             size_t next = capacity;
             while (length + required >= next && next < 65536) next *= 2;
             if (next > 65536) next = 65536;
-            if (length + required >= next) break;
+            if (length + required >= next) {
+                intentionally_truncated = 1;
+                break;
+            }
             char *grown = realloc(out, next);
             if (!grown) {
                 sqlite3_finalize(st);
@@ -1681,9 +1708,9 @@ static char *r2_diary_recent_life_log(int limit)
         length += required - 1;
     }
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE && length == 0) {
+    if (rc != SQLITE_DONE && !intentionally_truncated) {
         free(out);
-        return strdup("Life Log query ended unexpectedly.");
+        return strdup("Life Log query ended unexpectedly; partial results were discarded.");
     }
     if (length == 0)
         snprintf(out, capacity, "No relevant Life Log events yet.\n");
