@@ -1336,6 +1336,45 @@ int main(void)
     if (satisfaction < 76.9 || satisfaction > 77.1) fail("satisfaction should persist across restart");
     if (since_meal < 122.0 || since_meal > 124.0) fail("elapsed time since meal should persist across restart");
 
+    /* A new receipt must first resolve an interrupted wallet/piggybank
+       transfer. Otherwise a later recovery can silently erase the receipt. */
+    {
+        char money_path[1024];
+        sqlite3 *money_db = NULL;
+        sqlite3_stmt *money_st = NULL;
+        snprintf(money_path, sizeof(money_path), "%s/r2_reality.db", R2_HOME);
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not open Reality DB for interrupted money-transfer test");
+        if (sqlite3_exec(money_db,
+            "DELETE FROM r2_money_transfer_journal;"
+            "INSERT INTO r2_money_transfer_journal("
+            "id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,operation,phase) "
+            "VALUES(1,1000,2000,500,2500,'deposit','pending')",
+            NULL, NULL, NULL) != SQLITE_OK)
+            fail("could not seed interrupted money-transfer journal");
+        sqlite3_close(money_db);
+
+        if (r2_reality_money_receive(1.00) != 0)
+            fail("cash receipt failed while recovering an interrupted transfer");
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not reopen Reality DB after money-transfer recovery");
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT cash_cents,bank_cents FROM r2_money_account WHERE id=1",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int64(money_st, 0) != 1100 ||
+            sqlite3_column_int64(money_st, 1) != 2000)
+            fail("cash receipt did not preserve the recovered pre-transfer balances");
+        sqlite3_finalize(money_st);
+        money_st = NULL;
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT COUNT(*) FROM r2_money_transfer_journal",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int(money_st, 0) != 0)
+            fail("cash receipt left an interrupted money-transfer journal unresolved");
+        sqlite3_finalize(money_st);
+        sqlite3_close(money_db);
+    }
+
     /* At the 72-hour starvation marker, status must not still say only
        "very hungry" while the prolonged-starvation event is recorded. */
     if (sqlite3_open(path, &db) != SQLITE_OK) fail("could not reopen Reality database for starvation status");
