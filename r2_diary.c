@@ -1619,6 +1619,7 @@ static char *r2_diary_recent_life_log(int limit)
     char *out = NULL;
     size_t length = 0, capacity = 12288;
     int rc;
+    int intentionally_truncated = 0;
 
     if (!r2_diary_db || !r2_log_is_initialized())
         return strdup("Life Log is not initialized.");
@@ -1680,7 +1681,10 @@ static char *r2_diary_recent_life_log(int limit)
             size_t next = capacity;
             while (length + required >= next && next < 65536) next *= 2;
             if (next > 65536) next = 65536;
-            if (length + required >= next) break;
+            if (length + required >= next) {
+                intentionally_truncated = 1;
+                break;
+            }
             char *grown = realloc(out, next);
             if (!grown) {
                 sqlite3_finalize(st);
@@ -1704,7 +1708,7 @@ static char *r2_diary_recent_life_log(int limit)
         length += required - 1;
     }
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE) {
+    if (rc != SQLITE_DONE && !intentionally_truncated) {
         free(out);
         return strdup("Life Log query ended unexpectedly; partial results were discarded.");
     }
