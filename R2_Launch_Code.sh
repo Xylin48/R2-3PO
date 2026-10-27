@@ -306,27 +306,51 @@ if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
           "$R2_NVIDIA_QUERY_OK" == "1" ]] &&
        printf '%s\n' "$R2_NVIDIA_GPU_NAMES" | grep -qi 'GTX 1050 Ti'; then
         R2_OLLAMA_PREFLIGHT_OK=0
-        # Progressively reduce GPU offload on the 4 GiB GTX 1050 Ti. Retain an
-        # explicitly configured context; only restore 8192 when the launcher
-        # selected that context itself for this card.
-        for GPU_LAYERS in 12 8 4; do
-            echo "[GPU] Default inference preflight failed; retrying with ${GPU_LAYERS} GPU layers and the configured context."
+        # Try reducing KV-cache context at the original layer count before
+        # reducing layer offload. If context was explicitly configured, keep
+        # it operator-controlled and retry only the layer count.
+        if [[ "$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then
+            R2_OLLAMA_NUM_GPU_INITIAL="$R2_OLLAMA_NUM_GPU"
+            GPU_LAYER_CANDIDATES=("$R2_OLLAMA_NUM_GPU_INITIAL" 12 8 4)
+        else
+            GPU_LAYER_CANDIDATES=(12 8 4)
+        fi
+        for GPU_LAYERS in "${GPU_LAYER_CANDIDATES[@]}"; do
             export R2_OLLAMA_NUM_GPU="$GPU_LAYERS"
             if [[ "$R2_OLLAMA_NUM_CTX_DEFAULTED" == "1" ]]; then
-                export R2_OLLAMA_NUM_CTX=8192
-            fi
-            if sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
-                R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
-                R2_OLLAMA_NUM_CTX="$R2_OLLAMA_NUM_CTX" \
-                R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
-                R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}" \
-                python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
-                R2_OLLAMA_PREFLIGHT_OK=1
-                break
+                if [[ "$GPU_LAYERS" == "$R2_OLLAMA_NUM_GPU_INITIAL" ]]; then
+                    CONTEXT_CANDIDATES=(4096 2048)
+                else
+                    CONTEXT_CANDIDATES=(8192 4096 2048)
+                fi
+                for CONTEXT_TOKENS in "${CONTEXT_CANDIDATES[@]}"; do
+                    export R2_OLLAMA_NUM_CTX="$CONTEXT_TOKENS"
+                    echo "[GPU] Retrying foreground preflight with ${GPU_LAYERS} GPU layers and ${CONTEXT_TOKENS} context tokens."
+                    if sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+                        R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
+                        R2_OLLAMA_NUM_CTX="$R2_OLLAMA_NUM_CTX" \
+                        R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
+                        R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}" \
+                        python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
+                        R2_OLLAMA_PREFLIGHT_OK=1
+                        break 2
+                    fi
+                done
+            else
+                echo "[GPU] Retrying foreground preflight with ${GPU_LAYERS} GPU layers and explicitly configured context ${R2_OLLAMA_NUM_CTX}."
+                if sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+                    R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
+                    R2_OLLAMA_NUM_CTX="$R2_OLLAMA_NUM_CTX" \
+                    R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
+                    R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}" \
+                    python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
+                    R2_OLLAMA_PREFLIGHT_OK=1
+                    break
+                fi
             fi
         done
         if [[ "$R2_OLLAMA_PREFLIGHT_OK" != "1" ]]; then
-            echo "ERROR: Default, 12-layer, 8-layer, and 4-layer GPU preflights all failed."
+            echo "ERROR: All configured GPU-layer/context preflight combinations failed."
             echo "R2 was NOT launched; check the local model/server logs."
             read -p "Press Enter to exit..."
             exit 1

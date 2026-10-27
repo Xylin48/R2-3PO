@@ -1,5 +1,9 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "Reward.h"
 #include "r2_diary.h"
@@ -223,16 +227,24 @@ static int64_t find_existing_log_event(sqlite3_int64 reward_id)
         return 0;
     }
     sqlite3_busy_timeout(db, 3000);
-    if (sqlite3_prepare_v2(db,
-        "SELECT id FROM r2_log_events WHERE event_type='enjoyment_changed' "
-        "AND details GLOB ? ORDER BY id DESC LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, pattern, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW)
+    int rc = sqlite3_busy_timeout(db, 3000);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(db,
+            "SELECT id FROM r2_log_events WHERE event_type='enjoyment_changed' "
+            "AND details GLOB ? ORDER BY id DESC LIMIT 1", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, pattern, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
             event_id = sqlite3_column_int64(st, 0);
+            rc = SQLITE_OK;
+        } else if (rc == SQLITE_DONE) {
+            rc = SQLITE_OK;
+        }
     }
     if (st) sqlite3_finalize(st);
     sqlite3_close(db);
-    return event_id;
+    return rc == SQLITE_OK ? event_id : -1;
 }
 
 static int ensure_reward_memory_pointer(int64_t log_event_id,
@@ -254,13 +266,14 @@ static int ensure_reward_memory_pointer(int64_t log_event_id,
     rc = sqlite3_prepare_v2(db,
         "SELECT memory_saved FROM r2_log_events WHERE id=?",
         -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, log_event_id);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, log_event_id);
-        if (sqlite3_step(st) == SQLITE_ROW) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
             memory_saved = sqlite3_column_int(st, 0);
             rc = SQLITE_OK;
-        } else {
-            rc = SQLITE_ERROR;
+        } else if (rc == SQLITE_DONE) {
+            rc = SQLITE_NOTFOUND;
         }
     }
     if (st) sqlite3_finalize(st);
@@ -284,10 +297,9 @@ static int ensure_reward_memory_pointer(int64_t log_event_id,
     rc = sqlite3_prepare_v2(db,
         "UPDATE r2_log_events SET memory_saved=1 WHERE id=?",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, log_event_id);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, log_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     sqlite3_close(db);
     return rc == SQLITE_DONE ? 1 : -1;
@@ -307,12 +319,10 @@ static int store_log_link(sqlite3_int64 reward_id, int64_t log_event_id,
         "UPDATE reward_events SET log_event_id=?,memory_indexed=? "
         "WHERE id=? AND (log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0)",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, log_event_id);
-        sqlite3_bind_int(st, 2, memory_indexed ? 1 : 0);
-        sqlite3_bind_int64(st, 3, reward_id);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, log_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, memory_indexed ? 1 : 0);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, reward_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&reward_lock);
     return rc == SQLITE_DONE ? 0 : -1;
@@ -381,9 +391,10 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "FROM reward_events WHERE target=? AND source=? LIMIT 1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            int step_rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            int step_rc = rc == SQLITE_OK ? sqlite3_step(st) : rc;
             if (step_rc == SQLITE_ROW) {
                 const unsigned char *saved_target = sqlite3_column_text(st, 1);
                 const unsigned char *saved_source = sqlite3_column_text(st, 2);
@@ -414,10 +425,12 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "INSERT OR IGNORE INTO reward_once_keys(target,source,created_at) VALUES(?,?,?);",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 3, now);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK)
+                rc = sqlite3_bind_int64(st, 3, now);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) rc = SQLITE_OK;
         }
         if (st) sqlite3_finalize(st);
@@ -429,14 +442,14 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at)"
             " VALUES(?,?,?,?,?,?,?)", -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 3, points);
-            sqlite3_bind_text(st, 4, reason, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 5, now);
-            sqlite3_bind_int(st, 6, modifier);
-            sqlite3_bind_int64(st, 7, expires);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, points);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, reason, -1, SQLITE_TRANSIENT);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 6, modifier);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, expires);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) {
                 reward_id = sqlite3_last_insert_rowid(reward_db);
                 rc = SQLITE_OK;
@@ -451,10 +464,15 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             "UPDATE reward_totals SET points=points+?,updated_at=? WHERE id=1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int(st, 1, points);
-            sqlite3_bind_int64(st, 2, now);
-            rc = sqlite3_step(st);
-            if (rc == SQLITE_DONE) rc = SQLITE_OK;
+            rc = sqlite3_bind_int(st, 1, points);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            if (rc == SQLITE_DONE) {
+                if (sqlite3_changes(reward_db) != 1)
+                    rc = SQLITE_NOTFOUND;
+                else
+                    rc = SQLITE_OK;
+            }
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
@@ -556,8 +574,8 @@ int r2_reward_reconnect_history(int limit)
         "SELECT id,COALESCE(log_event_id,0),memory_indexed,target,source,points,reason,occurred_at,modifier,expires_at "
         "FROM reward_events WHERE log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0 "
         "ORDER BY id LIMIT ?", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 1, limit);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_int(st, 1, limit);
         while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
             PendingReward *item = &pending[count++];
             const unsigned char *target_text = sqlite3_column_text(st, 3);
@@ -589,6 +607,10 @@ int r2_reward_reconnect_history(int limit)
         PendingReward *item = &pending[i];
         int64_t log_event_id = item->log_event_id > 0
             ? item->log_event_id : find_existing_log_event(item->id);
+        if (log_event_id < 0) {
+            free(pending);
+            return -1;
+        }
         char summary[512], details[1600];
         format_reward_event(item, summary, sizeof(summary), details, sizeof(details));
         if (log_event_id <= 0)

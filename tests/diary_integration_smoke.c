@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
+#include <pthread.h>
 
 static int log_ready = 0;
 
@@ -250,6 +251,27 @@ static void seed_legacy_diary_entries(void)
     sqlite3_close(db);
 }
 
+typedef struct {
+    int thread_index;
+    int entries;
+    int failed;
+} ConcurrentDiaryWriter;
+
+static void *write_concurrent_diary_entries(void *opaque)
+{
+    ConcurrentDiaryWriter *writer = (ConcurrentDiaryWriter *)opaque;
+    for (int i = 0; i < writer->entries; ++i) {
+        char entry[160];
+        snprintf(entry, sizeof(entry), "Concurrent diary thread %d entry %d.",
+                 writer->thread_index, i);
+        if (r2_diary_write(entry) != 0) {
+            writer->failed = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
 static void verify_legacy_diary_migration(void)
 {
     sqlite3 *db = NULL;
@@ -331,6 +353,43 @@ int main(void)
     assert(r2_diary_reconnect_history(10) == 0);
     assert(scalar_int("SELECT COUNT(*) FROM r2_log_events "
                       "WHERE event_type='diary_entry_linked';") == 2);
+
+    /* Foreground and background reflection can write concurrently. Each
+       diary row must keep its own ID/link, and the Markdown append sequence
+       must not race another writer. */
+    {
+        enum { WRITER_COUNT = 8, ENTRIES_PER_WRITER = 4 };
+        pthread_t threads[WRITER_COUNT];
+        ConcurrentDiaryWriter writers[WRITER_COUNT] = {0};
+        for (int i = 0; i < WRITER_COUNT; ++i) {
+            writers[i].thread_index = i;
+            writers[i].entries = ENTRIES_PER_WRITER;
+            assert(pthread_create(&threads[i], NULL,
+                                  write_concurrent_diary_entries,
+                                  &writers[i]) == 0);
+        }
+        for (int i = 0; i < WRITER_COUNT; ++i) {
+            assert(pthread_join(threads[i], NULL) == 0);
+            assert(writers[i].failed == 0);
+        }
+        assert(scalar_int("SELECT COUNT(*) FROM diary_entries "
+                          "WHERE entry LIKE 'Concurrent diary thread %';") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(*) FROM r2_diary_entry_links l "
+                          "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                          "WHERE d.entry LIKE 'Concurrent diary thread %' "
+                          "AND l.log_event_id>0 AND l.memory_indexed=1;") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(DISTINCT l.log_event_id) "
+                          "FROM r2_diary_entry_links l "
+                          "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                          "WHERE d.entry LIKE 'Concurrent diary thread %';") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(*) FROM r2_log_events "
+                          "WHERE event_type='diary_entry_linked';") ==
+               2 + WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(r2_diary_reconnect_history(100) == 0);
+    }
 
     /* The old key-only table is migrated lazily when the idempotent API is
        first used. Replaying the same reward must not increment totals twice. */

@@ -1147,6 +1147,14 @@ static void shell_vision(const char *argument)
 
 static void shell_ears(const char *argument)
 {
+    /* Watch owns the microphone/ASR capture loop while active. Do not let
+       standalone Ears commands replace or close its source mid-utterance. */
+    if (watch_running && argument && *argument &&
+        strcasecmp(argument, "status") != 0) {
+        printf("[Ears] Watch owns microphone capture. Stop Watch before using standalone Ears commands.\n");
+        return;
+    }
+
     if (!argument || !*argument) {
 
         int state =
@@ -1361,6 +1369,13 @@ static void shell_watch_start(void)
         return;
     }
 
+    /* Ears may be consuming a file or desktop source, not the microphone.
+       Never replace an active source merely to preflight Watch. */
+    if (r2_ears_status() > 0) {
+        printf("[Watch] Cannot start while Ears has an active source. Stop Ears first; Watch uses the default microphone.\n");
+        return;
+    }
+
     const char *model = getenv("R2_WHISPER_MODEL");
     struct stat model_stat;
     if (!model || !*model || stat(model, &model_stat) != 0 ||
@@ -1376,14 +1391,12 @@ static void shell_watch_start(void)
     }
 
     /* Prove the default microphone can open before reporting Watch as active. */
-    int restore_ears_open = r2_ears_status() > 0;
     if (r2_ears_start() != 0) {
         printf("[Watch] Cannot start: R2 could not open the default microphone.\n");
         return;
     }
-    (void)r2_ears_stop();
-    if (restore_ears_open && r2_ears_start() != 0) {
-        printf("[Watch] Cannot start: the previously open Ears source could not be restored.\n");
+    if (r2_ears_stop() != 0) {
+        printf("[Watch] Cannot start: microphone preflight could not close its test capture.\n");
         return;
     }
 

@@ -710,29 +710,29 @@ int64_t r2_log_event(
     );
 
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3,
-                           (sqlite3_int64)r2_log_elapsed_ms());
+        rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_int64(statement, 3, (sqlite3_int64)r2_log_elapsed_ms());
+        if (rc == SQLITE_OK) {
+            if (current_session_id > 0)
+                rc = sqlite3_bind_int64(statement, 4, current_session_id);
+            else
+                rc = sqlite3_bind_null(statement, 4);
+        }
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_text(statement, 5, category_name(category), -1, SQLITE_STATIC);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, event_type, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 7, summary, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = bind_optional_text(statement, 8, details);
+        if (rc == SQLITE_OK) rc = bind_optional_text(statement, 9, source);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
 
-        if (current_session_id > 0)
-            sqlite3_bind_int64(statement, 4, current_session_id);
-        else
-            sqlite3_bind_null(statement, 4);
-
-        sqlite3_bind_text(statement, 5, category_name(category),
-                          -1, SQLITE_STATIC);
-        sqlite3_bind_text(statement, 6, event_type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 7, summary, -1, SQLITE_TRANSIENT);
-        bind_optional_text(statement, 8, details);
-        bind_optional_text(statement, 9, source);
-
-        rc = sqlite3_step(statement);
         if (rc == SQLITE_DONE)
             inserted_id = sqlite3_last_insert_rowid(log_db);
         else
-            fprintf(stderr, "[R2 Life Log] Insert failed: %s\n",
-                    sqlite3_errmsg(log_db));
+            fprintf(stderr, "[R2 Life Log] Insert/bind failed: %s (SQLite code %d)\n",
+                    sqlite3_errmsg(log_db), rc);
     } else {
         fprintf(stderr, "[R2 Life Log] Prepare failed: %s\n",
                 sqlite3_errmsg(log_db));
@@ -812,6 +812,8 @@ int64_t r2_log_event_with_memory(
 
     if (r2_save_memory(memory, "experience") == 0) {
         sqlite3_stmt *statement = NULL;
+        int update_rc = SQLITE_ERROR;
+        int updated_rows = 0;
 
         pthread_mutex_lock(&log_lock);
         if (log_initialized && log_db &&
@@ -820,11 +822,25 @@ int64_t r2_log_event_with_memory(
                 "UPDATE r2_log_events SET memory_saved=1 WHERE id=?;",
                 -1, &statement, NULL
             ) == SQLITE_OK) {
-            sqlite3_bind_int64(statement, 1, event_id);
-            sqlite3_step(statement);
+            if (sqlite3_bind_int64(statement, 1, event_id) == SQLITE_OK) {
+                update_rc = sqlite3_step(statement);
+                if (update_rc == SQLITE_DONE)
+                    updated_rows = sqlite3_changes(log_db);
+            } else {
+                update_rc = sqlite3_errcode(log_db);
+            }
+        } else if (log_initialized && log_db) {
+            update_rc = sqlite3_errcode(log_db);
         }
         sqlite3_finalize(statement);
         pthread_mutex_unlock(&log_lock);
+
+        if (update_rc != SQLITE_DONE || updated_rows != 1) {
+            fprintf(stderr,
+                    "[R2 Life Log] Memory pointer was saved, but event %lld "
+                    "could not be marked memory_saved (sqlite rc=%d, rows=%d).\n",
+                    (long long)event_id, update_rc, updated_rows);
+        }
     }
 
     return event_id;
@@ -881,12 +897,10 @@ int64_t r2_log_conversation_turn(const char *user_text,
         "INSERT OR REPLACE INTO r2_log_conversations "
         "(event_id,user_text,assistant_text) VALUES(?,?,?);",
         -1, &statement, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(statement, 1, event_id);
-        sqlite3_bind_text(statement, 2, user_text, (int)user_len, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, assistant_text, (int)assistant_len, SQLITE_TRANSIENT);
-        rc = sqlite3_step(statement);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, user_text, (int)user_len, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, assistant_text, (int)assistant_len, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     if (rc != SQLITE_DONE)
         fprintf(stderr, "[R2 Life Log] Conversation archive insert failed: %s\n",
                 sqlite3_errmsg(log_db));
@@ -926,16 +940,13 @@ int r2_log_session_start(void)
         -1, &statement, NULL
     );
 
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3,
-                           (sqlite3_int64)r2_log_elapsed_ms());
-        sqlite3_bind_int(statement, 4, (int)getpid());
-
-        if (sqlite3_step(statement) == SQLITE_DONE)
-            id = sqlite3_last_insert_rowid(log_db);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(statement, 3, (sqlite3_int64)r2_log_elapsed_ms());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 4, (int)getpid());
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) id = sqlite3_last_insert_rowid(log_db);
 
     sqlite3_finalize(statement);
 
@@ -980,20 +991,19 @@ int r2_log_session_end(const char *reason)
         -1, &statement, NULL
     );
 
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3,
-                           (sqlite3_int64)r2_log_elapsed_ms());
-        bind_optional_text(statement, 4, reason);
-        sqlite3_bind_int64(statement, 5, session_id);
-        rc = sqlite3_step(statement);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(statement, 3, (sqlite3_int64)r2_log_elapsed_ms());
+    if (rc == SQLITE_OK) rc = bind_optional_text(statement, 4, reason);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 5, session_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE && sqlite3_changes(log_db) != 1) rc = SQLITE_NOTFOUND;
 
     sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
 
-    if (rc != SQLITE_DONE && rc != SQLITE_OK)
+    if (rc != SQLITE_DONE)
         return -1;
 
     /* Keep the active session ID until its final event is written. */
