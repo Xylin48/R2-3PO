@@ -33,7 +33,7 @@ assert "if (r2_ears_status() > 0)" in start_body, (
     "Watch must not replace an already active file/desktop/microphone source during preflight"
 )
 ears_start = shell.index("static void shell_ears(const char *argument)")
-ears_end = shell.index("/* ============================================================\\n   WATCH COORDINATOR", ears_start)
+ears_end = shell.index("WATCH COORDINATOR", ears_start)
 ears_body = shell[ears_start:ears_end]
 assert "if (watch_running && argument && *argument" in ears_body, (
     "standalone Ears start/listen/stop commands must not compete with Watch's capture loop"
