@@ -4000,7 +4000,7 @@ int r2_reality_move_item(const char *name,const char *container)
     rc = sqlite3_prepare_v2(reality_db,
         "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
         -1, &prior, NULL);
-    if (rc == SQLITE_OK)
+    if (rc == SQLITE_OK) {
         rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             const unsigned char *oc = sqlite3_column_text(prior, 0);
