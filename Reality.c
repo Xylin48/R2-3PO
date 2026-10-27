@@ -4175,16 +4175,26 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
         return -1;
     }
     sqlite3_stmt *st = NULL;
-    if (consume_tracked_item && sqlite3_prepare_v2(reality_db,
-        "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
-        -1, &st, NULL) == SQLITE_OK) {
-        bind_text(st, 1, food);
-        if (sqlite3_step(st) == SQLITE_ROW) {
+    int tracked_lookup_rc = SQLITE_OK;
+    if (consume_tracked_item) {
+        tracked_lookup_rc = sqlite3_prepare_v2(reality_db,
+            "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
+            -1, &st, NULL);
+        if (tracked_lookup_rc == SQLITE_OK && bind_text(st, 1, food) != 0)
+            tracked_lookup_rc = SQLITE_ERROR;
+        if (tracked_lookup_rc == SQLITE_OK) tracked_lookup_rc = sqlite3_step(st);
+        if (tracked_lookup_rc == SQLITE_ROW) {
             const unsigned char *co = sqlite3_column_text(st, 0);
             const unsigned char *de = sqlite3_column_text(st, 1);
             if (co) snprintf(container, sizeof(container), "%s", (const char *)co);
             if (de) snprintf(description, sizeof(description), "%s", (const char *)de);
             quantity = sqlite3_column_int(st, 2);
+        }
+        if (tracked_lookup_rc != SQLITE_ROW && tracked_lookup_rc != SQLITE_DONE) {
+            if (st) sqlite3_finalize(st);
+            (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+            pthread_mutex_unlock(&reality_lock);
+            return -1;
         }
     }
     if (st) sqlite3_finalize(st);
@@ -4198,14 +4208,12 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
     int rc = sqlite3_prepare_v2(reality_db,
         "UPDATE r2_reality_self SET hunger=MIN(100,hunger+?), satisfaction=MIN(150,satisfaction+?), seconds_since_meal=0, energy=MIN(100,energy+?), updated_at=CURRENT_TIMESTAMP WHERE id=1",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_double(st, 1, fullness);
-        sqlite3_bind_double(st, 2, fullness);
-        sqlite3_bind_double(st, 3, energy_bonus);
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
-            rc = SQLITE_NOTFOUND;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 1, fullness);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 2, fullness);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, energy_bonus);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
+        rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     st = NULL;
 
@@ -4216,8 +4224,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             if (sqlite3_prepare_v2(reality_db,
                 "UPDATE r2_reality_objects SET quantity=quantity-1,updated_at=CURRENT_TIMESTAMP WHERE name=? COLLATE NOCASE",
                 -1, &st, NULL) == SQLITE_OK) {
-                bind_text(st, 1, food);
-                rc = sqlite3_step(st);
+                rc = bind_text(st, 1, food) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
                 if (rc == SQLITE_DONE && sqlite3_changes(reality_db) == 1)
                     consumed_tracked_item = 1;
                 else if (rc == SQLITE_DONE)
@@ -4227,8 +4234,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             if (sqlite3_prepare_v2(reality_db,
                 "DELETE FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
                 -1, &st, NULL) == SQLITE_OK) {
-                bind_text(st, 1, food);
-                rc = sqlite3_step(st);
+                rc = bind_text(st, 1, food) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
                 if (rc == SQLITE_DONE && sqlite3_changes(reality_db) == 1)
                     consumed_tracked_item = 1;
                 else if (rc == SQLITE_DONE)
@@ -4252,12 +4258,12 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
         if (sqlite3_prepare_v2(reality_db,
             "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) VALUES(?,?,?,?,?)",
             -1, &st, NULL) == SQLITE_OK) {
-            bind_text(st, 1, food);
-            bind_text(st, 2, ingredients);
-            sqlite3_bind_double(st, 3, fullness);
-            sqlite3_bind_double(st, 4, energy_bonus);
-            sqlite3_bind_int64(st, 5, (sqlite3_int64)time(NULL));
-            if (sqlite3_step(st) != SQLITE_DONE) rc = SQLITE_ERROR;
+            rc = bind_text(st, 1, food) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = bind_text(st, 2, ingredients) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, fullness);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 4, energy_bonus);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, (sqlite3_int64)time(NULL));
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
         } else rc = SQLITE_ERROR;
         if (st) sqlite3_finalize(st);
     }
