@@ -78,9 +78,13 @@ int r2_sj_init(void)
         pthread_mutex_unlock(&sj_lock);
         return -1;
     }
-    sqlite3_busy_timeout(sj_db, 5000);
-    sqlite3_exec(sj_db, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
-                 NULL, NULL, NULL);
+    if (sqlite3_busy_timeout(sj_db, 5000) != SQLITE_OK ||
+        sj_exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") != 0) {
+        if (sj_db) sqlite3_close(sj_db);
+        sj_db = NULL;
+        pthread_mutex_unlock(&sj_lock);
+        return -1;
+    }
     const char *schema =
         "CREATE TABLE IF NOT EXISTS r2_sensory_journal ("
         " event_id INTEGER PRIMARY KEY,"
@@ -156,9 +160,11 @@ void r2_sj_index_event(int64_t event_id, const char *category,
     if (sqlite3_prepare_v2(sj_db,
             "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind) VALUES(?,?);",
             -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
-        if (sqlite3_step(st) != SQLITE_DONE)
+        int bind_rc = sqlite3_bind_int64(st, 1, event_id);
+        if (bind_rc == SQLITE_OK)
+            bind_rc = sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
+        int step_rc = bind_rc == SQLITE_OK ? sqlite3_step(st) : bind_rc;
+        if (step_rc != SQLITE_DONE)
             fprintf(stderr, "[R2 Sensory Journal] Index failed: %s\n", sqlite3_errmsg(sj_db));
     }
     sqlite3_finalize(st);
@@ -175,8 +181,9 @@ void r2_sj_index_event(int64_t event_id, const char *category,
             "WHERE e.id=? ORDER BY d.id DESC LIMIT 1;",
             -1, &link, NULL);
         if (link_rc == SQLITE_OK) {
-            sqlite3_bind_int64(link, 1, event_id);
-            if (sqlite3_step(link) != SQLITE_DONE)
+            link_rc = sqlite3_bind_int64(link, 1, event_id);
+            if (link_rc == SQLITE_OK) link_rc = sqlite3_step(link);
+            if (link_rc != SQLITE_DONE)
                 fprintf(stderr, "[R2 Sensory Journal] Diary link failed: %s\n",
                         sqlite3_errmsg(sj_db));
         } else {
@@ -246,16 +253,29 @@ static char *sj_query(const char *query, int limit)
         }
         pat[pat_len++] = '%';
         pat[pat_len] = '\0';
-        for (int i = 1; i <= 5; ++i) sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 6, limit);
+        int bind_rc = SQLITE_OK;
+        for (int i = 1; i <= 5 && bind_rc == SQLITE_OK; ++i)
+            bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 6, limit);
         free(pat);
-    } else sqlite3_bind_int(st, 1, limit);
+        if (bind_rc != SQLITE_OK) {
+            sqlite3_finalize(st);
+            pthread_mutex_unlock(&sj_lock);
+            return NULL;
+        }
+    } else if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&sj_lock);
+        return NULL;
+    }
 
     size_t cap = 4096, len = 0;
     char *out = malloc(cap);
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
     out[0] = '\0';
     int rc;
+    int intentionally_truncated = 0;
+    int serialization_failed = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *utc = sqlite3_column_text(st, 1);
         const unsigned char *local = sqlite3_column_text(st, 2);
@@ -276,7 +296,14 @@ static char *sj_query(const char *query, int limit)
             source ? (const char *)source : "unspecified",
             diary_id ? (const char *)diary_id : "none",
             details ? (const char *)details : "");
-        if (needed < 0 || len + (size_t)needed + 1 > 2 * 1024 * 1024) break;
+        if (needed < 0) {
+            serialization_failed = 1;
+            break;
+        }
+        if (len + (size_t)needed + 1 > 2 * 1024 * 1024) {
+            intentionally_truncated = 1;
+            break;
+        }
         if (len + (size_t)needed + 1 > cap) {
             size_t next = cap;
             while (next < len + (size_t)needed + 1) next *= 2;
@@ -299,9 +326,18 @@ static char *sj_query(const char *query, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
+    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+        free(out);
+        return NULL;
+    }
     if (out && len == 0)
         snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
                                       "The Sensory Journal contains no entries yet.\n");
+    if (out && intentionally_truncated) {
+        const char *note = "[Sensory Journal output truncated at 2 MiB; remaining entries are still stored.]\n";
+        size_t note_len = strlen(note);
+        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+    }
     return out;
 }
 
@@ -321,10 +357,12 @@ long r2_sj_count(void)
     }
     sqlite3_stmt *st = NULL;
     long count = -1;
-    if (sqlite3_prepare_v2(sj_db,
-            "SELECT COUNT(*) FROM r2_sensory_journal;", -1, &st, NULL) == SQLITE_OK &&
-        sqlite3_step(st) == SQLITE_ROW) {
-        count = (long)sqlite3_column_int64(st, 0);
+    int rc = sqlite3_prepare_v2(sj_db,
+        "SELECT COUNT(*) FROM r2_sensory_journal;", -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            count = (long)sqlite3_column_int64(st, 0);
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
