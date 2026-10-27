@@ -162,14 +162,12 @@ static int upsert_target_locked(const char *target, const char *target_type,
         " ON CONFLICT(target) DO UPDATE SET target_type=excluded.target_type,"
         " enjoyment=excluded.enjoyment,updated_at=excluded.updated_at",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, target_type && *target_type ? target_type : "activity", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 3, enjoyment);
-        sqlite3_bind_int64(st, 4, now);
-        sqlite3_bind_int64(st, 5, now);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, target_type && *target_type ? target_type : "activity", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, enjoyment);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 4, now);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
@@ -188,13 +186,16 @@ static int update_status_locked(const char *target, const char *target_type,
         "SELECT status,enjoyment,COALESCE(last_chosen,0) FROM addiction_targets WHERE target=? COLLATE NOCASE",
         -1, &st, NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            const unsigned char *v = sqlite3_column_text(st, 0);
-            if (v) snprintf(previous, sizeof(previous), "%s", (const char *)v);
-            enjoyment = sqlite3_column_int(st, 1);
-            last = sqlite3_column_int64(st, 2);
-        } else rc = SQLITE_ERROR;
+        rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) {
+            int step_rc = sqlite3_step(st);
+            if (step_rc == SQLITE_ROW) {
+                const unsigned char *v = sqlite3_column_text(st, 0);
+                if (v) snprintf(previous, sizeof(previous), "%s", (const char *)v);
+                enjoyment = sqlite3_column_int(st, 1);
+                last = sqlite3_column_int64(st, 2);
+            } else rc = step_rc == SQLITE_DONE ? SQLITE_NOTFOUND : step_rc;
+        }
     }
     if (st) sqlite3_finalize(st);
     if (rc != SQLITE_OK) return -1;
@@ -205,12 +206,15 @@ static int update_status_locked(const char *target, const char *target_type,
         "FROM addiction_events WHERE target=? COLLATE NOCASE AND event_kind='choice' AND occurred_at>=?",
         -1, &st, NULL);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 2, now - 14 * 86400);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            count = sqlite3_column_int(st, 0);
-            days = sqlite3_column_int(st, 1);
-        } else rc = SQLITE_ERROR;
+        rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now - 14 * 86400);
+        if (rc == SQLITE_OK) {
+            int step_rc = sqlite3_step(st);
+            if (step_rc == SQLITE_ROW) {
+                count = sqlite3_column_int(st, 0);
+                days = sqlite3_column_int(st, 1);
+            } else rc = step_rc == SQLITE_DONE ? SQLITE_ERROR : step_rc;
+        }
     }
     if (st) sqlite3_finalize(st);
     if (rc != SQLITE_OK) return -1;
@@ -236,13 +240,13 @@ static int update_status_locked(const char *target, const char *target_type,
     rc = sqlite3_prepare_v2(addiction_db,
         "UPDATE addiction_targets SET status=?,target_type=?,updated_at=? WHERE target=? COLLATE NOCASE",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, next, -1, SQLITE_STATIC);
-        sqlite3_bind_text(st, 2, target_type && *target_type ? target_type : "activity", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, now);
-        sqlite3_bind_text(st, 4, target, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, next, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, target_type && *target_type ? target_type : "activity", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, now);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, target, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(addiction_db) != 1)
+        rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
