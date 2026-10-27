@@ -4072,9 +4072,8 @@ int r2_reality_remove_item(const char *name)
     int prior_rc = sqlite3_prepare_v2(reality_db, "SELECT container FROM r2_reality_objects WHERE name=? COLLATE NOCASE", -1, &prior, NULL);
     if (prior_rc == SQLITE_OK) prior_rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
     if (prior_rc == SQLITE_ROW) {
-            const unsigned char *oc = sqlite3_column_text(prior, 0);
-            if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
-        }
+        const unsigned char *oc = sqlite3_column_text(prior, 0);
+        if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
     }
     if (prior) sqlite3_finalize(prior);
     if (!*old_container || !container_accessible(old_container)) {
