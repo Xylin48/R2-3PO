@@ -370,6 +370,8 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&as_lock); return NULL; }
     out[0]='\0';
     int rc;
+    int intentionally_truncated = 0;
+    int serialization_failed = 0;
     while ((rc=sqlite3_step(st))==SQLITE_ROW) {
         int64_t id=sqlite3_column_int64(st,0);
         const unsigned char *name=sqlite3_column_text(st,1);
@@ -392,7 +394,11 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
             conclusion?(const char*)conclusion:"(not specified)",
             (long long)evidence,
             created?(const char*)created:"unknown");
-        if (needed<0 || len+(size_t)needed+2>1024*1024) break;
+        if (needed < 0) { serialization_failed = 1; break; }
+        if (len + (size_t)needed + 2 > 1024 * 1024) {
+            intentionally_truncated = 1;
+            break;
+        }
         if (len+(size_t)needed+2>cap) {
             size_t next=cap; while(next<len+(size_t)needed+2) next*=2;
             char *grown=realloc(out,next); if(!grown){free(out);out=NULL;break;}
@@ -414,7 +420,16 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
+    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+        free(out);
+        return NULL;
+    }
     if (out && !len) snprintf(out,cap,"No Alternate-Self branches found.\n");
+    if (out && intentionally_truncated) {
+        const char *note = "[Alternate-Self output truncated at 1 MiB; all branches remain stored.]\n";
+        size_t note_len = strlen(note);
+        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+    }
     return out;
 }
 char *r2_altself_list(int limit)
