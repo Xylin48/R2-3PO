@@ -293,6 +293,10 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     # image-encoder/KV-cache OOMs that text-only readiness can miss.
     vision_context = int(options.get("num_ctx", 4096))
     vision_options = dict(options)
+    # Visual.c does not override num_batch. Do not inherit the foreground
+    # text request's smaller prompt-evaluation batch into this vision probe;
+    # the readiness check must exercise the same inference options as runtime.
+    vision_options.pop("num_batch", None)
     # Match Visual.c's non-thinking sampler rather than carrying the
     # foreground reasoning sampler into the image-bearing readiness probe.
     vision_options["temperature"] = 0.7
