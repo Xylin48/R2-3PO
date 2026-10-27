@@ -1147,25 +1147,22 @@ static int update_hunger_locked(double elapsed)
     rc = sqlite3_prepare_v2(reality_db,
         "UPDATE r2_reality_self SET hunger=?, seconds_since_meal=?, sleepiness=?, energy=?, satisfaction=?, updated_at=CURRENT_TIMESTAMP WHERE id=1",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_double(st, 1, hunger);
-        sqlite3_bind_double(st, 2, since_meal);
-        sqlite3_bind_double(st, 3, sleepiness);
-        sqlite3_bind_double(st, 4, energy);
-        sqlite3_bind_double(st, 5, satisfaction);
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 1, hunger);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 2, since_meal);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, sleepiness);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 4, energy);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 5, satisfaction);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return -1;
     st = NULL;
     rc = sqlite3_prepare_v2(reality_db,
         "INSERT INTO r2_reality_meta(key,value) VALUES('world_elapsed_seconds',?) ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+CAST(excluded.value AS INTEGER) AS TEXT)",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, (sqlite3_int64)llround(elapsed));
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, (sqlite3_int64)llround(elapsed));
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
@@ -4540,12 +4537,10 @@ int r2_reality_sleep(double hours)
         rc = sqlite3_prepare_v2(reality_db,
             "UPDATE r2_reality_self SET sleepiness=MAX(0,sleepiness-?), energy=MIN(100,energy+?), updated_at=CURRENT_TIMESTAMP WHERE id=1",
             -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_double(st, 1, hours * 12.5);
-        sqlite3_bind_double(st, 2, hours * 10.0);
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 1, hours * 12.5);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 2, hours * 10.0);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) rc = SQLITE_OK;
     if (rc == SQLITE_OK) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
