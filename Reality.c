@@ -3794,8 +3794,7 @@ int r2_reality_add_item(const char *name,const char *description,const char *con
         "SELECT container,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
         -1, &prior, NULL);
     if (rc == SQLITE_OK) {
-        bind_text(prior, 1, name);
-        rc = sqlite3_step(prior);
+        rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             const unsigned char *oc = sqlite3_column_text(prior, 0);
             if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
@@ -3837,13 +3836,11 @@ int r2_reality_add_item(const char *name,const char *description,const char *con
     rc = sqlite3_prepare_v2(reality_db,
         "INSERT INTO r2_reality_containers(name,kind,description,parent) VALUES(?,?,?,?) ON CONFLICT(name) DO NOTHING",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, container);
-        bind_text(st, 2, container_is_inventory(container) ? "inventory" : "container");
-        bind_text(st, 3, "Persistent object container");
-        bind_text(st, 4, container_parent_name(container));
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 2, container_is_inventory(container) ? "inventory" : "container") == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 3, "Persistent object container") == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 4, container_parent_name(container)) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     st = NULL;
 
@@ -3852,13 +3849,11 @@ int r2_reality_add_item(const char *name,const char *description,const char *con
             "INSERT INTO r2_reality_objects(name,description,quantity,container,owner) VALUES(?,?,?,?, 'R2') "
             "ON CONFLICT(name) DO UPDATE SET description=excluded.description,quantity=r2_reality_objects.quantity+excluded.quantity,container=excluded.container,updated_at=CURRENT_TIMESTAMP",
             -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, name);
-        bind_text(st, 2, description);
-        sqlite3_bind_int(st, 3, quantity);
-        bind_text(st, 4, container);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 2, description) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, quantity);
+    if (rc == SQLITE_OK) rc = bind_text(st, 4, container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     st = NULL;
 
@@ -3868,12 +3863,12 @@ int r2_reality_add_item(const char *name,const char *description,const char *con
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
             sqlite3_int64 collected = (sqlite3_int64)time(NULL);
-            bind_text(st, 1, name);
-            bind_text(st, 2, description);
-            sqlite3_bind_int(st, 3, quantity);
-            sqlite3_bind_int64(st, 4, collected);
-            sqlite3_bind_int64(st, 5, collected);
-            rc = sqlite3_step(st);
+            rc = bind_text(st, 1, name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = bind_text(st, 2, description) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, quantity);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 4, collected);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, collected);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
@@ -3884,8 +3879,7 @@ int r2_reality_add_item(const char *name,const char *description,const char *con
             "SELECT quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            bind_text(st, 1, name);
-            rc = sqlite3_step(st);
+            rc = bind_text(st, 1, name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
             if (rc == SQLITE_ROW) {
                 sqlite3_int64 stored_quantity = sqlite3_column_int64(st, 0);
                 if (stored_quantity < 1 || stored_quantity > INT_MAX)
