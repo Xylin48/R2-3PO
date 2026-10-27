@@ -611,21 +611,21 @@ static int r2_diary_init_unlocked(void)
         return 0;
 
     if (r2_mkdir_recursive(R2_HOME) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create R2 home: %s\\n", R2_HOME);
+        fprintf(stderr, "[R2 DIARY] Could not create R2 home: %s\n", R2_HOME);
         return -1;
     }
     if (r2_mkdir_recursive(R2_WORKSPACE) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create workspace: %s\\n", R2_WORKSPACE);
+        fprintf(stderr, "[R2 DIARY] Could not create workspace: %s\n", R2_WORKSPACE);
         return -1;
     }
     if (r2_mkdir_recursive(R2_DIARY_DIR) != 0) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary directory: %s\\n", R2_DIARY_DIR);
+        fprintf(stderr, "[R2 DIARY] Could not create diary directory: %s\n", R2_DIARY_DIR);
         return -1;
     }
 
     result = sqlite3_open(R2_DIARY_DATABASE, &r2_diary_db);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] SQLite open failed: %s\\n",
+        fprintf(stderr, "[R2 DIARY] SQLite open failed: %s\n",
                 r2_diary_db ? sqlite3_errmsg(r2_diary_db) : "unknown error");
         r2_diary_close_failed_init();
         return -1;
@@ -633,7 +633,7 @@ static int r2_diary_init_unlocked(void)
 
     result = sqlite3_busy_timeout(r2_diary_db, 5000);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not configure SQLite busy timeout: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not configure SQLite busy timeout: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -641,14 +641,14 @@ static int r2_diary_init_unlocked(void)
 
     result = sqlite3_exec(r2_diary_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not enable SQLite WAL mode: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not enable SQLite WAL mode: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
     }
     result = sqlite3_exec(r2_diary_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not configure SQLite synchronous mode: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not configure SQLite synchronous mode: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -662,7 +662,7 @@ static int r2_diary_init_unlocked(void)
         ");",
         NULL, NULL, &error_message);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary table: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary table: %s\n",
                 error_message ? error_message : "unknown error");
         sqlite3_free(error_message);
         error_message = NULL;
@@ -671,7 +671,7 @@ static int r2_diary_init_unlocked(void)
     }
 
     if (diary_entries_migrate_schema() != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not migrate diary entry schema: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not migrate diary entry schema: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -681,7 +681,7 @@ static int r2_diary_init_unlocked(void)
         "CREATE INDEX IF NOT EXISTS idx_diary_created_at ON diary_entries(created_at);",
         NULL, NULL, NULL);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary chronology index: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary chronology index: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -696,7 +696,7 @@ static int r2_diary_init_unlocked(void)
         " memory_indexed INTEGER NOT NULL DEFAULT 0);",
         NULL, NULL, &error_message);
     if (result != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not create diary linkage table: %s\n",
                 error_message ? error_message : "unknown error");
         sqlite3_free(error_message);
         error_message = NULL;
@@ -714,16 +714,16 @@ static int r2_diary_init_unlocked(void)
             "CREATE INDEX IF NOT EXISTS r2_diary_entry_links_event_idx "
             "ON r2_diary_entry_links(log_event_id);",
             NULL, NULL, NULL) != SQLITE_OK) {
-        fprintf(stderr, "[R2 DIARY] Could not migrate diary linkage schema: %s\\n",
+        fprintf(stderr, "[R2 DIARY] Could not migrate diary linkage schema: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
     }
 
-    printf("[R2 DIARY] Initialized.\\n");
-    printf("[R2 DIARY] Database: %s\\n", R2_DIARY_DATABASE);
-    printf("[R2 DIARY] Diary: %s\\n", R2_DIARY_DIR);
-    printf("[R2 DIARY] Workspace: %s\\n", R2_WORKSPACE);
+    printf("[R2 DIARY] Initialized.\n");
+    printf("[R2 DIARY] Database: %s\n", R2_DIARY_DATABASE);
+    printf("[R2 DIARY] Diary: %s\n", R2_DIARY_DIR);
+    printf("[R2 DIARY] Workspace: %s\n", R2_WORKSPACE);
     return 0;
 }
 int r2_diary_init(void)
