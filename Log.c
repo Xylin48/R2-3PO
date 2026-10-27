@@ -709,31 +709,32 @@ int64_t r2_log_event(
         -1, &statement, NULL
     );
 
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(statement, 3, (sqlite3_int64)r2_log_elapsed_ms());
+
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3,
-                           (sqlite3_int64)r2_log_elapsed_ms());
-
         if (current_session_id > 0)
-            sqlite3_bind_int64(statement, 4, current_session_id);
+            rc = sqlite3_bind_int64(statement, 4, current_session_id);
         else
-            sqlite3_bind_null(statement, 4);
+            rc = sqlite3_bind_null(statement, 4);
+    }
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(statement, 5, category_name(category), -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, event_type, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 7, summary, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = bind_optional_text(statement, 8, details);
+    if (rc == SQLITE_OK) rc = bind_optional_text(statement, 9, source);
 
-        sqlite3_bind_text(statement, 5, category_name(category),
-                          -1, SQLITE_STATIC);
-        sqlite3_bind_text(statement, 6, event_type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 7, summary, -1, SQLITE_TRANSIENT);
-        bind_optional_text(statement, 8, details);
-        bind_optional_text(statement, 9, source);
-
-        rc = sqlite3_step(statement);
-        if (rc == SQLITE_DONE)
-            inserted_id = sqlite3_last_insert_rowid(log_db);
-        else
-            fprintf(stderr, "[R2 Life Log] Insert failed: %s\n",
-                    sqlite3_errmsg(log_db));
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) {
+        inserted_id = sqlite3_last_insert_rowid(log_db);
     } else {
+        fprintf(stderr, "[R2 Life Log] Insert/bind failed: %s (SQLite code %d)\n",
+                sqlite3_errmsg(log_db), rc);
+    }
+    if (statement) {
         fprintf(stderr, "[R2 Life Log] Prepare failed: %s\n",
                 sqlite3_errmsg(log_db));
     }
