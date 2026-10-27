@@ -1624,9 +1624,17 @@ static int fridge_change_one(const char *food, char *description, size_t descrip
                              char *ingredients, size_t ingredients_cap, char *taste, size_t taste_cap)
 {
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(fridge_db, "SELECT description,quantity,fullness,energy,ingredients,taste FROM r2_fridge_items WHERE name=? COLLATE NOCASE", -1, &st, NULL) != SQLITE_OK) return -1;
-    bind_text(st, 1, food);
-    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
+    int rc = sqlite3_prepare_v2(fridge_db, "SELECT description,quantity,fullness,energy,ingredients,taste FROM r2_fridge_items WHERE name=? COLLATE NOCASE", -1, &st, NULL);
+    if (rc != SQLITE_OK) return -1;
+    if (bind_text(st, 1, food) != 0) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    rc = sqlite3_step(st);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     const unsigned char *d = sqlite3_column_text(st, 0);
     if (description && description_cap) snprintf(description, description_cap, "%s", d ? (const char *)d : "");
     int qty = sqlite3_column_int(st, 1);
@@ -1660,8 +1668,9 @@ static int fridge_change_one(const char *food, char *description, size_t descrip
         if (n < 0 || (size_t)n >= sizeof(sql) - used) return -1;
         if (sqlite3_prepare_v2(fridge_db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
     }
-    bind_text(st, 1, food);
-    int rc = sqlite3_step(st);
+    rc = bind_text(st, 1, food) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
+    if (rc == SQLITE_DONE && sqlite3_changes(fridge_db) != 1)
+        rc = SQLITE_NOTFOUND;
     sqlite3_finalize(st);
     return rc == SQLITE_DONE ? 0 : -1;
 }
