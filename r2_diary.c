@@ -97,6 +97,8 @@
  */
 
 static sqlite3 *r2_diary_db = NULL;
+/* Serialize diary insert/link/mirror sequences across foreground and background workers. */
+static pthread_mutex_t r2_diary_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 /* ============================================================
@@ -899,10 +901,13 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
     sqlite3_bind_int64(st, 1, entry_id);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        event_id = sqlite3_column_int64(st, 0);
-        memory_indexed = sqlite3_column_int(st, 1);
+    rc = sqlite3_step(st);
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return -1;
     }
+    event_id = sqlite3_column_int64(st, 0);
+    memory_indexed = sqlite3_column_int(st, 1);
     sqlite3_finalize(st);
     st = NULL;
 
@@ -921,12 +926,19 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         rc = sqlite3_prepare_v2(r2_diary_db,
             "SELECT id FROM r2_log_events WHERE event_type='diary_entry_linked' "
             "AND details GLOB ? ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, pattern, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW)
-                event_id = sqlite3_column_int64(st, 0);
+        if (rc != SQLITE_OK) return -1;
+        if (sqlite3_bind_text(st, 1, pattern, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
         }
-        if (st) sqlite3_finalize(st);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            event_id = sqlite3_column_int64(st, 0);
+        else if (rc != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_finalize(st);
         st = NULL;
 
         if (event_id <= 0) {
@@ -946,20 +958,27 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         sqlite3_bind_text(st, 2, timestamp, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st, 3, entry_id);
         rc = sqlite3_step(st);
+        int changed = sqlite3_changes(r2_diary_db);
         sqlite3_finalize(st);
         st = NULL;
-        if (rc != SQLITE_DONE) return -1;
+        if (rc != SQLITE_DONE || changed != 1) return -1;
 
         rc = sqlite3_prepare_v2(r2_diary_db,
             "SELECT COALESCE(log_event_id,0),memory_indexed "
             "FROM r2_diary_entry_links WHERE diary_entry_id=?;",
             -1, &st, NULL);
         if (rc != SQLITE_OK) return -1;
-        sqlite3_bind_int64(st, 1, entry_id);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            event_id = sqlite3_column_int64(st, 0);
-            memory_indexed = sqlite3_column_int(st, 1);
+        if (sqlite3_bind_int64(st, 1, entry_id) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return -1;
         }
+        rc = sqlite3_step(st);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        event_id = sqlite3_column_int64(st, 0);
+        memory_indexed = sqlite3_column_int(st, 1);
         sqlite3_finalize(st);
         st = NULL;
     }
@@ -976,8 +995,12 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
                 "UPDATE r2_log_events SET memory_saved=1 WHERE id=?;",
                 -1, &st, NULL);
             if (rc == SQLITE_OK) {
-                sqlite3_bind_int64(st, 1, event_id);
-                rc = sqlite3_step(st);
+                if (sqlite3_bind_int64(st, 1, event_id) != SQLITE_OK)
+                    rc = SQLITE_ERROR;
+                else
+                    rc = sqlite3_step(st);
+                if (rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) != 1)
+                    rc = SQLITE_NOTFOUND;
             }
             if (st) sqlite3_finalize(st);
             st = NULL;
@@ -990,14 +1013,18 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         "UPDATE r2_diary_entry_links SET memory_indexed=? WHERE diary_entry_id=?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
-    sqlite3_bind_int(st, 1, memory_indexed);
-    sqlite3_bind_int64(st, 2, entry_id);
+    if (sqlite3_bind_int(st, 1, memory_indexed) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 2, entry_id) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
     rc = sqlite3_step(st);
+    int changed = sqlite3_changes(r2_diary_db);
     sqlite3_finalize(st);
-    return (rc == SQLITE_DONE && memory_indexed) ? 0 : -1;
+    return (rc == SQLITE_DONE && changed == 1 && memory_indexed) ? 0 : -1;
 }
 
-int r2_diary_reconnect_history(int limit)
+static int r2_diary_reconnect_history_unlocked(int limit)
 {
     sqlite3_stmt *st = NULL;
     int rc, count = 0, linked = 0;
@@ -1051,6 +1078,14 @@ int r2_diary_reconnect_history(int limit)
     return linked;
 }
 
+int r2_diary_reconnect_history(int limit)
+{
+    pthread_mutex_lock(&r2_diary_write_lock);
+    int rc = r2_diary_reconnect_history_unlocked(limit);
+    pthread_mutex_unlock(&r2_diary_write_lock);
+    return rc;
+}
+
 
 /* ============================================================
  * WRITE DIARY ENTRY
@@ -1099,7 +1134,7 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
     return id;
 }
 
-int r2_diary_write(
+static int r2_diary_write_unlocked(
     const char *entry
 )
 {
@@ -1246,6 +1281,14 @@ int r2_diary_write(
     );
 
     return 0;
+}
+
+int r2_diary_write(const char *entry)
+{
+    pthread_mutex_lock(&r2_diary_write_lock);
+    int rc = r2_diary_write_unlocked(entry);
+    pthread_mutex_unlock(&r2_diary_write_lock);
+    return rc;
 }
 
 
