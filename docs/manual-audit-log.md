@@ -229,3 +229,31 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Fix:** Removed the deterministic feed function and its API, removed fallback calls from all controller failure paths, and made failures log and leave the modeled world unchanged. Kept authoritative inventory checks, food-metric validation, transaction rollback, and conversation-turn coordination.
 - **Regression coverage:** Replaced the old safeguard source test with `tests/autonomous_needs_controller_smoke.py`; removed automatic-feed expectations from `tests/reality_needs_smoke.c`; updated conversation recovery/context integration contracts and CI workflow wiring.
 - **Validation:** exact head `78f97471831f1fd9743cb25703ae6a4568eb3d6f` passed [workflow 39357732761](https://github.com/Xylin48/R2-3PO/actions/runs/39357732761), 91/91 steps. Live autonomous decisions still require target-host testing.
+
+## Audit batch: 2026-10-27 — checked SQLite mutation paths
+
+### R2-AUD-2026-10-27-001 — fridge decrement ignored parameter-binding failures
+
+- **Area:** `Reality.c`, `fridge_change_one()`.
+- **Severity:** High / inventory integrity.
+- **Finding:** The fridge item lookup and subsequent DELETE/UPDATE ignored `bind_text()` results. A failed binding could make the operation act on an unintended/unmatched row or report a generic failure without preserving the exact SQL result. The mutation also treated `SQLITE_DONE` as sufficient without confirming exactly one row changed.
+- **Fix:** Check the lookup bind before stepping; check the mutation bind before stepping; and require exactly one affected row before reporting success.
+- **Regression coverage:** `tests/fridge_context_smoke.py` now asserts the production function checks both bindings and validates the affected-row count.
+- **Validation status:** New exact-head PR workflow is queued; source changes are not marked validated until that run completes. This is source-level/CI work, not a live database test on the target PC.
+
+### R2-AUD-2026-10-27-002 — Reality metric updates ignored SQLite bind failures
+
+- **Area:** `Reality.c`, `update_hunger_locked()` and `r2_reality_sleep()`.
+- **Severity:** High / modeled state and persistence integrity.
+- **Finding:** Hunger/satiety/sleepiness/energy updates, elapsed-world-time persistence, and sleep recovery stepped prepared statements without checking every bind result. This could permit an incomplete update to proceed rather than propagating the database failure.
+- **Fix:** Chain each bind through the SQLite result code, execute only after all binds succeed, and validate that the singleton Reality row or metadata row was actually updated where applicable.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks the production hunger/time and sleep paths for checked bindings.
+- **Validation status:** New exact-head PR workflow is queued; do not treat the source assertions as a substitute for the runtime Reality regression or target-host persistence/restart acceptance.
+
+### Current workload checkpoint
+
+- **Working branch:** `work/r2-priority-fixes-from-audit-2026-10-25`.
+- **Validation PR:** [#177](https://github.com/Xylin48/R2-3PO/pull/177), draft and unmerged, targeting the isolated integration-validation branch.
+- **Main branch:** untouched.
+- **Next audit pass:** continue the line-by-line review of SQLite error propagation and transaction boundaries across Reality, rewards, persistent memory/diary, and conversation handling. Review the full exact-head workflow and fix any newly confirmed regressions before closing findings.
+- **Release boundary:** CI cannot verify live Qwen response quality, GTX 1050 Ti allocation, or actual database/device state on the target PC.
