@@ -4000,9 +4000,8 @@ int r2_reality_move_item(const char *name,const char *container)
     rc = sqlite3_prepare_v2(reality_db,
         "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
         -1, &prior, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(prior, 1, name);
-        rc = sqlite3_step(prior);
+    if (rc == SQLITE_OK)
+        rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             const unsigned char *oc = sqlite3_column_text(prior, 0);
             const unsigned char *od = sqlite3_column_text(prior, 1);
@@ -4026,13 +4025,11 @@ int r2_reality_move_item(const char *name,const char *container)
     rc = sqlite3_prepare_v2(reality_db,
         "INSERT INTO r2_reality_containers(name,kind,description,parent) VALUES(?,?,?,?) ON CONFLICT(name) DO NOTHING",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, container);
-        bind_text(st, 2, container_is_inventory(container) ? "inventory" : "container");
-        bind_text(st, 3, "Persistent object container");
-        bind_text(st, 4, container_parent_name(container));
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 2, container_is_inventory(container) ? "inventory" : "container") == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 3, "Persistent object container") == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 4, container_parent_name(container)) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     st = NULL;
 
@@ -4040,13 +4037,11 @@ int r2_reality_move_item(const char *name,const char *container)
         rc = sqlite3_prepare_v2(reality_db,
             "UPDATE r2_reality_objects SET container=?,updated_at=CURRENT_TIMESTAMP WHERE name=? COLLATE NOCASE",
             -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, container);
-        bind_text(st, 2, name);
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) == 0)
-            rc = SQLITE_NOTFOUND;
-    }
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, container) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 2, name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) == 0)
+        rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
 
     if (rc == SQLITE_DONE) {
@@ -4074,9 +4069,9 @@ int r2_reality_remove_item(const char *name)
     char old_container[REALITY_MAX_TEXT + 1] = {0};
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *prior = NULL;
-    if (sqlite3_prepare_v2(reality_db, "SELECT container FROM r2_reality_objects WHERE name=? COLLATE NOCASE", -1, &prior, NULL) == SQLITE_OK) {
-        bind_text(prior, 1, name);
-        if (sqlite3_step(prior) == SQLITE_ROW) {
+    int prior_rc = sqlite3_prepare_v2(reality_db, "SELECT container FROM r2_reality_objects WHERE name=? COLLATE NOCASE", -1, &prior, NULL);
+    if (prior_rc == SQLITE_OK) prior_rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
+    if (prior_rc == SQLITE_ROW) {
             const unsigned char *oc = sqlite3_column_text(prior, 0);
             if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
         }
@@ -4088,7 +4083,8 @@ int r2_reality_remove_item(const char *name)
     }
     sqlite3_stmt *st=NULL;
     int rc=sqlite3_prepare_v2(reality_db,"DELETE FROM r2_reality_objects WHERE name=? COLLATE NOCASE",-1,&st,NULL);
-    if(rc==SQLITE_OK){bind_text(st,1,name);rc=sqlite3_step(st);if(rc==SQLITE_DONE&&sqlite3_changes(reality_db)==0)rc=SQLITE_NOTFOUND;}
+    if(rc==SQLITE_OK)rc=bind_text(st,1,name)==0?sqlite3_step(st):SQLITE_ERROR;
+    if(rc==SQLITE_DONE&&sqlite3_changes(reality_db)==0)rc=SQLITE_NOTFOUND;
     if(st)sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
     if(rc!=SQLITE_DONE)return -1;
