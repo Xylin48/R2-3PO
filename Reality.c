@@ -4592,11 +4592,21 @@ char *r2_reality_money_context(void)
 {
     if (!r2_reality_is_initialized()) return NULL;
     sqlite3_int64 cash=0,bank=0;
+    /* Read the account only after recovering interrupted cross-file changes.
+       Otherwise context construction can expose a half-applied transfer as
+       current reality, even though the next operation will roll it back. */
+    pthread_mutex_lock(&purchase_lock);
     pthread_mutex_lock(&reality_lock);
-    int ok=money_read_locked(&cash,&bank)==0;
+    int rc = purchase_journal_recover();
+    if (rc == 0) rc = money_journal_recover(NULL);
+    if (rc == 0) rc = money_read_locked(&cash,&bank);
     pthread_mutex_unlock(&reality_lock);
-    if (!ok) return NULL;
+    if (rc != 0) {
+        pthread_mutex_unlock(&purchase_lock);
+        return NULL;
+    }
     money_mirror_write(cash,bank);
+    pthread_mutex_unlock(&purchase_lock);
     char out[768];
     snprintf(out,sizeof(out),
         "MONEY ACCOUNT (derived from physical files): carried cash=$%.2f; piggybank=$%.2f; total=$%.2f. Each money/money(N) file is $1; change.txt stores cents. Deleting a bill removes that dollar permanently; no restart refill occurs.",
