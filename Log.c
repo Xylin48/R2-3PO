@@ -731,10 +731,10 @@ int64_t r2_log_event(
         if (rc == SQLITE_DONE)
             inserted_id = sqlite3_last_insert_rowid(log_db);
         else
-            fprintf(stderr, "[R2 Life Log] Insert/bind failed: %s (SQLite code %d)\\n",
+            fprintf(stderr, "[R2 Life Log] Insert/bind failed: %s (SQLite code %d)\n",
                     sqlite3_errmsg(log_db), rc);
     } else {
-        fprintf(stderr, "[R2 Life Log] Prepare failed: %s\\n",
+        fprintf(stderr, "[R2 Life Log] Prepare failed: %s\n",
                 sqlite3_errmsg(log_db));
     }
 
