@@ -330,40 +330,49 @@ int r2_addiction_record_choice(const char *target, const char *target_type,
     }
     if (st) sqlite3_finalize(st);
     st = NULL;
+    if (sqlite3_exec(addiction_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&addiction_lock);
+        return -1;
+    }
     if (upsert_target_locked(target, target_type, enjoyment, now) != 0) {
+        (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&addiction_lock);
         return -1;
     }
     int rc = sqlite3_prepare_v2(addiction_db,
         "INSERT INTO addiction_events(target,event_kind,enjoyment,source,details,occurred_at) VALUES(?,'choice',?,?,?,?)",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, enjoyment_0_100);
-        sqlite3_bind_text(st, 3, source && *source ? source : "unknown", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 5, now);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, enjoyment_0_100);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, source && *source ? source : "unknown", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) {
         st = NULL;
         rc = sqlite3_prepare_v2(addiction_db,
             "UPDATE addiction_targets SET last_chosen=?,updated_at=? WHERE target=? COLLATE NOCASE",
             -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, now);
-            sqlite3_bind_int64(st, 2, now);
-            sqlite3_bind_text(st, 3, target, -1, SQLITE_TRANSIENT);
-            rc = sqlite3_step(st);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, now);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE && sqlite3_changes(addiction_db) != 1)
+            rc = SQLITE_NOTFOUND;
         if (st) sqlite3_finalize(st);
     }
     if (rc == SQLITE_DONE)
         rc = update_status_locked(target, target_type, &changed, old_status, sizeof(old_status),
                                   new_status, sizeof(new_status), &count, &days, &enjoyment);
+    if (rc == 0) {
+        rc = sqlite3_exec(addiction_db, "COMMIT;", NULL, NULL, NULL);
+        if (rc != SQLITE_OK) (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
+    } else {
+        (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
+    }
     pthread_mutex_unlock(&addiction_lock);
-    if (rc != 0) return -1;
+    if (rc != SQLITE_OK && rc != 0) return -1;
     log_status_change(target, old_status, new_status, count, days, enjoyment, source);
     return 0;
 }
@@ -396,7 +405,12 @@ int r2_addiction_rate_enjoyment(const char *target, const char *target_type,
         pthread_mutex_unlock(&addiction_lock);
         return -1;
     }
+    if (sqlite3_exec(addiction_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&addiction_lock);
+        return -1;
+    }
     if (upsert_target_locked(target, target_type, enjoyment_0_100, now) != 0) {
+        (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
         pthread_mutex_unlock(&addiction_lock);
         return -1;
     }
@@ -404,20 +418,24 @@ int r2_addiction_rate_enjoyment(const char *target, const char *target_type,
     rc = sqlite3_prepare_v2(addiction_db,
         "INSERT INTO addiction_events(target,event_kind,enjoyment,source,details,occurred_at) VALUES(?,'enjoyment',?,?,?,?)",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 2, enjoyment_0_100);
-        sqlite3_bind_text(st, 3, source && *source ? source : "unknown", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 5, now);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, enjoyment_0_100);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, source && *source ? source : "unknown", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE)
         rc = update_status_locked(target, target_type, &changed, old_status, sizeof(old_status),
                                   new_status, sizeof(new_status), &count, &days, &current);
+    if (rc == 0) {
+        rc = sqlite3_exec(addiction_db, "COMMIT;", NULL, NULL, NULL);
+        if (rc != SQLITE_OK) (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
+    } else {
+        (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
+    }
     pthread_mutex_unlock(&addiction_lock);
-    if (rc != 0) return -1;
+    if (rc != SQLITE_OK && rc != 0) return -1;
 
     if (abs(enjoyment_0_100 - old_enjoyment) >= 10 && r2_log_is_initialized()) {
         char summary[768], event_details[1400];
