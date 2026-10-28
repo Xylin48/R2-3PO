@@ -199,7 +199,21 @@ static void *tv_control_server(void *unused)
             char *separator = strchr(payload, '|');
             if (separator) {
                 *separator = '\0';
-                const char *path = separator + 1;
+                char *path = separator + 1;
+                unsigned long published_window = 0;
+                int valid_locator = 1;
+                char *locator = strstr(path, "|x11=");
+                if (locator) {
+                    char *end = NULL;
+                    errno = 0;
+                    unsigned long value = strtoul(locator + 5, &end, 10);
+                    if (errno || end == locator + 5 || !end || *end || !value)
+                        valid_locator = 0;
+                    else {
+                        published_window = value;
+                        *locator = '\0';
+                    }
+                }
                 const char *allowed_actions[] = {
                     "vcr_playback_started", "vcr_playback_paused",
                     "vcr_playback_stopped", "vcr_playback_ended",
@@ -208,9 +222,11 @@ static void *tv_control_server(void *unused)
                 int allowed = 0;
                 for (size_t i = 0; i < sizeof(allowed_actions) / sizeof(allowed_actions[0]); ++i)
                     if (!strcmp(payload, allowed_actions[i])) { allowed = 1; break; }
-                if (allowed && path[0] == '/' && *path &&
+                if (allowed && valid_locator && path[0] == '/' && *path &&
                     !strchr(path, '\n') && !strchr(path, '\r') &&
                     strlen(path) < 1100) {
+                    atomic_store(&tv_live_video_window,
+                        !strcmp(payload, "vcr_playback_started") ? published_window : 0);
                     reply = r2_log_media_event(payload, "media", path,
                         "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
                         ? "OK media event recorded" : "ERROR could not record media event";
