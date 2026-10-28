@@ -124,6 +124,8 @@ static unsigned char *media_latest_data = NULL;
 static size_t media_latest_capacity = 0;
 static R2VisionFrame media_latest_frame;
 static R2VisionEvent media_latest_event;
+/* Chosen display attention never changes camera capture or playback. */
+static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int desktop_auto_allowed = ATOMIC_VAR_INIT(1);
@@ -166,6 +168,7 @@ static int vision_watch_thread_started = 0;
 static int query_requests_visual_context(const char *query);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
+static char *r2_vision_media_current_frame_base64(void);
 static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
                                         R2VisionEvent *event,
                                         unsigned char **owned_data);
@@ -3371,7 +3374,8 @@ static int ollama_json_append_message(struct json_object *array,
                                       const char *role,
                                       const char *content,
                                       size_t content_length,
-                                      const char *image_base64)
+                                      const char *image_base64,
+                                      const char *media_image_base64)
 {
     if (!array || !role || !content || content_length > INT_MAX)
         return -1;
@@ -3392,17 +3396,19 @@ static int ollama_json_append_message(struct json_object *array,
     content_value = NULL; /* ownership transferred to message */
 
     if (image_base64 && *image_base64) {
+        /* Image order is stable: real camera first, chosen media second. */
         struct json_object *images = json_object_new_array();
-        struct json_object *image = json_object_new_string(image_base64);
-        if (!images || !image) {
-            if (images) json_object_put(images);
-            if (image) json_object_put(image);
-            goto fail;
-        }
-        if (json_object_array_add(images, image) != 0) {
-            json_object_put(image);
-            json_object_put(images);
-            goto fail;
+        if (!images) goto fail;
+        const char *sources[2] = {image_base64, media_image_base64};
+        for (size_t j = 0; j < 2; ++j) {
+            if (!sources[j] || !*sources[j]) continue;
+            struct json_object *image = json_object_new_string(sources[j]);
+            if (!image) { json_object_put(images); goto fail; }
+            if (json_object_array_add(images, image) != 0) {
+                json_object_put(image);
+                json_object_put(images);
+                goto fail;
+            }
         }
         if (json_object_object_add(message, "images", images) != 0) {
             json_object_put(images);
@@ -3664,7 +3670,7 @@ static char *ollama_chat_with_limit(
             system_override, OLLAMA_MAX_SYSTEM_MESSAGE_CHARS);
     if (system_override &&
         ollama_json_append_message(arr, "system", system_override,
-                                   override_length, NULL) != 0) {
+                                   override_length, NULL, NULL) != 0) {
         json_object_put(arr);
         json_object_put(root);
         return NULL;
@@ -4062,17 +4068,21 @@ static char *ollama_chat_with_limit(
         const char *role = msgs[i].role ? msgs[i].role : "user";
         const char *content = msgs[i].content ? msgs[i].content : "";
         char *owned_image = NULL;
-        const char *image_base64 = NULL;
+        char *owned_media_image = NULL;
         int active_foreground_turn = ollama_authoritative_user_query &&
             *ollama_authoritative_user_query &&
             strstr(content, ollama_authoritative_user_query);
         if (i == current_user_index && !strcmp(role, "user") &&
             (active_foreground_turn || ollama_autonomous_sensory_input)) {
+            /* Live Eyes never becomes the movie. Chosen attention may add its
+               separate display as image two on the same model turn. */
             owned_image = r2_vision_current_frame_base64();
-            image_base64 = owned_image;
+            if (owned_image && atomic_load(&media_attention_selected))
+                owned_media_image = r2_vision_media_current_frame_base64();
         }
         int append_rc = ollama_json_append_message(
-            arr, role, content, limits[i], image_base64);
+            arr, role, content, limits[i], owned_image, owned_media_image);
+        free(owned_media_image);
         free(owned_image);
         if (append_rc != 0) {
             fprintf(stderr,
@@ -5592,7 +5602,7 @@ static int r2_recent_message_is_tool_payload(const char *content)
     static const char *const markers[] = {
         /* World, sensory, device, diary, and task actions. */
         "[WORLD]", "[IMAGINE]", "[IMAGINE_FEEDBACK]", "[SENSORY_JOURNAL]",
-        "[SENSE]", "[MEDIA_SEE]", "[EARS_LISTEN]",
+        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]",
         "[ALTERNATE_CREATE]", "[ALTERNATE_DISCARD]", "[ALTERNATE_RETAIN]",
         "[ALTERNATE_COMPARE]", "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]",
         "[GAMEBOY]", "[TV]", "[DIARY]", "[READ_DIARY]", "[TASK]", "[FRIDGE]",
@@ -7764,6 +7774,20 @@ static char *r2_process_sense_request(const char *request)
     return strdup("SENSE ERROR: use eyes|open/close, microphone|open/close, desktop|open/close.");
 }
 
+static char *r2_process_media_focus_request(const char *request)
+{
+    if (!request) return strdup("MEDIA FOCUS ERROR: missing choice.");
+    if (!strcasecmp(request, "watch"))
+        return strdup(r2_vision_media_set_attention(1) == 0
+                      ? "MEDIA FOCUS RESULT: watching the separate display. Camera Eyes remain primary."
+                      : "MEDIA FOCUS ERROR: no active media display is available or Eyes is closed.");
+    if (!strcasecmp(request, "away")) {
+        (void)r2_vision_media_set_attention(0);
+        return strdup("MEDIA FOCUS RESULT: looked away without closing camera Eyes or stopping playback.");
+    }
+    return strdup("MEDIA FOCUS ERROR: use watch or away.");
+}
+
 static char *r2_process_media_see_request(const char *question)
 {
     if (!question || !*question)
@@ -8627,6 +8651,17 @@ static char *process_tools_with_status(
         char *request = extract_marker(reply, "[SENSE]", "\n", &sense_pos);
         if (!request) break;
         char *result = r2_process_sense_request(trim(request));
+        if (result) { APPEND("%s\n", result); free(result); }
+        free(request);
+    }
+
+    /* R2 may choose to watch for subsequent model turns. Watch discovery
+       never sets the media-attention decision. */
+    size_t media_focus_pos = 0;
+    while (1) {
+        char *request = extract_marker(reply, "[MEDIA_FOCUS]", "\n", &media_focus_pos);
+        if (!request) break;
+        char *result = r2_process_media_focus_request(trim(request));
         if (result) { APPEND("%s\n", result); free(result); }
         free(request);
     }
@@ -10390,6 +10425,53 @@ char *r2_vision_media_see(const char *question)
     return description;
 }
 
+/* Watching is explicitly model-chosen. It does not start playback, switch
+   Eyes, or run image interpretation from the capture worker. */
+int r2_vision_media_attention_status(void)
+{
+    return atomic_load(&media_attention_selected) ? 1 : 0;
+}
+int r2_vision_media_set_attention(int watching)
+{
+    if (!watching) {
+        atomic_store(&media_attention_selected, 0);
+        r2_log_sensory("media_attention_released",
+                       "R2 chose to look away from the media display.",
+                       "Camera Eyes and playback were left untouched.",
+                       "media-attention");
+        return 0;
+    }
+    if (!atomic_load(&eyes_auto_allowed) || !r2_vision_media_status())
+        return -1;
+    atomic_store(&media_attention_selected, 1);
+    r2_log_sensory("media_attention_selected",
+                   "R2 chose sustained attention to a real separate display.",
+                   "Each subsequent active model turn may include its current frame, after camera Eyes.",
+                   "media-attention");
+    return 0;
+}
+
+/* Encoding is separate from capture and recognition. No frame summaries
+   are generated just because R2 chose to keep looking at a display. */
+static char *r2_vision_media_current_frame_base64(void)
+{
+    if (!r2_vision_media_attention_status() ||
+        !r2_vision_media_status() || !atomic_load(&eyes_auto_allowed))
+        return NULL;
+    pthread_mutex_lock(&media_frame_lock);
+    R2VisionFrame frame = media_latest_frame;
+    unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
+    if (copy) {
+        memcpy(copy, frame.data, frame.size);
+        frame.data = copy;
+    }
+    pthread_mutex_unlock(&media_frame_lock);
+    if (!copy) return NULL;
+    char *encoded = r2_visual_frame_base64(&frame);
+    free(copy);
+    return encoded;
+}
+
 /* Capture and inference are separate workers. Eyes keeps draining the real-time
    FFmpeg stream while Qwen processes a copied frame, so video playback never
    backs up behind inference. Only the latest frame is retained; the image-only
@@ -10783,6 +10865,7 @@ int r2_vision_open_file(const char *path)
 int r2_vision_close(void)
 {
     r2_sense_set_auto_allowed(1, 0);
+    (void)r2_vision_media_set_attention(0);
     (void)r2_vision_media_stop();
     (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
@@ -10828,6 +10911,7 @@ int r2_eyes_release_source(void)
 int r2_eyes_stop(void)
 {
     r2_sense_set_auto_allowed(1, 0);
+    (void)r2_vision_media_set_attention(0);
     (void)r2_vision_media_stop();
     int rc = r2_eyes_release_source();
     r2_log_event(R2_LOG_SENSORY, "eyes_stopped",
@@ -11661,6 +11745,7 @@ void r2_status(void)
         "Workers           : %d\n"
         "Eyes (camera)     : %s\n"
         "Media display     : %s\n"
+        "Media attention   : %s\n"
         "Ears (microphone) : %s\n"
         "Ears (desktop)    : %s\n"
         "Watch             : %s\n"
@@ -11676,6 +11761,7 @@ void r2_status(void)
         r2_worker_count(),
         r2_eyes_status() ? "OPEN" : "CLOSED",
         r2_vision_media_status() ? "AVAILABLE" : "CLOSED",
+        r2_vision_media_attention_status() ? "WATCHING" : "LOOKING AWAY",
         r2_ears_status() ? "OPEN" : "CLOSED",
         r2_ears_status_desktop() ? "OPEN" : "CLOSED",
         r2_watch_active() ? "ACTIVE" : "STOPPED"
@@ -12143,7 +12229,7 @@ static int reply_has_visible_text(const char *text)
         "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]", "[ALTERNATE_COMPARE]",
         "[ALTERNATE_RETAIN]", "[ALTERNATE_DISCARD]", "[READ_DIARY]",
         "[READ]", "[LIST]", "[DELETE]", "[SENSORY_JOURNAL]", "[WORLD]",
-        "[SENSE]", "[MEDIA_SEE]", "[EARS_LISTEN]",
+        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]",
         "[HAND]", "[END ALTERNATE_CREATE]", "[END DIARY]", "[END WRITE]",
         "[END HAND_REQUEST]", "[END RUN]", "[END IMAGINE]",
         "[END IMAGINE_FEEDBACK]"
