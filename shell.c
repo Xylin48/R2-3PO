@@ -177,10 +177,12 @@ static void *tv_control_server(void *unused)
         } else if (!strcmp(command, "display opened")) {
             reply = r2_reality_tv_display_event(1) == 0 ? "OK TV display-open event recorded" : "ERROR could not record TV display-open event";
         } else if (!strcmp(command, "display closed")) {
+            atomic_store(&tv_live_video_window, 0);
             reply = r2_reality_tv_display_event(0) == 0 ? "OK TV display-close event recorded" : "ERROR could not record TV display-close event";
         } else if (!strcmp(command, "power on")) {
             reply = r2_reality_tv_power(1) == 0 ? "OK powered on" : "ERROR power-on failed";
         } else if (!strcmp(command, "power off")) {
+            atomic_store(&tv_live_video_window, 0);
             reply = r2_reality_tv_power(0) == 0 ? "OK powered off" : "ERROR power-off failed";
         } else if (!strncmp(command, "input ", 6)) {
             char *end = NULL;
