@@ -196,7 +196,7 @@ int main(void)
     /* Restart/reconciliation is idempotent and retains the original diary link. */
     r2_sj_shutdown();
     assert(r2_sj_init() == 0);
-    assert(r2_sj_count() == 6);
+    assert(r2_sj_count() == 7);
     found = r2_sj_search("fresh reflective", 20);
     assert(found && strstr(found, "Diary link: 100"));
     free(found);
