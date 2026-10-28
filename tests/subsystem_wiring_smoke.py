@@ -192,4 +192,53 @@ assert "conversation_turn_lock" in core
 assert "r2_reply_reverses_speaker_roles" in core
 assert 'if (strcmp(m->role, "user") == 0 &&\n            r2_recent_message_is_tool_payload(m->content))' not in core
 
+log_event_exists_start = log.find("int r2_log_event_exists(")
+log_event_exists_end = log.find("\nint64_t r2_log_event_with_memory(", log_event_exists_start)
+if log_event_exists_start < 0 or log_event_exists_end < 0:
+    raise SystemExit("Could not locate Life Log event deduplication query.")
+log_event_exists = log[log_event_exists_start:log_event_exists_end]
+for bind in (
+    "rc = sqlite3_bind_text(statement, 1, event_type, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(statement, 2, source, -1, SQLITE_TRANSIENT)",
+):
+    if bind not in log_event_exists:
+        raise SystemExit(f"Life Log event deduplication ignores a binding result: {bind}")
+
+activity_start = log.find("int64_t r2_log_activity_start(")
+activity_end = log.find("\nint64_t r2_log_activity_end(", activity_start)
+if activity_start < 0 or activity_end < 0:
+    raise SystemExit("Could not locate Life Log activity-start persistence.")
+activity = log[activity_start:activity_end]
+for bind in (
+    "rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(statement, 2, activity_name, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id)",
+):
+    if bind not in activity:
+        raise SystemExit(f"Life Log activity-start persistence ignores a binding result: {bind}")
+
+activity_end_start = log.find("int64_t r2_log_activity_end(")
+activity_end_end = log.find("\n/* ------------------------------------------------------------\n * PERSISTENT LOCATION TRANSITIONS", activity_end_start)
+if activity_end_start < 0 or activity_end_end < 0:
+    raise SystemExit("Could not locate Life Log activity-end persistence.")
+activity_end_body = log[activity_end_start:activity_end_end]
+for bind in (
+    "rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT)",
+):
+    if bind not in activity_end_body:
+        raise SystemExit(f"Life Log activity-end persistence ignores a binding result: {bind}")
+
+location_start = log.find("int r2_log_location_transition(")
+location_end = log.find("\nint64_t r2_log_", location_start + 1)
+if location_start < 0 or location_end < 0:
+    raise SystemExit("Could not locate Life Log location persistence.")
+location = log[location_start:location_end]
+for bind in (
+    "rc = sqlite3_bind_text(statement, 1, location, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_int(statement, 3, is_home ? 0 : 1)",
+):
+    if bind not in location:
+        raise SystemExit(f"Life Log location persistence ignores a binding result: {bind}")
+
 print("Imagination, Sensory Journal, Reality, and conversation wiring smoke passed.")
