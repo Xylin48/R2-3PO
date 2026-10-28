@@ -10523,8 +10523,14 @@ static void *r2_ears_capture_worker(void *unused)
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
     while (!shutting_down && atomic_load(&ears_capture_running)) {
         ssize_t got = r2_ears_read(ears, pcm, sizeof(pcm));
-        if (got <= 0 || ((size_t)got % 4U) != 0U)
+        if (got <= 0 || ((size_t)got % 4U) != 0U) {
+            if (!shutting_down && atomic_load(&ears_capture_running))
+                r2_log_sensory("audio_capture_ended",
+                               "R2's continuous microphone stream stopped supplying valid PCM.",
+                               "The input worker ended; the buffered audio is not an active live stream.",
+                               "Ears");
             break;
+        }
         pthread_mutex_lock(&ears_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_recent_write_position;
@@ -10939,8 +10945,12 @@ int r2_ears_stop(void)
 int r2_ears_status(void)
 {
     pthread_mutex_lock(&ears_capture_lock);
-    int active = atomic_load(&ears_capture_running)
-        ? 1 : (ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0);
+    /* If the continuous worker exited on EOF/error, the underlying Pulse
+       handle can remain open until restart/stop. Do not report that as live
+       hearing. Explicitly opened non-worker sources retain their own status. */
+    int active = ears_capture_thread_started
+        ? (atomic_load(&ears_capture_running) ? 1 : 0)
+        : (ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0);
     pthread_mutex_unlock(&ears_capture_lock);
     return active;
 }
