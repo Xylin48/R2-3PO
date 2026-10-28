@@ -30,10 +30,12 @@ worker = shell[shell.index("static void *shell_watch_worker(void *unused)"):
                shell.index("static void shell_watch_start(void)")]
 assert "r2_ears_playback_pid()" in worker
 assert "r2_vision_window_for_pid(playback_pid)" in worker
-assert "wanted_eyes == 4" in worker
-assert "r2_vision_open_window(wanted_window_id)" in worker
-assert "managed_window_id != wanted_window_id" in worker
+assert "wanted_media == 3 ? media_window" in worker
+assert "r2_vision_media_open_window(wanted_window)" in worker
+assert "managed_window_id != wanted_window" in worker
 assert "r2_vision_watch_active()" in worker
+assert "r2_eyes_release_source()" in worker
+assert "r2_vision_media_stop()" in worker
 assert "r2_visual_analyze_frame(" not in worker
 assert "r2_ears_listen_cancelable(" not in worker
 print("Application-independent X11 visual-source discovery and raw frame handoff passed.")
