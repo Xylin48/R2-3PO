@@ -46,8 +46,14 @@ At the R2 prompt:
 - `ears listen` — deliberately capture the next five seconds from the live
   input (or directly record five seconds if continuous Ears is not already
   running), transcribe that interval locally, and send the resulting text to chat.
-- `ears listen 8` — deliberately inspect an eight-second interval.
+- `ears listen 8` — deliberately record and transcribe the next eight-second interval.
 - `ears status` — inspect whether the raw Ears source is currently open.
+
+When the brain itself decides that a real sound deserves attention, it can request
+`[EARS_LISTEN] recent|5` to inspect the most recent five seconds already in the
+rolling buffer, or `[EARS_LISTEN] live|5` to listen to the next five seconds.
+This is a deliberate tool action, not an automatic consequence of microphone
+capture. Recent-buffer listening requires Ears continuous capture to be active.
 - `ears stop` — stop continuous capture and clear its transient audio buffer.
 
 The capture duration is limited to 1–15 seconds. Local transcription is
