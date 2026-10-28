@@ -3639,7 +3639,7 @@ static char *ollama_chat_with_limit(
             system_override, OLLAMA_MAX_SYSTEM_MESSAGE_CHARS);
     if (system_override &&
         ollama_json_append_message(arr, "system", system_override,
-                                   override_length) != 0) {
+                                   override_length, NULL) != 0) {
         json_object_put(arr);
         json_object_put(root);
         return NULL;
