@@ -1079,7 +1079,7 @@ static void shell_vision(const char *argument)
 
     if (!strcasecmp(argument, "watch start")) {
         if (r2_vision_watch_start() == 0)
-            printf("[Visual observation is running; R2 will analyze a frame about every 15 seconds.]\n");
+            printf("[Visual observation is running; Eyes captures continuously and Qwen analyzes successive fresh frames as fast as it can.]\n");
         else
             printf("[Could not start visual observation. Check the vision model and R2 status.]\n");
         return;
