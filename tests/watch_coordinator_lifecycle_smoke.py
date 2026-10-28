@@ -23,7 +23,9 @@ assert "r2_ears_start()" in start_body and "r2_ears_stop()" in start_body
 assert "r2_ears_status() > 0" in start_body, (
     "Watch must not replace an already active file/desktop/microphone source"
 )
-assert "r2_ears_status() > 0" in worker
+assert "while (!shell_watch_cancelled(NULL))" in worker
+assert "r2_ears_stop()" in worker
+assert "UNAVAILABLE" in shell
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
