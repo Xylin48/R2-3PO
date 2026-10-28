@@ -100,6 +100,7 @@ struct R2Eyes
     uint64_t frame_count;
     uint64_t timestamp;
     uint64_t last_log_timestamp;
+    int auxiliary_display; /* No V-Webcam takeover: only real Eyes drives it. */
 
     R2VisionEvent event;
     R2VisionFrame frame;
@@ -992,7 +993,7 @@ void r2_eyes_close(R2Eyes *eyes)
     }
 
     eyes->open = 0;
-    r2_vwebcam_write_status(eyes, 0);
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 0);
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_NONE;
     eyes->frame_count = 0;
@@ -1024,13 +1025,18 @@ void r2_eyes_close(R2Eyes *eyes)
         eyes->frame_size;
 }
 
+void r2_eyes_set_auxiliary(R2Eyes *eyes, int auxiliary)
+{
+    if (eyes) eyes->auxiliary_display = auxiliary != 0;
+}
+
 void r2_eyes_shutdown(R2Eyes *eyes)
 {
     if (!eyes)
         return;
 
     r2_eyes_close(eyes);
-    r2_vwebcam_stop_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_stop_viewer();
 
     free(eyes->frame_buffer);
     eyes->frame_buffer = NULL;
@@ -1123,8 +1129,8 @@ static int r2_eyes_open_internal(
 
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
-    r2_vwebcam_start_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     char details[768];
     snprintf(details, sizeof(details),
@@ -1294,8 +1300,8 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
              "video rendering window %lu", window_id);
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
-    r2_vwebcam_start_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
     r2_log_sensory("vision_source_opened",
                    "R2 Eyes connected to an active rendered video window.",
                    "The source supplied a live window ID; frames are raw pixels.",
@@ -1398,8 +1404,8 @@ int r2_eyes_open_vlc(
     /* source_name was populated from the visible VLC window title above. */
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
-    r2_vwebcam_start_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     r2_log_sensory("vision_source_opened",
                    "R2 Eyes began capturing the visible VLC window.",
@@ -1496,8 +1502,8 @@ int r2_eyes_capture(
     eyes->frame.frame_number =
         eyes->frame_count;
 
-    r2_vwebcam_publish_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_publish_frame(eyes);
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
 
     /*
      * Record a bounded-rate sensory journal heartbeat instead of
