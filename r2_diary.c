@@ -51,6 +51,7 @@
 #include "r2.h"
 #include "Log.h"
 #include "Reward.h"
+#include "SensoryJournal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -937,7 +938,13 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
     rc = sqlite3_step(st);
     int changed = sqlite3_changes(r2_diary_db);
     sqlite3_finalize(st);
-    return (rc == SQLITE_DONE && changed == 1 && memory_indexed) ? 0 : -1;
+    if (rc != SQLITE_DONE || changed != 1 || !memory_indexed)
+        return -1;
+    /* The authoritative diary link is now fully durable. Project its exact
+       IDs into Sensory Journal; uninitialized Journal catches up at startup. */
+    if (r2_sj_link_diary_event(event_id, entry_id) != 0)
+        return -1;
+    return 0;
 }
 
 static int r2_diary_reconnect_history_unlocked(int limit)
