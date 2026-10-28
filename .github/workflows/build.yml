@@ -161,6 +161,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c Ears.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
           /tmp/r2-ears-source-discovery-smoke
 
+      - name: Exercise independent microphone and desktop PCM capture objects
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread -Wl,--wrap=pa_simple_new -Wl,--wrap=pa_simple_read -Wl,--wrap=pa_simple_free
+          /tmp/r2-ears-dual-sources-test
+
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
