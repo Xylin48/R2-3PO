@@ -9994,7 +9994,8 @@ static void *vision_watch_worker(void *unused)
                  start_details, source_name);
 
     uint64_t last_generation = 0;
-    uint64_t last_frame_number = 0;
+    char previous_observation[1024] = "";
+    char previous_source[512] = "";
     while (!shutting_down && atomic_load(&vision_watch_running)) {
         pthread_mutex_lock(&vision_watch_frame_lock);
         while (!shutting_down && atomic_load(&vision_watch_running) &&
@@ -10035,25 +10036,34 @@ static void *vision_watch_worker(void *unused)
                 break;
             continue;
         }
-        if (frame.frame_number <= last_frame_number) {
-            free(frame_copy);
-            continue;
+        const char *frame_source = event.source_name[0] ? event.source_name : source_name;
+        if (strcmp(previous_source, frame_source) != 0) {
+            previous_observation[0] = '\\0';
+            snprintf(previous_source, sizeof(previous_source), "%s", frame_source);
         }
-        last_frame_number = frame.frame_number;
-
-        char *description = r2_visual_analyze_frame(
-            &frame, event.source_name[0] ? event.source_name : source_name,
-            "Provide a concise sensory description of this newly captured video frame for R2. "
-            "Report visible details and uncertainty without deciding what they mean, "
-            "choosing an action, identifying a memory match, or composing something R2 should say. "
-            "Treat it as the next frame in an ongoing visual sequence; describe meaningful changes "
-            "from prior observations only when supported by the frame and recorded context.");
+        char question[2048];
+        if (previous_observation[0]) {
+            snprintf(question, sizeof(question),
+                     "This is the next sampled frame from the same ongoing video source. "
+                     "Previous frame observation: %.900s\\n"
+                     "Describe the current frame's visible details, and report meaningful changes "
+                     "only when directly supported. Separate visible facts from uncertainty. "
+                     "Do not choose actions, identify memory matches, or compose what R2 should say.",
+                     previous_observation);
+        } else {
+            snprintf(question, sizeof(question),
+                     "Describe this newly captured video frame for R2. Report visible details and "
+                     "uncertainty. This is the first observation for the current source. "
+                     "Do not choose actions, identify memory matches, or compose what R2 should say.");
+        }
+        char *description = r2_visual_analyze_frame(&frame, frame_source, question);
         free(frame_copy);
 
         if (description) {
             r2_log_event(R2_LOG_SENSORY, "vision_watch_observation",
                          "R2 analyzed a fresh frame during continuous visual observation.",
-                         description, source_name);
+                         description, frame_source);
+            snprintf(previous_observation, sizeof(previous_observation), "%s", description);
             free(description);
         }
     }
