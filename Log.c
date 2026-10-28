@@ -603,7 +603,7 @@ static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
                  details_text ? (const char *)details_text : "");
         sqlite3_finalize(st);
 
-        char source[256], summary[512], details[1800];
+        char source[256], summary[512], details[2048];
         snprintf(source, sizeof(source), "LogMigration:%s:%lld",
                  spec->table, (long long)row_id);
         snprintf(summary, sizeof(summary),
