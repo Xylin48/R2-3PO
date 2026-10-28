@@ -224,9 +224,10 @@ static int64_t find_existing_log_event(sqlite3_int64 reward_id)
     if (sqlite3_open_v2(R2_DIARY_DATABASE, &db,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         if (db) sqlite3_close(db);
-        return 0;
+        /* Missing/inaccessible Life Log is an error, not proof that the
+           reward has no prior log. Avoid generating a duplicate on retry. */
+        return -1;
     }
-    sqlite3_busy_timeout(db, 3000);
     int rc = sqlite3_busy_timeout(db, 3000);
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(db,
