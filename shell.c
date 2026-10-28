@@ -1320,7 +1320,8 @@ static void *shell_watch_worker(void *unused)
         int desktop_playing = r2_ears_desktop_playing();
         int microphone_available = r2_ears_microphone_available();
         int camera_available = r2_vision_camera_available();
-        int vlc_available = r2_vision_vlc_available();
+        /* An idle player window alone is not active video input. */
+        int vlc_available = r2_vision_vlc_available() && desktop_playing;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
