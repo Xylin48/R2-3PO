@@ -605,6 +605,7 @@ static const char *SYSTEM_PROMPT =
 "Use [ALTERNATE_RETAIN] id or [ALTERNATE_DISCARD] id only when explicitly requested. A retained hypothesis remains hypothetical and must never be promoted into a factual memory.\n"
 "Use [IMAGINE] question or scenario [END IMAGINE] to explore a hypothetical using relevant experience. Give evidence-based feedback only with [IMAGINE_FEEDBACK] branch_id|accurate/partial/incorrect/unresolved|notes [END IMAGINE_FEEDBACK]. Imagined events are never facts or real-world actions.\n"
 "Use [SENSORY_JOURNAL] recent|limit, [SENSORY_JOURNAL] search|query|limit, or [SENSORY_JOURNAL] note|note text|details to inspect or annotate the index of original Life Log events; do not duplicate raw sensory data.\n"
+"Your primary Eyes are the physical camera, not a movie window. Movies and playing video are separate displays that remain available independently; never replace camera vision to view a screen. Raw pixel changes can be noticed without interpretation. You decide whether to attend to the camera, a media display, or neither. A playing movie never obliges you to watch it. To deliberately close or reopen a sense, emit [SENSE] eyes|close/open, [SENSE] microphone|close/open, or [SENSE] desktop|close/open as a standalone line (write one exact operation, not both choices). Closed senses remain closed until you decide otherwise. To deliberately examine currently available media pixels, emit [MEDIA_SEE] question on its own line; unavailable media is not evidence about content. "
 "Eyes and Ears receive sensory input continuously only while an input source is active; input itself does not mean you are attending to or interpreting it. Microphone and desktop playback can be heard simultaneously but have separate histories. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] recent|seconds or [EARS_LISTEN] live|seconds for microphone, or [EARS_LISTEN] desktop_recent|seconds or [EARS_LISTEN] desktop_live|seconds for audio playing on the computer (1-15). The action locally recognizes speech; it is not a general non-speech sound classifier. Do not use it for hypothetical situations or merely because Ears is active. Use the result as sensory evidence, then decide what it means.\n"
 "When a proposed purchase has no user-supplied or otherwise evidenced price, do not invent a price or pretend a store has stock. Ask for the price or wait for explicit price information. Only execute [WORLD] buy|item name|price|description|destination after the item, price, and intended destination are established; report failure if funds or the transaction are insufficient.\n"
 "Use [WORLD] location|location name|home or [WORLD] location|location name|outside only when simulated movement is actually being carried out, not merely planned. Use home only for the actual home; stores and other away places use outside. The location transition persists, and private Welcome Home memory is created only after an away-to-home transition.\n"
@@ -7717,6 +7718,62 @@ static int r2_ears_action_cancelled(void *unused)
              atomic_load(&foreground_ollama_waiting) > 0));
 }
 
+/* A sensor decision originates in R2's own model action, not source discovery. */
+static char *r2_process_sense_request(const char *request)
+{
+    if (!request) return strdup("SENSE ERROR: missing decision.");
+    if (!strcasecmp(request, "eyes|close")) {
+        r2_sense_set_auto_allowed(1, 0);
+        (void)r2_eyes_stop();
+        return strdup("SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them.");
+    }
+    if (!strcasecmp(request, "eyes|open")) {
+        r2_sense_set_auto_allowed(1, 1);
+        return strdup(r2_eyes_start() == 0
+                      ? "SENSE RESULT: primary camera Eyes opened."
+                      : "SENSE RESULT: Eyes allowed to reopen, but no working camera is available.");
+    }
+    if (!strcasecmp(request, "microphone|close")) {
+        r2_sense_set_auto_allowed(2, 0);
+        (void)r2_ears_stop();
+        return strdup("SENSE RESULT: microphone voluntarily closed; Watch will respect this.");
+    }
+    if (!strcasecmp(request, "microphone|open")) {
+        r2_sense_set_auto_allowed(2, 1);
+        return strdup(r2_ears_start() == 0
+                      ? "SENSE RESULT: microphone opened."
+                      : "SENSE RESULT: microphone permitted but unavailable.");
+    }
+    if (!strcasecmp(request, "desktop|close")) {
+        r2_sense_set_auto_allowed(3, 0);
+        (void)r2_ears_stop_desktop();
+        return strdup("SENSE RESULT: desktop listening voluntarily closed.");
+    }
+    if (!strcasecmp(request, "desktop|open")) {
+        r2_sense_set_auto_allowed(3, 1);
+        return strdup(r2_ears_start_desktop() == 0
+                      ? "SENSE RESULT: desktop listening opened."
+                      : "SENSE RESULT: desktop listening permitted but source unavailable.");
+    }
+    return strdup("SENSE ERROR: use eyes|open/close, microphone|open/close, desktop|open/close.");
+}
+
+static char *r2_process_media_see_request(const char *question)
+{
+    if (!question || !*question)
+        return strdup("MEDIA OBSERVATION ERROR: an observation question is needed.");
+    char *observed = r2_vision_media_see(question);
+    if (!observed) return strdup(
+        "MEDIA OBSERVATION ERROR: no visible media frame is available or Eyes is closed. "
+        "Do not invent visual content.");
+    char *result = NULL;
+    if (asprintf(&result, "MEDIA OBSERVATION RESULT (chosen attention to a real display):\\n%s",
+                 observed) < 0)
+        result = NULL;
+    free(observed);
+    return result;
+}
+
 static char *r2_process_ears_listen_request(const char *request)
 {
     if (!request) return NULL;
@@ -8556,6 +8613,27 @@ static char *process_tools_with_status(
             APPEND("SENSORY JOURNAL ERROR: use recent|1..100, search|query|1..100, or note|text|details.\n");
         }
         free(entry);
+    }
+
+    /* Decisions to open/close sensors override Watch discovery. */
+    size_t sense_pos = 0;
+    while (1) {
+        char *request = extract_marker(reply, "[SENSE]", "\\n", &sense_pos);
+        if (!request) break;
+        char *result = r2_process_sense_request(trim(request));
+        if (result) { APPEND("%s\\n", result); free(result); }
+        free(request);
+    }
+
+    /* Media pixels only enter semantic reasoning when the brain requests
+       that display. Primary camera frames remain a distinct image source. */
+    size_t media_see_pos = 0;
+    while (1) {
+        char *request = extract_marker(reply, "[MEDIA_SEE]", "\\n", &media_see_pos);
+        if (!request) break;
+        char *result = r2_process_media_see_request(trim(request));
+        if (result) { APPEND("%s\\n", result); free(result); }
+        free(request);
     }
 
     /* Deliberate hearing is an action chosen by the brain, not a side effect
