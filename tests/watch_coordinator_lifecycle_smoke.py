@@ -19,20 +19,30 @@ stop_body = shell[stop:stop_end]
 assert "pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL)" in start_body
 assert "pthread_join(shell_watch_thread, NULL)" in stop_body
 assert "atomic_store(&shell_watch_stop_requested, 1)" in stop_body
-assert "r2_ears_start()" in start_body and "r2_ears_stop()" in start_body
-assert "r2_ears_status() > 0" in start_body, (
-    "Watch must not replace an already active file/desktop/microphone source"
-)
+# Boot only starts discovery; an unplugged microphone must not abort Watch.
+assert "pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL)" in start_body
+assert "r2_ears_status() > 0" in start_body
+assert "r2_ears_start()" not in start_body
+assert "r2_ears_stop()" not in start_body
+assert "shell_watch_start();" in shell[shell.index("int r2_shell_run(void)"):]
 assert "while (!shell_watch_cancelled(NULL))" in worker
-assert "r2_ears_stop()" in worker
-assert "UNAVAILABLE" in shell
+assert "r2_ears_microphone_available()" in worker
+assert "r2_ears_desktop_playing()" in worker
+assert "r2_vision_camera_available()" in worker
+assert "r2_vision_vlc_available()" in worker
+assert "r2_vision_window_available(media_window)" in worker
+assert "r2_ears_start_desktop()" in worker and "r2_ears_start()" in worker
+assert "if (managed_audio)" in worker and "r2_ears_stop()" in worker
+assert "if (managed_eyes)" in worker and "r2_eyes_stop()" in worker
+assert "r2_vision_watch_start()" in worker
+assert "r2_vision_open_window(media_window)" in worker
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
-assert "r2_vision_watch_start()" in worker and "r2_eyes_status() > 0" in worker
-assert "r2_vision_watch_stop()" in worker
-assert "Coordinator thread : %s" in shell and "Visual input       : %s" in shell
+assert "Source discovery    : %s" in shell
+assert "Visual input        : %s" in shell
 assert "no automatic transcription or image descriptions are generated." in shell
+
 assert "r2_talk(message)" in shell[
     shell.index("static void shell_talk_inner"):shell.index("static void shell_talk(const char *message)")
 ]
