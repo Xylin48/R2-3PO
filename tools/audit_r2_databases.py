@@ -124,6 +124,7 @@ def audit_database(path: Path) -> dict[str, Any]:
         "integrity": None,
         "tables": {},
         "legacy_phantom_food_records": [],
+        "foreign_key_violations": [],
         "error": None,
     }
     if path.is_symlink():
@@ -138,6 +139,11 @@ def audit_database(path: Path) -> dict[str, Any]:
         db = _readonly_connection(path)
         report["integrity"] = [
             str(row[0]) for row in db.execute("PRAGMA integrity_check").fetchall()
+        ]
+        report["foreign_key_violations"] = [
+            {"table": str(row[0]), "rowid": row[1],
+             "parent": str(row[2]), "fkid": int(row[3])}
+            for row in db.execute("PRAGMA foreign_key_check").fetchall()
         ]
         table_rows = db.execute(
             "SELECT name FROM sqlite_master "
@@ -170,6 +176,114 @@ def audit_database(path: Path) -> dict[str, Any]:
     return report
 
 
+def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
+    quoted = '"' + table.replace('"', '""') + '"'
+    return {str(row[1]) for row in db.execute(f"PRAGMA table_info({quoted})")}
+
+
+def _relationship_check(
+    source_db: sqlite3.Connection | None,
+    source_name: str,
+    source_table: str,
+    source_column: str,
+    target_db: sqlite3.Connection | None,
+    target_name: str,
+    target_table: str,
+    target_column: str,
+) -> dict[str, Any]:
+    name = f"{source_name}:{source_table}.{source_column}->{target_name}:{target_table}.{target_column}"
+    result: dict[str, Any] = {
+        "name": name, "status": "not_checked",
+        "source_database": source_name, "source_table": source_table,
+        "source_column": source_column, "target_database": target_name,
+        "target_table": target_table, "target_column": target_column,
+        "checked_rows": 0, "orphan_count": 0, "orphan_values": [],
+    }
+    if source_db is None or target_db is None:
+        result["reason"] = "source or target database file is unavailable"
+        return result
+    try:
+        source_tables = {str(row[0]) for row in source_db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        target_tables = {str(row[0]) for row in target_db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if source_table not in source_tables or target_table not in target_tables:
+            result["reason"] = "legacy schema is missing a source or target table"
+            return result
+        if source_column not in _table_columns(source_db, source_table) or \
+           target_column not in _table_columns(target_db, target_table):
+            result["reason"] = "legacy schema is missing a source or target column"
+            return result
+        qs = '"' + source_table.replace('"', '""') + '"'
+        qc = '"' + source_column.replace('"', '""') + '"'
+        values = [row[0] for row in source_db.execute(
+            f"SELECT {qc} FROM {qs} WHERE {qc} IS NOT NULL"
+        )]
+        qt = '"' + target_table.replace('"', '""') + '"'
+        qtc = '"' + target_column.replace('"', '""') + '"'
+        orphan_values: list[Any] = []
+        orphan_count = 0
+        for value in values:
+            if target_db.execute(
+                f"SELECT 1 FROM {qt} WHERE {qtc}=? LIMIT 1", (value,)
+            ).fetchone() is None:
+                orphan_count += 1
+                if len(orphan_values) < 50:
+                    orphan_values.append(value)
+        result["status"] = "checked"
+        result["checked_rows"] = len(values)
+        result["orphan_count"] = orphan_count
+        result["orphan_values"] = orphan_values
+    except sqlite3.Error as exc:
+        result["status"] = "error"
+        result["reason"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def audit_relationships(
+    root: Path, reports: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Read-only check that organs' persisted cross-references still resolve."""
+    connections: dict[str, sqlite3.Connection | None] = {}
+    for name in ("r2_memory.db", "r2_rewards.db"):
+        path = root / name
+        if not path.is_file() or path.is_symlink():
+            connections[name] = None
+            continue
+        try:
+            connections[name] = _readonly_connection(path)
+        except sqlite3.Error:
+            connections[name] = None
+
+    relations = [
+        ("r2_memory.db", "r2_visual_experiences", "life_log_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_alternate_self_branches", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_alternate_self_branches", "evidence_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_alternate_self_event_links", "branch_id", "r2_memory.db", "r2_alternate_self_branches", "id"),
+        ("r2_memory.db", "r2_alternate_self_event_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_diary_entry_links", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_diary_entry_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
+        ("r2_memory.db", "r2_sensory_journal", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_sensory_journal_diary_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_sensory_journal_diary_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
+        ("r2_rewards.db", "reward_events", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
+    ]
+    output = []
+    try:
+        for src_name, src_table, src_col, dst_name, dst_table, dst_col in relations:
+            output.append(_relationship_check(
+                connections[src_name], src_name, src_table, src_col,
+                connections[dst_name], dst_name, dst_table, dst_col,
+            ))
+    finally:
+        for connection in connections.values():
+            if connection is not None:
+                connection.close()
+    return output
+
+
 def audit_root(root: Path) -> dict[str, Any]:
     reports: dict[str, dict[str, Any]] = {}
     for name in ALL_DATABASES:
@@ -181,6 +295,7 @@ def audit_root(root: Path) -> dict[str, Any]:
                 "integrity": None,
                 "tables": {},
                 "legacy_phantom_food_records": [],
+                "foreign_key_violations": [],
                 "error": "database path traverses a symlink; refusing to follow it",
             }
         else:
@@ -194,10 +309,16 @@ def audit_root(root: Path) -> dict[str, Any]:
         name for name, item in reports.items()
         if item["exists"] and (
             item["error"] is not None or item["integrity"] != ["ok"]
+            or item["foreign_key_violations"]
         )
     ]
     missing = [name for name, item in required.items() if not item["exists"]]
     optional_missing = [name for name, item in optional.items() if not item["exists"]]
+    relationships = audit_relationships(root, reports)
+    relationship_failures = [
+        item for item in relationships
+        if item["status"] == "error" or item.get("orphan_count", 0) > 0
+    ]
     legacy = [
         {"database": name, **record}
         for name, item in reports.items()
@@ -207,6 +328,7 @@ def audit_root(root: Path) -> dict[str, Any]:
         "root": str(root.resolve()),
         "read_only": True,
         "databases": reports,
+        "relationships": relationships,
         "summary": {
             "found": len(required_existing),
             "expected": len(DATABASES),
@@ -215,6 +337,10 @@ def audit_root(root: Path) -> dict[str, Any]:
             "optional_expected": len(OPTIONAL_DATABASES),
             "optional_missing": optional_missing,
             "integrity_failures": failures,
+            "relationship_failures": relationship_failures,
+            "relationship_checks_not_run": [
+                item for item in relationships if item["status"] == "not_checked"
+            ],
             "legacy_phantom_food_records": legacy,
         },
     }
@@ -277,9 +403,14 @@ def main() -> int:
         summary = report["summary"]
         print(f"Summary: {summary['found']}/{summary['expected']} required database files found; "
               f"{summary['optional_found']}/{summary['optional_expected']} optional device database files found; "
-              f"{len(summary['integrity_failures'])} integrity failure(s); "
+              f"{len(summary['integrity_failures'])} integrity/foreign-key failure(s); "
+              f"{len(summary['relationship_failures'])} broken relationship(s); "
               f"{len(summary['legacy_phantom_food_records'])} legacy phantom-food "
               "record group(s).")
+        for relationship in summary["relationship_failures"]:
+            print(f"  RELATIONSHIP ERROR: {relationship['name']}: "
+                  f"status={relationship['status']}; "
+                  f"orphan_values={relationship.get('orphan_values', [])}")
         if summary["missing"]:
             print("Note: missing files are reported, not created.")
         if summary["legacy_phantom_food_records"]:
@@ -290,6 +421,7 @@ def main() -> int:
     # Missing expected databases are a failed preflight, not a clean pass.
     # The report remains read-only and still lists every missing path.
     return 2 if (report["summary"]["integrity_failures"] or
+                  report["summary"]["relationship_failures"] or
                   report["summary"]["missing"] or snapshot_errors) else 0
 
 
