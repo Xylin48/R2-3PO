@@ -279,3 +279,12 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 ### Database backward-compatibility audit checkpoint
 
 The repository currently has targeted legacy-schema tests for the primary memory database, Reality/fridge inventory, rewards, addictions, Life Log, and Visual Experience Library. These tests construct older schemas, open them through production migration paths, verify existing rows remain available, and exercise writes after migration. The isolated Game Boy state/cartridge databases and the shared Sensory Journal / Alternate-Self tables still need explicit legacy-schema coverage review; do not claim those schemas fully validated until that review and the exact-head suite complete.
+
+### R2-AUD-2026-10-28-005 — legacy Game Boy state could be stranded in the old combined database
+
+- **Area:** `GameBoyAdvance.py`, `gameboy.db` and `State/console_state.db`.
+- **Severity:** High / device-state continuity.
+- **Finding:** Current code stores cartridge state in `gameboy.db` and console/session state in `State/console_state.db`, but the repository's own module documentation described the earlier combined layout. Without an import, old console state, event history, and cartridge inventory tables in `gameboy.db` could be left unread by the new runtime.
+- **Fix:** Add a transactional, idempotent, additive import for legacy `console_state`, `console_events`, and `cartridge_inventory` tables from the attached legacy database. Preserve an existing state DB's row when IDs conflict, retain both event histories if event IDs conflict, keep the original source tables intact, and only mark the migration when legacy tables actually exist.
+- **Regression coverage:** Added `tests/gameboy_legacy_schema_smoke.py` and wired it into CI. It exercises old schemas in both files, preserves existing rows, verifies post-migration writes and SQLite integrity, confirms the source data remains readable, and checks that a fresh install is not prematurely marked migrated.
+- **Validation status:** The new exact-head CI run must pass before this migration is considered verified. No live hardware or mGBA session was available for this repository-side audit.
