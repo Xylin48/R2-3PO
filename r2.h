@@ -18,8 +18,10 @@
  *   - autonomous thinking
  *   - tools
  *   - diary integration
- *   - Eyes (frame capture; Visual.c sends frames to the unified Qwen 3.5 model)
- *   - Ears (raw PCM capture; speech-to-text is a separate capability)
+ *   - Eyes (continuous raw-frame capture; the conversation brain receives images
+ *     directly and chooses what to attend to; explicit inspection is separate)
+ *   - Ears (continuous raw PCM capture; explicit speech recognition is separate,
+ *     and capture itself never transcribes or classifies sound)
  *
  * This header is the PUBLIC bridge used by other R2 components,
  * especially shell.c.
