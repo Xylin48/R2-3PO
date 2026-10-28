@@ -488,6 +488,45 @@ int r2_ears_desktop_playing(void)
     return playing;
 }
 
+/* Resolve the real process responsible for an uncorked output stream.
+ * It is evidence of desktop playback, not evidence that a video exists.
+ * The optional Eyes bridge can look for a visible window owned by this PID. */
+long r2_ears_playback_pid(void)
+{
+    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
+    if (!pipe) return -1;
+    char line[2048];
+    long current_pid = -1, selected = -1;
+    int active = 0, seen_input = 0;
+    while (fgets(line, sizeof(line), pipe)) {
+        if (strstr(line, "Sink Input #")) {
+            if (seen_input && active && current_pid > 1 && selected < 0)
+                selected = current_pid;
+            seen_input = 1;
+            active = 0;
+            current_pid = -1;
+        } else if (seen_input && strstr(line, "Corked: ")) {
+            active = strstr(line, "Corked: no") != NULL;
+        } else if (seen_input) {
+            char *key = strstr(line, "application.process.id = ");
+            if (key) {
+                key += strlen("application.process.id = ");
+                if (*key == '"') ++key;
+                char *end = NULL;
+                errno = 0;
+                long value = strtol(key, &end, 10);
+                if (!errno && end != key && value > 1 && value <= INT_MAX &&
+                    (*end == '"' || *end == '\n' || *end == '\0'))
+                    current_pid = value;
+            }
+        }
+    }
+    if (seen_input && active && current_pid > 1 && selected < 0)
+        selected = current_pid;
+    if (pclose(pipe) != 0) return -1;
+    return selected;
+}
+
 /* ---------------------------------------------------------
  * File process handling
  * --------------------------------------------------------- */
