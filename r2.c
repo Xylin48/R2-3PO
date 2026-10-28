@@ -10709,6 +10709,84 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_tota
     return rc;
 }
 
+/* Desktop samples are independently available to R2's chosen attention. */
+static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav)
+{
+    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+        return -1;
+    unsigned char *snapshot = malloc(bytes_needed);
+    if (!snapshot) return -1;
+    pthread_mutex_lock(&ears_desktop_recent_lock);
+    if (ears_desktop_recent_length < bytes_needed) {
+        pthread_mutex_unlock(&ears_desktop_recent_lock);
+        free(snapshot);
+        return -1;
+    }
+    size_t start = (ears_desktop_recent_write_position +
+                    R2_EARS_RECENT_CAPACITY - bytes_needed) %
+                   R2_EARS_RECENT_CAPACITY;
+    size_t first = R2_EARS_RECENT_CAPACITY - start;
+    if (first > bytes_needed) first = bytes_needed;
+    memcpy(snapshot, ears_desktop_recent_audio + start, first);
+    if (bytes_needed > first)
+        memcpy(snapshot + first, ears_desktop_recent_audio, bytes_needed - first);
+    pthread_mutex_unlock(&ears_desktop_recent_lock);
+    int rc = fwrite(snapshot, 1, bytes_needed, wav) == bytes_needed ? 0 : -1;
+    free(snapshot);
+    return rc;
+}
+
+/* Copy a requested live PCM interval without consuming or interpreting it. */
+static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      FILE *wav, int (*cancelled)(void *), void *userdata)
+{
+    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+        return -1;
+    unsigned char *snapshot = malloc(bytes_needed);
+    if (!snapshot) return -1;
+    for (;;) {
+        if (shutting_down || (cancelled && cancelled(userdata))) {
+            free(snapshot);
+            return -1;
+        }
+        pthread_mutex_lock(&ears_desktop_recent_lock);
+        uint64_t captured_since_request = ears_desktop_recent_total_bytes >= start_total
+            ? ears_desktop_recent_total_bytes - start_total : 0;
+        if (captured_since_request >= bytes_needed &&
+            captured_since_request <= R2_EARS_RECENT_CAPACITY) {
+            size_t start = (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
+            size_t first = R2_EARS_RECENT_CAPACITY - start;
+            if (first > bytes_needed) first = bytes_needed;
+            memcpy(snapshot, ears_desktop_recent_audio + start, first);
+            if (bytes_needed > first)
+                memcpy(snapshot + first, ears_desktop_recent_audio, bytes_needed - first);
+            pthread_mutex_unlock(&ears_desktop_recent_lock);
+            break;
+        }
+        int overrun = captured_since_request > R2_EARS_RECENT_CAPACITY;
+        int still_capturing = atomic_load(&ears_desktop_capture_running);
+        pthread_mutex_unlock(&ears_desktop_recent_lock);
+        if (overrun) {
+            free(snapshot);
+            return -1;
+        }
+        if (!still_capturing) {
+            free(snapshot);
+            return -1;
+        }
+        struct timespec pause = {0, 100000000L};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+            if (shutting_down || (cancelled && cancelled(userdata))) {
+                free(snapshot);
+                return -1;
+            }
+        }
+    }
+    int rc = fwrite(snapshot, 1, bytes_needed, wav) == bytes_needed ? 0 : -1;
+    free(snapshot);
+    return rc;
+}
+
 static int r2_ears_write_wav_header(FILE *fp, uint32_t pcm_bytes)
 {
     unsigned char header[44] = {0};
