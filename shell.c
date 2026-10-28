@@ -1315,7 +1315,8 @@ static int shell_watch_cancelled(void *unused)
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int managed_eyes = 0;
+    int managed_camera = 0;
+    int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
     unsigned long managed_window_id = 0;
     int managed_microphone = 0;
     int managed_desktop = 0;
@@ -1325,75 +1326,80 @@ static void *shell_watch_worker(void *unused)
         int desktop_playing = r2_ears_desktop_playing();
         int microphone_available = r2_ears_microphone_available();
         int camera_available = r2_vision_camera_available();
-        /* An idle player window alone is not active video input. */
         int vlc_available = r2_vision_vlc_available() && desktop_playing;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
-        /* Follow the actual active audio producer, regardless of application.
-           No audio producer/visible X11 window means no generic video source. */
         long playback_pid = desktop_playing ? r2_ears_playback_pid() : -1;
         unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
 
-        /* Opening Eyes is not a request to interpret frames. Direct camera
-           input and accessible playing media are both valid visual sources.
-           A user-opened file/window is never silently overwritten. */
-        int wanted_eyes = window_available ? 3 :
-            (playback_window ? 4 :
-            (vlc_available ? 2 : (camera_available ? 1 : 0)));
-        unsigned long wanted_window_id = wanted_eyes == 3 ? media_window :
-                                         wanted_eyes == 4 ? playback_window : 0;
-        if (managed_eyes) {
-            int source_gone = (managed_eyes == 3 && !window_available) ||
-                              (managed_eyes == 4 && !playback_window) ||
-                              (managed_eyes == 2 && !vlc_available) ||
-                              (managed_eyes == 1 && !camera_available);
-            int source_changed = wanted_eyes != managed_eyes ||
-                (managed_eyes >= 3 && managed_window_id != wanted_window_id);
-            if (source_gone || source_changed || !r2_vision_watch_active()) {
-                (void)r2_eyes_stop();
-                managed_eyes = 0;
-                managed_window_id = 0;
-            }
+        /* The physical camera is the Eyes organ. Movies are separate displays.
+           Neither a playing media window nor its disappearance changes eyesight. */
+        int eyes_permitted = r2_sense_auto_allowed(1);
+        if (managed_camera &&
+            (!eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
+            (void)r2_eyes_release_source();
+            managed_camera = 0;
         }
-        if (!managed_eyes && r2_eyes_status() > 0) {
-            /* Existing deliberate Eyes input retains ownership. */
-            if (!r2_vision_watch_active() && r2_vision_available() &&
-                r2_vision_watch_start() == 0)
-                attached_visual = 1;
-        } else if (!managed_eyes && wanted_eyes && r2_vision_available()) {
-            int opened = (wanted_eyes == 3 || wanted_eyes == 4)
-                ? r2_vision_open_window(wanted_window_id)
-                : (wanted_eyes == 2 ? r2_vision_open_vlc() : r2_eyes_start());
+        if (eyes_permitted && !managed_camera && camera_available &&
+            r2_eyes_status() <= 0 && r2_eyes_start() == 0)
+            managed_camera = 1;
+
+        if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
+            !r2_vision_watch_active() && r2_vision_available() &&
+            r2_vision_watch_start() == 0)
+            attached_visual = 1;
+
+        /* Watch finds accessible media; R2 decides whether to watch it.
+           Media capture is independent, and no semantic inference is triggered. */
+        int wanted_media = window_available ? 3 :
+            (playback_window ? 4 : (vlc_available ? 2 : 0));
+        unsigned long wanted_window = wanted_media == 3 ? media_window :
+                                      wanted_media == 4 ? playback_window : 0;
+        if (managed_media &&
+            (!eyes_permitted || wanted_media != managed_media ||
+             managed_window_id != wanted_window ||
+             r2_vision_media_status() <= 0)) {
+            (void)r2_vision_media_stop();
+            managed_media = 0;
+            managed_window_id = 0;
+        }
+        if (eyes_permitted && !managed_media && wanted_media &&
+            !r2_vision_media_status() && r2_vision_available()) {
+            int opened = wanted_media == 2 ? r2_vision_open_vlc() :
+                         r2_vision_media_open_window(wanted_window);
             if (opened == 0) {
-                managed_eyes = wanted_eyes;
-                managed_window_id = wanted_window_id;
-                r2_log_event(R2_LOG_SENSORY, "watch_visual_source_available",
-                             "R2 automatically connected an available visual source.",
-                             "Frames are available to cognition; no automatic visual description was requested.",
-                             wanted_eyes == 3 ? "active CRT video renderer"
-                                 : wanted_eyes == 4 ? "visible window of active audio producer"
-                                 : (wanted_eyes == 2 ? "visible media window" : "camera"));
+                managed_media = wanted_media;
+                managed_window_id = wanted_window;
+                r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
+                             "R2 can observe an independent real media display.",
+                             "The display does not replace physical Eyes or demand attention.",
+                             wanted_media == 3 ? "CRT video renderer" :
+                             wanted_media == 4 ? "visible X11 audio producer" : "VLC");
             }
         }
 
-        /* Both audio streams independently follow the actual source lifecycle.
-           Neither stream is classified or transcribed just by being present. */
+        /* Both audio sources operate independently; the decision to close one
+           must not be overridden by mere availability of that source. */
         if (managed_microphone &&
-            (!microphone_available || r2_ears_status() <= 0)) {
+            (!r2_sense_auto_allowed(2) || !microphone_available ||
+             r2_ears_status() <= 0)) {
             (void)r2_ears_stop();
             managed_microphone = 0;
         }
-        if (!managed_microphone && microphone_available && r2_ears_status() <= 0 &&
+        if (!managed_microphone && r2_sense_auto_allowed(2) &&
+            microphone_available && r2_ears_status() <= 0 &&
             r2_ears_start() == 0)
             managed_microphone = 1;
 
         if (managed_desktop &&
-            (!desktop_playing || r2_ears_status_desktop() <= 0)) {
+            (!r2_sense_auto_allowed(3) || !desktop_playing ||
+             r2_ears_status_desktop() <= 0)) {
             (void)r2_ears_stop_desktop();
             managed_desktop = 0;
         }
-        if (!managed_desktop && desktop_playing && r2_ears_status_desktop() <= 0 &&
+        if (!managed_desktop && r2_sense_auto_allowed(3) &&
+            desktop_playing && r2_ears_status_desktop() <= 0 &&
             r2_ears_start_desktop() == 0)
             managed_desktop = 1;
 
@@ -1402,10 +1408,12 @@ static void *shell_watch_worker(void *unused)
             if (shell_watch_cancelled(NULL)) break;
     }
 
-    if (managed_eyes)
-        (void)r2_eyes_stop();
+    if (managed_camera)
+        (void)r2_eyes_release_source();
     else if (attached_visual)
         (void)r2_vision_watch_stop();
+    if (managed_media)
+        (void)r2_vision_media_stop();
     if (managed_microphone)
         (void)r2_ears_stop();
     if (managed_desktop)
@@ -1420,12 +1428,8 @@ static void shell_watch_start(void)
         return;
     }
 
-    /* Preexisting explicit audio input must not be displaced by discovery. */
-    if (r2_ears_status() > 0) {
-        printf("[Watch] Existing Ears input is active. Stop it before enabling automatic source discovery.\n");
-        return;
-    }
-
+    /* Source discovery may coexist with a user-opened microphone or media
+       stream; its worker does not claim or replace those existing sources. */
     atomic_store(&shell_watch_stop_requested, 0);
     if (r2_watch_start() != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
