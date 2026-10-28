@@ -5986,7 +5986,8 @@ static char *chat_with_relevant_memories(
         }
         free(prior_visual);
     }
-    if (visual_requested && (!eyes || !r2_eyes_is_open(eyes))) {
+    if (visual_requested && atomic_load(&eyes_auto_allowed) &&
+        (!eyes || !r2_eyes_is_open(eyes))) {
         /* An explicit request to see permits opening Eyes; ordinary turns do not. */
         pthread_mutex_lock(&visual_capture_lock);
         int open_rc = eyes ? r2_eyes_open_camera(eyes) : -1;
@@ -10116,7 +10117,8 @@ static int query_requests_visual_context(const char *query)
 /* Analyze the next real frame. Never starts a camera implicitly here. */
 static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
-    if (!r2_visual_is_initialized()) return NULL;
+    if (!r2_visual_is_initialized() || !atomic_load(&eyes_auto_allowed))
+        return NULL;
     pthread_mutex_lock(&visual_capture_lock);
 
     if ((!eyes || !r2_eyes_is_open(eyes)) && open_camera) {
