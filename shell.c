@@ -49,6 +49,7 @@
 
 #include "shell.h"
 #include "r2.h"
+#include "Ears.h"
 #include "r2_input.h"
 #include "Log.h"
 #include "Reality.h"
