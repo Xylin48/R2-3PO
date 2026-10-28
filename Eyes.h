@@ -105,6 +105,8 @@ void r2_eyes_shutdown(R2Eyes *eyes);
 
 /* Probe physical camera readiness without starting continuous capture. */
 int r2_eyes_camera_available(void);
+/* Check for a visible existing VLC window without opening it. */
+int r2_eyes_vlc_available(void);
 
 /* Input sources */
 int r2_eyes_open_file(R2Eyes *eyes, const char *path);
