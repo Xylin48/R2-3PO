@@ -10747,9 +10747,11 @@ int r2_ears_stop(void)
 
 int r2_ears_status(void)
 {
-    if (atomic_load(&ears_capture_running))
-        return 1;
-    return ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0;
+    pthread_mutex_lock(&ears_capture_lock);
+    int active = atomic_load(&ears_capture_running)
+        ? 1 : (ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0);
+    pthread_mutex_unlock(&ears_capture_lock);
+    return active;
 }
 
 int r2_watch_active(void){ return watch_running ? 1 : 0; }
