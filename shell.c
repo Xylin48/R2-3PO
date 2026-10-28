@@ -1261,22 +1261,22 @@ static void shell_watch_status(void)
         "\n"
         "================ WATCH STATUS =============================\n"
         "\n"
-        "Coordinator thread : %s\n"
-        "Audio input        : %s\n"
-        "Visual input       : %s\n"
-        "Core Watch state   : %s\n"
+        "Source discovery    : %s\n"
+        "Audio input         : %s\n"
+        "Visual input        : %s\n"
+        "Core Watch state    : %s\n"
         "\n"
-        "Ears buffers raw microphone PCM without automatic transcription. Visual\n"
-        "input runs only while an Eyes source is already open; Watch never opens Eyes.\n"
+        "When sources are unavailable, Watch checks for new sources without\n"
+        "continuous PCM or video capture. Source input is never automatically\n"
+        "transcribed, described or converted into conversation.\n"
         "============================================================\n"
         "\n",
-        shell_watch_thread_started ? "RUNNING" : "STOPPED",
-        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "UNAVAILABLE"),
-        r2_vision_watch_active() ? "ACTIVE" : "INACTIVE",
+        shell_watch_thread_started ? "MONITORING" : "STOPPED",
+        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "WAITING"),
+        r2_vision_watch_active() ? "ACTIVE" : "WAITING",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
 }
-
 
 static int shell_watch_cancelled(void *unused)
 {
@@ -1284,30 +1284,80 @@ static int shell_watch_cancelled(void *unused)
     return atomic_load(&shell_watch_stop_requested) || r2_is_shutting_down();
 }
 
+/*
+ * Source discovery is inexpensive polling, not a continuous audio/video feed.
+ * A source that actually becomes available owns its continuous capture until
+ * it goes away. No filename, player brand, microphone model or spoken content
+ * is treated as an instruction to the brain.
+ */
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int visual_started = 0;
-
-    /* Watch may join an already-open Eyes source, but never opens a camera. */
-    if (r2_eyes_status() > 0 && r2_vision_available() &&
-        !r2_vision_watch_active() && r2_vision_watch_start() == 0) {
-        visual_started = 1;
-        fprintf(stderr, "[Watch] Raw visual input attached to the already-open Eyes source.\n");
-    }
+    int managed_eyes = 0;
+    int managed_audio = 0; /* 0=none; 1=microphone; 2=desktop playback */
+    int attached_visual = 0;
 
     while (!shell_watch_cancelled(NULL)) {
-        /* Keep coordinator lifecycle stable if a device disconnects. Status
-           reports the missing source; Watch does not silently reopen it. */
-        struct timespec pause = {1, 0};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
-            if (shell_watch_cancelled(NULL)) break;
+        int desktop_playing = r2_ears_desktop_playing();
+        int microphone_available = r2_ears_microphone_available();
+        int camera_available = r2_vision_camera_available();
+        int vlc_available = r2_vision_vlc_available();
+
+        /* Opening Eyes is not a request to interpret frames. Direct camera
+           input and accessible playing media are both valid visual sources.
+           A user-opened file/window is never silently overwritten. */
+        int wanted_eyes = vlc_available ? 2 : (camera_available ? 1 : 0);
+        if (managed_eyes) {
+            int source_gone = (managed_eyes == 2 && !vlc_available) ||
+                              (managed_eyes == 1 && !camera_available);
+            int source_changed = wanted_eyes != managed_eyes;
+            if (source_gone || source_changed || !r2_vision_watch_active()) {
+                (void)r2_eyes_stop();
+                managed_eyes = 0;
+            }
         }
+        if (!managed_eyes && r2_eyes_status() > 0) {
+            /* Existing deliberate Eyes input retains ownership. */
+            if (!r2_vision_watch_active() && r2_vision_available() &&
+                r2_vision_watch_start() == 0)
+                attached_visual = 1;
+        } else if (!managed_eyes && wanted_eyes && r2_vision_available()) {
+            int opened = wanted_eyes == 2
+                ? r2_vision_open_vlc() : r2_eyes_start();
+            if (opened == 0) {
+                managed_eyes = wanted_eyes;
+                r2_log_event(R2_LOG_SENSORY, "watch_visual_source_available",
+                             "R2 automatically connected an available visual source.",
+                             "Frames are available to cognition; no automatic visual description was requested.",
+                             wanted_eyes == 2 ? "visible media window" : "camera");
+            }
+        }
+
+        /* Desktop playback is activated for any uncorked application stream;
+           otherwise a present microphone is the live input. A missing USB
+           microphone never blocks Watch or Eyes from coming online. */
+        int wanted_audio = desktop_playing ? 2 : (microphone_available ? 1 : 0);
+        if (managed_audio &&
+            (wanted_audio != managed_audio || r2_ears_status() <= 0)) {
+            (void)r2_ears_stop();
+            managed_audio = 0;
+        }
+        if (!managed_audio && wanted_audio && r2_ears_status() <= 0) {
+            int rc = wanted_audio == 2 ? r2_ears_start_desktop() : r2_ears_start();
+            if (rc == 0) managed_audio = wanted_audio;
+        }
+
+        struct timespec pause = {WATCH_POLL_INTERVAL, 0};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
+            if (shell_watch_cancelled(NULL)) break;
     }
 
-    if (visual_started)
+    if (managed_eyes)
+        (void)r2_eyes_stop();
+    else if (attached_visual)
         (void)r2_vision_watch_stop();
-    (void)r2_ears_stop();
+    if (managed_audio)
+        (void)r2_ears_stop();
     return NULL;
 }
 
@@ -1318,10 +1368,9 @@ static void shell_watch_start(void)
         return;
     }
 
-    /* Ears may be consuming a file or desktop source, not the microphone.
-       Never replace an active source merely to preflight Watch. */
+    /* Preexisting explicit audio input must not be displaced by discovery. */
     if (r2_ears_status() > 0) {
-        printf("[Watch] Cannot start while Ears has an active source. Stop Ears first; Watch uses the default microphone.\n");
+        printf("[Watch] Existing Ears input is active. Stop it before enabling automatic source discovery.\n");
         return;
     }
 
@@ -1331,24 +1380,16 @@ static void shell_watch_start(void)
         printf("[Watch] Core refused to start Watch mode.\n");
         return;
     }
-    if (r2_ears_start() != 0) {
-        atomic_store(&shell_watch_stop_requested, 1);
-        (void)r2_watch_stop();
-        printf("[Watch] Cannot start: continuous raw microphone capture failed.\n");
-        return;
-    }
     if (pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL) != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
-        (void)r2_ears_stop();
         (void)r2_watch_stop();
-        printf("[Watch] Could not create the sensory coordinator thread.\n");
+        printf("[Watch] Could not start the sensory discovery thread.\n");
         return;
     }
     shell_watch_thread_started = 1;
     watch_running = 1;
-    printf("[Watch] ACTIVE. Ears and any already-open Eyes source provide raw sensory input; no automatic transcription or image descriptions are generated.\n");
+    printf("[Watch] MONITORING. Continuous feed starts only when an audio or visual source is active; no automatic transcription or image descriptions are generated.\n");
 }
-
 
 static void shell_watch_stop(void)
 {
@@ -1356,7 +1397,7 @@ static void shell_watch_stop(void)
         printf("[Watch] Already stopped.\n");
         return;
     }
-    printf("[Watch] Stopping continuous sensory input and waiting for capture workers...\n");
+    printf("[Watch] Stopping source discovery and its owned capture streams...\n");
     atomic_store(&shell_watch_stop_requested, 1);
     (void)r2_watch_stop();
     if (shell_watch_thread_started) {
@@ -1366,7 +1407,6 @@ static void shell_watch_stop(void)
     watch_running = 0;
     printf("[Watch] STOPPED.\n");
 }
-
 
 static void shell_watch(const char *argument)
 {
@@ -2733,6 +2773,10 @@ int r2_shell_run(void)
         fprintf(stderr, "[TV] GUI control socket unavailable; shell TV commands remain available.\n");
 
     shell_banner();
+
+    /* Source discovery is enabled by default; an unplugged mic or camera is
+       not a startup error. No feed starts until a real input is found. */
+    shell_watch_start();
 
     while (
         shell_running &&
