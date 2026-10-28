@@ -371,6 +371,17 @@ static int migrate_legacy_log_schema(void)
         }
     }
 
+    /* Older beta tables used event_id/related_event_id for links. Preserve
+       those actual endpoints when upgrading to the current column names. */
+    if (log_column_exists("r2_log_links", "event_id") &&
+        exec_sql("UPDATE r2_log_links SET from_event_id=event_id "
+                 "WHERE from_event_id<=0 AND event_id>0;") != 0)
+        return -1;
+    if (log_column_exists("r2_log_links", "related_event_id") &&
+        exec_sql("UPDATE r2_log_links SET to_event_id=related_event_id "
+                 "WHERE to_event_id<=0 AND related_event_id>0;") != 0)
+        return -1;
+
     /* Existing tables are upgraded before indexes are created, so a missing
        column from an older beta cannot abort the entire Life Log startup. */
     return exec_sql(
@@ -537,6 +548,193 @@ static int ensure_tables(void)
     return migrate_legacy_log_schema();
 }
 
+typedef struct R2LegacyLogLinkBackfill {
+    const char *table;
+    const char *link_column;
+    const char *summary_expression;
+    const char *details_expression;
+} R2LegacyLogLinkBackfill;
+
+static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
+{
+    if (!spec || !spec->table || !spec->link_column ||
+        !spec->summary_expression || !spec->details_expression)
+        return -1;
+
+    char select_sql[4096];
+    int n = snprintf(select_sql, sizeof(select_sql),
+        "SELECT t.id, COALESCE((%s),''), COALESCE((%s),'') "
+        "FROM %s AS t WHERE t.%s IS NULL OR t.%s<=0 OR NOT EXISTS "
+        "(SELECT 1 FROM r2_log_events e WHERE e.id=t.%s) "
+        "ORDER BY t.id LIMIT 1;",
+        spec->summary_expression, spec->details_expression,
+        spec->table, spec->link_column, spec->link_column, spec->link_column);
+    if (n < 0 || (size_t)n >= sizeof(select_sql))
+        return -1;
+
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(log_db, select_sql, -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            fprintf(stderr, "[R2 Log] Could not inspect legacy link %s.%s: %s\n",
+                    spec->table, spec->link_column, sqlite3_errmsg(log_db));
+            return -1;
+        }
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return 0;
+        }
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "[R2 Log] Could not read legacy link %s.%s: %s\n",
+                    spec->table, spec->link_column, sqlite3_errmsg(log_db));
+            sqlite3_finalize(st);
+            return -1;
+        }
+
+        sqlite3_int64 row_id = sqlite3_column_int64(st, 0);
+        const unsigned char *summary_text = sqlite3_column_text(st, 1);
+        const unsigned char *details_text = sqlite3_column_text(st, 2);
+        char legacy_summary[384], legacy_details[1400];
+        snprintf(legacy_summary, sizeof(legacy_summary), "%s",
+                 summary_text ? (const char *)summary_text : "");
+        snprintf(legacy_details, sizeof(legacy_details), "%s",
+                 details_text ? (const char *)details_text : "");
+        sqlite3_finalize(st);
+
+        char source[256], summary[512], details[1800];
+        snprintf(source, sizeof(source), "LogMigration:%s:%lld",
+                 spec->table, (long long)row_id);
+        snprintf(summary, sizeof(summary),
+                 "Recovered legacy %s record #%lld: %.300s",
+                 spec->table, (long long)row_id, legacy_summary);
+        snprintf(details, sizeof(details),
+                 "table=%s; legacy_id=%lld; legacy_summary=%s; legacy_details=%s",
+                 spec->table, (long long)row_id, legacy_summary, legacy_details);
+
+        int64_t event_id = -1;
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT id FROM r2_log_events WHERE event_type=? AND source=? "
+            "ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, "legacy_log_link_restored", -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            event_id = sqlite3_column_int64(st, 0);
+        else if (rc != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_finalize(st);
+
+        if (event_id <= 0)
+            event_id = r2_log_event(R2_LOG_THINKING,
+                                    "legacy_log_link_restored",
+                                    summary, details, source);
+        if (event_id <= 0) {
+            fprintf(stderr, "[R2 Log] Could not create a Life Log link for %s row %lld.\n",
+                    spec->table, (long long)row_id);
+            return -1;
+        }
+
+        char update_sql[1024];
+        n = snprintf(update_sql, sizeof(update_sql),
+            "UPDATE %s SET %s=? WHERE id=? AND "
+            "(%s IS NULL OR %s<=0 OR NOT EXISTS "
+            "(SELECT 1 FROM r2_log_events e WHERE e.id=%s));",
+            spec->table, spec->link_column, spec->link_column,
+            spec->link_column, spec->link_column);
+        if (n < 0 || (size_t)n >= sizeof(update_sql))
+            return -1;
+        rc = sqlite3_prepare_v2(log_db, update_sql, -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, event_id);
+        sqlite3_bind_int64(st, 2, row_id);
+        rc = sqlite3_step(st);
+        int changed = sqlite3_changes(log_db);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE || changed != 1) {
+            fprintf(stderr, "[R2 Log] Could not repair Life Log relationship for %s row %lld.\n",
+                    spec->table, (long long)row_id);
+            return -1;
+        }
+    }
+}
+
+static int log_validate_required_event_links(void)
+{
+    static const char *const queries[] = {
+        "SELECT COUNT(*) FROM r2_log_activity_sessions s LEFT JOIN r2_log_events e ON e.id=s.start_event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_milestones m LEFT JOIN r2_log_events e ON e.id=m.first_event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_conversations c LEFT JOIN r2_log_events e ON e.id=c.event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_inner_states s LEFT JOIN r2_log_events e ON e.id=s.event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_beliefs b LEFT JOIN r2_log_events e ON e.id=b.last_event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_continuity c LEFT JOIN r2_log_events e ON e.id=c.last_event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_hypotheticals h LEFT JOIN r2_log_events e ON e.id=h.event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_system_snapshots s LEFT JOIN r2_log_events e ON e.id=s.event_id WHERE e.id IS NULL;",
+        "SELECT COUNT(*) FROM r2_log_links l LEFT JOIN r2_log_events f ON f.id=l.from_event_id LEFT JOIN r2_log_events t ON t.id=l.to_event_id WHERE f.id IS NULL OR t.id IS NULL;"
+    };
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(log_db, queries[i], -1, &st, NULL) != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        int rc = sqlite3_step(st);
+        sqlite3_int64 broken = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+        sqlite3_finalize(st);
+        if (broken != 0) {
+            fprintf(stderr, "[R2 Log] Required event relationships remain broken (check %zu: %lld).\n",
+                    i + 1, (long long)broken);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int log_restore_missing_event_links(void)
+{
+    static const R2LegacyLogLinkBackfill backfills[] = {
+        {"r2_log_activity_sessions", "start_event_id",
+         "COALESCE(t.activity_name,'Legacy activity session')",
+         "'activity_key='||COALESCE(t.activity_key,'')||'; started_utc='||COALESCE(t.started_utc,'')||'; status='||COALESCE(t.status,'')"},
+        {"r2_log_milestones", "first_event_id",
+         "COALESCE(t.description,t.milestone_key,'Legacy milestone')",
+         "'milestone_key='||COALESCE(t.milestone_key,'')"},
+        {"r2_log_conversations", "event_id",
+         "substr(COALESCE(t.user_text,'Legacy conversation'),1,300)",
+         "'assistant_text='||COALESCE(t.assistant_text,'')"},
+        {"r2_log_inner_states", "event_id",
+         "COALESCE(t.description,t.state_kind,'Legacy inner state')",
+         "'state_kind='||COALESCE(t.state_kind,'')||'; evidence='||COALESCE(t.evidence,'')||'; confidence='||COALESCE(CAST(t.confidence AS TEXT),'')||'; origin='||COALESCE(t.origin,'')"},
+        {"r2_log_beliefs", "last_event_id",
+         "COALESCE(t.belief,t.belief_key,'Legacy belief')",
+         "'belief_key='||COALESCE(t.belief_key,'')||'; evidence='||COALESCE(t.evidence,'')||'; status='||COALESCE(t.status,'')||'; origin='||COALESCE(t.origin,'')"},
+        {"r2_log_continuity", "last_event_id",
+         "COALESCE(t.title,t.item_key,'Legacy continuity item')",
+         "'item_key='||COALESCE(t.item_key,'')||'; item_type='||COALESCE(t.item_type,'')||'; description='||COALESCE(t.description,'')||'; status='||COALESCE(t.status,'')||'; next_action='||COALESCE(t.next_action,'')"},
+        {"r2_log_hypotheticals", "event_id",
+         "COALESCE(t.scenario,'Legacy hypothetical')",
+         "'assumptions='||COALESCE(t.assumptions,'')||'; predicted_outcome='||COALESCE(t.predicted_outcome,'')||'; conclusion='||COALESCE(t.conclusion,'')||'; origin='||COALESCE(t.origin,'')"},
+        {"r2_log_system_snapshots", "event_id",
+         "COALESCE(t.hostname,'')||' '||COALESCE(t.operating_system,'')",
+         "'kernel='||COALESCE(t.kernel_release,'')||'; machine='||COALESCE(t.machine,'')||'; pid='||COALESCE(CAST(t.process_id AS TEXT),'')||'; elapsed_ms='||COALESCE(CAST(t.process_elapsed_ms AS TEXT),'')"}
+    };
+    for (size_t i = 0; i < sizeof(backfills) / sizeof(backfills[0]); ++i) {
+        if (log_backfill_one_legacy_link(&backfills[i]) != 0)
+            return -1;
+    }
+    return log_validate_required_event_links();
+}
+
 /* ------------------------------------------------------------
  * INITIALIZATION / SHUTDOWN
  * ------------------------------------------------------------ */
@@ -595,6 +793,12 @@ int r2_log_init(void)
 
     log_initialized = 1;
     pthread_mutex_unlock(&log_lock);
+
+    if (log_restore_missing_event_links() != 0) {
+        fprintf(stderr, "[R2 Life Log] Required legacy event links could not be restored; refusing to initialize with disconnected records.\n");
+        r2_log_shutdown();
+        return -1;
+    }
 
     if (r2_log_session_start() != 0) {
         fprintf(stderr,
