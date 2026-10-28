@@ -20,6 +20,15 @@ int r2_log_is_initialized(void)
     return log_ready;
 }
 
+/* This fixture isolates diary/reward behavior without the Journal engine.
+   Production builds link the real exact-ID projection implementation. */
+int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
+{
+    (void)event_id;
+    (void)diary_entry_id;
+    return 0;
+}
+
 int r2_addiction_record_choice(const char *target, const char *target_type,
                                int enjoyment_0_100, const char *source,
                                const char *details)
