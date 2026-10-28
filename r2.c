@@ -117,6 +117,10 @@ static R2Eyes *media_eyes = NULL;
 static pthread_mutex_t media_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t media_frame_cond = PTHREAD_COND_INITIALIZER;
+/* A generation belongs to the current auxiliary display, not a prior window. */
+static uint64_t media_frame_generation = 0;
+static int media_capture_done = 1;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
 static int media_capture_thread_started = 0;
@@ -10289,6 +10293,8 @@ static void *r2_media_capture_worker(void *unused)
                 media_latest_frame = frame;
                 media_latest_frame.data = media_latest_data;
                 media_latest_event = event;
+                ++media_frame_generation;
+                pthread_cond_broadcast(&media_frame_cond);
             }
             pthread_mutex_unlock(&media_frame_lock);
         }
@@ -10324,6 +10330,17 @@ static void *r2_media_capture_worker(void *unused)
         have_previous = 1;
     }
     atomic_store(&media_capture_running, 0);
+    pthread_mutex_lock(&media_frame_lock);
+    media_capture_done = 1;
+    pthread_cond_broadcast(&media_frame_cond);
+    pthread_mutex_unlock(&media_frame_lock);
+    /* A display that ends by itself must not leave an attention choice
+       attached to the next source. This is source loss, not R2 looking away. */
+    if (atomic_exchange(&media_attention_selected, 0))
+        r2_log_sensory("media_attention_source_lost",
+                       "The display R2 was watching stopped supplying frames.",
+                       "Attention ended with its source; camera Eyes stayed independent.",
+                       "media-attention");
     return NULL;
 }
 
@@ -10332,6 +10349,9 @@ static void *r2_media_capture_worker(void *unused)
 static int r2_vision_media_stop_locked(void)
 {
     atomic_store(&media_capture_running, 0);
+    pthread_mutex_lock(&media_frame_lock);
+    pthread_cond_broadcast(&media_frame_cond);
+    pthread_mutex_unlock(&media_frame_lock);
     /* Attention belongs to the selected display, not to whichever different
        window Watch happens to discover after a playback source is replaced. */
     if (atomic_exchange(&media_attention_selected, 0))
@@ -10352,6 +10372,9 @@ static int r2_vision_media_stop_locked(void)
     media_latest_capacity = 0;
     memset(&media_latest_frame, 0, sizeof(media_latest_frame));
     memset(&media_latest_event, 0, sizeof(media_latest_event));
+    media_frame_generation = 0;
+    media_capture_done = 1;
+    pthread_cond_broadcast(&media_frame_cond);
     pthread_mutex_unlock(&media_frame_lock);
     return 0;
 }
@@ -10395,10 +10418,18 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
         pthread_mutex_unlock(&media_lifecycle_lock);
         return rc;
     }
+    pthread_mutex_lock(&media_frame_lock);
+    media_frame_generation = 0;
+    media_capture_done = 0;
+    pthread_mutex_unlock(&media_frame_lock);
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
         atomic_store(&media_capture_running, 0);
+        pthread_mutex_lock(&media_frame_lock);
+        media_capture_done = 1;
+        pthread_cond_broadcast(&media_frame_cond);
+        pthread_mutex_unlock(&media_frame_lock);
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
@@ -10419,20 +10450,43 @@ int r2_vision_media_open_window(unsigned long window)
     return window ? r2_vision_media_open(1, window, NULL) : -1;
 }
 
+/* One capture owner publishes complete frames. Deliberate attention waits
+   for the first published frame; end-of-source and close wake immediately. */
+static int r2_vision_copy_media_frame(R2VisionFrame *frame,
+                                       R2VisionEvent *event,
+                                       unsigned char **owned_data)
+{
+    if (!frame || !event || !owned_data) return -1;
+    *owned_data = NULL;
+    pthread_mutex_lock(&media_frame_lock);
+    while (!shutting_down && atomic_load(&media_capture_running) &&
+           media_frame_generation == 0 && !media_capture_done)
+        pthread_cond_wait(&media_frame_cond, &media_frame_lock);
+    if (!shutting_down && atomic_load(&media_capture_running) &&
+        !media_capture_done && media_frame_generation > 0 &&
+        media_latest_frame.data && media_latest_frame.size > 0) {
+        unsigned char *copy = malloc(media_latest_frame.size);
+        if (copy) {
+            memcpy(copy, media_latest_data, media_latest_frame.size);
+            *frame = media_latest_frame;
+            frame->data = copy;
+            *event = media_latest_event;
+            *owned_data = copy;
+        }
+    }
+    pthread_mutex_unlock(&media_frame_lock);
+    return *owned_data ? 0 : -1;
+}
+
 char *r2_vision_media_see(const char *question)
 {
     if (!r2_vision_media_status() || !question || !*question ||
         !atomic_load(&eyes_auto_allowed)) return NULL;
-    pthread_mutex_lock(&media_frame_lock);
-    R2VisionFrame frame = media_latest_frame;
-    R2VisionEvent event = media_latest_event;
-    unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
-    if (copy) {
-        memcpy(copy, frame.data, frame.size);
-        frame.data = copy;
-    }
-    pthread_mutex_unlock(&media_frame_lock);
-    if (!copy) return NULL;
+    R2VisionFrame frame = {0};
+    R2VisionEvent event = {0};
+    unsigned char *copy = NULL;
+    if (r2_vision_copy_media_frame(&frame, &event, &copy) != 0)
+        return NULL;
     char *description = r2_visual_analyze_frame(&frame, event.source_name, question);
     free(copy);
     return description;
@@ -10473,15 +10527,11 @@ static char *r2_vision_media_current_frame_base64(void)
     if (!r2_vision_media_attention_status() ||
         !r2_vision_media_status() || !atomic_load(&eyes_auto_allowed))
         return NULL;
-    pthread_mutex_lock(&media_frame_lock);
-    R2VisionFrame frame = media_latest_frame;
-    unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
-    if (copy) {
-        memcpy(copy, frame.data, frame.size);
-        frame.data = copy;
-    }
-    pthread_mutex_unlock(&media_frame_lock);
-    if (!copy) return NULL;
+    R2VisionFrame frame = {0};
+    R2VisionEvent event = {0};
+    unsigned char *copy = NULL;
+    if (r2_vision_copy_media_frame(&frame, &event, &copy) != 0)
+        return NULL;
     char *encoded = r2_visual_frame_base64(&frame);
     free(copy);
     return encoded;
