@@ -115,6 +115,7 @@ static R2Eyes *eyes = NULL;
    camera-owning brain may choose to observe, never an alternative pair of eyes. */
 static R2Eyes *media_eyes = NULL;
 static pthread_mutex_t media_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
@@ -10266,7 +10267,9 @@ static void *r2_media_capture_worker(void *unused)
     return NULL;
 }
 
-int r2_vision_media_stop(void)
+/* Caller holds media_lifecycle_lock; never close FFmpeg while capture is
+   reading. Independent media open/stop operations cannot overlap. */
+static int r2_vision_media_stop_locked(void)
 {
     atomic_store(&media_capture_running, 0);
     if (media_capture_thread_started) {
@@ -10286,6 +10289,14 @@ int r2_vision_media_stop(void)
     return 0;
 }
 
+int r2_vision_media_stop(void)
+{
+    pthread_mutex_lock(&media_lifecycle_lock);
+    int rc = r2_vision_media_stop_locked();
+    pthread_mutex_unlock(&media_lifecycle_lock);
+    return rc;
+}
+
 int r2_vision_media_status(void)
 {
     return atomic_load(&media_capture_running) ? 1 : 0;
@@ -10296,10 +10307,16 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
 {
     if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
         !atomic_load(&eyes_auto_allowed)) return -1;
-    (void)r2_vision_media_stop();
+    pthread_mutex_lock(&media_lifecycle_lock);
+    if (shutting_down || !atomic_load(&eyes_auto_allowed)) {
+        pthread_mutex_unlock(&media_lifecycle_lock);
+        return -1;
+    }
+    (void)r2_vision_media_stop_locked();
     pthread_mutex_lock(&media_capture_lock);
     if (!media_eyes && r2_eyes_init(&media_eyes) != 0) {
         pthread_mutex_unlock(&media_capture_lock);
+        pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
     }
     r2_eyes_set_auxiliary(media_eyes, 1);
@@ -10307,7 +10324,10 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
              kind == 2 ? r2_eyes_open_vlc(media_eyes) :
                          r2_eyes_open_file(media_eyes, path);
     pthread_mutex_unlock(&media_capture_lock);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        pthread_mutex_unlock(&media_lifecycle_lock);
+        return rc;
+    }
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
@@ -10315,9 +10335,11 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
+        pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
     }
     media_capture_thread_started = 1;
+    pthread_mutex_unlock(&media_lifecycle_lock);
     r2_log_sensory("media_display_connected",
                   "An independent video display is available to R2's visual attention.",
                   "The video is not R2's eyes. Camera input remains primary; "
