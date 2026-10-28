@@ -483,10 +483,8 @@ int r2_ears_desktop_playing(void)
     int playing = 0, have_input = 0;
     while (fgets(line, sizeof(line), pipe)) {
         if (strstr(line, "Sink Input #")) have_input = 1;
-        if (have_input && strstr(line, "Corked: no")) {
+        if (have_input && strstr(line, "Corked: no"))
             playing = 1;
-            break;
-        }
     }
     if (pclose(pipe) != 0) return 0;
     return playing;
