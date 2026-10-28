@@ -13,12 +13,15 @@ worker_start = watch.index("static void *shell_watch_worker(void *unused)")
 worker_end = watch.index("static void shell_watch_start(void)", worker_start)
 worker = watch[worker_start:worker_end]
 
-assert "[EARS_LISTEN] seconds" in prompt
+assert "[EARS_LISTEN] recent|seconds" in prompt and "[EARS_LISTEN] live|seconds" in prompt
 assert "do not use this tool for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in tool
 assert "seconds >= 1UL && seconds <= 15UL" in tool
 assert "r2_ears_listen_cancelable((unsigned)seconds, NULL, NULL)" in tool
+assert "r2_ears_recent_requested = recent;" in tool
+assert "r2_ears_write_buffered_audio(total_bytes, wav)" in core
+assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in core
 assert "r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in tool
 assert "That source was left untouched" in tool
 assert "Do not infer what was said." in tool
