@@ -15,6 +15,12 @@ assert "r2_ears_read(ears_desktop, pcm, sizeof(pcm))" in desktop_capture
 assert "ears_recent_audio" in capture and "ears_recent_audio" not in desktop_capture
 assert "ears_desktop_recent_audio" in desktop_capture
 assert "ears_desktop_recent_total_bytes += count" in desktop_capture
+# An environmental change can become noticeable without automatic speech ASR.
+assert "r2_ears_notice_pcm_change(pcm" in capture
+assert "r2_ears_notice_pcm_change(pcm" in desktop_capture
+assert "audio_level_change_notice" in core
+assert "r2_ears_listen_cancelable(" not in capture
+assert "r2_ears_listen_cancelable(" not in desktop_capture
 assert "r2_ears_write_desktop_recent_audio(" in core
 assert "r2_ears_write_desktop_buffered_audio(" in core
 listen_start = core.index("char *r2_ears_listen_cancelable(unsigned seconds,")
