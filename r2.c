@@ -10594,6 +10594,44 @@ static void *r2_ears_capture_worker(void *unused)
     return NULL;
 }
 
+/* Independent capture: microphone and desktop never displace each other. */
+static void *r2_ears_desktop_capture_worker(void *unused)
+{
+    (void)unused;
+    unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
+    while (!shutting_down && atomic_load(&ears_desktop_capture_running)) {
+        ssize_t got = r2_ears_read(ears_desktop, pcm, sizeof(pcm));
+        if (got <= 0 || ((size_t)got % 4U) != 0U) {
+            if (!shutting_down && atomic_load(&ears_desktop_capture_running))
+                r2_log_sensory("audio_capture_ended",
+                               "R2's continuous desktop playback stream stopped supplying valid PCM.",
+                               "The input worker ended; the buffered audio is not an active live stream.",
+                               "Ears desktop");
+            break;
+        }
+        pthread_mutex_lock(&ears_desktop_recent_lock);
+        size_t count = (size_t)got;
+        size_t first = R2_EARS_RECENT_CAPACITY - ears_desktop_recent_write_position;
+        if (first > count) first = count;
+        memcpy(ears_desktop_recent_audio + ears_desktop_recent_write_position, pcm, first);
+        if (count > first)
+            memcpy(ears_desktop_recent_audio, pcm + first, count - first);
+        ears_desktop_recent_write_position =
+            (ears_desktop_recent_write_position + count) % R2_EARS_RECENT_CAPACITY;
+        if (count >= R2_EARS_RECENT_CAPACITY)
+            ears_desktop_recent_length = R2_EARS_RECENT_CAPACITY;
+        else {
+            ears_desktop_recent_length += count;
+            if (ears_desktop_recent_length > R2_EARS_RECENT_CAPACITY)
+                ears_desktop_recent_length = R2_EARS_RECENT_CAPACITY;
+        }
+        ears_desktop_recent_total_bytes += count;
+        pthread_mutex_unlock(&ears_desktop_recent_lock);
+    }
+    atomic_store(&ears_desktop_capture_running, 0);
+    return NULL;
+}
+
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
 {
     if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
