@@ -29,5 +29,5 @@ assert "Do not infer what was said." in tool
 # Watch only maintains raw capture and must not turn incoming speech into chat.
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
-assert "No automatic transcription or image descriptions are generated." in watch
+assert "no automatic transcription or image descriptions are generated." in watch
 print("Deliberate Ears listening tool and no-auto-transcription Watch behavior passed.")
