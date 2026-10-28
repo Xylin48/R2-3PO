@@ -840,6 +840,34 @@ static int r2_eyes_probe_vlc_dimensions(
  * Start an FFmpeg X11 capture attached specifically
  * to the VLC window.
  */
+/* Generic X11 input: connect a visible rendering window to the process
+ * that is actually producing desktop audio. Never infer image contents from
+ * the process name or synthesize descriptions before the brain attends. */
+unsigned long r2_eyes_window_for_pid(long pid)
+{
+    if (pid <= 1 || pid > INT_MAX) return 0;
+    char command[160];
+    int n = snprintf(command, sizeof(command),
+                     "xdotool search --onlyvisible --pid %ld 2>/dev/null", pid);
+    if (n < 0 || (size_t)n >= sizeof(command)) return 0;
+    FILE *pipe = popen(command, "r");
+    if (!pipe) return 0;
+    unsigned long best = 0, candidate = 0;
+    uint64_t best_area = 0;
+    while (fscanf(pipe, "%lu", &candidate) == 1) {
+        uint32_t width = 0, height = 0;
+        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height) != 0)
+            continue;
+        uint64_t area = (uint64_t)width * height;
+        if (area > best_area) {
+            best = candidate;
+            best_area = area;
+        }
+    }
+    (void)pclose(pipe);
+    return best;
+}
+
 static FILE *r2_eyes_start_vlc(
     unsigned long window_id)
 {
