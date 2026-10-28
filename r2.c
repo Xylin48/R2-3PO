@@ -10395,6 +10395,30 @@ int r2_vision_set_model(const char *model)
 int r2_vision_camera_available(void) { return r2_eyes_camera_available(); }
 int r2_vision_vlc_available(void) { return r2_eyes_vlc_available(); }
 
+int r2_vision_window_available(unsigned long window_id)
+{
+    return r2_eyes_window_available(window_id);
+}
+
+int r2_vision_open_window(unsigned long window_id)
+{
+    if (!eyes || !r2_visual_is_initialized() || window_id == 0) return -1;
+    pthread_mutex_lock(&visual_capture_lock);
+    int rc = r2_eyes_open_window(eyes, window_id);
+    pthread_mutex_unlock(&visual_capture_lock);
+    if (rc != 0) return rc;
+    if (r2_vision_watch_start() != 0) {
+        pthread_mutex_lock(&visual_capture_lock);
+        r2_eyes_close(eyes);
+        pthread_mutex_unlock(&visual_capture_lock);
+        return -1;
+    }
+    r2_log_media_event("opened_for_observation", "video_window",
+                       "visible video renderer",
+                       "A real playback source reported a rendering window; its actual frames are available to R2.");
+    return 0;
+}
+
 int r2_vision_open_vlc(void)
 {
     if (!eyes || !r2_visual_is_initialized()) return -1;
@@ -11851,14 +11875,16 @@ finalize_reply:
         if (eyes && r2_eyes_is_open(eyes) &&
             r2_eyes_get_event(eyes, &visual_event) == 0 &&
             (visual_event.origin == R2_VISION_FILE ||
-             visual_event.origin == R2_VISION_VLC)) {
+             visual_event.origin == R2_VISION_VLC ||
+             visual_event.origin == R2_VISION_WINDOW)) {
             char details[1200];
             snprintf(details, sizeof(details),
                      "conversation_event_id=%lld\nvisual_source=%s\n"
                      "visual_origin=%s\nThe media source was active during this conversation; "
                      "this association does not assert that its contents were fully understood.",
                      (long long)turn_event_id, visual_event.source_name,
-                     visual_event.origin == R2_VISION_VLC ? "VLC window" : "file");
+                     visual_event.origin == R2_VISION_VLC ? "VLC window" :
+                     visual_event.origin == R2_VISION_WINDOW ? "active video window" : "file");
             int64_t association_id = r2_log_event(
                 R2_LOG_CONVERSATION, "conversation_during_visual_media",
                 "A conversation turn occurred while R2 was observing media.",
