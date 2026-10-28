@@ -10332,6 +10332,13 @@ static void *r2_media_capture_worker(void *unused)
 static int r2_vision_media_stop_locked(void)
 {
     atomic_store(&media_capture_running, 0);
+    /* Attention belongs to the selected display, not to whichever different
+       window Watch happens to discover after a playback source is replaced. */
+    if (atomic_exchange(&media_attention_selected, 0))
+        r2_log_sensory("media_attention_source_lost",
+                       "The display R2 chose to watch stopped or was replaced.",
+                       "Focus was cleared because that source ended, not because R2 chose to look away.",
+                       "media-attention");
     if (media_capture_thread_started) {
         pthread_join(media_capture_thread, NULL);
         media_capture_thread_started = 0;
@@ -10435,7 +10442,8 @@ char *r2_vision_media_see(const char *question)
    Eyes, or run image interpretation from the capture worker. */
 int r2_vision_media_attention_status(void)
 {
-    return atomic_load(&media_attention_selected) ? 1 : 0;
+    return atomic_load(&media_attention_selected) &&
+           r2_vision_media_status() ? 1 : 0;
 }
 int r2_vision_media_set_attention(int watching)
 {
