@@ -19,11 +19,14 @@ def require(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 cap = body.find("size_t final_context_limit = explicit_recall ? 28000U : 16000U;")
-live_visual = body.find("CURRENT LIVE VISUAL OBSERVATION")
+visual_history = body.find("PRIOR VISUAL EXPERIENCES")
 copy_messages = body.find("size_t base_count")
 require(cap >= 0, "final assembled context has a recall/focused size cap")
-require(live_visual >= 0 and cap > live_visual,
-        "cap is applied after the optional live visual section is appended")
+require(visual_history >= 0 and cap > visual_history,
+        "cap is applied after historical visual context is appended; live images are serialized separately")
+require('json_object_object_add(message, "images", images)' in core
+        and "r2_vision_current_frame_base64()" in core,
+        "current raw visual input is attached separately from bounded text retrieval")
 require(copy_messages >= 0 and cap < copy_messages,
         "retrieval evidence is bounded before conversation history is copied into the prompt")
 require("r2_bound_context_records(memory_context, final_context_limit);" in body,
