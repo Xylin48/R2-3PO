@@ -59,6 +59,110 @@ static int altself_ensure_column(const char *column, const char *definition)
     return sqlite3_exec(as_db, sql, NULL, NULL, NULL);
 }
 
+static int altself_restore_missing_log_links(void)
+{
+    /*
+     * Early Alternate-Self schemas gained log_event_id with DEFAULT 0. Those
+     * rows retained their hypothetical content but were disconnected from the
+     * shared Life Log. Create/reuse a migration event and repair the link before
+     * exposing the organ as initialized.
+     */
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(as_db,
+            "SELECT b.id,b.name,b.scenario,b.status FROM r2_alternate_self_branches b "
+            "WHERE b.log_event_id IS NULL OR b.log_event_id<=0 OR NOT EXISTS "
+            "(SELECT 1 FROM r2_log_events e WHERE e.id=b.log_event_id) "
+            "ORDER BY b.id LIMIT 1;", -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not find unlinked legacy branches: %s\n",
+                    sqlite3_errmsg(as_db));
+            return -1;
+        }
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return 0;
+        }
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not read legacy branch linkage: %s\n",
+                    sqlite3_errmsg(as_db));
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_int64 branch_id = sqlite3_column_int64(st, 0);
+        const unsigned char *name_text = sqlite3_column_text(st, 1);
+        const unsigned char *scenario_text = sqlite3_column_text(st, 2);
+        const unsigned char *status_text = sqlite3_column_text(st, 3);
+        char name[256], scenario[512], status[64], summary[512], details[1200];
+        snprintf(name, sizeof(name), "%s", name_text ? (const char *)name_text : "");
+        snprintf(scenario, sizeof(scenario), "%s",
+                 scenario_text ? (const char *)scenario_text : "");
+        snprintf(status, sizeof(status), "%s",
+                 status_text ? (const char *)status_text : "active");
+        sqlite3_finalize(st);
+
+        snprintf(summary, sizeof(summary),
+                 "Restored Life Log link for legacy Alternate-Self branch #%lld: %.180s",
+                 (long long)branch_id, name);
+        snprintf(details, sizeof(details),
+                 "branch_id=%lld; name=%s; status=%s; scenario=%s; "
+                 "migration=restored missing Life Log relationship without changing the hypothetical",
+                 (long long)branch_id, name, status, scenario);
+
+        int64_t event_id = -1;
+        rc = sqlite3_prepare_v2(as_db,
+            "SELECT id FROM r2_log_events WHERE event_type=? AND summary=? "
+            "ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, "alternate_self_legacy_link_restored",
+                          -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, summary, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            event_id = sqlite3_column_int64(st, 0);
+        else if (rc != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_finalize(st);
+
+        if (event_id <= 0)
+            event_id = r2_log_event(R2_LOG_THINKING,
+                                    "alternate_self_legacy_link_restored",
+                                    summary, details, "AlternateSelf");
+        if (event_id <= 0) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not create Life Log link for legacy branch #%lld.\n",
+                    (long long)branch_id);
+            return -1;
+        }
+
+        rc = sqlite3_prepare_v2(as_db,
+            "UPDATE r2_alternate_self_branches SET log_event_id=? WHERE id=? "
+            "AND (log_event_id IS NULL OR log_event_id<=0 OR NOT EXISTS "
+            "(SELECT 1 FROM r2_log_events e WHERE e.id=log_event_id));",
+            -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, event_id);
+        sqlite3_bind_int64(st, 2, branch_id);
+        rc = sqlite3_step(st);
+        int changed = sqlite3_changes(as_db);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE || changed != 1) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not restore branch #%lld Life Log relationship.\n",
+                    (long long)branch_id);
+            return -1;
+        }
+    }
+}
+
 static int migrate_altself_schema(void)
 {
     const char *columns[][2] = {
@@ -80,7 +184,7 @@ static int migrate_altself_schema(void)
             return -1;
         }
     }
-    return as_exec(
+    if (as_exec(
         "UPDATE r2_alternate_self_branches SET created_utc=CURRENT_TIMESTAMP "
         "WHERE created_utc IS NULL OR created_utc='';"
         "UPDATE r2_alternate_self_branches SET updated_utc=CURRENT_TIMESTAMP "
@@ -88,7 +192,9 @@ static int migrate_altself_schema(void)
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_status_idx "
         "ON r2_alternate_self_branches(status,id);"
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_log_event_idx "
-        "ON r2_alternate_self_branches(log_event_id);");
+        "ON r2_alternate_self_branches(log_event_id);") != 0)
+        return -1;
+    return altself_restore_missing_log_links();
 }
 
 int r2_altself_init(void)
