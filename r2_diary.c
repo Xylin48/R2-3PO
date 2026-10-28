@@ -944,6 +944,7 @@ static int r2_diary_reconnect_history_unlocked(int limit)
 {
     sqlite3_stmt *st = NULL;
     int rc, count = 0, linked = 0;
+    sqlite3_int64 last_seen_id = 0;
     typedef struct {
         int64_t id;
         char created_at[64];
@@ -965,16 +966,22 @@ static int r2_diary_reconnect_history_unlocked(int limit)
 
     pending = calloc((size_t)limit, sizeof(*pending));
     if (!pending) return -1;
+    /* Scan the complete pending history in bounded pages, even when a
+       particular legacy row cannot yet be linked. */
+    for (;;) {
+    count = 0;
     rc = sqlite3_prepare_v2(r2_diary_db,
         "SELECT d.id,d.created_at FROM diary_entries d "
         "JOIN r2_diary_entry_links l ON l.diary_entry_id=d.id "
-        "WHERE COALESCE(l.log_event_id,0)=0 OR COALESCE(l.memory_indexed,0)=0 ORDER BY d.id ASC LIMIT ?;",
+        "WHERE (COALESCE(l.log_event_id,0)=0 OR COALESCE(l.memory_indexed,0)=0) "
+        "AND d.id>? ORDER BY d.id ASC LIMIT ?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK) {
         free(pending);
         return -1;
     }
-    if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+    if (sqlite3_bind_int64(st, 1, last_seen_id) != SQLITE_OK ||
+        sqlite3_bind_int(st, 2, limit) != SQLITE_OK) {
         sqlite3_finalize(st);
         free(pending);
         return -1;
@@ -991,9 +998,12 @@ static int r2_diary_reconnect_history_unlocked(int limit)
         free(pending);
         return -1;
     }
+    if (count == 0) break;
+    last_seen_id = pending[count - 1].id;
     for (int i = 0; i < count; ++i)
         if (r2_diary_link_entry(pending[i].id, pending[i].created_at) == 0)
             linked++;
+    }
     free(pending);
     return linked;
 }
