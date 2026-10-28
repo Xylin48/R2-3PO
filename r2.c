@@ -10392,6 +10392,9 @@ int r2_vision_set_model(const char *model)
     return r2_visual_set_model(model);
 }
 
+int r2_vision_camera_available(void) { return r2_eyes_camera_available(); }
+int r2_vision_vlc_available(void) { return r2_eyes_vlc_available(); }
+
 int r2_vision_open_vlc(void)
 {
     if (!eyes || !r2_visual_is_initialized()) return -1;
