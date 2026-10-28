@@ -162,6 +162,10 @@ int r2_ears_init(R2Ears **ears);
 void r2_ears_shutdown(R2Ears *ears);
 
 
+/* Read-only input discovery. Never starts a stream or interprets sound. */
+int r2_ears_microphone_available(void);
+int r2_ears_desktop_playing(void);
+
 /* ---------------------------------------------------------
  * Input sources
  * --------------------------------------------------------- */
