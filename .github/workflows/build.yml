@@ -172,6 +172,11 @@ jobs:
       - name: Trace live audio-producer window discovery to Eyes
         run: python3 tests/visual_audio_producer_bridge_smoke.py
 
+      - name: Exercise playback producer to live X11 window geometry lookup
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c Eyes.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
+          /tmp/r2-eyes-window-discovery-test
+
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
