@@ -182,6 +182,26 @@ def main() -> int:
         finally:
             db.close()
 
+    # Fresh installations must not receive a migration marker before an old
+    # combined database is ever present at the configured cartridge path.
+    with tempfile.TemporaryDirectory(prefix="r2-gameboy-fresh-") as fresh:
+        fresh_root = Path(fresh) / "device"
+        os.environ["R2_GAMEBOY_ROOT"] = str(fresh_root)
+        os.environ["R2_GAMEBOY_DB"] = str(fresh_root / "gameboy.db")
+        fresh_spec = importlib.util.spec_from_file_location(
+            "r2_gameboy_fresh", CONSOLE
+        )
+        assert fresh_spec and fresh_spec.loader
+        fresh_module = importlib.util.module_from_spec(fresh_spec)
+        fresh_spec.loader.exec_module(fresh_module)
+        fresh_db = fresh_module.connect()
+        try:
+            assert fresh_db.execute(
+                "SELECT COUNT(*) FROM console_migrations"
+            ).fetchone()[0] == 0
+        finally:
+            fresh_db.close()
+
     print("Legacy Game Boy cartridge/state schemas preserve existing data and accept new writes.")
     return 0
 
