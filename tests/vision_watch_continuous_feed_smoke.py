@@ -22,6 +22,7 @@ assert "memcpy(vision_watch_latest_frame_data, frame.data, frame.size)" in captu
 assert "++vision_watch_frame_generation" in capture
 assert "pthread_cond_broadcast(&vision_watch_frame_cond)" in capture
 assert "vision_watch_capture_done = 1" in capture
+assert '"vision_watch_frame_snapshot_failed"' in capture
 
 assert "pthread_cond_wait(&vision_watch_frame_cond" in worker
 assert "memcpy(frame_copy, vision_watch_latest_frame_data" in worker
