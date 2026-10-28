@@ -16,7 +16,8 @@ worker_start = watch.index("static void *shell_watch_worker(void *unused)")
 worker_end = watch.index("static void shell_watch_start(void)", worker_start)
 worker = watch[worker_start:worker_end]
 
-assert "[EARS_LISTEN] recent|seconds" in prompt and "[EARS_LISTEN] live|seconds" in prompt
+for source in ("recent", "live", "desktop_recent", "desktop_live"):
+    assert f"[EARS_LISTEN] {source}|seconds" in prompt, source
 assert "do not use it for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in ears_helper
@@ -25,7 +26,10 @@ assert "r2_ears_listen_cancelable(" in ears_helper and "r2_ears_action_cancelled
 assert "r2_ears_recent_requested = recent;" in ears_helper
 assert "r2_ears_write_buffered_audio(total_bytes, wav)" in core
 assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in core
-assert "r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in ears_helper
+assert "!desktop && r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in ears_helper
+assert "r2_ears_desktop_requested = desktop;" in ears_helper
+assert "r2_ears_desktop_requested = 0;" in ears_helper
+assert "r2_ears_status_desktop()" in core
 assert "That source was left untouched" in ears_helper
 assert "Do not infer what was said." in ears_helper
 assert "r2_process_ears_listen_request(request)" in tool
