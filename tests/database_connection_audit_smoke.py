@@ -54,6 +54,18 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert all(item["status"] == "checked" for item in relationships), relationships
     assert all(item["orphan_count"] == 0 for item in relationships), relationships
 
+    with sqlite3.connect(memory) as db:
+        db.execute("INSERT INTO r2_alternate_self_branches VALUES(2,NULL,NULL)")
+    relationships = audit.audit_relationships(root, reports["databases"])
+    missing_required = [
+        item for item in relationships
+        if item["source_table"] == "r2_alternate_self_branches"
+        and item["source_column"] == "log_event_id"
+    ]
+    assert len(missing_required) == 1 and missing_required[0]["orphan_values"] == [None], missing_required
+    with sqlite3.connect(memory) as db:
+        db.execute("DELETE FROM r2_alternate_self_branches WHERE id=2")
+
     with sqlite3.connect(rewards) as db:
         db.execute("INSERT INTO reward_events VALUES(2,999)")
     relationships = audit.audit_relationships(root, reports["databases"])
