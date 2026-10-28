@@ -9081,7 +9081,7 @@ static void *autonomous_thinking(void *arg)
             "\n"
             "Write naturally in first person as R2.\n"
             "\n"
-            "Return ONLY the private diary reflection.";
+            "If no tool action is needed, return only the private diary reflection. If you deliberately choose a hearing action, return the single [EARS_LISTEN] marker on its own line so the system can provide the result and ask for the final reflection.";
 
         Message m = { "user", ctx, 0, 0 };
         int previous_background_mode = ollama_background_mode;
@@ -9113,8 +9113,10 @@ static void *autonomous_thinking(void *arg)
                         "Now write the final private diary reflection using the supplied context "
                         "and the real listening result. Do not emit tool markers. If the listening "
                         "result is an error, treat the sound as unknown; do not invent speech.",
-                        ctx, reflection, listen_result) < 0)
+                        ctx, reflection, listen_result) < 0) {
+                        free(followup);
                         followup = NULL;
+                    }
                     free(listen_result);
                     if (!followup) {
                         free(reflection);
