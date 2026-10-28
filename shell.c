@@ -49,6 +49,7 @@
 
 #include "shell.h"
 #include "r2.h"
+#include "Ears.h"
 #include "r2_input.h"
 #include "Log.h"
 #include "Reality.h"
@@ -87,6 +88,7 @@ static pthread_t tv_control_thread;
 static int tv_control_started = 0;
 static int tv_control_fd = -1;
 static atomic_int tv_control_stop = ATOMIC_VAR_INIT(0);
+static atomic_ulong tv_live_video_window = ATOMIC_VAR_INIT(0);
 static char tv_control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 static void *tv_control_server(void *unused)
@@ -176,10 +178,12 @@ static void *tv_control_server(void *unused)
         } else if (!strcmp(command, "display opened")) {
             reply = r2_reality_tv_display_event(1) == 0 ? "OK TV display-open event recorded" : "ERROR could not record TV display-open event";
         } else if (!strcmp(command, "display closed")) {
+            atomic_store(&tv_live_video_window, 0);
             reply = r2_reality_tv_display_event(0) == 0 ? "OK TV display-close event recorded" : "ERROR could not record TV display-close event";
         } else if (!strcmp(command, "power on")) {
             reply = r2_reality_tv_power(1) == 0 ? "OK powered on" : "ERROR power-on failed";
         } else if (!strcmp(command, "power off")) {
+            atomic_store(&tv_live_video_window, 0);
             reply = r2_reality_tv_power(0) == 0 ? "OK powered off" : "ERROR power-off failed";
         } else if (!strncmp(command, "input ", 6)) {
             char *end = NULL;
@@ -198,7 +202,21 @@ static void *tv_control_server(void *unused)
             char *separator = strchr(payload, '|');
             if (separator) {
                 *separator = '\0';
-                const char *path = separator + 1;
+                char *path = separator + 1;
+                unsigned long published_window = 0;
+                int valid_locator = 1;
+                char *locator = strstr(path, "|x11=");
+                if (locator) {
+                    char *end = NULL;
+                    errno = 0;
+                    unsigned long value = strtoul(locator + 5, &end, 10);
+                    if (errno || end == locator + 5 || !end || *end || !value)
+                        valid_locator = 0;
+                    else {
+                        published_window = value;
+                        *locator = '\0';
+                    }
+                }
                 const char *allowed_actions[] = {
                     "vcr_playback_started", "vcr_playback_paused",
                     "vcr_playback_stopped", "vcr_playback_ended",
@@ -207,9 +225,11 @@ static void *tv_control_server(void *unused)
                 int allowed = 0;
                 for (size_t i = 0; i < sizeof(allowed_actions) / sizeof(allowed_actions[0]); ++i)
                     if (!strcmp(payload, allowed_actions[i])) { allowed = 1; break; }
-                if (allowed && path[0] == '/' && *path &&
+                if (allowed && valid_locator && path[0] == '/' && *path &&
                     !strchr(path, '\n') && !strchr(path, '\r') &&
                     strlen(path) < 1100) {
+                    atomic_store(&tv_live_video_window,
+                        !strcmp(payload, "vcr_playback_started") ? published_window : 0);
                     reply = r2_log_media_event(payload, "media", path,
                         "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
                         ? "OK media event recorded" : "ERROR could not record media event";
@@ -715,18 +735,6 @@ static void shell_talk(const char *message)
     pthread_mutex_unlock(&shell_conversation_lock);
 }
 
-static void shell_talk_watch(const char *message)
-{
-    pthread_mutex_lock(&shell_conversation_lock);
-    if (!atomic_load(&shell_watch_stop_requested) && !r2_is_shutting_down()) {
-        printf("\n[Watch] Heard: %s\n", message ? message : "");
-        fflush(stdout);
-        shell_talk_inner(message);
-    }
-    pthread_mutex_unlock(&shell_conversation_lock);
-}
-
-
 /* ============================================================
    NORMAL CONVERSATION
    ============================================================ */
@@ -997,7 +1005,7 @@ static void shell_eyes(const char *argument)
     }
 
     if (!strcasecmp(argument, "stop")) {
-
+        r2_sense_set_auto_allowed(1, 0);
         int result =
             r2_eyes_stop();
 
@@ -1060,6 +1068,21 @@ static void shell_vision(const char *argument)
         return;
     }
 
+    if (!strcasecmp(argument, "media see") ||
+        shell_starts_with(argument, "media see ")) {
+        const char *question = shell_starts_with(argument, "media see ")
+            ? shell_trim((char *)argument + strlen("media see ")) :
+              "What can be observed in this media display?";
+        char *result = r2_vision_media_see(question);
+        if (result) {
+            printf("[Media display observation] %s\n", result);
+            free(result);
+        } else {
+            printf("[Media display input unavailable or deliberately closed.]\n");
+        }
+        return;
+    }
+
     if (!strcasecmp(argument, "see")) {
         char *result = r2_vision_see(
             "Describe what is visible in the current frame. Identify objects, visible text, "
@@ -1079,15 +1102,16 @@ static void shell_vision(const char *argument)
 
     if (!strcasecmp(argument, "watch start")) {
         if (r2_vision_watch_start() == 0)
-            printf("[Visual observation is running; R2 will analyze a frame about every 15 seconds.]\n");
+            printf("[Eyes is capturing continuously; the conversation brain receives the latest image with its turn and chooses what to attend to. No background image descriptions are generated.]\n");
         else
             printf("[Could not start visual observation. Check the vision model and R2 status.]\n");
         return;
     }
 
     if (!strcasecmp(argument, "watch stop")) {
-        r2_vision_watch_stop();
-        printf("[Visual observation stopped.]\n");
+        r2_sense_set_auto_allowed(1, 0);
+        (void)r2_eyes_stop();
+        printf("[Visual observation deliberately stopped; Watch will not reopen Eyes.]\n");
         return;
     }
 
@@ -1098,8 +1122,9 @@ static void shell_vision(const char *argument)
     }
 
     if (!strcasecmp(argument, "vlc")) {
+        r2_sense_set_auto_allowed(1, 1);
         if (r2_vision_open_vlc() == 0)
-            printf("[Eyes connected to the visible VLC window. Use 'vision see' or 'vision watch start' after it opens.]\n");
+            printf("[Independent VLC display connected; camera eyesight is unchanged. Use 'vision media see' to inspect it.]\n");
         else
             printf("[Could not open VLC capture. Ensure VLC is visible in the graphical desktop session.]\n");
         return;
@@ -1107,8 +1132,9 @@ static void shell_vision(const char *argument)
 
     if (shell_starts_with(argument, "file ")) {
         const char *path = shell_trim((char *)argument + 5);
+        r2_sense_set_auto_allowed(1, 1);
         if (r2_vision_open_file(path) == 0)
-            printf("[Eyes opened visual file: %s]\n", path);
+            printf("[Independent media file opened without replacing camera Eyes: %s]\n", path);
         else
             printf("[Could not open visual file: %s]\n", path);
         return;
@@ -1147,6 +1173,9 @@ static void shell_vision(const char *argument)
 
 static void shell_ears(const char *argument)
 {
+    /* An explicit sensory decision is valid even while Watch discovers sources.
+       A deliberately closed microphone or desktop remains closed. */
+
     if (!argument || !*argument) {
 
         int state =
@@ -1165,7 +1194,7 @@ static void shell_ears(const char *argument)
     }
 
     if (!strcasecmp(argument, "start")) {
-
+        r2_sense_set_auto_allowed(2, 1);
         int result =
             r2_ears_start();
 
@@ -1214,7 +1243,7 @@ static void shell_ears(const char *argument)
     }
 
     if (!strcasecmp(argument, "stop")) {
-
+        r2_sense_set_auto_allowed(2, 0);
         int result =
             r2_ears_stop();
 
@@ -1223,6 +1252,20 @@ static void shell_ears(const char *argument)
         else
             printf("[Ears] Failed to stop.\n");
 
+        return;
+    }
+
+    if (!strcasecmp(argument, "desktop stop")) {
+        r2_sense_set_auto_allowed(3, 0);
+        (void)r2_ears_stop_desktop();
+        printf("[Ears] Desktop playback listening deliberately closed.\n");
+        return;
+    }
+    if (!strcasecmp(argument, "desktop start")) {
+        r2_sense_set_auto_allowed(3, 1);
+        printf(r2_ears_start_desktop() == 0
+               ? "[Ears] Independent desktop listening started.\n"
+               : "[Ears] Could not open desktop listening.\n");
         return;
     }
 
@@ -1253,11 +1296,10 @@ static void shell_ears(const char *argument)
    WATCH COORDINATOR
    ============================================================
  *
- * Watch coordinates bounded microphone capture and local Whisper
- * transcription, then sends each usable transcript through the shared
- * shell conversation path. It may attach to visual observation only when
- * Eyes is already open. Audio capture and visual perception remain owned
- * by their existing subsystems.
+ * Watch coordinates continuous raw sensory input. Ears receives PCM into a
+ * rolling in-memory buffer and Eyes continuously publishes raw frames when
+ * open. Neither sensor automatically transcribes, describes, or interprets
+ * what arrives; R2's brain chooses when to inspect sensory information.
  */
 
 static void shell_watch_status(void)
@@ -1266,22 +1308,24 @@ static void shell_watch_status(void)
         "\n"
         "================ WATCH STATUS =============================\n"
         "\n"
-        "Coordinator thread : %s\n"
-        "Speech input       : %s\n"
-        "Visual observation : %s\n"
-        "Core Watch state   : %s\n"
+        "Source discovery    : %s\n"
+        "Microphone input    : %s\n"
+        "Desktop audio input : %s\n"
+        "Visual input        : %s\n"
+        "Core Watch state    : %s\n"
         "\n"
-        "Microphone capture uses local Whisper transcription. Visual observation\n"
-        "runs only while an Eyes source is already open; Watch never opens Eyes.\n"
+        "When sources are unavailable, Watch checks for new sources without\n"
+        "continuous PCM or video capture. Source input is never automatically\n"
+        "transcribed, described or converted into conversation.\n"
         "============================================================\n"
         "\n",
-        shell_watch_thread_started ? "RUNNING" : "STOPPED",
-        watch_running ? "ENABLED" : "DISABLED",
-        r2_vision_watch_active() ? "ACTIVE" : "INACTIVE",
+        shell_watch_thread_started ? "MONITORING" : "STOPPED",
+        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "WAITING"),
+        !watch_running ? "STOPPED" : (r2_ears_status_desktop() > 0 ? "ACTIVE" : "WAITING"),
+        r2_vision_watch_active() ? "ACTIVE" : "WAITING",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
 }
-
 
 static int shell_watch_cancelled(void *unused)
 {
@@ -1289,68 +1333,118 @@ static int shell_watch_cancelled(void *unused)
     return atomic_load(&shell_watch_stop_requested) || r2_is_shutting_down();
 }
 
-static int shell_command_available(const char *command)
-{
-    if (!command || !*command) return 0;
-    if (strchr(command, '/')) return access(command, X_OK) == 0;
-    const char *path = getenv("PATH");
-    if (!path) return 0;
-    const char *part = path;
-    while (1) {
-        const char *end = strchr(part, ':');
-        size_t length = end ? (size_t)(end - part) : strlen(part);
-        if (length > 0 && length < PATH_MAX - 2) {
-            char candidate[PATH_MAX];
-            int n = snprintf(candidate, sizeof(candidate), "%.*s/%s",
-                             (int)length, part, command);
-            struct stat st;
-            if (n > 0 && (size_t)n < sizeof(candidate) &&
-                access(candidate, X_OK) == 0 && stat(candidate, &st) == 0 &&
-                S_ISREG(st.st_mode)) return 1;
-        }
-        if (!end) break;
-        part = end + 1;
-    }
-    return 0;
-}
-
+/*
+ * Source discovery is inexpensive polling, not a continuous audio/video feed.
+ * A source that actually becomes available owns its continuous capture until
+ * it goes away. No filename, player brand, microphone model or spoken content
+ * is treated as an instruction to the brain.
+ */
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int restore_ears_open = r2_ears_status() > 0;
-    int visual_started = 0;
-
-    /* Never open Eyes on Watch's behalf. Only attach to an already-open source. */
-    if (r2_eyes_status() > 0 && r2_vision_available() &&
-        r2_vision_watch_start() == 0) {
-        visual_started = 1;
-        fprintf(stderr, "[Watch] Visual observation attached to the already-open Eyes source.\n");
-    }
+    int managed_camera = 0;
+    int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
+    unsigned long managed_window_id = 0;
+    int managed_microphone = 0;
+    int managed_desktop = 0;
+    int attached_visual = 0;
 
     while (!shell_watch_cancelled(NULL)) {
-        /* Bounded non-overlapping chunks: one transcript can create at most one chat turn. */
-        char *transcript = r2_ears_listen_cancelable(5, shell_watch_cancelled, NULL);
-        if (shell_watch_cancelled(NULL)) {
-            free(transcript);
-            break;
+        int desktop_playing = r2_ears_desktop_playing();
+        int microphone_available = r2_ears_microphone_available();
+        int camera_available = r2_vision_camera_available();
+        int vlc_available = r2_vision_vlc_available() && desktop_playing;
+        unsigned long media_window = atomic_load(&tv_live_video_window);
+        int window_available = media_window &&
+            r2_vision_window_available(media_window);
+        long playback_pid = desktop_playing ? r2_ears_playback_pid() : -1;
+        unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
+
+        /* The physical camera is the Eyes organ. Movies are separate displays.
+           Neither a playing media window nor its disappearance changes eyesight. */
+        int eyes_permitted = r2_sense_auto_allowed(1);
+        if (managed_camera &&
+            (!eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
+            (void)r2_eyes_release_source();
+            managed_camera = 0;
         }
-        if (!transcript) {
-            /* Back off if capture/ASR fails immediately; silence is not a turn. */
-            struct timespec retry_delay = {1, 0};
-            while (nanosleep(&retry_delay, &retry_delay) != 0 && errno == EINTR) {
-                if (shell_watch_cancelled(NULL)) break;
+        if (eyes_permitted && !managed_camera && camera_available &&
+            r2_eyes_status() <= 0 && r2_eyes_start() == 0)
+            managed_camera = 1;
+
+        if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
+            !r2_vision_watch_active() && r2_vision_available() &&
+            r2_vision_watch_start() == 0)
+            attached_visual = 1;
+
+        /* Watch finds accessible media; R2 decides whether to watch it.
+           Media capture is independent, and no semantic inference is triggered. */
+        int wanted_media = window_available ? 3 :
+            (playback_window ? 4 : (vlc_available ? 2 : 0));
+        unsigned long wanted_window = wanted_media == 3 ? media_window :
+                                      wanted_media == 4 ? playback_window : 0;
+        if (managed_media &&
+            (!eyes_permitted || wanted_media != managed_media ||
+             managed_window_id != wanted_window ||
+             r2_vision_media_status() <= 0)) {
+            (void)r2_vision_media_stop();
+            managed_media = 0;
+            managed_window_id = 0;
+        }
+        if (eyes_permitted && !managed_media && wanted_media &&
+            !r2_vision_media_status() && r2_vision_available()) {
+            int opened = wanted_media == 2 ? r2_vision_open_vlc() :
+                         r2_vision_media_open_window(wanted_window);
+            if (opened == 0) {
+                managed_media = wanted_media;
+                managed_window_id = wanted_window;
+                r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
+                             "R2 can observe an independent real media display.",
+                             "The display does not replace physical Eyes or demand attention.",
+                             wanted_media == 3 ? "CRT video renderer" :
+                             wanted_media == 4 ? "visible X11 audio producer" : "VLC");
             }
-            continue;
         }
-        shell_talk_watch(transcript);
-        free(transcript);
+
+        /* Both audio sources operate independently; the decision to close one
+           must not be overridden by mere availability of that source. */
+        if (managed_microphone &&
+            (!r2_sense_auto_allowed(2) || !microphone_available ||
+             r2_ears_status() <= 0)) {
+            (void)r2_ears_stop();
+            managed_microphone = 0;
+        }
+        if (!managed_microphone && r2_sense_auto_allowed(2) &&
+            microphone_available && r2_ears_status() <= 0 &&
+            r2_ears_start() == 0)
+            managed_microphone = 1;
+
+        if (managed_desktop &&
+            (!r2_sense_auto_allowed(3) || !desktop_playing ||
+             r2_ears_status_desktop() <= 0)) {
+            (void)r2_ears_stop_desktop();
+            managed_desktop = 0;
+        }
+        if (!managed_desktop && r2_sense_auto_allowed(3) &&
+            desktop_playing && r2_ears_status_desktop() <= 0 &&
+            r2_ears_start_desktop() == 0)
+            managed_desktop = 1;
+
+        struct timespec pause = {WATCH_POLL_INTERVAL, 0};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
+            if (shell_watch_cancelled(NULL)) break;
     }
 
-    if (visual_started)
+    if (managed_camera)
+        (void)r2_eyes_release_source();
+    else if (attached_visual)
         (void)r2_vision_watch_stop();
-    /* Restore a microphone state that predated Watch; otherwise leave it closed. */
-    if (restore_ears_open && !r2_is_shutting_down())
-        (void)r2_ears_start();
+    if (managed_media)
+        (void)r2_vision_media_stop();
+    if (managed_microphone)
+        (void)r2_ears_stop();
+    if (managed_desktop)
+        (void)r2_ears_stop_desktop();
     return NULL;
 }
 
@@ -1361,32 +1455,8 @@ static void shell_watch_start(void)
         return;
     }
 
-    const char *model = getenv("R2_WHISPER_MODEL");
-    struct stat model_stat;
-    if (!model || !*model || stat(model, &model_stat) != 0 ||
-        !S_ISREG(model_stat.st_mode) || access(model, R_OK) != 0) {
-        printf("[Watch] Cannot start: set R2_WHISPER_MODEL to a readable local Whisper GGML model.\n");
-        return;
-    }
-    const char *cli = getenv("R2_WHISPER_CLI");
-    if (!cli || !*cli) cli = "whisper-cli";
-    if (!shell_command_available(cli)) {
-        printf("[Watch] Cannot start: local Whisper CLI '%s' is not executable or not in PATH.\n", cli);
-        return;
-    }
-
-    /* Prove the default microphone can open before reporting Watch as active. */
-    int restore_ears_open = r2_ears_status() > 0;
-    if (r2_ears_start() != 0) {
-        printf("[Watch] Cannot start: R2 could not open the default microphone.\n");
-        return;
-    }
-    (void)r2_ears_stop();
-    if (restore_ears_open && r2_ears_start() != 0) {
-        printf("[Watch] Cannot start: the previously open Ears source could not be restored.\n");
-        return;
-    }
-
+    /* Source discovery may coexist with a user-opened microphone or media
+       stream; its worker does not claim or replace those existing sources. */
     atomic_store(&shell_watch_stop_requested, 0);
     if (r2_watch_start() != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
@@ -1396,14 +1466,13 @@ static void shell_watch_start(void)
     if (pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL) != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
         (void)r2_watch_stop();
-        printf("[Watch] Could not create the sensory coordinator thread.\n");
+        printf("[Watch] Could not start the sensory discovery thread.\n");
         return;
     }
     shell_watch_thread_started = 1;
     watch_running = 1;
-    printf("[Watch] ACTIVE. Local microphone transcription is enabled; Eyes is observed only if already open.\n");
+    printf("[Watch] MONITORING. Continuous feed starts only when an audio or visual source is active; no automatic transcription or image descriptions are generated.\n");
 }
-
 
 static void shell_watch_stop(void)
 {
@@ -1411,7 +1480,7 @@ static void shell_watch_stop(void)
         printf("[Watch] Already stopped.\n");
         return;
     }
-    printf("[Watch] Stopping; cancelling capture/transcription and waiting for active work...\n");
+    printf("[Watch] Stopping source discovery and its owned capture streams...\n");
     atomic_store(&shell_watch_stop_requested, 1);
     (void)r2_watch_stop();
     if (shell_watch_thread_started) {
@@ -1421,7 +1490,6 @@ static void shell_watch_stop(void)
     watch_running = 0;
     printf("[Watch] STOPPED.\n");
 }
-
 
 static void shell_watch(const char *argument)
 {
@@ -2788,6 +2856,10 @@ int r2_shell_run(void)
         fprintf(stderr, "[TV] GUI control socket unavailable; shell TV commands remain available.\n");
 
     shell_banner();
+
+    /* Source discovery is enabled by default; an unplugged mic or camera is
+       not a startup error. No feed starts until a real input is found. */
+    shell_watch_start();
 
     while (
         shell_running &&

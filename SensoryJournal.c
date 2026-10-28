@@ -78,9 +78,13 @@ int r2_sj_init(void)
         pthread_mutex_unlock(&sj_lock);
         return -1;
     }
-    sqlite3_busy_timeout(sj_db, 5000);
-    sqlite3_exec(sj_db, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
-                 NULL, NULL, NULL);
+    if (sqlite3_busy_timeout(sj_db, 5000) != SQLITE_OK ||
+        sj_exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") != 0) {
+        if (sj_db) sqlite3_close(sj_db);
+        sj_db = NULL;
+        pthread_mutex_unlock(&sj_lock);
+        return -1;
+    }
     const char *schema =
         "CREATE TABLE IF NOT EXISTS r2_sensory_journal ("
         " event_id INTEGER PRIMARY KEY,"
@@ -109,14 +113,32 @@ int r2_sj_init(void)
             "WHERE indexed_utc IS NULL OR indexed_utc='';"
             "UPDATE r2_sensory_journal_diary_links SET linked_utc=CURRENT_TIMESTAMP "
             "WHERE linked_utc IS NULL OR linked_utc='';"
-            "INSERT OR IGNORE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id) "
-            "SELECT e.id,d.id FROM r2_log_events e "
+            "INSERT OR IGNORE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
+            "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
             "WHERE e.category='thinking' "
-            "AND e.event_type IN ('diary_entry_written','reflection_completed');"
-            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind) "
-            "SELECT id,category FROM r2_log_events "
+            "AND e.event_type IN ('diary_entry_written','reflection_completed') "
+            "AND (SELECT COUNT(*) FROM diary_entries match_row "
+            "WHERE match_row.entry=e.details)=1;"
+            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
+            "SELECT id,category,CURRENT_TIMESTAMP FROM r2_log_events "
             "WHERE category IN ('sensory','thinking','conversation');") != 0) {
+        sqlite3_close(sj_db);
+        sj_db = NULL;
+        pthread_mutex_unlock(&sj_lock);
+        return -1;
+    }
+    /* The diary organ's own entry-to-event table is authoritative. Its
+       stable IDs survive identical diary prose and old database schemas. */
+    if (sj_column_exists("r2_diary_entry_links", "diary_entry_id") &&
+        sj_column_exists("r2_diary_entry_links", "log_event_id") &&
+        sj_exec("INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
+                "(event_id,diary_entry_id,linked_utc) "
+                "SELECT e.id,d.id,CURRENT_TIMESTAMP "
+                "FROM r2_diary_entry_links l "
+                "JOIN r2_log_events e ON e.id=l.log_event_id "
+                "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                "WHERE e.category='thinking' AND e.event_type='diary_entry_linked';") != 0) {
         sqlite3_close(sj_db);
         sj_db = NULL;
         pthread_mutex_unlock(&sj_lock);
@@ -154,11 +176,14 @@ void r2_sj_index_event(int64_t event_id, const char *category,
     }
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(sj_db,
-            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind) VALUES(?,?);",
+            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
+            "VALUES(?,?,CURRENT_TIMESTAMP);",
             -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
-        if (sqlite3_step(st) != SQLITE_DONE)
+        int bind_rc = sqlite3_bind_int64(st, 1, event_id);
+        if (bind_rc == SQLITE_OK)
+            bind_rc = sqlite3_bind_text(st, 2, kind, -1, SQLITE_STATIC);
+        int step_rc = bind_rc == SQLITE_OK ? sqlite3_step(st) : bind_rc;
+        if (step_rc != SQLITE_DONE)
             fprintf(stderr, "[R2 Sensory Journal] Index failed: %s\n", sqlite3_errmsg(sj_db));
     }
     sqlite3_finalize(st);
@@ -169,14 +194,17 @@ void r2_sj_index_event(int64_t event_id, const char *category,
          !strcmp(event_type, "reflection_completed"))) {
         sqlite3_stmt *link = NULL;
         int link_rc = sqlite3_prepare_v2(sj_db,
-            "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id) "
-            "SELECT e.id,d.id FROM r2_log_events e "
+            "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
+            "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
-            "WHERE e.id=? ORDER BY d.id DESC LIMIT 1;",
+            "WHERE e.id=? AND (SELECT COUNT(*) FROM diary_entries match_row "
+                "WHERE match_row.entry=e.details)=1 "
+                "ORDER BY d.id DESC LIMIT 1;",
             -1, &link, NULL);
         if (link_rc == SQLITE_OK) {
-            sqlite3_bind_int64(link, 1, event_id);
-            if (sqlite3_step(link) != SQLITE_DONE)
+            link_rc = sqlite3_bind_int64(link, 1, event_id);
+            if (link_rc == SQLITE_OK) link_rc = sqlite3_step(link);
+            if (link_rc != SQLITE_DONE)
                 fprintf(stderr, "[R2 Sensory Journal] Diary link failed: %s\n",
                         sqlite3_errmsg(sj_db));
         } else {
@@ -187,6 +215,44 @@ void r2_sj_index_event(int64_t event_id, const char *category,
     }
     pthread_mutex_unlock(&sj_lock);
     (void)source;
+}
+
+/* After diary.c has committed its exact authoritative diary-to-log pointer,
+   establish the Journal projection using IDs, never matching diary prose.
+   Before journal startup, r2_sj_init reconciles this exact link from the
+   durable r2_diary_entry_links table. */
+int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
+{
+    if (event_id <= 0 || diary_entry_id <= 0) return -1;
+    pthread_mutex_lock(&sj_lock);
+    if (!sj_ready || !sj_db) {
+        pthread_mutex_unlock(&sj_lock);
+        return 0; /* The diary link is durable; startup backfill owns it. */
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(sj_db,
+        "INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
+        "(event_id,diary_entry_id,linked_utc) "
+        "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
+        "JOIN r2_diary_entry_links l ON l.log_event_id=e.id AND l.diary_entry_id=? "
+        "JOIN diary_entries d ON d.id=l.diary_entry_id "
+        "WHERE e.id=? AND e.category='thinking' "
+        "AND e.event_type='diary_entry_linked';",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 1, diary_entry_id);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 2, event_id);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_step(st);
+    int changed = rc == SQLITE_DONE ? sqlite3_changes(sj_db) : 0;
+    if (rc != SQLITE_DONE || changed != 1)
+        fprintf(stderr,
+                "[R2 Sensory Journal] Exact diary link failed (event=%lld, entry=%lld): %s\n",
+                (long long)event_id, (long long)diary_entry_id, sqlite3_errmsg(sj_db));
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&sj_lock);
+    return rc == SQLITE_DONE && changed == 1 ? 0 : -1;
 }
 
 int64_t r2_sj_note(const char *note, const char *details)
@@ -208,13 +274,21 @@ static char *sj_query(const char *query, int limit)
 
     const char *sql_recent =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,d.diary_entry_id FROM r2_sensory_journal j "
+        "e.details,e.source,CASE WHEN "
+        "e.event_type IN ('diary_entry_written','reflection_completed') "
+        "AND (SELECT COUNT(*) FROM diary_entries match_row "
+        "WHERE match_row.entry=e.details)<>1 "
+        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "ORDER BY e.id DESC LIMIT ?;";
     const char *sql_search =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,d.diary_entry_id FROM r2_sensory_journal j "
+        "e.details,e.source,CASE WHEN "
+        "e.event_type IN ('diary_entry_written','reflection_completed') "
+        "AND (SELECT COUNT(*) FROM diary_entries match_row "
+        "WHERE match_row.entry=e.details)<>1 "
+        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
@@ -246,16 +320,29 @@ static char *sj_query(const char *query, int limit)
         }
         pat[pat_len++] = '%';
         pat[pat_len] = '\0';
-        for (int i = 1; i <= 5; ++i) sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(st, 6, limit);
+        int bind_rc = SQLITE_OK;
+        for (int i = 1; i <= 5 && bind_rc == SQLITE_OK; ++i)
+            bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 6, limit);
         free(pat);
-    } else sqlite3_bind_int(st, 1, limit);
+        if (bind_rc != SQLITE_OK) {
+            sqlite3_finalize(st);
+            pthread_mutex_unlock(&sj_lock);
+            return NULL;
+        }
+    } else if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&sj_lock);
+        return NULL;
+    }
 
     size_t cap = 4096, len = 0;
     char *out = malloc(cap);
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
     out[0] = '\0';
     int rc;
+    int intentionally_truncated = 0;
+    int serialization_failed = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *utc = sqlite3_column_text(st, 1);
         const unsigned char *local = sqlite3_column_text(st, 2);
@@ -276,7 +363,14 @@ static char *sj_query(const char *query, int limit)
             source ? (const char *)source : "unspecified",
             diary_id ? (const char *)diary_id : "none",
             details ? (const char *)details : "");
-        if (needed < 0 || len + (size_t)needed + 1 > 2 * 1024 * 1024) break;
+        if (needed < 0) {
+            serialization_failed = 1;
+            break;
+        }
+        if (len + (size_t)needed + 1 > 2 * 1024 * 1024) {
+            intentionally_truncated = 1;
+            break;
+        }
         if (len + (size_t)needed + 1 > cap) {
             size_t next = cap;
             while (next < len + (size_t)needed + 1) next *= 2;
@@ -299,9 +393,18 @@ static char *sj_query(const char *query, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
+    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+        free(out);
+        return NULL;
+    }
     if (out && len == 0)
         snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
                                       "The Sensory Journal contains no entries yet.\n");
+    if (out && intentionally_truncated) {
+        const char *note = "[Sensory Journal output truncated at 2 MiB; remaining entries are still stored.]\n";
+        size_t note_len = strlen(note);
+        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+    }
     return out;
 }
 
@@ -321,10 +424,12 @@ long r2_sj_count(void)
     }
     sqlite3_stmt *st = NULL;
     long count = -1;
-    if (sqlite3_prepare_v2(sj_db,
-            "SELECT COUNT(*) FROM r2_sensory_journal;", -1, &st, NULL) == SQLITE_OK &&
-        sqlite3_step(st) == SQLITE_ROW) {
-        count = (long)sqlite3_column_int64(st, 0);
+    int rc = sqlite3_prepare_v2(sj_db,
+        "SELECT COUNT(*) FROM r2_sensory_journal;", -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            count = (long)sqlite3_column_int64(st, 0);
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);

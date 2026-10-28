@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """R2's persistent virtual Game Boy console.
 
-This is the device layer, not an emulator. It delegates game execution to mGBA
-and stores only the inserted cartridge plus console/session state in gameboy.db.
+This is the device layer, not an emulator. It delegates game execution to mGBA.
+The cartridge slot lives in gameboy.db; console/session state and event history
+live in State/console_state.db. Older combined gameboy.db state is imported
+transactionally and retained in the source database for recovery.
 No emulator save-state or rewind commands are exposed by this interface.
 """
 from __future__ import annotations
@@ -55,14 +57,130 @@ def ensure_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
+def _table_columns(db: sqlite3.Connection, schema: str, table: str) -> list[str]:
+    # Schema/table names are fixed internal identifiers, never user input.
+    return [str(row["name"]) for row in
+            db.execute(f'PRAGMA {schema}.table_info("{table}")').fetchall()]
+
+
+def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
+    """Import old state tables from gameboy.db without deleting source data.
+
+    Earlier releases kept cartridge, console state, inventory, and event history
+    together in gameboy.db. Current releases split state into State/console_state.db.
+    This additive import is idempotent and transactional; the original tables are
+    deliberately retained in the old database as a recovery copy.
+    """
+    migration_key = f"split_legacy_gameboy_db_v1:{DB_PATH.resolve()}"
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS console_migrations ("
+        "migration_key TEXT PRIMARY KEY, completed_at TEXT NOT NULL)"
+    )
+    if db.execute(
+        "SELECT 1 FROM console_migrations WHERE migration_key=?", (migration_key,)
+    ).fetchone():
+        return
+
+    legacy_tables = {
+        table for table in ("console_state", "console_events", "cartridge_inventory")
+        if db.execute(
+            "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    }
+    # A fresh cartridge-only DB must not be marked as migrated; an older combined
+    # DB may be restored into this path later and still needs its one-time import.
+    if not legacy_tables:
+        return
+
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for table in ("console_state", "cartridge_inventory"):
+            exists = db.execute(
+                "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                continue
+            source_columns = set(_table_columns(db, "cartridge", table))
+            target_columns = _table_columns(db, "main", table)
+            common = [name for name in target_columns if name in source_columns]
+            if not common:
+                continue
+            quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in common)
+            db.execute(
+                f'INSERT OR IGNORE INTO main."{table}" ({quoted}) '
+                f'SELECT {quoted} FROM cartridge."{table}"'
+            )
+
+        table = "console_events"
+        exists = db.execute(
+            "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if exists:
+            source_columns = _table_columns(db, "cartridge", table)
+            target_columns = _table_columns(db, "main", table)
+            common = [name for name in target_columns
+                      if name in source_columns and name != "id"]
+            if all(name in source_columns and name in target_columns
+                   for name in ("timestamp", "context", "event_type", "summary")):
+                source_rows = db.execute(
+                    'SELECT * FROM cartridge."console_events" ORDER BY id'
+                ).fetchall()
+                for row in source_rows:
+                    source_id = row["id"] if "id" in source_columns else None
+                    if source_id is not None:
+                        existing = db.execute(
+                            "SELECT * FROM main.console_events WHERE id=?", (source_id,)
+                        ).fetchone()
+                        if existing is not None:
+                            same = all(existing[name] == row[name] for name in common)
+                            if same:
+                                continue
+                            # Preserve both histories if the old ID collides with
+                            # a different event already recorded in the new DB.
+                            columns = common
+                            values = [row[name] for name in columns]
+                            quoted = ", ".join('"' + name.replace('"', '""') + '"'
+                                               for name in columns)
+                            placeholders = ", ".join("?" for _ in columns)
+                            db.execute(
+                                f'INSERT INTO main.console_events ({quoted}) '
+                                f'VALUES ({placeholders})', values
+                            )
+                            continue
+                        columns = ["id"] + common
+                        values = [source_id] + [row[name] for name in common]
+                    else:
+                        columns = common
+                        values = [row[name] for name in common]
+                    quoted = ", ".join('"' + name.replace('"', '""') + '"'
+                                       for name in columns)
+                    placeholders = ", ".join("?" for _ in columns)
+                    db.execute(
+                        f'INSERT INTO main.console_events ({quoted}) VALUES ({placeholders})',
+                        values,
+                    )
+
+        db.execute(
+            "INSERT INTO console_migrations(migration_key, completed_at) VALUES(?,?)",
+            (migration_key, utc_now()),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def connect() -> sqlite3.Connection:
     ensure_dirs()
     db = sqlite3.connect(STATE_DB_PATH, timeout=5.0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA journal_mode=WAL")
-    # gameboy.db is intentionally only the cartridge slot. Runtime/power state
-    # and the event history live in State/console_state.db instead.
+    # gameboy.db may be an older combined database. Its legacy state tables are
+    # imported transactionally below; the original tables remain untouched.
     db.execute("ATTACH DATABASE ? AS cartridge", (str(DB_PATH),))
     db.executescript("""
         CREATE TABLE IF NOT EXISTS cartridge.cartridge_slot (
@@ -81,7 +199,6 @@ def connect() -> sqlite3.Connection:
             game_started_at TEXT,
             session_id TEXT
         );
-        INSERT OR IGNORE INTO console_state(id, power_state) VALUES (1, 'off');
         CREATE TABLE IF NOT EXISTS console_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -155,6 +272,10 @@ def connect() -> sqlite3.Connection:
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE console_events ADD COLUMN {name} {declaration}")
+    # Import old combined-database state before creating a default state row.
+    # If State/console_state.db already has a real row, INSERT OR IGNORE preserves it.
+    _migrate_legacy_combined_database(db)
+    db.execute("INSERT OR IGNORE INTO console_state(id, power_state) VALUES (1, 'off')")
     db.commit()
     return db
 

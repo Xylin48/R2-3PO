@@ -16,10 +16,32 @@ end = core.index("int r2_ears_start(void)", start)
 bridge = core[start:end]
 
 assert "r2_ears_read(ears, pcm, wanted)" in bridge
+assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in bridge
+capture_start = core.index("static void *r2_ears_capture_worker(void *unused)")
+capture_end = core.index("static int r2_ears_write_recent_audio(", capture_start)
+capture_worker = core[capture_start:capture_end]
+assert "r2_ears_read(ears, pcm, sizeof(pcm))" in capture_worker
+assert "ears_recent_audio" in capture_worker
+assert "ears_recent_total_bytes += count" in capture_worker
+assert "No transcription or semantic interpretation is performed by the capture worker." in core
+assert "pthread_create(&ears_capture_thread, NULL," in core and "r2_ears_capture_worker, NULL)" in core
+assert "pthread_join(ears_capture_thread, NULL)" in core
 assert "r2_wav_write_wav_header" not in bridge
 assert "r2_ears_write_wav_header(wav, total_bytes)" in bridge
 assert '"R2_WHISPER_MODEL"' in bridge and '"R2_WHISPER_CLI"' in bridge
-assert 'execlp(cli, cli, "-m", model, "-f", wav_path' in bridge
+assert 'execlp(cli, cli, "-m", model, "-f", whisper_path' in bridge
+assert 'r2_ears_write_whisper_wav(whisper_input,' in bridge
+assert '"%s/whisper.wav"' in bridge
+assert "if (!normalized_ok)" in bridge
+assert "unlink(whisper_path)" in bridge
+convert = core[core.index("static int r2_ears_write_whisper_wav("):
+               core.index("char *r2_ears_listen_cancelable(unsigned seconds,")]
+assert "16000U" in convert and "32000U" in convert
+assert "const uint32_t normalized_bytes = raw_pcm_bytes / 6U;" in convert
+assert "fread(input, 12U, count, raw)" in convert
+assert "fwrite(output, 2U, count, normalized)" in convert
+assert 'source_rate != 48000U' in convert
+assert "r2_wav_put_u32(target_header + 24, 16000U)" in convert
 assert "system(" not in bridge and "popen(" not in bridge
 assert "seconds < 1U || seconds > 15U" in bridge
 assert "O_EXCL | O_CLOEXEC, 0600" in bridge

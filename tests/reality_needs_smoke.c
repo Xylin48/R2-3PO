@@ -1127,6 +1127,124 @@ int main(void)
         fail("could not remove transaction rollback test trigger");
     sqlite3_close(db);
 
+    /* A rating must roll back its experience and aggregate preference if
+       any ingredient-preference write fails later in the same transaction. */
+    if (r2_reality_eat("burger", -1.0) != 0)
+        fail("could not create a food experience for the rating transaction test");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not open Reality DB for food-rating rollback trigger");
+    if (sqlite3_exec(db,
+        "UPDATE r2_food_experiences SET ingredients='historical-only-ingredient' "
+        "WHERE id=(SELECT id FROM r2_food_experiences "
+        "WHERE food_name='burger' AND satisfaction IS NULL ORDER BY eaten_at DESC LIMIT 1)",
+        NULL, NULL, NULL) != SQLITE_OK || sqlite3_changes(db) != 1)
+        fail("could not set historical ingredients for rating regression");
+    if (sqlite3_exec(db,
+        "CREATE TRIGGER smoke_fail_food_rating_ingredient "
+        "BEFORE INSERT ON r2_food_ingredient_preferences "
+        "WHEN NEW.ingredient='historical-only-ingredient' "
+        "BEGIN SELECT RAISE(ABORT,'intentional food-rating rollback test'); END",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not install food-rating rollback trigger");
+    sqlite3_close(db);
+
+    if (r2_reality_rate_food("burger", 2, "transaction rollback regression") == 0)
+        fail("injected ingredient preference failure must reject the whole food rating");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB after food-rating rollback");
+    if (sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM r2_food_experiences "
+        "WHERE food_name='burger' AND satisfaction IS NULL",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query food experience after rating rollback");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 1)
+        fail("failed food rating must leave the eating experience unrated");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT COUNT(*) FROM r2_food_preferences WHERE food_name='burger'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query aggregate preference after rating rollback");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 0)
+        fail("failed food rating must roll back its aggregate food preference");
+    sqlite3_finalize(st);
+    if (sqlite3_exec(db, "DROP TRIGGER smoke_fail_food_rating_ingredient",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not remove food-rating rollback trigger");
+    sqlite3_close(db);
+
+    /* After the injected failure is removed, the same experience must rate
+       successfully and update both aggregate and historical-ingredient data. */
+    if (r2_reality_rate_food("burger", 1, "successful rating regression") != 0)
+        fail("food rating did not succeed after the injected failure was removed");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB to verify successful food rating");
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction FROM r2_food_experiences "
+        "WHERE food_name='burger' ORDER BY eaten_at DESC LIMIT 1",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successfully rated food experience");
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int(st, 0) != 1)
+        fail("successful rating was not persisted on the eating experience");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction_sum,rating_count FROM r2_food_preferences WHERE food_name='burger'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successful aggregate food preference");
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_double(st, 0) != 1.0 ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("successful rating did not update aggregate food preference exactly once");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction_sum,rating_count FROM r2_food_ingredient_preferences "
+        "WHERE ingredient='historical-only-ingredient'",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query successful historical ingredient preference");
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_double(st, 0) != 1.0 ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("rating did not learn from the ingredients recorded at eating time");
+    sqlite3_finalize(st);
+
+    /* Two unrated experiences can share a second-resolution timestamp. The
+       highest ID is the most recently inserted and must receive the rating. */
+    if (sqlite3_exec(db,
+        "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) "
+        "VALUES('burger','tie-older-ingredient',100,10,42)",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not insert older tied-timestamp food experience");
+    sqlite3_int64 older_tied_id = sqlite3_last_insert_rowid(db);
+    if (sqlite3_exec(db,
+        "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) "
+        "VALUES('burger','tie-newer-ingredient',100,10,42)",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not insert newer tied-timestamp food experience");
+    sqlite3_int64 newer_tied_id = sqlite3_last_insert_rowid(db);
+    sqlite3_close(db);
+    if (r2_reality_rate_food("burger", -1, "same timestamp tie-breaker regression") != 0)
+        fail("could not rate the newest tied-timestamp food experience");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen Reality DB to verify tied-timestamp food rating");
+    if (sqlite3_prepare_v2(db,
+        "SELECT ingredients,satisfaction FROM r2_food_experiences WHERE id=?",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query newer tied-timestamp food experience");
+    sqlite3_bind_int64(st, 1, newer_tied_id);
+    if (sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "tie-newer-ingredient") != 0 ||
+        sqlite3_column_int(st, 1) != -1)
+        fail("rating did not select the newest experience when timestamps tied");
+    sqlite3_finalize(st);
+    if (sqlite3_prepare_v2(db,
+        "SELECT satisfaction FROM r2_food_experiences WHERE id=?",
+        -1, &st, NULL) != SQLITE_OK)
+        fail("could not query older tied-timestamp food experience");
+    sqlite3_bind_int64(st, 1, older_tied_id);
+    if (sqlite3_step(st) != SQLITE_ROW || sqlite3_column_type(st, 0) != SQLITE_NULL)
+        fail("rating incorrectly selected the older experience when timestamps tied");
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+
     if (r2_reality_remove_item("burger") != 0) fail("could not remove remaining regression-test food");
     if (r2_reality_remove_item("zero_fullness") != 0) fail("could not remove zero-fullness regression item");
     if (r2_reality_remove_item("unlisted_food") != 0) fail("could not remove unlisted-object regression item");
@@ -1217,6 +1335,80 @@ int main(void)
     if (hunger < 23.4 || hunger > 23.6) fail("hunger should persist across restart");
     if (satisfaction < 76.9 || satisfaction > 77.1) fail("satisfaction should persist across restart");
     if (since_meal < 122.0 || since_meal > 124.0) fail("elapsed time since meal should persist across restart");
+
+    /* A new receipt must first resolve an interrupted wallet/piggybank
+       transfer. Otherwise a later recovery can silently erase the receipt. */
+    {
+        char money_path[1024];
+        sqlite3 *money_db = NULL;
+        sqlite3_stmt *money_st = NULL;
+        snprintf(money_path, sizeof(money_path), "%s/r2_reality.db", R2_HOME);
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not open Reality DB for interrupted money-transfer test");
+        if (sqlite3_exec(money_db,
+            "DELETE FROM r2_money_transfer_journal;"
+            "INSERT INTO r2_money_transfer_journal("
+            "id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,operation,phase) "
+            "VALUES(1,1000,2000,500,2500,'deposit','pending')",
+            NULL, NULL, NULL) != SQLITE_OK)
+            fail("could not seed interrupted money-transfer journal");
+        sqlite3_close(money_db);
+
+        if (r2_reality_money_receive(1.00) != 0)
+            fail("cash receipt failed while recovering an interrupted transfer");
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not reopen Reality DB after money-transfer recovery");
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT cash_cents,bank_cents FROM r2_money_account WHERE id=1",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int64(money_st, 0) != 1100 ||
+            sqlite3_column_int64(money_st, 1) != 2000)
+            fail("cash receipt did not preserve the recovered pre-transfer balances");
+        sqlite3_finalize(money_st);
+        money_st = NULL;
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT COUNT(*) FROM r2_money_transfer_journal",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int(money_st, 0) != 0)
+            fail("cash receipt left an interrupted money-transfer journal unresolved");
+        sqlite3_finalize(money_st);
+        sqlite3_close(money_db);
+    }
+
+    /* Context generation must also recover an interrupted transfer before
+       presenting wallet balances as current reality. */
+    {
+        char money_path[1024];
+        char *money_context = NULL;
+        sqlite3 *money_db = NULL;
+        sqlite3_stmt *money_st = NULL;
+        snprintf(money_path, sizeof(money_path), "%s/r2_reality.db", R2_HOME);
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not open Reality DB for money-context recovery test");
+        if (sqlite3_exec(money_db,
+            "INSERT OR REPLACE INTO r2_money_transfer_journal("
+            "id,old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,operation,phase) "
+            "VALUES(1,1000,2000,500,2500,'deposit','pending')",
+            NULL, NULL, NULL) != SQLITE_OK)
+            fail("could not seed interrupted transfer for money-context recovery");
+        sqlite3_close(money_db);
+
+        money_context = r2_reality_money_context();
+        if (!money_context ||
+            !strstr(money_context, "carried cash=$10.00; piggybank=$20.00"))
+            fail("money context exposed balances before recovering the interrupted transfer");
+        free(money_context);
+
+        if (sqlite3_open(money_path, &money_db) != SQLITE_OK)
+            fail("could not reopen Reality DB after money-context recovery");
+        if (sqlite3_prepare_v2(money_db,
+            "SELECT COUNT(*) FROM r2_money_transfer_journal",
+            -1, &money_st, NULL) != SQLITE_OK || sqlite3_step(money_st) != SQLITE_ROW ||
+            sqlite3_column_int(money_st, 0) != 0)
+            fail("money-context generation left the interrupted transfer unresolved");
+        sqlite3_finalize(money_st);
+        sqlite3_close(money_db);
+    }
 
     /* At the 72-hour starvation marker, status must not still say only
        "very hungry" while the prolonged-starvation event is recorded. */

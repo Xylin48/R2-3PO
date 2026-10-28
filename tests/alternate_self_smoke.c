@@ -27,7 +27,26 @@ static int ensure_log_schema(void)
         "source TEXT);"
         "INSERT INTO r2_log_events(category,event_type,summary,details,source) "
         "SELECT 0,'test_evidence','Existing evidence','Fixture row','test' "
-        "WHERE NOT EXISTS (SELECT 1 FROM r2_log_events);";
+        "WHERE NOT EXISTS (SELECT 1 FROM r2_log_events);"
+        "CREATE TABLE IF NOT EXISTS r2_alternate_self_branches ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,scenario TEXT NOT NULL,"
+        "assumptions TEXT,predicted_outcome TEXT,conclusion TEXT,status TEXT NOT NULL,"
+        "evidence_event_id INTEGER,log_event_id INTEGER NOT NULL,"
+        "created_utc TEXT NOT NULL,updated_utc TEXT NOT NULL);"
+        "INSERT INTO r2_alternate_self_branches"
+        "(id,name,scenario,status,log_event_id,created_utc,updated_utc) "
+        "SELECT 1,'Legacy branch','Legacy scenario','active',id,"
+        "'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z' FROM r2_log_events "
+        "WHERE id=(SELECT MIN(id) FROM r2_log_events) "
+        "AND NOT EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=1);"
+        "INSERT INTO r2_alternate_self_branches"
+        "(id,name,scenario,status,log_event_id,created_utc,updated_utc) "
+        "SELECT 2,'Unlinked legacy branch','Legacy scenario without Life Log link','active',0,"
+        "'2020-01-02T00:00:00Z','2020-01-02T00:00:00Z' "
+        "WHERE NOT EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=2);"
+        "CREATE TABLE IF NOT EXISTS r2_alternate_self_event_links ("
+        "branch_id INTEGER NOT NULL,event_id INTEGER NOT NULL,relation TEXT NOT NULL,"
+        "details TEXT,created_utc TEXT NOT NULL,PRIMARY KEY(branch_id,event_id,relation));";
     char *error = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &error);
     if (rc != SQLITE_OK)
@@ -129,10 +148,34 @@ int main(void)
     if (!check(evidence_id > 0, "fixture evidence ID exists")) goto done;
     if (!check(r2_altself_init() == 0, "initialize Alternate-Self Lab schema")) goto done;
 
+    sqlite3 *link_check = NULL;
+    sqlite3_stmt *link_stmt = NULL;
+    int restored_link = 0;
+    if (sqlite3_open(database, &link_check) == SQLITE_OK &&
+        sqlite3_prepare_v2(link_check,
+            "SELECT b.log_event_id>0 AND e.id IS NOT NULL "
+            "AND e.event_type='alternate_self_legacy_link_restored' "
+            "FROM r2_alternate_self_branches b "
+            "LEFT JOIN r2_log_events e ON e.id=b.log_event_id WHERE b.id=2;",
+            -1, &link_stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(link_stmt) == SQLITE_ROW)
+        restored_link = sqlite3_column_int(link_stmt, 0);
+    if (link_stmt) sqlite3_finalize(link_stmt);
+    if (link_check) sqlite3_close(link_check);
+    if (!check(restored_link, "backfill orphaned legacy branch into the shared Life Log")) goto done;
+
+    view = r2_altself_show(1);
+    if (!check(view && strstr(view, "Legacy branch") && strstr(view, "Legacy scenario"),
+               "preserve legacy Alternate-Self branch through additive migration")) goto done;
+    free(view); view = NULL;
+
     first = r2_altself_create("Look left", "What if I looked left?",
                               "I have not looked yet.", "I might see an object.",
                               "This is only a prediction.", evidence_id);
     if (!check(first > 0, "create a hypothetical branch with evidence")) goto done;
+    if (!check(r2_altself_link_event(first, evidence_id, "legacy_link_test",
+                               "write to legacy link schema") == 0,
+               "write link when legacy created_utc is NOT NULL without a default")) goto done;
     second = r2_altself_create("Look right", "What if I looked right?",
                                "I have not looked yet.", "I might see something else.",
                                "Compare only after actual observation.", evidence_id);

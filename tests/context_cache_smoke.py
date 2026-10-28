@@ -22,7 +22,7 @@ for token, message in (
     ("context_cache_invalidate();", "writes invalidate cached evidence"),
     ("context_cache_store(associative_query, memory_limit, memory_context)", "memory results are cached under the exact semantic query and selected limit"),
     ("context_cache_get(associative_query, memory_limit)", "the conversation path reuses only results for the exact semantic retrieval query"),
-    ("char *visual_context = NULL;", "live visual context is still assembled separately on each turn"),
+    ("r2_vision_current_frame_base64()", "raw live visual input is captured and encoded separately for the active brain turn"),
     ("char *context = r2_reality_context();", "Reality remains refreshed rather than served from historical cache"),
     ("prompt_tokens=%lld prompt_s=%.3f", "inference logs include prompt processing metrics"),
     ("generated_tokens=%lld generation_s=%.3f tok_s=%.2f", "inference logs include generated tokens and measured generation rate"),

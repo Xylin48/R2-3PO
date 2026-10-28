@@ -229,3 +229,177 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Fix:** Removed the deterministic feed function and its API, removed fallback calls from all controller failure paths, and made failures log and leave the modeled world unchanged. Kept authoritative inventory checks, food-metric validation, transaction rollback, and conversation-turn coordination.
 - **Regression coverage:** Replaced the old safeguard source test with `tests/autonomous_needs_controller_smoke.py`; removed automatic-feed expectations from `tests/reality_needs_smoke.c`; updated conversation recovery/context integration contracts and CI workflow wiring.
 - **Validation:** exact head `78f97471831f1fd9743cb25703ae6a4568eb3d6f` passed [workflow 39357732761](https://github.com/Xylin48/R2-3PO/actions/runs/39357732761), 91/91 steps. Live autonomous decisions still require target-host testing.
+
+## Audit batch: 2026-10-27 — checked SQLite mutation paths
+
+### R2-AUD-2026-10-27-001 — fridge decrement ignored parameter-binding failures
+
+- **Area:** `Reality.c`, `fridge_change_one()`.
+- **Severity:** High / inventory integrity.
+- **Finding:** The fridge item lookup and subsequent DELETE/UPDATE ignored `bind_text()` results. A failed binding could make the operation act on an unintended/unmatched row or report a generic failure without preserving the exact SQL result. The mutation also treated `SQLITE_DONE` as sufficient without confirming exactly one row changed.
+- **Fix:** Check the lookup bind before stepping; check the mutation bind before stepping; and require exactly one affected row before reporting success.
+- **Regression coverage:** `tests/fridge_context_smoke.py` now asserts the production function checks both bindings and validates the affected-row count.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps). This is source-level/CI validation, not a live database test on the target PC.
+
+### R2-AUD-2026-10-27-002 — Reality metric updates ignored SQLite bind failures
+
+- **Area:** `Reality.c`, `update_hunger_locked()` and `r2_reality_sleep()`.
+- **Severity:** High / modeled state and persistence integrity.
+- **Finding:** Hunger/satiety/sleepiness/energy updates, elapsed-world-time persistence, and sleep recovery stepped prepared statements without checking every bind result. This could permit an incomplete update to proceed rather than propagating the database failure.
+- **Fix:** Chain each bind through the SQLite result code, execute only after all binds succeed, and validate that the singleton Reality row or metadata row was actually updated where applicable.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks the production hunger/time and sleep paths for checked bindings.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps). Source assertions supplement the runtime Reality regression; target-host persistence/restart acceptance remains outstanding.
+
+### Current workload checkpoint
+
+- **Working branch:** `work/r2-priority-fixes-from-audit-2026-10-25`.
+- **Validation PR:** [#177](https://github.com/Xylin48/R2-3PO/pull/177), draft and unmerged, targeting the isolated integration-validation branch.
+- **Main branch:** untouched.
+- **Next audit pass:** continue the line-by-line review of SQLite error propagation and transaction boundaries across Reality, rewards, persistent memory/diary, and conversation handling. Review the full exact-head workflow and fix any newly confirmed regressions before closing findings.
+- **Release boundary:** CI cannot verify live Qwen response quality, GTX 1050 Ti allocation, or actual database/device state on the target PC.
+
+### R2-AUD-2026-10-27-003 — unchecked bindings across Reality tick and TV device persistence
+
+- **Area:** `Reality.c`, persistent-time catch-up, normal tick/quantity-decay updates, TV signal lookup, and TV device registration.
+- **Severity:** High / world-state consistency.
+- **Finding:** Several prepared statements ignored SQLite binding results and still executed. A failed bind could make the operation report a result based on incomplete parameters.
+- **Fix:** Propagate each bind result and execute the statement only when all required bindings succeed. Existing transaction rollback and affected-row checks remain in place.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks Reality tick and TV-device binding paths. Existing Reality behavior tests exercise normal tick/state persistence.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps); target-host behavior remains unverified.
+
+### R2-AUD-2026-10-27-004 — unchecked bindings in Life Log, memory, and reward lookups/writes
+
+- **Area:** `Log.c` event deduplication, milestone insertion, activity session start/end, location transitions, and system snapshots; `r2.c` persistent memory timestamp update and Game Boy event deduplication; `Reward.c` active modifier lookup.
+- **Severity:** High / persistence and duplicate-event integrity.
+- **Finding:** Several writes and lookups stepped prepared statements after unchecked bindings. In particular, incomplete activity/location/system snapshot writes could be treated as successful, while a memory or Game Boy lookup could use incomplete query parameters.
+- **Fix:** Chain each bind through the SQLite result code, step only after all required bindings succeed, and preserve existing write-success/affected-row checks.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now asserts the updated memory, reward, and Life Log paths. Existing migration and integration tests exercise real writes against SQLite.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps).
+
+### Database backward-compatibility audit checkpoint
+
+The repository has targeted legacy-schema tests for the shared memory/Life Log database, Reality/fridge inventory, rewards, addictions, Visual Experience Library, and Game Boy's cartridge/state databases. The Game Boy regression now covers migration from the old combined `gameboy.db` layout into `State/console_state.db`, including ID collisions, preservation of both event histories, retained source data, and new writes. Sensory Journal and Alternate-Self use tables within the shared `r2_memory.db`; their additive migration paths were source-reviewed and their normal persistence paths are exercised by the suite, but dedicated old-column fixtures for those individual tables remain a possible coverage improvement. The full CI workflow passed 92/92 steps on code revision `7b9309d1`. This establishes repository-level compatibility for the exercised schemas, not a claim that the user's on-disk databases have been inspected or that target-host migration has run.
+
+### R2-AUD-2026-10-28-005 — legacy Game Boy state could be stranded in the old combined database
+
+- **Area:** `GameBoyAdvance.py`, `gameboy.db` and `State/console_state.db`.
+- **Severity:** High / device-state continuity.
+- **Finding:** Current code stores cartridge state in `gameboy.db` and console/session state in `State/console_state.db`, but the repository's own module documentation described the earlier combined layout. Without an import, old console state, event history, and cartridge inventory tables in `gameboy.db` could be left unread by the new runtime.
+- **Fix:** Add a transactional, idempotent, additive import for legacy `console_state`, `console_events`, and `cartridge_inventory` tables from the attached legacy database. Preserve an existing state DB's row when IDs conflict, retain both event histories if event IDs conflict, keep the original source tables intact, and only mark the migration when legacy tables actually exist.
+- **Regression coverage:** Added `tests/gameboy_legacy_schema_smoke.py` and wired it into CI. It exercises old schemas in both files, preserves existing rows, verifies post-migration writes and SQLite integrity, confirms the source data remains readable, and checks that a fresh install is not prematurely marked migrated.
+- **Validation status:** The new exact-head CI run must pass before this migration is considered verified. No live hardware or mGBA session was available for this repository-side audit.
+
+
+### Validation result: 2026-10-28
+
+- **Exact code revision tested:** `7b9309d1b83cf5703408cedcaa723b98ac70328f`.
+- **GitHub Actions:** [run 40629395737](https://github.com/Xylin48/R2-3PO/actions/runs/40629395737) — passed, 92/92 steps.
+- **What this proves:** strict build and the configured regression suite, including the primary legacy-schema tests and the new Game Boy split-database migration test.
+- **What this does not prove:** live Qwen/Ollama response quality on the target PC, actual GTX 1050 Ti behavior, or the integrity/schema of the user's real database files. Those require target-host checks and a read-only database audit before any migration is applied to user data.
+
+### R2-AUD-2026-10-28-006 — Alternate-Self writes assumed timestamp defaults in older schemas
+
+- **Area:** `AlternateSelf.c`, `r2_alternate_self_branches` and `r2_alternate_self_event_links`.
+- **Severity:** High / persistent hypothetical-history continuity.
+- **Finding:** Branch and link inserts relied on `created_utc` defaults. An older table can have the timestamp columns declared `NOT NULL` without a default, causing writes to fail after additive migration.
+- **Fix:** Branch creation and hypothesis import now explicitly supply `CURRENT_TIMESTAMP` for `created_utc` and `updated_utc`; event-link insertion explicitly supplies `created_utc`.
+- **Regression coverage:** `tests/alternate_self_smoke.c` now starts with a legacy branch table and legacy link table whose timestamp columns have no defaults, verifies the old branch remains readable, and exercises new branch/link/import writes.
+- **Validation:** Passed the full repository CI workflow on code revision `5e0e5018` (92/92 steps).
+
+### R2-AUD-2026-10-28-007 — Sensory Journal writes could be ignored by legacy timestamp constraints
+
+- **Area:** `SensoryJournal.c`, journal indexing and diary-link backfill/runtime writes.
+- **Severity:** High / sensory-history continuity.
+- **Finding:** Backfill and runtime inserts omitted `indexed_utc` or `linked_utc`. If an older table already had either column as `NOT NULL` without a default, `INSERT OR IGNORE` could silently skip the row.
+- **Fix:** All backfill and runtime index/link inserts now provide `CURRENT_TIMESTAMP` explicitly, independent of schema defaults.
+- **Regression coverage:** `tests/sensory_journal_search_smoke.c` now exercises pre-existing legacy timestamp columns without defaults, backfills a prior diary event, verifies non-empty timestamps, and checks that new diary events remain indexed and linked after restart.
+- **Validation:** Passed the full repository CI workflow on code revision `5e0e5018` (92/92 steps).
+
+### Latest code validation checkpoint
+
+- **Exact tested code revision:** `5e0e5018aedcd624c2284366198df35cc96920d2`.
+- **GitHub Actions:** [run 40630710375](https://github.com/Xylin48/R2-3PO/actions/runs/40630710375) — passed, 92/92 steps.
+- **Repository-level status:** All configured strict build/regression steps pass, including the primary legacy database tests, Game Boy split-database import, Alternate-Self legacy timestamp constraints, and Sensory Journal legacy timestamp constraints.
+- **Outstanding acceptance boundary:** The user's actual `R2_Home` databases have not been opened or audited in this session, and live Qwen/Ollama/GPU behavior has not been exercised on the target PC. Run the existing read-only preflight against the actual data directory before any on-disk migration or live acceptance.
+
+
+### R2-AUD-2026-10-28-008 — Visual observation blocked capture during Qwen inference
+
+- **Area:** `r2.c` visual watcher and the existing `Eyes.c` frame stream.
+- **Finding:** the observer captured and analyzed on one worker while holding the capture lock across Qwen inference, then waited an additional fixed interval before sampling again. Slow inference could stall the FFmpeg pipe and make the next analyzed frame stale; the nominal 15-second loop was sparse sampling rather than continuous frame acquisition.
+- **Fix:** split continuous Eyes capture from Qwen analysis. The capture worker keeps draining the live stream and publishes the newest frame snapshot; the analysis worker receives an owned copy outside the capture lock and analyzes successive fresh frames at the model's actual processing rate. Explicit one-frame vision requests also copy the frame and release the capture lock before inference. Each observation includes the previous successful description from the same source so frame-to-frame changes have explicit context; changing or restarting a source resets that comparison context. A failed snapshot is reported rather than silently treated as a successful observation. Shutdown joins both workers and releases the retained frame buffer.
+- **Regression coverage:** added `tests/vision_watch_continuous_feed_smoke.py` to verify independent capture/analysis workers, latest-frame handoff, sequential context, source-restart reset, unlocked explicit inference, and joined shutdown. Full workflow run [40651201828](https://github.com/Xylin48/R2-3PO/actions/runs/40651201828) passed all 93/93 steps on code commit `6bb344744b7fe67e48cfd0f8929110259617c636`, including the strict production build and the new regression.
+- **Scope:** the image-only Qwen model still receives individual images, not a native video tensor. Continuous acquisition plus successive frame analysis is the implemented bridge; model throughput determines observation cadence, and no claim is made that every raw source frame is individually inferred. Target-host video playback and live Qwen inference remain unverified.
+
+
+## Audit batch: 2026-10-28 — autonomous sensory input and database relationships
+
+### R2-AUD-2026-10-28-009 — Continuous Eyes input automatically interpreted every sampled frame
+
+- **Area:** `r2.c`, `Visual.c`, Ollama message serialization, Watch coordinator.
+- **Finding:** the continuous Eyes capture worker fed successive frames to a vision-analysis worker that generated descriptions and persisted interpretations without a brain-selected reason to inspect the scene. That conflated receiving sensory input with attention and analysis.
+- **Fix:** continuous capture now maintains an owned latest-frame snapshot. The raw JPEG/base64 image is attached to the active user message through Ollama's `images` field when Eyes is open. The conversation brain receives the image directly and decides what to attend to; the capture worker no longer calls the vision model or creates automatic descriptions. Explicit `vision see` remains the deliberate inspection path. Explicit visual questions may open Eyes; ordinary turns do not silently open a camera. A source is closed if continuous capture cannot start.
+- **Regression coverage:** `tests/vision_watch_continuous_feed_smoke.py`, `tests/vision_watch_cancellation_smoke.py`, and `tests/qwen35_model_smoke.py` cover raw-frame handoff, deliberate-only interpretation, and lifecycle. The latest full CI result is pending; this entry does not claim runtime hardware acceptance.
+
+### R2-AUD-2026-10-28-010 — Ears and Watch automatically transcribed incoming sound
+
+- **Area:** `r2.c`, `shell.c`, `docs/local-speech-input.md`.
+- **Finding:** Watch repeatedly captured bounded microphone chunks, transcribed them automatically, and injected transcripts as chat turns. That made reception itself trigger interpretation and conversation.
+- **Fix:** explicit Ears start now continuously receives raw 48 kHz stereo PCM into a 16-second in-memory rolling buffer. The capture worker does not transcribe or classify sound. A deliberate `ears listen` request records the next requested 1–15-second interval from the live buffer and passes it to the existing local Whisper bridge; if continuous capture is not active, the existing direct capture path remains available. Watch now coordinates raw audio capture and an already-open Eyes source without automatically transcribing or creating chat turns.
+- **Brain-selected attention:** conversation and autonomous reflection can deliberately emit `[EARS_LISTEN] recent|seconds` to inspect already-buffered sound or `[EARS_LISTEN] live|seconds` to listen to the next interval. The actual result is returned to the brain for interpretation; the tool refuses to overwrite an already-open non-continuous audio source, and autonomous listening yields when foreground conversation takes priority.
+- **Limit:** Qwen 3.5 9B does not accept raw audio, and the current Whisper bridge recognizes speech rather than classifying non-speech environmental sounds. The sensory input path is separated from automatic interpretation, but semantic sound recognition is not claimed as implemented.
+- **Regression coverage:** `tests/ears_speech_bridge_smoke.py`, `tests/watch_coordinator_lifecycle_smoke.py`, and `tests/vision_watch_continuous_feed_smoke.py`. Live microphone and cancellation behavior still require target-host testing.
+
+### R2-AUD-2026-10-28-011 — Database audit did not inspect foreign-key or cross-organ reference integrity
+
+- **Area:** `tools/audit_r2_databases.py` and `tests/database_connection_audit_smoke.py`.
+- **Finding:** the prior read-only audit reported SQLite `integrity_check`, table inventories, and selected legacy rows, but it did not report `foreign_key_check` results or dangling references between separate reward and memory databases.
+- **Fix:** the audit now reports SQLite foreign-key violations and checks the known Life Log, diary, sensory journal, visual library, Alternate-Self, and reward-to-Life-Log references without writing to the source databases. Missing legacy tables/columns are reported as checks not run; actual orphaned references and FK violations are failures. Added a fixture test proving it detects an orphaned reward-to-Life-Log reference and an in-file foreign-key violation while preserving source rows.
+- **Limit:** this is a read-only audit implementation and fixture regression. The user's actual `/home/x/R2_Home/R2` database files have not been accessed in this session; run the audit against that installation to determine whether its existing data needs repair. No live database was migrated or modified by this workload.
+
+
+### R2-AUD-2026-10-28-012 — Legacy Alternate-Self branches could be disconnected from the Life Log
+
+- **Area:** `AlternateSelf.c`, shared `r2_memory.db`, database relationship audit.
+- **Finding:** the additive migration adds `log_event_id INTEGER NOT NULL DEFAULT 0` to older Alternate-Self branch tables. That makes the old table writable, but leaves pre-existing branches pointing at event ID zero, which is not a real Life Log event. The old hypothetical itself survives while its required event relationship does not.
+- **Fix:** Alternate-Self initialization now finds branches whose Life Log link is missing, nonpositive, or dangling. It creates (or reuses, if a prior interrupted migration already created it) a dedicated Life Log migration event and updates the branch link before the organ reports initialized. It preserves the existing branch name, scenario, assumptions, prediction, conclusion, and status. If it cannot restore the required link, initialization fails rather than exposing an incorrectly linked branch.
+- **Regression coverage:** `tests/alternate_self_smoke.c` now seeds an unlinked legacy branch and verifies that initialization restores its Life Log relationship. The read-only database audit reports orphaned relationships across the shared memory database and the reward ledger.
+- **Scope:** this migration runs only when R2 initializes its database. The user's installed database has not been accessed here, so the audit output from that machine is still needed to identify any historical orphaned rows outside this known schema migration.
+
+
+### R2-AUD-2026-10-28-013 — Legacy Life Log organ records could retain default-zero event references
+
+- **Area:** `Log.c`, shared `r2_memory.db`, read-only database relationship audit.
+- **Finding:** the additive migration adds event-link columns to older Life Log organ tables with `DEFAULT 0`. If those tables already contained rows, the new columns could remain pointed at nonexistent event ID zero. Older `r2_log_links` schemas could also retain their original `event_id` and `related_event_id` endpoints while the new `from_event_id` and `to_event_id` columns stayed zero.
+- **Fix:** the migration now maps the old link endpoint names when they exist, then restores missing event links for legacy activity sessions, milestones, conversations, inner states, beliefs, continuity items, hypotheticals, and system snapshots. Each repair creates or reuses a Life Log migration event, preserves the original organ record, and updates its required event reference. Required relationships are validated before Life Log initialization succeeds; unmappable old log-link endpoints are not silently accepted.
+- **Regression coverage:** `tests/life_log_legacy_schema_smoke.c` now seeds legacy versions of all eight linked record types plus old-style `r2_log_links` endpoints and verifies that their links resolve after initialization. `tools/audit_r2_databases.py` also reports foreign-key violations and dangling references across the Life Log, diary, sensory journal, visual library, Alternate-Self, and reward ledger.
+- **Limit:** fixture tests exercise legacy schemas and migration logic. The user's actual databases remain uninspected until the read-only audit is run against `/home/x/R2_Home/R2`.
+
+
+### R2-AUD-2026-10-28-014 — Camera snapshots and voluntary media attention were not fully integrated
+
+- **Area:** `r2.c`, `r2.h`, primary Eyes camera, auxiliary media display, conversation Ollama payload, autonomous reflection.
+- **Finding:** deliberate camera observation could independently consume frames from the FFmpeg camera pipe while the continuous Eyes worker owned that same stream. It could also fail before the worker's first published frame; direct conversation serialization could return a stale image after capture finished. The display received continuously captured frames, but R2 had no sustained voluntary choice to watch it across model turns.
+- **Fix:** deliberate camera observation and active conversation now copy the same owned current-frame snapshot, waiting for the first published frame and rejecting the terminated worker's last stale snapshot. `[MEDIA_FOCUS] watch` and `[MEDIA_FOCUS] away` let the conversation and reflection model choose or release sustained display attention; that choice never starts playback, replaces camera Eyes, or triggers image interpretation from raw capture. When R2 has chosen to watch an available display and has a live camera image, the Ollama message contains the camera image first and the independent display frame second. The focus state is cleared if the selected display source stops or is replaced rather than silently following a different display.
+- **Regression coverage:** `tests/camera_media_attention_contract_smoke.py`, `tests/vision_watch_continuous_feed_smoke.py`, `tests/media_focus_bridge_smoke.py`, and compiled `tests/media_focus_payload_runtime.c`.
+- **Limit:** a current frame delivered to a model turn is not equivalent to consuming every frame of a video or possessing temporal awareness of a whole movie. Real Qwen model acceptance of a two-image turn on the installed 4 GiB GTX 1050 Ti remains a target-machine check, not proven by JSON/regression tests.
+
+### R2-AUD-2026-10-28-015 — Sensory Journal could guess the wrong diary identity from duplicated prose
+
+- **Area:** `SensoryJournal.c`, `SensoryJournal.h`, `r2_diary.c`, the shared `r2_memory.db`.
+- **Finding:** the Journal's `diary_entry_written` / `reflection_completed` link projections matched diary rows by `d.entry=e.details` and selected the newest identical text. Two legitimate entries with identical prose could therefore be linked to the wrong diary row. Meanwhile newer diary entries already had an exact durable `r2_diary_entry_links(diary_entry_id,log_event_id)` relationship, but their `diary_entry_linked` Life Log events were not projected into the Journal by that authoritative ID relationship.
+- **Fix:** new diary linkage is projected by the exact committed event ID and diary row ID. Journal startup reconciles preexisting authoritative diary links; active diary writes invoke `r2_sj_link_diary_event` once the diary's durable ID relationship is committed. Legacy text links remain supported only if the text has exactly one candidate row. Ambiguous legacy text matches are displayed without a fabricated diary ID, including when a previous version already wrote a guessed association. Existing diary text and underlying Life Log rows remain untouched.
+- **Regression coverage:** existing `tests/sensory_journal_search_smoke.c`, isolated diary fixture, and compiled `tests/sensory_journal_diary_identity_runtime.c` with duplicated text, distinct IDs, live insertion, and restart reconstruction.
+- **Limit:** installed databases were not read here; tests use disposable local fixture databases. Full source/organ/database inspection and actual host-data acceptance are still required.
+
+### Deferred next workload, requested after completion of current sensory/database work
+
+Manually inspect every line in every tracked source file, not merely signatures, build results, or TODO searches. For each declared or introduced subsystem, trace actual execution and data flow from initialization through runtime, persistence, recovery, failure handling, and shutdown; finish incomplete paths rather than calling presence of a scaffold an implementation. Follow the interfaces among brain, Eyes, Ears, diary, Reality, Life Log, rewards, other organs, and all five existing databases, including backward-compatible historical records. Then audit process and model allocations, fixed output/input/context budgets, temporary buffers, truncations, and resource headroom so data and instructions are not silently shortened, while respecting actual hardware limits. Do not add autonomous-behavior safeguards or replace model choices with deterministic substitutes without asking the project owner. Do this **after** the current workload; neither this note nor green CI claims that exhaustive audit has already happened.
+
+### R2-AUD-2026-10-28-016 — Local Whisper transcription received an incompatible 48 kHz stereo WAV
+
+- **Area:** `r2.c` continuous Ears microphone/desktop buffers, explicit local speech-recognition bridge, `docs/local-speech-input.md`.
+- **Finding:** Ears correctly captures independent 48 kHz stereo 16-bit PCM, but `r2_ears_listen_cancelable` previously sent that 48 kHz stereo file directly to `whisper-cli`. whisper.cpp's sample WAV reader requires 16 kHz input. A valid RIFF header at the wrong rate cannot be relied on as a working local transcription bridge, even with a working microphone and installed Whisper model.
+- **Fix:** preserve both raw continuous Ears streams and histories. After an explicit 1–15 second listening action captures its full interval to a private WAV, convert **only the temporary clip** to 16 kHz mono 16-bit PCM in bounded chunks, with stereo averaging and a 3:1 downsample. Verify the original sample rate/channels/data size before conversion; reject an incomplete file rather than passing corrupted audio to Whisper. Invoke the configured local `whisper-cli` with the compatible file; cleanup removes both temporary WAV files and the transcript. This does not automatically transcribe, analyze, or change input capture.
+- **Regression:** `tests/ears_speech_bridge_smoke.py` asserts the converted file reaches the Whisper executable. Compiled `tests/ears_whisper_wav_runtime.c` checks sample rate, channels, bit depth, full clip duration, converted signal values, original capture preservation, and a truncated source.
+- **Limit:** even with the correctly normalized WAV, successful actual speech recognition still depends on `R2_WHISPER_MODEL`, the executable, the real PulseAudio/PipeWire devices, and available CPU/memory on the target installation.

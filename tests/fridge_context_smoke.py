@@ -23,6 +23,16 @@ if 'const char *guaranteed = "burger:' in reality:
 if '<food name=\\"burger\\" fullness=\\"100\\"' in reality:
     raise SystemExit("fresh Reality setup still seeds a hard-coded burger metric")
 
+change_start = reality.find("static int fridge_change_one(")
+change_end = reality.find("int r2_fridge_add_item(", change_start)
+change_one = reality[change_start:change_end] if change_start >= 0 and change_end > change_start else ""
+if (
+    "if (bind_text(st, 1, food) != 0)" not in change_one
+    or "rc = bind_text(st, 1, food) == 0 ? sqlite3_step(st) : SQLITE_ERROR;" not in change_one
+    or "sqlite3_changes(fridge_db) != 1" not in change_one
+):
+    raise SystemExit("fridge item decrement must check lookup/update bindings and confirm exactly one row changed")
+
 fridge_list_start = reality.find("char *r2_fridge_list(void)")
 fridge_list_end = reality.find("char *r2_fridge_context(void)", fridge_list_start)
 fridge_list = reality[fridge_list_start:fridge_list_end] if fridge_list_start >= 0 and fridge_list_end > fridge_list_start else ""

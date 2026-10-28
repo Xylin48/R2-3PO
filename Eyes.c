@@ -6,6 +6,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -97,6 +100,7 @@ struct R2Eyes
     uint64_t frame_count;
     uint64_t timestamp;
     uint64_t last_log_timestamp;
+    int auxiliary_display; /* No V-Webcam takeover: only real Eyes drives it. */
 
     R2VisionEvent event;
     R2VisionFrame frame;
@@ -737,6 +741,12 @@ static int r2_eyes_find_vlc_window(
     return 0;
 }
 
+int r2_eyes_vlc_available(void)
+{
+    unsigned long window_id = 0;
+    return r2_eyes_find_vlc_window(&window_id) == 0;
+}
+
 /*
  * Determine the current VLC window dimensions.
  *
@@ -831,6 +841,34 @@ static int r2_eyes_probe_vlc_dimensions(
  * Start an FFmpeg X11 capture attached specifically
  * to the VLC window.
  */
+/* Generic X11 input: connect a visible rendering window to the process
+ * that is actually producing desktop audio. Never infer image contents from
+ * the process name or synthesize descriptions before the brain attends. */
+unsigned long r2_eyes_window_for_pid(long pid)
+{
+    if (pid <= 1 || pid > INT_MAX) return 0;
+    char command[160];
+    int n = snprintf(command, sizeof(command),
+                     "xdotool search --onlyvisible --pid %ld 2>/dev/null", pid);
+    if (n < 0 || (size_t)n >= sizeof(command)) return 0;
+    FILE *pipe = popen(command, "r");
+    if (!pipe) return 0;
+    unsigned long best = 0, candidate = 0;
+    uint64_t best_area = 0;
+    while (fscanf(pipe, "%lu", &candidate) == 1) {
+        uint32_t width = 0, height = 0;
+        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height) != 0)
+            continue;
+        uint64_t area = (uint64_t)width * height;
+        if (area > best_area) {
+            best = candidate;
+            best_area = area;
+        }
+    }
+    (void)pclose(pipe);
+    return best;
+}
+
 static FILE *r2_eyes_start_vlc(
     unsigned long window_id)
 {
@@ -955,7 +993,7 @@ void r2_eyes_close(R2Eyes *eyes)
     }
 
     eyes->open = 0;
-    r2_vwebcam_write_status(eyes, 0);
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 0);
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_NONE;
     eyes->frame_count = 0;
@@ -987,13 +1025,18 @@ void r2_eyes_close(R2Eyes *eyes)
         eyes->frame_size;
 }
 
+void r2_eyes_set_auxiliary(R2Eyes *eyes, int auxiliary)
+{
+    if (eyes) eyes->auxiliary_display = auxiliary != 0;
+}
+
 void r2_eyes_shutdown(R2Eyes *eyes)
 {
     if (!eyes)
         return;
 
     r2_eyes_close(eyes);
-    r2_vwebcam_stop_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_stop_viewer();
 
     free(eyes->frame_buffer);
     eyes->frame_buffer = NULL;
@@ -1086,8 +1129,8 @@ static int r2_eyes_open_internal(
 
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
-    r2_vwebcam_start_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     char details[768];
     snprintf(details, sizeof(details),
@@ -1120,13 +1163,58 @@ int r2_eyes_open_file(
     );
 }
 
-int r2_eyes_open_camera(
-    R2Eyes *eyes)
+/* Find actual video-capture devices, rather than assuming /dev/video0.
+ * A single camera can expose multiple V4L2 nodes (e.g. capture + metadata).
+ * Query capabilities to avoid treating a metadata-only node as an eye. */
+static int r2_eyes_camera_path(char *out, size_t capacity)
 {
-    const char *device = getenv("R2_CAMERA_DEVICE");
-    if (!device || !*device)
-        device = "/dev/video0";
-    return r2_eyes_open_device(eyes, device);
+    const char *configured = getenv("R2_CAMERA_DEVICE");
+    glob_t candidates = {0};
+    if (!out || capacity == 0) return -1;
+    out[0] = '\0';
+    if (!configured || !*configured) {
+        if (glob("/dev/video*", 0, NULL, &candidates) != 0)
+            return -1;
+    }
+    size_t count = (configured && *configured) ? 1 : candidates.gl_pathc;
+    for (size_t i = 0; i < count; ++i) {
+        const char *path = (configured && *configured)
+            ? configured : candidates.gl_pathv[i];
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISCHR(st.st_mode))
+            continue;
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        struct v4l2_capability caps = {0};
+        int rc = ioctl(fd, VIDIOC_QUERYCAP, &caps);
+        close(fd);
+        if (rc != 0) continue;
+        uint32_t effective = (caps.capabilities & V4L2_CAP_DEVICE_CAPS)
+            ? caps.device_caps : caps.capabilities;
+        if (!(effective & (V4L2_CAP_VIDEO_CAPTURE |
+                           V4L2_CAP_VIDEO_CAPTURE_MPLANE)))
+            continue;
+        if (snprintf(out, capacity, "%s", path) >= (int)capacity)
+            break;
+        globfree(&candidates);
+        return 0;
+    }
+    globfree(&candidates);
+    return -1;
+}
+
+int r2_eyes_camera_available(void)
+{
+    char camera[512];
+    return r2_eyes_camera_path(camera, sizeof(camera)) == 0;
+}
+
+int r2_eyes_open_camera(R2Eyes *eyes)
+{
+    char camera[512];
+    if (r2_eyes_camera_path(camera, sizeof(camera)) != 0)
+        return -1;
+    return r2_eyes_open_device(eyes, camera);
 }
 
 int r2_eyes_open_device(
@@ -1180,6 +1268,46 @@ int r2_eyes_open_source(
 /* ============================================================
    VLC SOURCE
    ============================================================ */
+
+/* A video producer can publish its real X11 rendering window, regardless
+ * of which UI framework hosts the player. Capture the window's pixels, never
+ * a speculative description derived from its filename or player identity. */
+int r2_eyes_window_available(unsigned long window_id)
+{
+    uint32_t width = 0, height = 0;
+    return window_id != 0 &&
+        r2_eyes_probe_vlc_dimensions(window_id, &width, &height) == 0;
+}
+
+int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
+{
+    if (!eyes || window_id == 0) return -1;
+    r2_eyes_close(eyes);
+    uint32_t width = 0, height = 0;
+    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height) != 0 ||
+        r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
+        r2_eyes_allocate_record_buffer(eyes) != 0)
+        return -1;
+    FILE *stream = r2_eyes_start_vlc(window_id);
+    if (!stream) return -1;
+    eyes->stream = stream;
+    eyes->open = 1;
+    eyes->source_is_live = 0;
+    eyes->origin = R2_VISION_WINDOW;
+    eyes->frame_count = 0;
+    eyes->timestamp = 0;
+    snprintf(eyes->source_name, sizeof(eyes->source_name),
+             "video rendering window %lu", window_id);
+    r2_eyes_reset_event(eyes);
+    r2_eyes_reset_frame(eyes);
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
+    r2_log_sensory("vision_source_opened",
+                   "R2 Eyes connected to an active rendered video window.",
+                   "The source supplied a live window ID; frames are raw pixels.",
+                   eyes->source_name);
+    return 0;
+}
 
 int r2_eyes_open_vlc(
     R2Eyes *eyes)
@@ -1276,8 +1404,8 @@ int r2_eyes_open_vlc(
     /* source_name was populated from the visible VLC window title above. */
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
-    r2_vwebcam_start_viewer();
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     r2_log_sensory("vision_source_opened",
                    "R2 Eyes began capturing the visible VLC window.",
@@ -1374,8 +1502,8 @@ int r2_eyes_capture(
     eyes->frame.frame_number =
         eyes->frame_count;
 
-    r2_vwebcam_publish_frame(eyes);
-    r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_publish_frame(eyes);
+    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
 
     /*
      * Record a bounded-rate sensory journal heartbeat instead of
