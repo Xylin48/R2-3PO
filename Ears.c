@@ -452,10 +452,8 @@ static int r2_ears_find_microphone(char *out, size_t capacity)
             r2_ears_is_monitor(name))
             continue;
         if (!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", name);
-        if (default_name && strcmp(name, default_name) == 0) {
+        if (default_name && strcmp(name, default_name) == 0)
             snprintf(preferred, sizeof(preferred), "%s", name);
-            break;
-        }
     }
     int closed = pclose(pipe);
     free(default_name);
