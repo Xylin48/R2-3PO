@@ -14,8 +14,8 @@ for api in ("r2_vision_media_attention_status", "r2_vision_media_set_attention")
 assert "static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);" in core
 focus = core[core.index("int r2_vision_media_attention_status(void)"):
              core.index("/* Capture and inference are separate workers.")]
-assert "atomic_store(&media_attention_selected, 1)" in focus
-assert "atomic_store(&media_attention_selected, 0)" in focus
+assert "atomic_exchange(&media_attention_selected, 1)" in focus
+assert "atomic_exchange(&media_attention_selected, 0)" in focus
 assert "!atomic_load(&eyes_auto_allowed) || !r2_vision_media_status()" in focus
 assert "r2_log_sensory(\"media_attention_selected\"" in focus
 assert "r2_log_sensory(\"media_attention_released\"" in focus
