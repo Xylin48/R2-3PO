@@ -322,6 +322,8 @@ int r2_vision_close(void);
  * The implementation must call the EXISTING Ears subsystem.
  */
 int r2_ears_start(void);
+/* Capture the default sink monitor instead of the microphone. */
+int r2_ears_start_desktop(void);
 int r2_ears_stop(void);
 int r2_ears_status(void);
 /* Capture a short utterance and return a malloc-owned local ASR transcript.
