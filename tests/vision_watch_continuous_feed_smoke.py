@@ -44,6 +44,10 @@ assert '"images"' in serializer
 assert "image_base64" in serializer
 assert "i == current_user_index" in core
 assert "strstr(content, ollama_authoritative_user_query)" in core
+assert "ollama_autonomous_sensory_input" in serializer
+assert "ollama_autonomous_sensory_input = 1;" in core
+assert "If Eyes is already open, a current image may be attached as raw visual input." in core
+assert "Its presence is not an instruction to describe the image" in core
 
 # The live image comes from the latest owned frame snapshot (or a fresh frame
 # from an explicitly open Eyes source), then undergoes encoding only.
