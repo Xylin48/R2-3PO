@@ -83,6 +83,34 @@ for bind in ("rc = sqlite3_bind_double(st, 1, hours * 12.5)",
     if bind not in sleep_update:
         raise SystemExit(f"Reality sleep persistence ignores a SQLite bind result: {bind}")
 
+reality_tick_start = reality.find("int r2_reality_tick(void)")
+reality_tick_end = reality.find("\nint r2_reality_", reality_tick_start + 1)
+if reality_tick_start < 0 or reality_tick_end < 0:
+    raise SystemExit("Could not locate Reality tick transaction.")
+reality_tick = reality[reality_tick_start:reality_tick_end]
+for bind in (
+    "rc = sqlite3_bind_int64(st, 1, last)",
+    "rc = sqlite3_bind_int64(st, 2, now)",
+    "rc = sqlite3_bind_int64(st, 3, now - last)",
+    "rc = sqlite3_bind_int64(st, 2, now - 30 * 86400)",
+    "rc = sqlite3_bind_int64(st, 2, now - 7 * 86400)",
+):
+    if bind not in reality_tick:
+        raise SystemExit(f"Reality tick ignores a SQLite binding result: {bind}")
+
+tv_start = reality.find("int r2_reality_tv_connect(")
+tv_end = reality.find("\nint r2_reality_tv_disconnect(", tv_start)
+if tv_start < 0 or tv_end < 0:
+    raise SystemExit("Could not locate Reality TV device write path.")
+tv_connect = reality[tv_start:tv_end]
+for bind in (
+    'rc = bind_text(st, 1, name) == 0 ? SQLITE_OK : SQLITE_ERROR',
+    'rc = bind_text(st, 2, rf ? "rf" : "input") == 0 ? SQLITE_OK : SQLITE_ERROR',
+    "rc = sqlite3_bind_int(st, 3, port)",
+):
+    if bind not in tv_connect:
+        raise SystemExit(f"Reality TV device write ignores a binding result: {bind}")
+
 assert 'extract_marker(reply, "[IMAGINE]"' in core
 assert 'extract_marker(reply, "[IMAGINE_FEEDBACK]"' in core
 assert "[END IMAGINE]" in core and "[END IMAGINE_FEEDBACK]" in core
