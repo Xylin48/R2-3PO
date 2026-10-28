@@ -383,6 +383,17 @@ static unsigned char *encode_jpeg(const R2VisionFrame *frame, size_t *jpeg_lengt
     return jpeg;
 }
 
+char *r2_visual_frame_base64(const R2VisionFrame *frame)
+{
+    size_t jpeg_length = 0;
+    unsigned char *jpeg = encode_jpeg(frame, &jpeg_length);
+    if (!jpeg)
+        return NULL;
+    char *encoded = base64_encode(jpeg, jpeg_length);
+    free(jpeg);
+    return encoded;
+}
+
 static int vision_progress(void *userdata,
                             curl_off_t download_total,
                             curl_off_t download_now,
