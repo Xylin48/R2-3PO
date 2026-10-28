@@ -10346,6 +10346,7 @@ static unsigned char ears_recent_audio[R2_EARS_RECENT_CAPACITY];
 static pthread_mutex_t ears_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t ears_recent_length = 0;
 static size_t ears_recent_write_position = 0;
+static uint64_t ears_recent_total_bytes = 0;
 static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
 static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
@@ -10388,6 +10389,7 @@ static void *r2_ears_capture_worker(void *unused)
             if (ears_recent_length > R2_EARS_RECENT_CAPACITY)
                 ears_recent_length = R2_EARS_RECENT_CAPACITY;
         }
+        ears_recent_total_bytes += count;
         pthread_mutex_unlock(&ears_recent_lock);
     }
     atomic_store(&ears_capture_running, 0);
@@ -10395,8 +10397,8 @@ static void *r2_ears_capture_worker(void *unused)
 }
 
 /* Copy recent PCM without consuming or interpreting it. */
-static int r2_ears_write_recent_audio(uint32_t bytes_needed, FILE *wav,
-                                      int (*cancelled)(void *), void *userdata)
+static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      FILE *wav, int (*cancelled)(void *), void *userdata)
 {
     if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
@@ -10408,10 +10410,11 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, FILE *wav,
             return -1;
         }
         pthread_mutex_lock(&ears_recent_lock);
-        if (ears_recent_length >= bytes_needed) {
-            size_t start = (ears_recent_write_position +
-                            R2_EARS_RECENT_CAPACITY - bytes_needed) %
-                           R2_EARS_RECENT_CAPACITY;
+        uint64_t captured_since_request = ears_recent_total_bytes >= start_total
+            ? ears_recent_total_bytes - start_total : 0;
+        if (captured_since_request >= bytes_needed &&
+            captured_since_request <= R2_EARS_RECENT_CAPACITY) {
+            size_t start = (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
             size_t first = R2_EARS_RECENT_CAPACITY - start;
             if (first > bytes_needed) first = bytes_needed;
             memcpy(snapshot, ears_recent_audio + start, first);
@@ -10420,8 +10423,13 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, FILE *wav,
             pthread_mutex_unlock(&ears_recent_lock);
             break;
         }
+        int overrun = captured_since_request > R2_EARS_RECENT_CAPACITY;
         int still_capturing = atomic_load(&ears_capture_running);
         pthread_mutex_unlock(&ears_recent_lock);
+        if (overrun) {
+            free(snapshot);
+            return -1;
+        }
         if (!still_capturing) {
             free(snapshot);
             return -1;
@@ -10528,8 +10536,11 @@ char *r2_ears_listen_cancelable(unsigned seconds,
 
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running)) {
+        pthread_mutex_lock(&ears_recent_lock);
+        uint64_t start_total = ears_recent_total_bytes;
+        pthread_mutex_unlock(&ears_recent_lock);
         pthread_mutex_unlock(&ears_capture_lock);
-        if (r2_ears_write_recent_audio(total_bytes, wav, cancelled, userdata) == 0 &&
+        if (r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata) == 0 &&
             !shutting_down && !(cancelled && cancelled(userdata)) &&
             r2_ears_write_wav_header(wav, total_bytes) == 0 &&
             fflush(wav) == 0)
@@ -10686,6 +10697,7 @@ int r2_ears_start(void)
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
         ears_recent_write_position = 0;
+        ears_recent_total_bytes = 0;
         pthread_mutex_unlock(&ears_recent_lock);
         atomic_store(&ears_capture_running, 1);
         if (pthread_create(&ears_capture_thread, NULL,
@@ -10719,6 +10731,7 @@ int r2_ears_stop(void)
     pthread_mutex_lock(&ears_recent_lock);
     ears_recent_length = 0;
     ears_recent_write_position = 0;
+    ears_recent_total_bytes = 0;
     pthread_mutex_unlock(&ears_recent_lock);
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, "ears_stopped",
