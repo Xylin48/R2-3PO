@@ -32,7 +32,7 @@ assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_bo
 assert "r2_vision_watch_start()" in worker and "r2_eyes_status() > 0" in worker
 assert "r2_vision_watch_stop()" in worker
 assert "Coordinator thread : %s" in shell and "Visual input       : %s" in shell
-assert "No automatic transcription or image descriptions are generated." in shell
+assert "no automatic transcription or image descriptions are generated." in shell
 assert "r2_talk(message)" in shell[
     shell.index("static void shell_talk_inner"):shell.index("static void shell_talk(const char *message)")
 ]
