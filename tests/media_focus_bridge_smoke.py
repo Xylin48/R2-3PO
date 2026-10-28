@@ -19,6 +19,13 @@ assert "atomic_exchange(&media_attention_selected, 0)" in focus
 assert "!atomic_load(&eyes_auto_allowed) || !r2_vision_media_status()" in focus
 assert "r2_log_sensory(\"media_attention_selected\"" in focus
 assert "r2_log_sensory(\"media_attention_released\"" in focus
+assert "r2_vision_media_status() ? 1 : 0;" in focus
+media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
+                  core.index("int r2_vision_media_stop(void)")]
+assert "atomic_exchange(&media_attention_selected, 0)" in media_stop
+assert "media_attention_source_lost" in media_stop
+assert "r2_eyes_close(media_eyes)" in media_stop
+assert "r2_eyes_close(eyes)" not in media_stop
 
 # Automatic discovery and continuous raw capture never choose R2's attention.
 watch = shell[shell.index("static void *shell_watch_worker(void *unused)"):
