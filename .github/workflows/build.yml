@@ -94,7 +94,8 @@ jobs:
           python3 tests/r2_hardware_preflight_smoke.py
       - name: Check deployment audit utilities and read-only database behavior
         run: |
-          python3 -m py_compile tools/audit_r2_databases.py tools/audit_r2_sound_assets.py
+          python3 -m py_compile tools/audit_r2_databases.py tools/audit_r2_sound_assets.py tests/database_connection_audit_smoke.py
+          python3 tests/database_connection_audit_smoke.py
           ROOT="$(mktemp -d)"
           set +e
           python3 tools/audit_r2_databases.py --root "$ROOT" --json > "$ROOT/report.json"
