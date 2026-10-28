@@ -56,7 +56,7 @@ helper_end = core.index("\nstatic void *vision_watch_worker(void *unused)", help
 helper = core[helper_start:helper_end]
 assert "r2_vision_copy_watched_frame(&frame, &event, &frame_copy)" in helper
 assert "r2_eyes_capture(eyes)" in helper
-snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\\n"):
+snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\n"):
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "vision_watch_latest_frame_data" in snapshot
 assert "vision_watch_frame_generation == 0 && !vision_watch_capture_done" in snapshot
