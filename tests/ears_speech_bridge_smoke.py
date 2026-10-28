@@ -24,7 +24,7 @@ assert "r2_ears_read(ears, pcm, sizeof(pcm))" in capture_worker
 assert "ears_recent_audio" in capture_worker
 assert "ears_recent_total_bytes += count" in capture_worker
 assert "No transcription or semantic interpretation is performed by the capture worker." in core
-assert "pthread_create(&ears_capture_thread, NULL, r2_ears_capture_worker, NULL)" in core
+assert "pthread_create(&ears_capture_thread, NULL," in core and "r2_ears_capture_worker, NULL)" in core
 assert "pthread_join(ears_capture_thread, NULL)" in core
 assert "r2_wav_write_wav_header" not in bridge
 assert "r2_ears_write_wav_header(wav, total_bytes)" in bridge
