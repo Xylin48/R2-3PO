@@ -42,7 +42,8 @@ typedef enum
     R2_VISION_NONE = 0,
     R2_VISION_FILE,
     R2_VISION_WORLD,
-    R2_VISION_VLC
+    R2_VISION_VLC,
+    R2_VISION_WINDOW
 } R2VisionOrigin;
 
 /* Visual type */
@@ -115,6 +116,10 @@ int r2_eyes_open_device(R2Eyes *eyes,
                         const char *device);
 int r2_eyes_open_source(R2Eyes *eyes,
                         const char *source_name);
+
+/* Live video-rendering window supplied by a playback source. */
+int r2_eyes_window_available(unsigned long window_id);
+int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
 
 /* VLC window input */
 int r2_eyes_open_vlc(R2Eyes *eyes);
