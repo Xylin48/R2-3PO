@@ -582,6 +582,7 @@ static const char *SYSTEM_PROMPT =
 "Use [ALTERNATE_RETAIN] id or [ALTERNATE_DISCARD] id only when explicitly requested. A retained hypothesis remains hypothetical and must never be promoted into a factual memory.\n"
 "Use [IMAGINE] question or scenario [END IMAGINE] to explore a hypothetical using relevant experience. Give evidence-based feedback only with [IMAGINE_FEEDBACK] branch_id|accurate/partial/incorrect/unresolved|notes [END IMAGINE_FEEDBACK]. Imagined events are never facts or real-world actions.\n"
 "Use [SENSORY_JOURNAL] recent|limit, [SENSORY_JOURNAL] search|query|limit, or [SENSORY_JOURNAL] note|note text|details to inspect or annotate the index of original Life Log events; do not duplicate raw sensory data.\n"
+"Eyes and Ears receive sensory input continuously when open; input itself does not mean you are attending to or interpreting it. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] seconds on its own line (1-15). This records a fresh interval from live microphone input and locally recognizes speech; it is not a general non-speech sound classifier. Do not use this tool for hypothetical situations or merely because Ears is active. Use the result as sensory evidence, then decide what it means.\n"
 "When a proposed purchase has no user-supplied or otherwise evidenced price, do not invent a price or pretend a store has stock. Ask for the price or wait for explicit price information. Only execute [WORLD] buy|item name|price|description|destination after the item, price, and intended destination are established; report failure if funds or the transaction are insufficient.\n"
 "Use [WORLD] location|location name|home or [WORLD] location|location name|outside only when simulated movement is actually being carried out, not merely planned. Use home only for the actual home; stores and other away places use outside. The location transition persists, and private Welcome Home memory is created only after an away-to-home transition.\n"
 "For a real activity/device session, use [WORLD] activity_start|activity key|activity or game name|optional details only when it actually starts, and [WORLD] activity_end|activity key|last verified state|stop reason|optional details when it actually ends. Use a stable generic key such as gameboy:game-title; never assume a device exists or invent gameplay. If the last in-game state or reason is not known, record unknown rather than guessing.\n"
@@ -8458,6 +8459,33 @@ static char *process_tools_with_status(
             APPEND("SENSORY JOURNAL ERROR: use recent|1..100, search|query|1..100, or note|text|details.\n");
         }
         free(entry);
+    }
+
+    /* Deliberate hearing is an action chosen by the brain, not a side effect
+       of raw audio capture. Only this marker invokes speech recognition. */
+    size_t ears_listen_pos = 0;
+    while (1) {
+        char *request = extract_marker(reply, "[EARS_LISTEN]", "\n", &ears_listen_pos);
+        if (!request) break;
+        char *seconds_text = trim(request);
+        char *end = NULL;
+        errno = 0;
+        unsigned long seconds = strtoul(seconds_text, &end, 10);
+        int valid = !errno && end != seconds_text && end && *end == '\0' &&
+                    seconds >= 1UL && seconds <= 15UL;
+        if (!valid) {
+            APPEND("EARS LISTEN ERROR: use [EARS_LISTEN] 1..15 to deliberately listen to a real microphone interval. No capture was started.\n");
+        } else if (r2_ears_status() > 0 && !atomic_load(&ears_capture_running)) {
+            APPEND("EARS LISTEN ERROR: Ears is already connected to a non-continuous source. That source was left untouched; stop or change it explicitly before microphone listening.\n");
+        } else {
+            char *transcript = r2_ears_listen_cancelable((unsigned)seconds, NULL, NULL);
+            if (transcript && *transcript)
+                APPEND("EARS LISTEN RESULT (locally recognized speech from real audio):\n%s\n", transcript);
+            else
+                APPEND("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.\n");
+            free(transcript);
+        }
+        free(request);
     }
 
     /* Persistent room, object, inventory and self-continuity actions.
