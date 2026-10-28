@@ -28,7 +28,10 @@ assert "memcpy(frame_copy, vision_watch_latest_frame_data" in worker
 assert "frame.data = frame_copy" in worker
 assert "r2_visual_analyze_frame(" in worker
 assert worker.index("pthread_mutex_unlock(&vision_watch_frame_lock)") < worker.index("r2_visual_analyze_frame(")
-assert "frame.frame_number <= last_frame_number" in worker
+assert "vision_watch_frame_generation == last_generation" in worker
+assert "previous_observation[1024]" in worker
+assert "Previous frame observation:" in worker
+assert "strcmp(previous_source, frame_source) != 0" in worker
 assert "interval=approximately 15 seconds" not in worker
 assert "elapsed_seconds >= 15" not in worker
 
