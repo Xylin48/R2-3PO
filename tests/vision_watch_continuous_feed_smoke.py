@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Regression checks for continuous capture independent of image-model inference."""
+"""Verify continuous raw Eyes input reaches the conversation brain without forced analysis."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
 shell = (ROOT / "shell.c").read_text(encoding="utf-8")
+visual = (ROOT / "Visual.c").read_text(encoding="utf-8")
+visual_header = (ROOT / "Visual.h").read_text(encoding="utf-8")
 
+# Eyes continuously captures and publishes a stable latest-frame snapshot.
 capture_start = core.index("static void *vision_watch_capture_worker(void *unused)")
 worker_start = core.index("static void *vision_watch_worker(void *unused)", capture_start)
 start_start = core.index("int r2_vision_watch_start(void)", worker_start)
@@ -24,31 +27,52 @@ assert "pthread_cond_broadcast(&vision_watch_frame_cond)" in capture
 assert "vision_watch_capture_done = 1" in capture
 assert '"vision_watch_frame_snapshot_failed"' in capture
 
-assert "pthread_cond_wait(&vision_watch_frame_cond" in worker
-assert "memcpy(frame_copy, vision_watch_latest_frame_data" in worker
-assert "frame.data = frame_copy" in worker
-assert "r2_visual_analyze_frame(" in worker
-assert worker.index("pthread_mutex_unlock(&vision_watch_frame_lock)") < worker.index("r2_visual_analyze_frame(")
+# The observer tracks capture lifecycle only; it must not call a vision model,
+# describe each frame, or persist an interpretation just because a frame arrived.
+assert "r2_visual_analyze_frame(" not in worker
+assert "Describe this newly captured video frame" not in worker
+assert "vision_watch_observation" not in worker
+assert "visual_input_available" in worker
 assert "vision_watch_frame_generation == last_generation" in worker
-assert "previous_observation[1024]" in worker
-assert "Previous frame observation:" in worker
-assert "strcmp(previous_source, frame_source) != 0" in worker
-assert "frame.frame_number <= previous_frame_number" in worker
-assert "interval=approximately 15 seconds" not in worker
-assert "elapsed_seconds >= 15" not in worker
+assert "pthread_cond_wait(&vision_watch_frame_cond" in worker
+
+# Raw images, not generated descriptions, are serialized with the active user turn.
+serializer_start = core.index("static int ollama_json_append_message(")
+serializer_end = core.index("\ntypedef struct {", serializer_start)
+serializer = core[serializer_start:serializer_end]
+assert '"images"' in serializer
+assert "image_base64" in serializer
+assert "i == current_user_index" in core
+assert "strstr(content, ollama_authoritative_user_query)" in core
+
+# The live image comes from the latest owned frame snapshot (or a fresh frame
+# from an explicitly open Eyes source), then undergoes encoding only.
+helper_start = core.index("static char *r2_vision_current_frame_base64(void)\n{")
+helper_end = core.index("\nstatic void *vision_watch_worker(void *unused)", helper_start)
+helper = core[helper_start:helper_end]
+assert "vision_watch_latest_frame_data" in helper
+assert "r2_eyes_capture(eyes)" in helper
+assert "r2_visual_frame_base64(&frame)" in helper
+assert "r2_visual_analyze_frame(" not in helper
+assert "r2_eyes_open_camera" not in helper
+
+encoder_start = visual.index("char *r2_visual_frame_base64(")
+encoder_end = visual.index("\nstatic int vision_progress(", encoder_start)
+encoder = visual[encoder_start:encoder_end]
+assert "encode_jpeg(frame" in encoder
+assert "base64_encode(jpeg, jpeg_length)" in encoder
+assert "call_vision_model(" not in encoder
+assert "r2_visual_frame_base64" in visual_header
+
+# Explicit inspection remains available as a deliberate brain-selected action.
+assert "char *r2_vision_see(const char *question)" in core
+assert "vision_analyze_current_frame(question, 1)" in core
 
 assert "pthread_create(&vision_watch_capture_thread" in start
 assert "pthread_create(&vision_watch_thread" in start
 assert "pthread_join(vision_watch_thread, NULL)" in stop
 assert "pthread_join(vision_watch_capture_thread, NULL)" in stop
 assert "pthread_cond_broadcast(&vision_watch_frame_cond)" in stop
-assert "Eyes captures continuously and Qwen analyzes successive fresh frames" in shell
+assert "No background image descriptions are generated" in shell
 
-direct_start = core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\n{")
-direct_end = core.index("\nchar *r2_vision_see(", direct_start)
-direct = core[direct_start:direct_end]
-assert "memcpy(frame_copy, frame.data, frame.size)" in direct
-assert direct.rindex("pthread_mutex_unlock(&visual_capture_lock)") < direct.index("r2_visual_analyze_frame(")
-assert "free(frame_copy);" in direct
-
-print("Continuous Eyes capture, latest-frame handoff, nonblocking Qwen analysis, and dual-worker shutdown passed.")
+print("Continuous raw Eyes input, direct image-to-brain serialization, and deliberate-only visual analysis passed.")
