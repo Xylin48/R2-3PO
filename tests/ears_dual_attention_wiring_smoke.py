@@ -33,7 +33,7 @@ assert "r2_ears_write_buffered_audio" in listen
 assert "r2_ears_write_recent_audio" in listen
 assert "r2_ears_open_microphone(ears)" in listen
 # The Life Log must not mistake desktop playback for microphone perception.
-assert 'r2_ears_desktop_requested ? "Ears desktop playback" : "Ears microphone"' in listen
+assert 'r2_ears_desktop_requested ? "Ears desktop playback" : "Ears microphone"' in " ".join(listen.split())
 assert 'r2_ears_desktop_requested ? "desktop" : "microphone"' in listen
 assert 'r2_ears_recent_requested ? "recent" : "live"' in listen
 assert 'r2_log_sensory("speech_transcribed", observation, details, source)' in listen
