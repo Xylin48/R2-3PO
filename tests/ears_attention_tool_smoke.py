@@ -25,9 +25,9 @@ assert "r2_ears_listen_cancelable(" in ears_helper and "r2_ears_action_cancelled
 assert "r2_ears_recent_requested = recent;" in ears_helper
 assert "r2_ears_write_buffered_audio(total_bytes, wav)" in core
 assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in core
-assert "r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in tool
-assert "That source was left untouched" in tool
-assert "Do not infer what was said." in tool
+assert "r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in ears_helper
+assert "That source was left untouched" in ears_helper
+assert "Do not infer what was said." in ears_helper
 assert "r2_process_ears_listen_request(request)" in tool
 assert "r2_process_ears_listen_request(ears_request)" in core
 assert "AUTONOMOUS REFLECTION CONTEXT:" in core
