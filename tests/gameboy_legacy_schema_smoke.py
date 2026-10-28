@@ -56,7 +56,7 @@ def main() -> int:
                     'legacy event with non-colliding ID', 'source database history');
 
             CREATE TABLE cartridge_inventory (filename TEXT PRIMARY KEY COLLATE NOCASE);
-            INSERT INTO cartridge_inventory(filename) VALUES ('Target.gba');
+            INSERT INTO cartridge_inventory(filename) VALUES ('Legacy.gba');
         """)
         cartridge_db.commit()
         cartridge_db.close()
@@ -89,7 +89,7 @@ def main() -> int:
             CREATE TABLE cartridge_inventory (
                 filename TEXT PRIMARY KEY COLLATE NOCASE
             );
-            INSERT INTO cartridge_inventory(filename) VALUES ('Legacy.gba');
+            INSERT INTO cartridge_inventory(filename) VALUES ('Target.gba');
         """)
         legacy.commit()
         legacy.close()
