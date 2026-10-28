@@ -11040,10 +11040,9 @@ char *r2_ears_listen(unsigned seconds)
     return r2_ears_listen_cancelable(seconds, NULL, NULL);
 }
 
-/* Both live inputs use the same raw PCM capture/attention pipeline. The
- * desktop monitor is activated only while actual playback is detected;
- * it is never treated as spoken instructions or automatically transcribed. */
-static int r2_ears_start_input(int desktop)
+/* Microphone retains the existing Ears bridge and its history, including
+ * direct speech capture. It never takes over the separate desktop monitor. */
+static int r2_ears_start_input(void)
 {
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
@@ -11054,8 +11053,7 @@ static int r2_ears_start_input(int desktop)
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? (desktop ? r2_ears_open_desktop(ears)
-                             : r2_ears_open_microphone(ears)) : -1;
+    int rc = ears ? r2_ears_open_microphone(ears) : -1;
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
@@ -11074,23 +11072,87 @@ static int r2_ears_start_input(int desktop)
     }
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_started" : "ears_start_failed",
-                 rc == 0 ? (desktop
-                     ? "R2 Ears is continuously receiving raw desktop playback PCM."
-                     : "R2 Ears is continuously receiving raw microphone PCM.")
-                     : "R2 Ears could not start the requested raw-audio source.",
+                 rc == 0 ? "R2 Ears is continuously receiving raw microphone PCM."
+                         : "R2 Ears could not start microphone capture.",
                  rc == 0 ? "No transcription or semantic interpretation is performed by the capture worker."
-                         : NULL, desktop ? "r2_ears_start_desktop" : "r2_ears_start");
+                         : NULL, "r2_ears_start");
     return rc;
 }
 
 int r2_ears_start(void)
 {
-    return r2_ears_start_input(0);
+    return r2_ears_start_input();
 }
 
+/* Playback monitor has its own Pulse stream, worker and rolling history.
+ * It can run alongside the microphone and shuts down independently. */
 int r2_ears_start_desktop(void)
 {
-    return r2_ears_start_input(1);
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    if (atomic_load(&ears_desktop_capture_running) &&
+        ears_desktop_capture_thread_started) {
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        return 0;
+    }
+    if (ears_desktop_capture_thread_started) {
+        pthread_join(ears_desktop_capture_thread, NULL);
+        ears_desktop_capture_thread_started = 0;
+    }
+    if (!ears_desktop && r2_ears_init(&ears_desktop) != 0) {
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        return -1;
+    }
+    int rc = r2_ears_open_desktop(ears_desktop);
+    if (rc == 0) {
+        pthread_mutex_lock(&ears_desktop_recent_lock);
+        ears_desktop_recent_length = 0;
+        ears_desktop_recent_write_position = 0;
+        ears_desktop_recent_total_bytes = 0;
+        pthread_mutex_unlock(&ears_desktop_recent_lock);
+        atomic_store(&ears_desktop_capture_running, 1);
+        if (pthread_create(&ears_desktop_capture_thread, NULL,
+                           r2_ears_desktop_capture_worker, NULL) != 0) {
+            atomic_store(&ears_desktop_capture_running, 0);
+            r2_ears_close(ears_desktop);
+            rc = -1;
+        } else {
+            ears_desktop_capture_thread_started = 1;
+        }
+    }
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_desktop_started" : "ears_desktop_start_failed",
+                 rc == 0 ? "R2 Ears is continuously receiving real desktop playback PCM."
+                         : "R2 Ears could not open desktop monitor audio.",
+                 rc == 0 ? "No automatic transcription or semantic interpretation."
+                         : NULL, "r2_ears_start_desktop");
+    return rc;
+}
+
+int r2_ears_stop_desktop(void)
+{
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    atomic_store(&ears_desktop_capture_running, 0);
+    if (ears_desktop_capture_thread_started) {
+        pthread_join(ears_desktop_capture_thread, NULL);
+        ears_desktop_capture_thread_started = 0;
+    }
+    if (ears_desktop) r2_ears_close(ears_desktop);
+    pthread_mutex_lock(&ears_desktop_recent_lock);
+    ears_desktop_recent_length = 0;
+    ears_desktop_recent_write_position = 0;
+    ears_desktop_recent_total_bytes = 0;
+    pthread_mutex_unlock(&ears_desktop_recent_lock);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    return 0;
+}
+
+int r2_ears_status_desktop(void)
+{
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    int active = ears_desktop_capture_thread_started &&
+                 atomic_load(&ears_desktop_capture_running) ? 1 : 0;
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    return active;
 }
 
 int r2_ears_stop(void)
