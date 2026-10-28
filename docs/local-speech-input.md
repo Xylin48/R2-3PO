@@ -40,10 +40,15 @@ The launcher explicitly passes both variables through to R2's dedicated user.
 
 At the R2 prompt:
 
-- `ears listen` — record five seconds, transcribe locally, and send the result to chat.
-- `ears listen 8` — record eight seconds.
+- `ears start` — open the microphone and continuously receive raw PCM into a
+  16-second in-memory rolling buffer. The capture worker does not transcribe,
+  classify, or interpret the audio.
+- `ears listen` — deliberately capture the next five seconds from the live
+  input (or directly record five seconds if continuous Ears is not already
+  running), transcribe that interval locally, and send the resulting text to chat.
+- `ears listen 8` — deliberately inspect an eight-second interval.
 - `ears status` — inspect whether the raw Ears source is currently open.
-- `ears start` / `ears stop` — open/close raw microphone capture; these commands alone do not transcribe speech.
+- `ears stop` — stop continuous capture and clear its transient audio buffer.
 
 The capture duration is limited to 1–15 seconds. Local transcription is
 terminated if it exceeds 90 seconds or R2 begins shutting down. If the model
@@ -52,30 +57,28 @@ instead of pretending it understood audio.
 
 ## Watch coordinator
 
-- `watch` or `watch start` starts a background coordinator after validating the
-  local Whisper model, CLI, and default microphone.
+- `watch` or `watch start` opens continuous raw microphone capture and starts
+  a coordinator that keeps sensory input active. It does not require Whisper.
 - Watch refuses to start while Ears already has an active source, because that
   source could be a file or desktop monitor rather than the microphone. Stop
   the existing Ears source first; Watch does not silently replace it.
 - While Watch is active, standalone `ears start`, `ears listen`, and
-  `ears stop` commands are refused so they cannot compete with the coordinator's
-  capture/transcription loop. `ears status` remains available.
-- Watch captures non-overlapping five-second microphone chunks. A usable
-  transcript is sent through the same serialized shell chat path as typed
-  text; silence does not create a turn.
-- `watch status` reports the coordinator thread, speech input, and visual
-  observation states. `watch stop` cancels microphone capture/Whisper work and
-  joins the worker; if a user-facing chat turn has already begun, Watch waits
-  for that turn to finish rather than corrupting conversation state.
-- If Eyes is already open and the visual subsystem is available, Watch attaches
-  the periodic visual observer. Watch never opens a camera or media source by
-  itself.
+  `ears stop` commands are refused so they cannot compete with Watch's source.
+  `ears status` remains available.
+- Watch does not automatically transcribe speech or create chat turns from
+  whatever happens to be audible. R2 must deliberately request a listening
+  action to inspect an audio interval.
+- `watch status` reports the coordinator thread, raw audio input, and visual
+  input states. `watch stop` stops continuous microphone capture and joins the
+  coordinator worker.
+- If Eyes is already open, Watch may join its existing raw-frame capture.
+  Watch never opens a camera or media source by itself and does not start a
+  background image-description loop.
 
-This is bounded chunked listening, not yet uninterrupted streaming or
-voice-activity-detected turn segmentation. While a chunk is being transcribed
-or R2 is generating its reply, subsequent speech may not be captured. That is
-a known next step for the coordinator, not something the current implementation
-claims to solve.
+This provides continuous raw PCM capture plus deliberate speech recognition.
+It is not yet semantic perception of non-speech sounds: Qwen 3.5 9B does not
+accept raw audio, and the current explicit Whisper bridge recognizes speech
+rather than classifying every environmental sound.
 
 This wiring is covered by a static CI regression check. A passing CI build
 does not prove that a particular microphone, PulseAudio/PipeWire setup, Whisper
