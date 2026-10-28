@@ -10884,7 +10884,10 @@ char *r2_ears_listen(unsigned seconds)
     return r2_ears_listen_cancelable(seconds, NULL, NULL);
 }
 
-int r2_ears_start(void)
+/* Both live inputs use the same raw PCM capture/attention pipeline. The
+ * desktop monitor is activated only while actual playback is detected;
+ * it is never treated as spoken instructions or automatically transcribed. */
+static int r2_ears_start_input(int desktop)
 {
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
@@ -10895,7 +10898,8 @@ int r2_ears_start(void)
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? r2_ears_open_microphone(ears) : -1;
+    int rc = ears ? (desktop ? r2_ears_open_desktop(ears)
+                             : r2_ears_open_microphone(ears)) : -1;
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
@@ -10914,11 +10918,23 @@ int r2_ears_start(void)
     }
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_started" : "ears_start_failed",
-                 rc == 0 ? "R2 Ears is continuously receiving raw microphone PCM."
-                         : "R2 Ears could not start continuous microphone capture.",
+                 rc == 0 ? (desktop
+                     ? "R2 Ears is continuously receiving raw desktop playback PCM."
+                     : "R2 Ears is continuously receiving raw microphone PCM.")
+                     : "R2 Ears could not start the requested raw-audio source.",
                  rc == 0 ? "No transcription or semantic interpretation is performed by the capture worker."
-                         : NULL, "r2_ears_start");
+                         : NULL, desktop ? "r2_ears_start_desktop" : "r2_ears_start");
     return rc;
+}
+
+int r2_ears_start(void)
+{
+    return r2_ears_start_input(0);
+}
+
+int r2_ears_start_desktop(void)
+{
+    return r2_ears_start_input(1);
 }
 
 int r2_ears_stop(void)
