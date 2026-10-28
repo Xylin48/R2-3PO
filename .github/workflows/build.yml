@@ -169,6 +169,9 @@ jobs:
       - name: Require source-specific raw hearing, deliberate attention, and shutdown
         run: python3 tests/ears_dual_attention_wiring_smoke.py
 
+      - name: Trace live audio-producer window discovery to Eyes
+        run: python3 tests/visual_audio_producer_bridge_smoke.py
+
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
