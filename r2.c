@@ -10405,8 +10405,9 @@ static R2VisionEvent vision_watch_latest_event;
 static unsigned char *vision_watch_latest_frame_data = NULL;
 static size_t vision_watch_latest_frame_capacity = 0;
 
-/* The camera reader is the sole owner of live capture. Copy out its latest
-   complete frame under the snapshot lock so analysis cannot race overwrites. */
+/* Camera capture has one reader. Both conversation vision and deliberate
+   observation copy the same current, complete frame. Wait for the first
+   published frame; a stopped/end-of-stream worker cannot supply stale sight. */
 static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
                                         R2VisionEvent *event,
                                         unsigned char **owned_data)
@@ -10414,7 +10415,12 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
     if (!frame || !event || !owned_data) return -1;
     *owned_data = NULL;
     pthread_mutex_lock(&vision_watch_frame_lock);
-    if (vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
+    while (!shutting_down && atomic_load(&vision_watch_running) &&
+           vision_watch_frame_generation == 0 && !vision_watch_capture_done)
+        pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
+    if (!shutting_down && atomic_load(&vision_watch_running) &&
+        !vision_watch_capture_done && vision_watch_frame_generation > 0 &&
+        vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
         vision_watch_latest_frame.size > 0) {
         unsigned char *copy = malloc(vision_watch_latest_frame.size);
         if (copy) {
@@ -10532,34 +10538,16 @@ static void *vision_watch_capture_worker(void *unused)
 }
 static char *r2_vision_current_frame_base64(void)
 {
-    if (!eyes || !r2_eyes_is_open(eyes))
-        return NULL;
-
-    R2VisionFrame frame;
-    R2VisionEvent event;
-    memset(&frame, 0, sizeof(frame));
-    memset(&event, 0, sizeof(event));
+    R2VisionFrame frame = {0};
+    R2VisionEvent event = {0};
     unsigned char *frame_copy = NULL;
 
     if (atomic_load(&vision_watch_running)) {
-        pthread_mutex_lock(&vision_watch_frame_lock);
-        while (!shutting_down && atomic_load(&vision_watch_running) &&
-               vision_watch_frame_generation == 0 && !vision_watch_capture_done)
-            pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
-        if (vision_watch_latest_frame.data && vision_watch_latest_frame.size > 0) {
-            frame_copy = malloc(vision_watch_latest_frame.size);
-            if (frame_copy) {
-                memcpy(frame_copy, vision_watch_latest_frame_data,
-                       vision_watch_latest_frame.size);
-                frame = vision_watch_latest_frame;
-                frame.data = frame_copy;
-                event = vision_watch_latest_event;
-            }
-        }
-        pthread_mutex_unlock(&vision_watch_frame_lock);
+        (void)r2_vision_copy_watched_frame(&frame, &event, &frame_copy);
     } else {
         pthread_mutex_lock(&visual_capture_lock);
-        int captured = (eyes && r2_eyes_is_open(eyes)) ? r2_eyes_capture(eyes) : -1;
+        int captured = (eyes && r2_eyes_is_open(eyes))
+            ? r2_eyes_capture(eyes) : -1;
         if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
             r2_eyes_get_event(eyes, &event) == 0 && frame.data && frame.size > 0) {
             frame_copy = malloc(frame.size);
@@ -10574,7 +10562,7 @@ static char *r2_vision_current_frame_base64(void)
     if (!frame_copy) {
         r2_log_sensory("visual_input_unavailable",
                        "R2's active conversation could not obtain a current image from Eyes.",
-                       "No valid fresh frame snapshot was available for direct multimodal input.",
+                       "No valid live frame snapshot was available for direct multimodal input.",
                        event.source_name[0] ? event.source_name : "Eyes");
         return NULL;
     }
