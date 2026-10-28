@@ -170,7 +170,8 @@ class TVDisplaySmoke(unittest.TestCase):
     def test_vcr_client_accepts_transport_and_media_commands(self) -> None:
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",
                         "vcr insert /tmp/example-film.mp4", "vcr position 42.750",
-                        "media vcr_playback_started|/tmp/example-film.mp4"):
+                        "media vcr_playback_started|/tmp/example-film.mp4",
+                        "media vcr_playback_started|/tmp/example-film.mp4|x11=8412"):
             received = []
             TV.SOCKET_PATH.unlink(missing_ok=True)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -300,6 +301,7 @@ class TVDisplaySmoke(unittest.TestCase):
         display._player = FakePlayer()
         display._vlc = type("FakeVLC", (), {"State": FakeState})
         display._last_logged_vlc_state = None
+        display.video_surface = type("Surface", (), {"winfo_id": lambda self: 8412})()
         commands = []
         with patch.object(TV, "send_control_command",
                           side_effect=lambda command: commands.append(command) or "OK"):
@@ -311,7 +313,7 @@ class TVDisplaySmoke(unittest.TestCase):
             display._record_playback_state("/tmp/movie.mp4")
 
         self.assertEqual(commands, [
-            "media vcr_playback_started|/tmp/movie.mp4",
+            "media vcr_playback_started|/tmp/movie.mp4|x11=8412",
             "media vcr_playback_paused|/tmp/movie.mp4",
         ])
 
@@ -326,6 +328,8 @@ class TVDisplaySmoke(unittest.TestCase):
             TV.send_control_command("media vcr_playback_started|relative/movie.mp4")
         with self.assertRaises(ValueError):
             TV.send_control_command("media arbitrary_action|/tmp/movie.mp4")
+        with self.assertRaises(ValueError):
+            TV.send_control_command("media vcr_playback_started|/tmp/movie.mp4|x11=bogus")
 
 if __name__ == "__main__":
     unittest.main()
