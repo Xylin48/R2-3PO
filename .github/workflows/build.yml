@@ -186,6 +186,11 @@ jobs:
       - name: Regress chosen display focus with dual-camera/media imagery
         run: python3 tests/media_focus_bridge_smoke.py
 
+      - name: Verify camera-first media image order in a real JSON payload
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/media_focus_payload_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-media-focus-payload-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-media-focus-payload-test
+
       - name: Exercise independent raw camera and auxiliary media frames
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_primary_media_runtime.c Eyes.c -o /tmp/r2-eyes-primary-media-test -lpthread -lm
