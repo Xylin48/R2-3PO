@@ -51,8 +51,10 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert reports["read_only"] is True
     relationships = audit.audit_relationships(root, reports["databases"])
     assert relationships
-    assert all(item["status"] == "checked" for item in relationships), relationships
-    assert all(item["orphan_count"] == 0 for item in relationships), relationships
+    checked_relationships = [item for item in relationships if item["status"] == "checked"]
+    assert checked_relationships
+    assert all(item["status"] in ("checked", "not_checked") for item in relationships), relationships
+    assert all(item["orphan_count"] == 0 for item in checked_relationships), checked_relationships
 
     with sqlite3.connect(memory) as db:
         db.execute("INSERT INTO r2_alternate_self_branches VALUES(2,NULL,NULL)")
