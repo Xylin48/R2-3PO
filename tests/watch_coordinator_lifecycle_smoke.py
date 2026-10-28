@@ -32,7 +32,10 @@ assert "r2_vision_camera_available()" in worker
 assert "r2_vision_vlc_available()" in worker
 assert "r2_vision_window_available(media_window)" in worker
 assert "r2_ears_start_desktop()" in worker and "r2_ears_start()" in worker
-assert "if (managed_audio)" in worker and "r2_ears_stop()" in worker
+assert "if (managed_microphone)" in worker and "r2_ears_stop()" in worker
+assert "if (managed_desktop)" in worker and "r2_ears_stop_desktop()" in worker
+assert "r2_ears_status_desktop()" in worker
+assert "wanted_audio" not in worker, "desktop playback must never displace microphone hearing"
 assert "if (managed_eyes)" in worker and "r2_eyes_stop()" in worker
 assert "r2_vision_watch_start()" in worker
 assert "r2_vision_open_window(media_window)" in worker
@@ -40,6 +43,8 @@ assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
 assert "Source discovery    : %s" in shell
+assert "Microphone input    : %s" in shell
+assert "Desktop audio input : %s" in shell
 assert "Visual input        : %s" in shell
 assert "no automatic transcription or image descriptions are generated." in shell
 
