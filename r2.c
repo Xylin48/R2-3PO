@@ -13194,6 +13194,14 @@ void r2_shutdown(void)
         ears = NULL;
     }
 
+    /* Auxiliary media has its own capture worker, frame buffer and Eyes object.
+       Stop it before the primary camera and before the Life Log closes. */
+    (void)r2_vision_media_stop();
+    if (media_eyes) {
+        r2_eyes_shutdown(media_eyes);
+        media_eyes = NULL;
+    }
+
     if (eyes) {
         r2_eyes_shutdown(eyes);
         eyes = NULL;
