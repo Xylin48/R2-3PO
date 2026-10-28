@@ -21,7 +21,7 @@ assert "pthread_join(shell_watch_thread, NULL)" in stop_body
 assert "atomic_store(&shell_watch_stop_requested, 1)" in stop_body
 # Boot only starts discovery; an unplugged microphone must not abort Watch.
 assert "pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL)" in start_body
-assert "r2_ears_status() > 0" in start_body
+assert "r2_ears_status() > 0" not in start_body
 assert "r2_ears_start()" not in start_body
 assert "r2_ears_stop()" not in start_body
 assert "shell_watch_start();" in shell[shell.index("int r2_shell_run(void)"):]
@@ -36,10 +36,12 @@ assert "if (managed_microphone)" in worker and "r2_ears_stop()" in worker
 assert "if (managed_desktop)" in worker and "r2_ears_stop_desktop()" in worker
 assert "r2_ears_status_desktop()" in worker
 assert "wanted_audio" not in worker, "desktop playback must never displace microphone hearing"
-assert "if (managed_eyes)" in worker and "r2_eyes_stop()" in worker
+assert "if (managed_camera)" in worker and "r2_eyes_release_source()" in worker
+assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_vision_watch_start()" in worker
-assert "r2_vision_open_window(wanted_window_id)" in worker
-assert "managed_window_id != wanted_window_id" in worker
+assert "r2_vision_media_open_window(wanted_window)" in worker
+assert "managed_window_id != wanted_window" in worker
+assert "r2_vision_media_stop()" in worker
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
@@ -55,8 +57,8 @@ assert "r2_talk(message)" in shell[
 ears_start = shell.index("static void shell_ears(const char *argument)")
 ears_end = shell.index("WATCH COORDINATOR", ears_start)
 ears_body = shell[ears_start:ears_end]
-assert "if (watch_running && argument && *argument" in ears_body
-assert "Watch owns continuous raw microphone capture" in ears_body
+assert "r2_sense_set_auto_allowed(2, 0);" in ears_body
+assert "r2_sense_set_auto_allowed(3, 0);" in ears_body
 assert "r2_ears_listen_cancelable(unsigned seconds," in core
 assert "int r2_watch_start(void);" in header and "int r2_watch_stop(void);" in header
 assert "shell_watch_stop();" in shell[
