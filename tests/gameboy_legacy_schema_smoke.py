@@ -30,6 +30,33 @@ def main() -> int:
                 id INTEGER PRIMARY KEY CHECK (id = 1)
             );
             INSERT INTO cartridge_slot(id) VALUES (1);
+
+            -- Legacy releases stored these tables alongside cartridge_slot.
+            CREATE TABLE console_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                power_state TEXT NOT NULL DEFAULT 'off'
+            );
+            INSERT INTO console_state(id, power_state) VALUES (1, 'on');
+
+            CREATE TABLE console_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                context TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details TEXT,
+                game_title TEXT,
+                session_id TEXT
+            );
+            INSERT INTO console_events(id, timestamp, context, event_type, summary, details)
+            VALUES (1, '2023-01-01T00:00:00+00:00', 'system', 'legacy_combined_boot',
+                    'legacy combined event retained', 'source database history');
+            INSERT INTO console_events(id, timestamp, context, event_type, summary, details)
+            VALUES (7, '2023-01-02T00:00:00+00:00', 'system', 'legacy_combined_event_7',
+                    'legacy event with non-colliding ID', 'source database history');
+
+            CREATE TABLE cartridge_inventory (filename TEXT PRIMARY KEY COLLATE NOCASE);
+            INSERT INTO cartridge_inventory(filename) VALUES ('Legacy.gba');
         """)
         cartridge_db.commit()
         cartridge_db.close()
@@ -88,6 +115,18 @@ def main() -> int:
             assert old_event["summary"] == "legacy event retained"
             assert old_event["verified"] == 0 and old_event["life_log_synced"] == 0
 
+            combined_event = db.execute(
+                "SELECT summary, verified, life_log_synced FROM console_events "
+                "WHERE event_type='legacy_combined_boot'"
+            ).fetchone()
+            assert combined_event is not None
+            assert combined_event["summary"] == "legacy combined event retained"
+            assert combined_event["verified"] == 0 and combined_event["life_log_synced"] == 0
+            assert db.execute(
+                "SELECT COUNT(*) FROM console_events WHERE event_type='legacy_combined_event_7'"
+            ).fetchone()[0] == 1
+
+
             old_cartridge = db.execute(
                 "SELECT filename, title, location, discovered_at, updated_at "
                 "FROM cartridge_inventory WHERE filename='Legacy.gba'"
@@ -125,6 +164,18 @@ def main() -> int:
             ).fetchone()[0] == 2
             assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert db.execute("PRAGMA cartridge.integrity_check").fetchone()[0] == "ok"
+
+            # Migration is copy-only: the original combined DB remains readable.
+            source = sqlite3.connect(root / "gameboy.db")
+            try:
+                assert source.execute(
+                    "SELECT COUNT(*) FROM console_events WHERE event_type='legacy_combined_boot'"
+                ).fetchone()[0] == 1
+                assert source.execute(
+                    "SELECT COUNT(*) FROM cartridge_inventory WHERE filename='Legacy.gba'"
+                ).fetchone()[0] == 1
+            finally:
+                source.close()
         finally:
             db.close()
 
