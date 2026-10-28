@@ -10102,6 +10102,162 @@ char *r2_vision_search(const char *query, int limit)
 }
 
 
+
+/* A media display has its own receiver and latest-frame storage; it cannot
+   replace or close the physical camera. Only an explicit media attention
+   request sends these pixels to Qwen. */
+static void *r2_media_capture_worker(void *unused)
+{
+    (void)unused;
+    unsigned char previous[256] = {0};
+    int have_previous = 0;
+    uint64_t last_change_event = 0;
+    while (!shutting_down && atomic_load(&media_capture_running)) {
+        pthread_mutex_lock(&media_capture_lock);
+        R2VisionFrame frame = {0};
+        R2VisionEvent event = {0};
+        int captured = media_eyes && r2_eyes_is_open(media_eyes)
+            ? r2_eyes_capture(media_eyes) : -1;
+        int available = captured == 1 &&
+            r2_eyes_get_frame(media_eyes, &frame) == 0 &&
+            r2_eyes_get_event(media_eyes, &event) == 0 &&
+            frame.data && frame.size > 0;
+        if (available) {
+            pthread_mutex_lock(&media_frame_lock);
+            if (frame.size > media_latest_capacity) {
+                unsigned char *grown = realloc(media_latest_data, frame.size);
+                if (grown) {
+                    media_latest_data = grown;
+                    media_latest_capacity = frame.size;
+                } else {
+                    available = 0;
+                }
+            }
+            if (available) {
+                memcpy(media_latest_data, frame.data, frame.size);
+                media_latest_frame = frame;
+                media_latest_frame.data = media_latest_data;
+                media_latest_event = event;
+            }
+            pthread_mutex_unlock(&media_frame_lock);
+        }
+        pthread_mutex_unlock(&media_capture_lock);
+        if (!available) {
+            if (!shutting_down && atomic_load(&media_capture_running))
+                r2_log_sensory("media_capture_ended",
+                              "The separate media display stopped supplying frames.",
+                              "Camera Eyes was not closed or replaced.", "media");
+            break;
+        }
+        /* Low-level awareness of temporal variation, not recognition of
+           objects, emotions, events, speech or video contents. */
+        unsigned changed = 0;
+        for (unsigned i = 0; i < 256; ++i) {
+            unsigned char sample = frame.data[(size_t)i * frame.size / 256U];
+            if (have_previous && abs((int)sample - (int)previous[i]) > 24)
+                changed++;
+            previous[i] = sample;
+        }
+        if (have_previous && changed >= 12 &&
+            (last_change_event == 0 || (frame.timestamp >= last_change_event &&
+             frame.timestamp - last_change_event >= 5000))) {
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                     "changed_sample_positions=%u/256; timestamp_ms=%llu; meaning=unknown",
+                     changed, (unsigned long long)frame.timestamp);
+            r2_log_sensory("media_visual_change_notice",
+                           "Raw visual variation was detected in an available media display.",
+                           detail, event.source_name);
+            last_change_event = frame.timestamp;
+        }
+        have_previous = 1;
+    }
+    atomic_store(&media_capture_running, 0);
+    return NULL;
+}
+
+int r2_vision_media_stop(void)
+{
+    atomic_store(&media_capture_running, 0);
+    if (media_capture_thread_started) {
+        pthread_join(media_capture_thread, NULL);
+        media_capture_thread_started = 0;
+    }
+    pthread_mutex_lock(&media_capture_lock);
+    if (media_eyes) r2_eyes_close(media_eyes);
+    pthread_mutex_unlock(&media_capture_lock);
+    pthread_mutex_lock(&media_frame_lock);
+    free(media_latest_data);
+    media_latest_data = NULL;
+    media_latest_capacity = 0;
+    memset(&media_latest_frame, 0, sizeof(media_latest_frame));
+    memset(&media_latest_event, 0, sizeof(media_latest_event));
+    pthread_mutex_unlock(&media_frame_lock);
+    return 0;
+}
+
+int r2_vision_media_status(void)
+{
+    return atomic_load(&media_capture_running) ? 1 : 0;
+}
+
+/* kind=window, vlc or file; only a separate receiver is changed. */
+static int r2_vision_media_open(int kind, unsigned long window, const char *path)
+{
+    if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
+        !atomic_load(&eyes_auto_allowed)) return -1;
+    (void)r2_vision_media_stop();
+    pthread_mutex_lock(&media_capture_lock);
+    if (!media_eyes && r2_eyes_init(&media_eyes) != 0) {
+        pthread_mutex_unlock(&media_capture_lock);
+        return -1;
+    }
+    int rc = kind == 1 ? r2_eyes_open_window(media_eyes, window) :
+             kind == 2 ? r2_eyes_open_vlc(media_eyes) :
+                         r2_eyes_open_file(media_eyes, path);
+    pthread_mutex_unlock(&media_capture_lock);
+    if (rc != 0) return rc;
+    atomic_store(&media_capture_running, 1);
+    if (pthread_create(&media_capture_thread, NULL,
+                       r2_media_capture_worker, NULL) != 0) {
+        atomic_store(&media_capture_running, 0);
+        pthread_mutex_lock(&media_capture_lock);
+        r2_eyes_close(media_eyes);
+        pthread_mutex_unlock(&media_capture_lock);
+        return -1;
+    }
+    media_capture_thread_started = 1;
+    r2_log_sensory("media_display_connected",
+                  "An independent video display is available to R2's visual attention.",
+                  "The video is not R2's eyes. Camera input remains primary; "
+                  "no media contents were analyzed automatically.",
+                  kind == 1 ? "X11 renderer" : kind == 2 ? "VLC display" : path);
+    return 0;
+}
+int r2_vision_media_open_window(unsigned long window)
+{
+    return window ? r2_vision_media_open(1, window, NULL) : -1;
+}
+
+char *r2_vision_media_see(const char *question)
+{
+    if (!r2_vision_media_status() || !question || !*question ||
+        !atomic_load(&eyes_auto_allowed)) return NULL;
+    pthread_mutex_lock(&media_frame_lock);
+    R2VisionFrame frame = media_latest_frame;
+    R2VisionEvent event = media_latest_event;
+    unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
+    if (copy) {
+        memcpy(copy, frame.data, frame.size);
+        frame.data = copy;
+    }
+    pthread_mutex_unlock(&media_frame_lock);
+    if (!copy) return NULL;
+    char *description = r2_visual_analyze_frame(&frame, event.source_name, question);
+    free(copy);
+    return description;
+}
+
 /* Capture and inference are separate workers. Eyes keeps draining the real-time
    FFmpeg stream while Qwen processes a copied frame, so video playback never
    backs up behind inference. Only the latest frame is retained; the image-only
