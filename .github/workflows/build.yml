@@ -183,6 +183,9 @@ jobs:
       - name: Verify primary camera and independent media attention
         run: python3 tests/camera_media_attention_contract_smoke.py
 
+      - name: Regress chosen display focus with dual-camera/media imagery
+        run: python3 tests/media_focus_bridge_smoke.py
+
       - name: Exercise independent raw camera and auxiliary media frames
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_primary_media_runtime.c Eyes.c -o /tmp/r2-eyes-primary-media-test -lpthread -lm
