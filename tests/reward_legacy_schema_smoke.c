@@ -83,6 +83,10 @@ int main(void)
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(legacy);
 
+    /* A missing Life Log is an unavailable connection, not evidence that a
+       reward never had an event. Do not create duplicate history on retry. */
+    assert(find_existing_log_event(42) == -1);
+
     /* Opening an older ledger must add missing fields without replacing history. */
     assert(r2_reward_init() == 0);
     assert(r2_reward_apply("new target", "new source", 1,
