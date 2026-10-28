@@ -47,6 +47,11 @@ assert "r2_eyes_release_source()" in worker
 assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen closure"
 for channel in ("1", "2", "3"):
     assert f"r2_sense_auto_allowed({channel})" in worker
+# A visual question cannot undo R2's explicit decision to close Eyes.
+assert "visual_requested && atomic_load(&eyes_auto_allowed)" in core
+camera_analysis = core[core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\\n{"):
+                       core.index("char *r2_vision_see(const char *question)")]
+assert "!atomic_load(&eyes_auto_allowed)" in camera_analysis
 assert "r2_eyes_open_window(eyes," not in core, "media must not replace camera"
 assert "r2_eyes_open_vlc(eyes)" not in core
 assert "r2_eyes_open_file(eyes," not in core
