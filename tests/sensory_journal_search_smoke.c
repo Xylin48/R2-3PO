@@ -93,18 +93,25 @@ int main(void)
         "details TEXT, source TEXT);"
         "CREATE TABLE diary_entries (id INTEGER PRIMARY KEY, entry TEXT);"
         "CREATE TABLE r2_sensory_journal ("
-        "event_id INTEGER PRIMARY KEY, journal_kind TEXT NOT NULL);"
+        "event_id INTEGER PRIMARY KEY, journal_kind TEXT NOT NULL,"
+        "indexed_utc TEXT NOT NULL);"
         "CREATE TABLE r2_sensory_journal_diary_links ("
-        "event_id INTEGER PRIMARY KEY, diary_entry_id INTEGER NOT NULL);") == 0);
+        "event_id INTEGER PRIMARY KEY, diary_entry_id INTEGER NOT NULL,"
+        "linked_utc TEXT NOT NULL);") == 0);
     assert(insert_event(db, "Saw 100% battery", "capacity was 100%") == 0);
     assert(insert_event(db, "Saw 100 percent battery", "capacity was described in words") == 0);
     assert(insert_event(db, "Saw sensor_port value", "literal underscore in sensor_port") == 0);
     assert(insert_event(db, "Saw sensorXport value", "one-character variant only") == 0);
     assert(insert_event(db, "Saw bang!mark", "literal escape character") == 0);
+    assert(exec_sql(db,
+        "INSERT INTO diary_entries(id,entry) VALUES(99,'Legacy diary entry');"
+        "INSERT INTO r2_log_events(utc_time,local_time,category,event_type,summary,details,source) "
+        "VALUES(datetime('now'),datetime('now'),'thinking','diary_entry_written',"
+        "'Legacy diary record','Legacy diary entry','legacy-schema-smoke');") == 0);
     sqlite3_close(db);
 
     assert(r2_sj_init() == 0);
-    assert(r2_sj_count() == 5);
+    assert(r2_sj_count() == 6);
 
     /* Legacy journal tables predate timestamp columns. Migration must add
        them before any backfill or new event-link write is attempted. */
@@ -131,6 +138,22 @@ int main(void)
     }
     sqlite3_finalize(schema_st);
     assert(has_linked_utc);
+
+    /* Legacy timestamp columns already existed but had no DEFAULT clause.
+       Backfill must explicitly populate them instead of silently ignoring rows. */
+    sqlite3_stmt *legacy_link = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT j.indexed_utc,l.linked_utc FROM r2_log_events e "
+        "JOIN r2_sensory_journal j ON j.event_id=e.id "
+        "JOIN r2_sensory_journal_diary_links l ON l.event_id=e.id "
+        "WHERE e.event_type='diary_entry_written' AND e.source='legacy-schema-smoke'",
+        -1, &legacy_link, NULL) == SQLITE_OK);
+    assert(sqlite3_step(legacy_link) == SQLITE_ROW);
+    assert(sqlite3_column_text(legacy_link, 0) != NULL);
+    assert(sqlite3_column_text(legacy_link, 1) != NULL);
+    assert(strlen((const char *)sqlite3_column_text(legacy_link, 0)) > 0);
+    assert(strlen((const char *)sqlite3_column_text(legacy_link, 1)) > 0);
+    sqlite3_finalize(legacy_link);
     sqlite3_close(db);
 
     char *found = r2_sj_search("100%", 20);
