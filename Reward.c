@@ -558,12 +558,17 @@ int r2_reward_reconnect_history(int limit)
     PendingReward *pending = NULL;
     sqlite3_stmt *st = NULL;
     int rc, count = 0, linked = 0;
+    sqlite3_int64 last_seen_id = 0;
     if (!r2_log_is_initialized()) return -1;
     if (limit <= 0) limit = 100;
     if (limit > 500) limit = 500;
 
     pending = calloc((size_t)limit, sizeof(*pending));
     if (!pending) return -1;
+    /* Walk the entire legacy backlog in fixed-size pages. A failed early link
+       must not permanently starve later historical events. */
+    for (;;) {
+    count = 0;
     pthread_mutex_lock(&reward_lock);
     if (ensure_db_locked() != 0) {
         pthread_mutex_unlock(&reward_lock);
@@ -572,9 +577,10 @@ int r2_reward_reconnect_history(int limit)
     }
     rc = sqlite3_prepare_v2(reward_db,
         "SELECT id,COALESCE(log_event_id,0),memory_indexed,target,source,points,reason,occurred_at,modifier,expires_at "
-        "FROM reward_events WHERE log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0 "
-        "ORDER BY id LIMIT ?", -1, &st, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 1, limit);
+        "FROM reward_events WHERE (log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0) "
+        "AND id>? ORDER BY id LIMIT ?", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, last_seen_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, limit);
     if (rc == SQLITE_OK) {
         while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
             PendingReward *item = &pending[count++];
@@ -602,6 +608,8 @@ int r2_reward_reconnect_history(int limit)
         free(pending);
         return -1;
     }
+    if (count == 0) break;
+    last_seen_id = pending[count - 1].id;
 
     for (int i = 0; i < count; ++i) {
         PendingReward *item = &pending[i];
@@ -622,6 +630,7 @@ int r2_reward_reconnect_history(int limit)
                 memory_indexed > 0)
                 linked++;
         }
+    }
     }
     free(pending);
     return linked;
