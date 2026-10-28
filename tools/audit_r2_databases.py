@@ -218,7 +218,25 @@ def _relationship_check(
             return result
         qs = '"' + source_table.replace('"', '""') + '"'
         qc = '"' + source_column.replace('"', '""') + '"'
-        required = source_table == "r2_alternate_self_branches" and source_column == "log_event_id"
+        required = (source_table, source_column) in {
+            ("r2_alternate_self_branches", "log_event_id"),
+            ("r2_alternate_self_event_links", "branch_id"),
+            ("r2_alternate_self_event_links", "event_id"),
+            ("r2_diary_entry_links", "diary_entry_id"),
+            ("r2_sensory_journal", "event_id"),
+            ("r2_sensory_journal_diary_links", "event_id"),
+            ("r2_sensory_journal_diary_links", "diary_entry_id"),
+            ("r2_log_activity_sessions", "start_event_id"),
+            ("r2_log_milestones", "first_event_id"),
+            ("r2_log_conversations", "event_id"),
+            ("r2_log_inner_states", "event_id"),
+            ("r2_log_beliefs", "last_event_id"),
+            ("r2_log_continuity", "last_event_id"),
+            ("r2_log_hypotheticals", "event_id"),
+            ("r2_log_system_snapshots", "event_id"),
+            ("r2_log_links", "from_event_id"),
+            ("r2_log_links", "to_event_id"),
+        }
         select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
         values = [row[0] for row in source_db.execute(select_sql)]
         qt = '"' + target_table.replace('"', '""') + '"'
@@ -258,6 +276,19 @@ def audit_relationships(
             connections[name] = None
 
     relations = [
+        ("r2_memory.db", "r2_log_events", "session_id", "r2_memory.db", "r2_log_sessions", "id"),
+        ("r2_memory.db", "r2_log_events", "related_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_activity_sessions", "start_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_activity_sessions", "end_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_milestones", "first_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_conversations", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_inner_states", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_beliefs", "last_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_continuity", "last_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_links", "from_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_links", "to_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_hypotheticals", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_log_system_snapshots", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_visual_experiences", "life_log_event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_alternate_self_branches", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_alternate_self_branches", "evidence_event_id", "r2_memory.db", "r2_log_events", "id"),
