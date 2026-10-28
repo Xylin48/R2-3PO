@@ -1282,7 +1282,8 @@ static void shell_watch_status(void)
         "================ WATCH STATUS =============================\n"
         "\n"
         "Source discovery    : %s\n"
-        "Audio input         : %s\n"
+        "Microphone input    : %s\n"
+        "Desktop audio input : %s\n"
         "Visual input        : %s\n"
         "Core Watch state    : %s\n"
         "\n"
@@ -1293,6 +1294,7 @@ static void shell_watch_status(void)
         "\n",
         shell_watch_thread_started ? "MONITORING" : "STOPPED",
         !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "WAITING"),
+        !watch_running ? "STOPPED" : (r2_ears_status_desktop() > 0 ? "ACTIVE" : "WAITING"),
         r2_vision_watch_active() ? "ACTIVE" : "WAITING",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
@@ -1314,7 +1316,8 @@ static void *shell_watch_worker(void *unused)
 {
     (void)unused;
     int managed_eyes = 0;
-    int managed_audio = 0; /* 0=none; 1=microphone; 2=desktop playback */
+    int managed_microphone = 0;
+    int managed_desktop = 0;
     int attached_visual = 0;
 
     while (!shell_watch_cancelled(NULL)) {
@@ -1360,19 +1363,25 @@ static void *shell_watch_worker(void *unused)
             }
         }
 
-        /* Desktop playback is activated for any uncorked application stream;
-           otherwise a present microphone is the live input. A missing USB
-           microphone never blocks Watch or Eyes from coming online. */
-        int wanted_audio = desktop_playing ? 2 : (microphone_available ? 1 : 0);
-        if (managed_audio &&
-            (wanted_audio != managed_audio || r2_ears_status() <= 0)) {
+        /* Both audio streams independently follow the actual source lifecycle.
+           Neither stream is classified or transcribed just by being present. */
+        if (managed_microphone &&
+            (!microphone_available || r2_ears_status() <= 0)) {
             (void)r2_ears_stop();
-            managed_audio = 0;
+            managed_microphone = 0;
         }
-        if (!managed_audio && wanted_audio && r2_ears_status() <= 0) {
-            int rc = wanted_audio == 2 ? r2_ears_start_desktop() : r2_ears_start();
-            if (rc == 0) managed_audio = wanted_audio;
+        if (!managed_microphone && microphone_available && r2_ears_status() <= 0 &&
+            r2_ears_start() == 0)
+            managed_microphone = 1;
+
+        if (managed_desktop &&
+            (!desktop_playing || r2_ears_status_desktop() <= 0)) {
+            (void)r2_ears_stop_desktop();
+            managed_desktop = 0;
         }
+        if (!managed_desktop && desktop_playing && r2_ears_status_desktop() <= 0 &&
+            r2_ears_start_desktop() == 0)
+            managed_desktop = 1;
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
@@ -1383,8 +1392,10 @@ static void *shell_watch_worker(void *unused)
         (void)r2_eyes_stop();
     else if (attached_visual)
         (void)r2_vision_watch_stop();
-    if (managed_audio)
+    if (managed_microphone)
         (void)r2_ears_stop();
+    if (managed_desktop)
+        (void)r2_ears_stop_desktop();
     return NULL;
 }
 
