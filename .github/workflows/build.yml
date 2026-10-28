@@ -183,6 +183,11 @@ jobs:
       - name: Verify primary camera and independent media attention
         run: python3 tests/camera_media_attention_contract_smoke.py
 
+      - name: Exercise independent raw camera and auxiliary media frames
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_primary_media_runtime.c Eyes.c -o /tmp/r2-eyes-primary-media-test -lpthread -lm
+          /tmp/r2-eyes-primary-media-test
+
       - name: Require open Eyes before starting visual observation
         run: python3 tests/vision_watch_requires_open_eyes_smoke.py
 
