@@ -9895,7 +9895,53 @@ char *r2_vision_search(const char *query, int limit)
 }
 
 
-/* Periodic sensory observation: record what Eyes receives, not decisions. */
+/* Capture and inference are separate workers. Eyes keeps draining the real-time
+   FFmpeg stream while Qwen processes a copied frame, so video playback never
+   backs up behind inference. Only the latest frame is retained; the image-only
+   model receives successive fresh frames at its own processing rate. */
+static pthread_t vision_watch_capture_thread;
+static int vision_watch_capture_thread_started = 0;
+static pthread_mutex_t vision_watch_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vision_watch_frame_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t vision_watch_frame_generation = 0;
+static int vision_watch_capture_done = 0;
+
+static void *vision_watch_capture_worker(void *unused)
+{
+    (void)unused;
+    while (!shutting_down && atomic_load(&vision_watch_running)) {
+        pthread_mutex_lock(&visual_capture_lock);
+        int captured = (eyes && r2_eyes_is_open(eyes))
+            ? r2_eyes_capture(eyes) : -1;
+        pthread_mutex_unlock(&visual_capture_lock);
+
+        if (captured != 1) {
+            if (captured == 0)
+                r2_log_sensory("vision_source_ended",
+                               "R2's visual source reached its end.",
+                               "Continuous observation stopped because the source supplied no more frames.",
+                               "Eyes");
+            else if (!shutting_down && atomic_load(&vision_watch_running))
+                r2_log_sensory("vision_watch_capture_failed",
+                               "R2's continuous visual observer could not capture another frame.",
+                               "The source stopped or Eyes returned a capture error.",
+                               "Eyes");
+            break;
+        }
+
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        ++vision_watch_frame_generation;
+        pthread_cond_broadcast(&vision_watch_frame_cond);
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+    }
+
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    vision_watch_capture_done = 1;
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
+    return NULL;
+}
+
 static void *vision_watch_worker(void *unused)
 {
     (void)unused;
@@ -9910,77 +9956,88 @@ static void *vision_watch_worker(void *unused)
 
     char start_details[768];
     snprintf(start_details, sizeof(start_details),
-             "source=%s; observation=periodic visual sampling; interval=approximately 15 seconds; "
-             "frames are analyzed individually, not as continuous motion.",
+             "source=%s; observation=successive fresh visual frames; "
+             "capture runs continuously while Qwen analyzes copied frames; "
+             "analysis cadence is limited by model processing time.",
              source_name);
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_started",
                  "R2 continuous visual observation started.",
                  start_details, source_name);
 
+    uint64_t last_generation = 0;
+    uint64_t last_frame_number = 0;
     while (!shutting_down && atomic_load(&vision_watch_running)) {
-        char *description = vision_analyze_current_frame(
-            "Provide a concise sensory description of this frame for R2. "
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        while (!shutting_down && atomic_load(&vision_watch_running) &&
+               vision_watch_frame_generation == last_generation &&
+               !vision_watch_capture_done)
+            pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
+        uint64_t generation = vision_watch_frame_generation;
+        int capture_done = vision_watch_capture_done;
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+
+        if (shutting_down || !atomic_load(&vision_watch_running))
+            break;
+        if (generation == last_generation && capture_done)
+            break;
+        last_generation = generation;
+
+        R2VisionFrame frame;
+        R2VisionEvent event;
+        memset(&frame, 0, sizeof(frame));
+        memset(&event, 0, sizeof(event));
+        unsigned char *frame_copy = NULL;
+
+        pthread_mutex_lock(&visual_capture_lock);
+        int frame_ready = eyes && r2_eyes_is_open(eyes) &&
+            r2_eyes_get_frame(eyes, &frame) == 0 &&
+            r2_eyes_get_event(eyes, &event) == 0 &&
+            frame.data && frame.size > 0;
+        if (frame_ready) {
+            frame_copy = malloc(frame.size);
+            if (frame_copy) {
+                memcpy(frame_copy, frame.data, frame.size);
+                frame.data = frame_copy;
+            }
+        }
+        pthread_mutex_unlock(&visual_capture_lock);
+
+        if (!frame_copy) {
+            if (capture_done)
+                break;
+            continue;
+        }
+        if (frame.frame_number <= last_frame_number) {
+            free(frame_copy);
+            continue;
+        }
+        last_frame_number = frame.frame_number;
+
+        char *description = r2_visual_analyze_frame(
+            &frame, event.source_name[0] ? event.source_name : source_name,
+            "Provide a concise sensory description of this newly captured video frame for R2. "
             "Report visible details and uncertainty without deciding what they mean, "
             "choosing an action, identifying a memory match, or composing something R2 should say. "
-            "This is perceptual input for R2's own thinking, not a decision.", 0);
+            "Treat it as the next frame in an ongoing visual sequence; describe meaningful changes "
+            "from prior observations only when supported by the frame and recorded context.");
+        free(frame_copy);
+
         if (description) {
             r2_log_event(R2_LOG_SENSORY, "vision_watch_observation",
-                         "R2 analyzed a frame during continuous visual observation.",
+                         "R2 analyzed a fresh frame during continuous visual observation.",
                          description, source_name);
-
             free(description);
-        }
-
-        /*
-         * Eyes' FFmpeg stream is real-time. Drain frames while waiting so
-         * the pipe cannot build a stale backlog while R2 reasons about a
-         * sampled frame. Analyze one fresh frame after roughly 15 seconds.
-         * If a file ends, stop observing rather than silently switching
-         * from the requested media to the physical camera.
-         */
-        struct timespec sample_start, sample_now;
-        clock_gettime(CLOCK_MONOTONIC, &sample_start);
-        while (!shutting_down && atomic_load(&vision_watch_running)) {
-            pthread_mutex_lock(&visual_capture_lock);
-            int captured = (eyes && r2_eyes_is_open(eyes))
-                ? r2_eyes_capture(eyes) : -1;
-            pthread_mutex_unlock(&visual_capture_lock);
-
-            if (captured != 1) {
-                if (captured == 0)
-                    r2_log_sensory("vision_source_ended",
-                                   "R2's visual source reached its end.",
-                                   "Continuous observation stopped because the source supplied no more frames.",
-                                   source_name);
-                else
-                    r2_log_sensory("vision_watch_capture_failed",
-                                   "R2's continuous visual observer could not capture another frame.",
-                                   "The source stopped or Eyes returned a capture error.",
-                                   source_name);
-                atomic_store(&vision_watch_running, 0);
-                break;
-            }
-
-            clock_gettime(CLOCK_MONOTONIC, &sample_now);
-            time_t elapsed_seconds = sample_now.tv_sec - sample_start.tv_sec;
-            long elapsed_nanoseconds = sample_now.tv_nsec - sample_start.tv_nsec;
-            if (elapsed_nanoseconds < 0) {
-                --elapsed_seconds;
-                elapsed_nanoseconds += 1000000000L;
-            }
-            if (elapsed_seconds >= 15)
-                break;
         }
     }
 
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_stopped",
                  "R2 continuous visual observation stopped.",
-                 "The observation worker exited; consult visual sensory events to determine whether the source ended or capture failed.",
+                 "The frame observer exited; consult visual sensory events to determine whether the source ended or capture failed.",
                  source_name);
+    atomic_store(&vision_watch_running, 0);
     vision_watch_worker_context = 0;
     return NULL;
 }
-
 int r2_vision_watch_start(void)
 {
     if (!core_initialized || shutting_down || !r2_visual_is_initialized() ||
@@ -9993,22 +10050,57 @@ int r2_vision_watch_start(void)
         pthread_mutex_unlock(&vision_watch_lock);
         return -1;
     }
+    if (vision_watch_thread_started && atomic_load(&vision_watch_running)) {
+        pthread_mutex_unlock(&vision_watch_lock);
+        return 0;
+    }
+
+    /* Reap both completed workers before reusing their lifecycle state. */
+    atomic_store(&vision_watch_running, 0);
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
-        if (atomic_load(&vision_watch_running)) {
-            pthread_mutex_unlock(&vision_watch_lock);
-            return 0;
-        }
-        /* Reap a naturally ended worker before creating its replacement. */
         pthread_join(vision_watch_thread, NULL);
         vision_watch_thread_started = 0;
     }
+    if (vision_watch_capture_thread_started) {
+        pthread_join(vision_watch_capture_thread, NULL);
+        vision_watch_capture_thread_started = 0;
+    }
+
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    vision_watch_frame_generation = 0;
+    vision_watch_capture_done = 0;
+    pthread_mutex_unlock(&vision_watch_frame_lock);
 
     atomic_store(&vision_watch_running, 1);
+    if (pthread_create(&vision_watch_capture_thread, NULL,
+                       vision_watch_capture_worker, NULL) != 0) {
+        atomic_store(&vision_watch_running, 0);
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        vision_watch_capture_done = 1;
+        pthread_cond_broadcast(&vision_watch_frame_cond);
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+        pthread_mutex_unlock(&vision_watch_lock);
+        r2_log_event(R2_LOG_ERROR, "vision_watch_capture_start_failed",
+                     "Could not start the continuous Eyes capture worker.",
+                     NULL, "r2_vision_watch_start");
+        return -1;
+    }
+    vision_watch_capture_thread_started = 1;
+
     if (pthread_create(&vision_watch_thread, NULL, vision_watch_worker, NULL) != 0) {
         atomic_store(&vision_watch_running, 0);
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        pthread_cond_broadcast(&vision_watch_frame_cond);
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+        pthread_join(vision_watch_capture_thread, NULL);
+        vision_watch_capture_thread_started = 0;
         pthread_mutex_unlock(&vision_watch_lock);
         r2_log_event(R2_LOG_ERROR, "vision_watch_start_failed",
-                     "Could not start the visual observation thread.", NULL, "r2_vision_watch_start");
+                     "Could not start the visual analysis worker.",
+                     NULL, "r2_vision_watch_start");
         return -1;
     }
     vision_watch_thread_started = 1;
@@ -10020,14 +10112,20 @@ int r2_vision_watch_stop(void)
 {
     pthread_mutex_lock(&vision_watch_lock);
     atomic_store(&vision_watch_running, 0);
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
         pthread_join(vision_watch_thread, NULL);
         vision_watch_thread_started = 0;
     }
+    if (vision_watch_capture_thread_started) {
+        pthread_join(vision_watch_capture_thread, NULL);
+        vision_watch_capture_thread_started = 0;
+    }
     pthread_mutex_unlock(&vision_watch_lock);
     return 0;
 }
-
 int r2_vision_watch_active(void)
 {
     return atomic_load(&vision_watch_running) ? 1 : 0;
