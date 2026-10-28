@@ -42,4 +42,11 @@ assert "pthread_join(vision_watch_capture_thread, NULL)" in stop
 assert "pthread_cond_broadcast(&vision_watch_frame_cond)" in stop
 assert "Eyes captures continuously and Qwen analyzes successive fresh frames" in shell
 
+direct_start = core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\\n{")
+direct_end = core.index("\\nchar *r2_vision_see(", direct_start)
+direct = core[direct_start:direct_end]
+assert "memcpy(frame_copy, frame.data, frame.size)" in direct
+assert direct.index("pthread_mutex_unlock(&visual_capture_lock)") < direct.index("r2_visual_analyze_frame(")
+assert "free(frame_copy);" in direct
+
 print("Continuous Eyes capture, latest-frame handoff, nonblocking Qwen analysis, and dual-worker shutdown passed.")
