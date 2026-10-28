@@ -152,7 +152,7 @@ int main(void)
                               "I have not looked yet.", "I might see an object.",
                               "This is only a prediction.", evidence_id);
     if (!check(first > 0, "create a hypothetical branch with evidence")) goto done;
-    if (!check(r2_altself_link(first, evidence_id, "legacy_link_test",
+    if (!check(r2_altself_link_event(first, evidence_id, "legacy_link_test",
                                "write to legacy link schema") == 0,
                "write link when legacy created_utc is NOT NULL without a default")) goto done;
     second = r2_altself_create("Look right", "What if I looked right?",
