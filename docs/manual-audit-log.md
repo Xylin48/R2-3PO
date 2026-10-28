@@ -296,3 +296,28 @@ The repository has targeted legacy-schema tests for the shared memory/Life Log d
 - **GitHub Actions:** [run 40629395737](https://github.com/Xylin48/R2-3PO/actions/runs/40629395737) — passed, 92/92 steps.
 - **What this proves:** strict build and the configured regression suite, including the primary legacy-schema tests and the new Game Boy split-database migration test.
 - **What this does not prove:** live Qwen/Ollama response quality on the target PC, actual GTX 1050 Ti behavior, or the integrity/schema of the user's real database files. Those require target-host checks and a read-only database audit before any migration is applied to user data.
+
+### R2-AUD-2026-10-28-006 — Alternate-Self writes assumed timestamp defaults in older schemas
+
+- **Area:** `AlternateSelf.c`, `r2_alternate_self_branches` and `r2_alternate_self_event_links`.
+- **Severity:** High / persistent hypothetical-history continuity.
+- **Finding:** Branch and link inserts relied on `created_utc` defaults. An older table can have the timestamp columns declared `NOT NULL` without a default, causing writes to fail after additive migration.
+- **Fix:** Branch creation and hypothesis import now explicitly supply `CURRENT_TIMESTAMP` for `created_utc` and `updated_utc`; event-link insertion explicitly supplies `created_utc`.
+- **Regression coverage:** `tests/alternate_self_smoke.c` now starts with a legacy branch table and legacy link table whose timestamp columns have no defaults, verifies the old branch remains readable, and exercises new branch/link/import writes.
+- **Validation:** Passed the full repository CI workflow on code revision `5e0e5018` (92/92 steps).
+
+### R2-AUD-2026-10-28-007 — Sensory Journal writes could be ignored by legacy timestamp constraints
+
+- **Area:** `SensoryJournal.c`, journal indexing and diary-link backfill/runtime writes.
+- **Severity:** High / sensory-history continuity.
+- **Finding:** Backfill and runtime inserts omitted `indexed_utc` or `linked_utc`. If an older table already had either column as `NOT NULL` without a default, `INSERT OR IGNORE` could silently skip the row.
+- **Fix:** All backfill and runtime index/link inserts now provide `CURRENT_TIMESTAMP` explicitly, independent of schema defaults.
+- **Regression coverage:** `tests/sensory_journal_search_smoke.c` now exercises pre-existing legacy timestamp columns without defaults, backfills a prior diary event, verifies non-empty timestamps, and checks that new diary events remain indexed and linked after restart.
+- **Validation:** Passed the full repository CI workflow on code revision `5e0e5018` (92/92 steps).
+
+### Latest code validation checkpoint
+
+- **Exact tested code revision:** `5e0e5018aedcd624c2284366198df35cc96920d2`.
+- **GitHub Actions:** [run 40630710375](https://github.com/Xylin48/R2-3PO/actions/runs/40630710375) — passed, 92/92 steps.
+- **Repository-level status:** All configured strict build/regression steps pass, including the primary legacy database tests, Game Boy split-database import, Alternate-Self legacy timestamp constraints, and Sensory Journal legacy timestamp constraints.
+- **Outstanding acceptance boundary:** The user's actual `R2_Home` databases have not been opened or audited in this session, and live Qwen/Ollama/GPU behavior has not been exercised on the target PC. Run the existing read-only preflight against the actual data directory before any on-disk migration or live acceptance.
