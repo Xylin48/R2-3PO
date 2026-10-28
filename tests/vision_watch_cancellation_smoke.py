@@ -21,7 +21,7 @@ stop = core[stop_start:stop_end]
 assert stop.index("atomic_store(&vision_watch_running, 0)") < stop.index("pthread_join(vision_watch_thread, NULL)")
 assert stop.index("atomic_store(&vision_watch_running, 0)") < stop.index("pthread_join(vision_watch_capture_thread, NULL)")
 assert "pthread_cond_broadcast(&vision_watch_frame_cond)" in stop
-assert "r2_visual_analyze_frame(" in core[
+assert "vision_analyze_current_frame(question, 1)" in core[
     core.index("char *r2_vision_see(const char *question)"):
     core.index("char *r2_vision_recent(int limit)")
 ]
