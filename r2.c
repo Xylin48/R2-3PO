@@ -11280,7 +11280,8 @@ void r2_status(void)
         "Thinking          : %s\n"
         "Workers           : %d\n"
         "Eyes              : %s\n"
-        "Ears              : %s\n"
+        "Ears (microphone) : %s\n"
+        "Ears (desktop)    : %s\n"
         "Watch             : %s\n"
         "============================================================\n",
         r2_is_initialized() ? "YES" : "NO",
@@ -11294,6 +11295,7 @@ void r2_status(void)
         r2_worker_count(),
         r2_eyes_status() ? "OPEN" : "CLOSED",
         r2_ears_status() ? "OPEN" : "CLOSED",
+        r2_ears_status_desktop() ? "OPEN" : "CLOSED",
         r2_watch_active() ? "ACTIVE" : "STOPPED"
     );
 }
@@ -12878,6 +12880,12 @@ void r2_shutdown(void)
     /* Reap any short sound player before closing the Life Log. */
     r2_sounds_shutdown();
 
+    /* Both independent audio workers stop before persistent stores close. */
+    (void)r2_ears_stop_desktop();
+    if (ears_desktop) {
+        r2_ears_shutdown(ears_desktop);
+        ears_desktop = NULL;
+    }
     if (ears) {
         (void)r2_ears_stop();
         r2_ears_shutdown(ears);
