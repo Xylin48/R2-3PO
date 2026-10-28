@@ -9161,7 +9161,7 @@ static void *autonomous_thinking(void *arg)
             "Write a private diary reflection based ONLY on the information supplied.\n"
             "If Eyes is already open, a current image may be attached as raw visual input. "
             "Its presence is not an instruction to describe the image; decide whether it matters "
-            "to your reflection, and attend only to what you choose. Never open Eyes from this reflection. "
+            "to your reflection, and attend only to what you choose. Open or close Eyes only by a deliberate [SENSE] decision, not automatically for an imagined scene. "
             "Your camera is your primary eyesight. A movie is a separate visible display, not replacement eyes. Raw change notices may attract your attention without proving what happened. You can choose [SENSE] eyes|close or eyes|open, microphone|close or microphone|open, desktop|close or desktop|open as a standalone deliberate decision; Watch will respect it. You may choose [MEDIA_SEE] question on its own line to examine a real media display, but never invent contents if unavailable. "
 "If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds or desktop_live|seconds "
             "marker on its own line. The system will return the listening result and request a final reflection; "
@@ -11558,7 +11558,8 @@ void r2_status(void)
         "Relevant memory   : %d records/turn\n"
         "Thinking          : %s\n"
         "Workers           : %d\n"
-        "Eyes              : %s\n"
+        "Eyes (camera)     : %s\n"
+        "Media display     : %s\n"
         "Ears (microphone) : %s\n"
         "Ears (desktop)    : %s\n"
         "Watch             : %s\n"
@@ -11573,6 +11574,7 @@ void r2_status(void)
         r2_thinking_active() ? "ACTIVE" : "INACTIVE",
         r2_worker_count(),
         r2_eyes_status() ? "OPEN" : "CLOSED",
+        r2_vision_media_status() ? "AVAILABLE" : "CLOSED",
         r2_ears_status() ? "OPEN" : "CLOSED",
         r2_ears_status_desktop() ? "OPEN" : "CLOSED",
         r2_watch_active() ? "ACTIVE" : "STOPPED"
@@ -12401,6 +12403,30 @@ finalize_reply:
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
                             "conversation_occurred_during_media", visual_event.source_name);
+        }
+
+        /* Media is a display present in R2's world, not another pair of eyes.
+           Being available never proves he watched or understood its content. */
+        R2VisionEvent display_event = {0};
+        pthread_mutex_lock(&media_frame_lock);
+        int display_present = atomic_load(&media_capture_running) &&
+            media_latest_frame.data && media_latest_frame.size &&
+            media_latest_event.source_name[0];
+        if (display_present) display_event = media_latest_event;
+        pthread_mutex_unlock(&media_frame_lock);
+        if (display_present) {
+            char details[1200];
+            snprintf(details, sizeof(details),
+                     "conversation_event_id=%lld\\nmedia_display=%s\\n"
+                     "display_available=1; attended=not_established; interpreted=not_established",
+                     (long long)turn_event_id, display_event.source_name);
+            int64_t association_id = r2_log_event(
+                R2_LOG_CONVERSATION, "conversation_with_media_display_available",
+                "A separate video display was available during this conversation.",
+                details, display_event.source_name);
+            if (association_id > 0)
+                r2_log_link(turn_event_id, association_id,
+                            "media_display_was_available", display_event.source_name);
         }
 
         R2HearingEvent hearing_event;
