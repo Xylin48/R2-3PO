@@ -38,6 +38,10 @@ int main(void)
         "  echo 'Sink Input #21'\n"
         "  if [ \"$R2_TEST_PLAYING\" = \"1\" ]; then echo '    Corked: no'\n"
         "  else echo '    Corked: yes'; fi\n"
+        "  echo '    application.process.id = \"3141\"'\n"
+        "  echo 'Sink Input #22'\n"
+        "  echo '    Corked: yes'\n"
+        "  echo '    application.process.id = \"2718\"'\n"
         "fi\n";
     assert(fputs(body, fp) >= 0);
     assert(fclose(fp) == 0);
@@ -51,18 +55,22 @@ int main(void)
     assert(setenv("R2_TEST_PLAYING", "0", 1) == 0);
     assert(r2_ears_microphone_available() == 0);
     assert(r2_ears_desktop_playing() == 0);
+    assert(r2_ears_playback_pid() == -1);
 
     assert(setenv("R2_TEST_MIC", "1", 1) == 0);
     assert(r2_ears_microphone_available() == 1);
     assert(r2_ears_desktop_playing() == 0);
+    assert(r2_ears_playback_pid() == -1);
 
     assert(setenv("R2_TEST_PLAYING", "1", 1) == 0);
     assert(r2_ears_microphone_available() == 1);
     assert(r2_ears_desktop_playing() == 1);
+    assert(r2_ears_playback_pid() == 3141);
 
     assert(setenv("R2_TEST_MIC", "0", 1) == 0);
     assert(r2_ears_microphone_available() == 0);
     assert(r2_ears_desktop_playing() == 1);
+    assert(r2_ears_playback_pid() == 3141);
 
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
