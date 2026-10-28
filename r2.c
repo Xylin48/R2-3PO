@@ -111,6 +111,22 @@
 static sqlite3 *db = NULL;
 
 static R2Eyes *eyes = NULL;
+/* The physical camera is R2's primary eyesight. Media is something the
+   camera-owning brain may choose to observe, never an alternative pair of eyes. */
+static R2Eyes *media_eyes = NULL;
+static pthread_mutex_t media_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t media_capture_thread;
+static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
+static int media_capture_thread_started = 0;
+static unsigned char *media_latest_data = NULL;
+static size_t media_latest_capacity = 0;
+static R2VisionFrame media_latest_frame;
+static R2VisionEvent media_latest_event;
+static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
+static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
+static atomic_int desktop_auto_allowed = ATOMIC_VAR_INIT(1);
+
 static R2Ears *ears = NULL;
 /* Desktop and microphone are independent live hearing organs. */
 static R2Ears *ears_desktop = NULL;
@@ -10531,6 +10547,27 @@ int r2_eyes_stop(void)
 int r2_eyes_status(void)
 {
     return eyes ? (r2_eyes_is_open(eyes) ? 1 : 0) : 0;
+}
+
+/* Automatic discovery is subordinate to deliberate sensory decisions. An
+   unavailable source is not a voluntary choice to close a sense. */
+int r2_sense_auto_allowed(int which)
+{
+    switch (which) {
+        case 1: return atomic_load(&eyes_auto_allowed);
+        case 2: return atomic_load(&microphone_auto_allowed);
+        case 3: return atomic_load(&desktop_auto_allowed);
+        default: return 0;
+    }
+}
+void r2_sense_set_auto_allowed(int which, int allowed)
+{
+    switch (which) {
+        case 1: atomic_store(&eyes_auto_allowed, allowed != 0); break;
+        case 2: atomic_store(&microphone_auto_allowed, allowed != 0); break;
+        case 3: atomic_store(&desktop_auto_allowed, allowed != 0); break;
+        default: break;
+    }
 }
 
 /* Serialize Ears source lifecycle against explicit capture requests. */
