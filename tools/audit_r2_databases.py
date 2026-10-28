@@ -218,15 +218,15 @@ def _relationship_check(
             return result
         qs = '"' + source_table.replace('"', '""') + '"'
         qc = '"' + source_column.replace('"', '""') + '"'
-        values = [row[0] for row in source_db.execute(
-            f"SELECT {qc} FROM {qs} WHERE {qc} IS NOT NULL"
-        )]
+        required = source_table == "r2_alternate_self_branches" and source_column == "log_event_id"
+        select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
+        values = [row[0] for row in source_db.execute(select_sql)]
         qt = '"' + target_table.replace('"', '""') + '"'
         qtc = '"' + target_column.replace('"', '""') + '"'
         orphan_values: list[Any] = []
         orphan_count = 0
         for value in values:
-            if target_db.execute(
+            if value is None or target_db.execute(
                 f"SELECT 1 FROM {qt} WHERE {qtc}=? LIMIT 1", (value,)
             ).fetchone() is None:
                 orphan_count += 1
