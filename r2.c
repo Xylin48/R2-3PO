@@ -11293,6 +11293,85 @@ static int r2_ears_write_wav_header(FILE *fp, uint32_t pcm_bytes)
 }
 
 /*
+ * PulseAudio gives both independent Ears receivers interleaved 48 kHz
+ * stereo S16LE samples. whisper-cli's WAV reader expects 16 kHz samples:
+ * a valid 48 kHz RIFF header does not make that data compatible.
+ *
+ * Convert a completed, private capture to 16 kHz mono S16LE without
+ * resampling the continuously captured source or touching its ring history.
+ * Consecutive groups of three input frames are averaged across both
+ * channels. The 3-frame box average is a small low-pass filter before the
+ * exact 3:1 downsampling; no partial transcript input is accepted.
+ */
+static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
+                                      uint32_t raw_pcm_bytes)
+{
+    if (!raw || !normalized || raw_pcm_bytes == 0 ||
+        raw_pcm_bytes % 12U != 0 || raw_pcm_bytes > 15U * 192000U)
+        return -1;
+
+    unsigned char source_header[44];
+    if (fseek(raw, 0, SEEK_SET) != 0 ||
+        fread(source_header, 1, sizeof(source_header), raw) != sizeof(source_header) ||
+        memcmp(source_header, "RIFF", 4) != 0 ||
+        memcmp(source_header + 8, "WAVEfmt ", 8) != 0 ||
+        memcmp(source_header + 36, "data", 4) != 0)
+        return -1;
+    /* Validate the exact source format rather than trusting a mislabeled
+       WAV or interpreting arbitrary bytes as a 48 kHz PCM stream. */
+    const unsigned char *h = source_header;
+    uint32_t source_rate = (uint32_t)h[24] |
+        ((uint32_t)h[25] << 8) | ((uint32_t)h[26] << 16) | ((uint32_t)h[27] << 24);
+    uint32_t source_size = (uint32_t)h[40] |
+        ((uint32_t)h[41] << 8) | ((uint32_t)h[42] << 16) | ((uint32_t)h[43] << 24);
+    if (h[20] != 1 || h[21] != 0 || h[22] != 2 || h[23] != 0 ||
+        source_rate != 48000U || h[34] != 16 || h[35] != 0 ||
+        source_size != raw_pcm_bytes)
+        return -1;
+
+    const uint32_t normalized_bytes = raw_pcm_bytes / 6U;
+    unsigned char target_header[44] = {0};
+    memcpy(target_header, "RIFF", 4);
+    r2_wav_put_u32(target_header + 4, normalized_bytes + 36U);
+    memcpy(target_header + 8, "WAVEfmt ", 8);
+    r2_wav_put_u32(target_header + 16, 16U);
+    r2_wav_put_u16(target_header + 20, 1U);
+    r2_wav_put_u16(target_header + 22, 1U);
+    r2_wav_put_u32(target_header + 24, 16000U);
+    r2_wav_put_u32(target_header + 28, 32000U);
+    r2_wav_put_u16(target_header + 32, 2U);
+    r2_wav_put_u16(target_header + 34, 16U);
+    memcpy(target_header + 36, "data", 4);
+    r2_wav_put_u32(target_header + 40, normalized_bytes);
+    if (fwrite(target_header, 1, sizeof(target_header), normalized) !=
+        sizeof(target_header))
+        return -1;
+
+    unsigned char input[12U * 512U];
+    unsigned char output[2U * 512U];
+    uint32_t remaining = raw_pcm_bytes / 12U;
+    while (remaining > 0) {
+        size_t count = remaining > 512U ? 512U : (size_t)remaining;
+        if (fread(input, 12U, count, raw) != count) return -1;
+        for (size_t i = 0; i < count; ++i) {
+            int32_t sum = 0;
+            for (size_t j = 0; j < 6U; ++j) {
+                const unsigned char *sample = input + i * 12U + j * 2U;
+                int16_t value = (int16_t)((uint16_t)sample[0] |
+                                          ((uint16_t)sample[1] << 8));
+                sum += value;
+            }
+            int16_t mono = (int16_t)(sum / 6);
+            output[i * 2U] = (unsigned char)((uint16_t)mono & 0xFFU);
+            output[i * 2U + 1U] = (unsigned char)(((uint16_t)mono >> 8) & 0xFFU);
+        }
+        if (fwrite(output, 2U, count, normalized) != count) return -1;
+        remaining -= (uint32_t)count;
+    }
+    return ferror(raw) || fflush(normalized) != 0 ? -1 : 0;
+}
+
+/*
  * Record a short, explicit microphone utterance and transcribe it with a
  * locally installed whisper.cpp CLI. Qwen's chat endpoint accepts text/images,
  * not raw PCM; the ASR stage is therefore a real bridge, not a fake audio prompt.
@@ -11307,10 +11386,11 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     const char *cli = getenv("R2_WHISPER_CLI");
     struct stat model_stat;
     char temp_dir[] = "/tmp/r2-ears-listen-XXXXXX";
-    char wav_path[PATH_MAX] = {0}, output_base[PATH_MAX] = {0}, transcript_path[PATH_MAX] = {0};
+    char wav_path[PATH_MAX] = {0}, whisper_path[PATH_MAX] = {0};
+    char output_base[PATH_MAX] = {0}, transcript_path[PATH_MAX] = {0};
     char *transcript = NULL;
-    int own_mic = 0, wav_fd = -1, child_status = 0;
-    FILE *wav = NULL;
+    int own_mic = 0, wav_fd = -1, whisper_fd = -1, child_status = 0;
+    FILE *wav = NULL, *whisper_input = NULL, *whisper_output = NULL;
     pid_t child = -1;
     unsigned char pcm[1920];
     const uint32_t bytes_per_second = 48000U * 2U * 2U;
@@ -11343,9 +11423,11 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     }
     (void)chmod(temp_dir, 0700);
     int wn = snprintf(wav_path, sizeof(wav_path), "%s/input.wav", temp_dir);
+    int xn = snprintf(whisper_path, sizeof(whisper_path), "%s/whisper.wav", temp_dir);
     int on = snprintf(output_base, sizeof(output_base), "%s/transcript", temp_dir);
     int tn = snprintf(transcript_path, sizeof(transcript_path), "%s.txt", output_base);
     if (wn < 0 || (size_t)wn >= sizeof(wav_path) ||
+        xn < 0 || (size_t)xn >= sizeof(whisper_path) ||
         on < 0 || (size_t)on >= sizeof(output_base) ||
         tn < 0 || (size_t)tn >= sizeof(transcript_path))
         goto cleanup;
@@ -11454,9 +11536,29 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     wav = NULL;
     if (!capture_ok) goto cleanup;
 
+    /* Only the private completed clip is normalized for whisper.cpp.
+       Microphone and desktop live PCM streams are never modified. */
+    whisper_input = fopen(wav_path, "rb");
+    if (!whisper_input) goto cleanup;
+    whisper_fd = open(whisper_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (whisper_fd < 0) goto cleanup;
+    whisper_output = fdopen(whisper_fd, "wb");
+    if (!whisper_output) goto cleanup;
+    whisper_fd = -1;
+    int normalized_ok = r2_ears_write_whisper_wav(whisper_input,
+                                                   whisper_output, total_bytes) == 0;
+    if (fclose(whisper_input) != 0) normalized_ok = 0;
+    whisper_input = NULL;
+    if (fclose(whisper_output) != 0) normalized_ok = 0;
+    whisper_output = NULL;
+    if (!normalized_ok) {
+        fprintf(stderr, "[Ears] Could not normalize the completed PCM clip to 16 kHz mono for Whisper.\n");
+        goto cleanup;
+    }
+
     child = fork();
     if (child == 0) {
-        execlp(cli, cli, "-m", model, "-f", wav_path,
+        execlp(cli, cli, "-m", model, "-f", whisper_path,
                "-nt", "-np", "-otxt", "-of", output_base, (char *)NULL);
         _exit(127);
     }
@@ -11544,8 +11646,12 @@ cleanup:
         pthread_mutex_unlock(&ears_capture_lock);
     }
     if (wav) fclose(wav);
+    if (whisper_input) fclose(whisper_input);
+    if (whisper_output) fclose(whisper_output);
     if (wav_fd >= 0) close(wav_fd);
+    if (whisper_fd >= 0) close(whisper_fd);
     if (wav_path[0]) unlink(wav_path);
+    if (whisper_path[0]) unlink(whisper_path);
     if (transcript_path[0]) unlink(transcript_path);
     rmdir(temp_dir);
     return transcript;
