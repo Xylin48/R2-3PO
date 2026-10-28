@@ -239,7 +239,7 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Finding:** The fridge item lookup and subsequent DELETE/UPDATE ignored `bind_text()` results. A failed binding could make the operation act on an unintended/unmatched row or report a generic failure without preserving the exact SQL result. The mutation also treated `SQLITE_DONE` as sufficient without confirming exactly one row changed.
 - **Fix:** Check the lookup bind before stepping; check the mutation bind before stepping; and require exactly one affected row before reporting success.
 - **Regression coverage:** `tests/fridge_context_smoke.py` now asserts the production function checks both bindings and validates the affected-row count.
-- **Validation status:** New exact-head PR workflow is queued; source changes are not marked validated until that run completes. This is source-level/CI work, not a live database test on the target PC.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps). This is source-level/CI validation, not a live database test on the target PC.
 
 ### R2-AUD-2026-10-27-002 — Reality metric updates ignored SQLite bind failures
 
@@ -248,7 +248,7 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Finding:** Hunger/satiety/sleepiness/energy updates, elapsed-world-time persistence, and sleep recovery stepped prepared statements without checking every bind result. This could permit an incomplete update to proceed rather than propagating the database failure.
 - **Fix:** Chain each bind through the SQLite result code, execute only after all binds succeed, and validate that the singleton Reality row or metadata row was actually updated where applicable.
 - **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks the production hunger/time and sleep paths for checked bindings.
-- **Validation status:** New exact-head PR workflow is queued; do not treat the source assertions as a substitute for the runtime Reality regression or target-host persistence/restart acceptance.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps). Source assertions supplement the runtime Reality regression; target-host persistence/restart acceptance remains outstanding.
 
 ### Current workload checkpoint
 
@@ -265,7 +265,7 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Finding:** Several prepared statements ignored SQLite binding results and still executed. A failed bind could make the operation report a result based on incomplete parameters.
 - **Fix:** Propagate each bind result and execute the statement only when all required bindings succeed. Existing transaction rollback and affected-row checks remain in place.
 - **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks Reality tick and TV-device binding paths. Existing Reality behavior tests exercise normal tick/state persistence.
-- **Validation status:** Pending the latest exact-head CI run; target-host behavior remains unverified.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps); target-host behavior remains unverified.
 
 ### R2-AUD-2026-10-27-004 — unchecked bindings in Life Log, memory, and reward lookups/writes
 
@@ -274,11 +274,11 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Finding:** Several writes and lookups stepped prepared statements after unchecked bindings. In particular, incomplete activity/location/system snapshot writes could be treated as successful, while a memory or Game Boy lookup could use incomplete query parameters.
 - **Fix:** Chain each bind through the SQLite result code, step only after all required bindings succeed, and preserve existing write-success/affected-row checks.
 - **Regression coverage:** `tests/subsystem_wiring_smoke.py` now asserts the updated memory, reward, and Life Log paths. Existing migration and integration tests exercise real writes against SQLite.
-- **Validation status:** Pending the latest exact-head CI run.
+- **Validation status:** Passed the full repository CI workflow on code revision `7b9309d1` (92/92 steps).
 
 ### Database backward-compatibility audit checkpoint
 
-The repository currently has targeted legacy-schema tests for the primary memory database, Reality/fridge inventory, rewards, addictions, Life Log, and Visual Experience Library. These tests construct older schemas, open them through production migration paths, verify existing rows remain available, and exercise writes after migration. The isolated Game Boy state/cartridge databases and the shared Sensory Journal / Alternate-Self tables still need explicit legacy-schema coverage review; do not claim those schemas fully validated until that review and the exact-head suite complete.
+The repository has targeted legacy-schema tests for the shared memory/Life Log database, Reality/fridge inventory, rewards, addictions, Visual Experience Library, and Game Boy's cartridge/state databases. The Game Boy regression now covers migration from the old combined `gameboy.db` layout into `State/console_state.db`, including ID collisions, preservation of both event histories, retained source data, and new writes. Sensory Journal and Alternate-Self use tables within the shared `r2_memory.db`; their additive migration paths were source-reviewed and their normal persistence paths are exercised by the suite, but dedicated old-column fixtures for those individual tables remain a possible coverage improvement. The full CI workflow passed 92/92 steps on code revision `7b9309d1`. This establishes repository-level compatibility for the exercised schemas, not a claim that the user's on-disk databases have been inspected or that target-host migration has run.
 
 ### R2-AUD-2026-10-28-005 — legacy Game Boy state could be stranded in the old combined database
 
@@ -288,3 +288,11 @@ The repository currently has targeted legacy-schema tests for the primary memory
 - **Fix:** Add a transactional, idempotent, additive import for legacy `console_state`, `console_events`, and `cartridge_inventory` tables from the attached legacy database. Preserve an existing state DB's row when IDs conflict, retain both event histories if event IDs conflict, keep the original source tables intact, and only mark the migration when legacy tables actually exist.
 - **Regression coverage:** Added `tests/gameboy_legacy_schema_smoke.py` and wired it into CI. It exercises old schemas in both files, preserves existing rows, verifies post-migration writes and SQLite integrity, confirms the source data remains readable, and checks that a fresh install is not prematurely marked migrated.
 - **Validation status:** The new exact-head CI run must pass before this migration is considered verified. No live hardware or mGBA session was available for this repository-side audit.
+
+
+### Validation result: 2026-10-28
+
+- **Exact code revision tested:** `7b9309d1b83cf5703408cedcaa723b98ac70328f`.
+- **GitHub Actions:** [run 40629395737](https://github.com/Xylin48/R2-3PO/actions/runs/40629395737) — passed, 92/92 steps.
+- **What this proves:** strict build and the configured regression suite, including the primary legacy-schema tests and the new Game Boy split-database migration test.
+- **What this does not prove:** live Qwen/Ollama response quality on the target PC, actual GTX 1050 Ti behavior, or the integrity/schema of the user's real database files. Those require target-host checks and a read-only database audit before any migration is applied to user data.
