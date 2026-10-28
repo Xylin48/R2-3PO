@@ -234,7 +234,8 @@ int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
         "INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
         "(event_id,diary_entry_id,linked_utc) "
         "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
-        "JOIN diary_entries d ON d.id=? "
+        "JOIN r2_diary_entry_links l ON l.log_event_id=e.id AND l.diary_entry_id=? "
+        "JOIN diary_entries d ON d.id=l.diary_entry_id "
         "WHERE e.id=? AND e.category='thinking' "
         "AND e.event_type='diary_entry_linked';",
         -1, &st, NULL);
