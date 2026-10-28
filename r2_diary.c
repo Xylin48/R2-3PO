@@ -900,6 +900,12 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
         st = NULL;
     }
 
+    /* The authoritative event-to-diary ID relation is already durable.
+       Project it now, independent of whether optional memory indexing later
+       needs a retry. The Journal itself backfills when not yet initialized. */
+    if (r2_sj_link_diary_event(event_id, entry_id) != 0)
+        return -1;
+
     /* Retry indexing if the Life Log event persisted but its memory pointer
        did not. r2_save_memory deduplicates the exact pointer/category pair. */
     if (!memory_indexed && event_id > 0) {
@@ -938,13 +944,7 @@ static int r2_diary_link_entry(int64_t entry_id, const char *created_at)
     rc = sqlite3_step(st);
     int changed = sqlite3_changes(r2_diary_db);
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE || changed != 1 || !memory_indexed)
-        return -1;
-    /* The authoritative diary link is now fully durable. Project its exact
-       IDs into Sensory Journal; uninitialized Journal catches up at startup. */
-    if (r2_sj_link_diary_event(event_id, entry_id) != 0)
-        return -1;
-    return 0;
+    return rc == SQLITE_DONE && changed == 1 && memory_indexed ? 0 : -1;
 }
 
 static int r2_diary_reconnect_history_unlocked(int limit)
