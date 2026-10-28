@@ -328,6 +328,9 @@ static int curl_global_initialized = 0;
 static int startup_memory_loaded = 0;
 static int watch_running = 0;
 static int diary_initialized = 0;
+/* These flags are consumed by the tool dispatcher before the capture implementation. */
+static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
+static _Thread_local int r2_ears_recent_requested = 0;
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
@@ -10404,8 +10407,6 @@ static size_t ears_recent_write_position = 0;
 static uint64_t ears_recent_total_bytes = 0;
 static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
-static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
-static _Thread_local int r2_ears_recent_requested = 0;
 
 static void r2_wav_put_u16(unsigned char *p, uint16_t value)
 {
