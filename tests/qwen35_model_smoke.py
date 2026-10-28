@@ -123,10 +123,15 @@ require(
     "vision can yield to foreground conversation or shutdown",
 )
 require(
-    "if (visual_requested && !r2_vision_watch_active())" in core
-    and 'Separate visible facts from inference and uncertainty.", 1);' in core
-    and "CURRENT LIVE VISUAL OBSERVATION: unavailable." in core,
-    "explicit visual questions open the configured camera and never substitute old memories for a missing live frame",
+    "r2_visual_frame_base64(&frame)" in core
+    and '"images"' in core
+    and "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request." in core
+    and "if (visual_requested && !r2_vision_watch_active())" not in core
+    and "r2_visual_analyze_frame(" not in core[
+        core.index("static void *vision_watch_worker(void *unused)"):
+        core.index("int r2_vision_watch_start(void)")
+    ],
+    "raw live images reach the conversation brain while background capture never forces image analysis",
 )
 require(
     "if (query_requests_visual_context(query) &&" not in core,

@@ -42,7 +42,8 @@ typedef enum
     R2_VISION_NONE = 0,
     R2_VISION_FILE,
     R2_VISION_WORLD,
-    R2_VISION_VLC
+    R2_VISION_VLC,
+    R2_VISION_WINDOW
 } R2VisionOrigin;
 
 /* Visual type */
@@ -102,6 +103,13 @@ typedef struct R2Eyes R2Eyes;
 /* Initialization / shutdown */
 int r2_eyes_init(R2Eyes **eyes);
 void r2_eyes_shutdown(R2Eyes *eyes);
+/* Auxiliary media streams cannot overwrite the primary Eyes viewer. */
+void r2_eyes_set_auxiliary(R2Eyes *eyes, int auxiliary);
+
+/* Probe physical camera readiness without starting continuous capture. */
+int r2_eyes_camera_available(void);
+/* Check for a visible existing VLC window without opening it. */
+int r2_eyes_vlc_available(void);
 
 /* Input sources */
 int r2_eyes_open_file(R2Eyes *eyes, const char *path);
@@ -110,6 +118,11 @@ int r2_eyes_open_device(R2Eyes *eyes,
                         const char *device);
 int r2_eyes_open_source(R2Eyes *eyes,
                         const char *source_name);
+
+/* Live video-rendering window supplied by a playback source. */
+int r2_eyes_window_available(unsigned long window_id);
+unsigned long r2_eyes_window_for_pid(long pid);
+int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
 
 /* VLC window input */
 int r2_eyes_open_vlc(R2Eyes *eyes);

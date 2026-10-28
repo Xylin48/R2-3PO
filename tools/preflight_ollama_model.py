@@ -24,6 +24,61 @@ ALLOWED_API_BASES = {
 MODEL = "qwen3.5:9b"
 
 
+def _adaptive_context_tokens() -> int:
+    """Mirror r2_ollama_context_tokens() when no explicit context is set."""
+    gib = 1024 ** 3
+    available = 0
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        available = 0
+
+    def read_uint(path: str) -> int | None:
+        try:
+            with open(path, "r", encoding="ascii") as stream:
+                raw = stream.read().strip()
+            value = int(raw, 10)
+            return value if value >= 0 else None
+        except (OSError, ValueError):
+            return None
+
+    # Match the core's cgroup precedence: use v2 when its limit is numeric;
+    # otherwise try v1. A known limit with unreadable usage means headroom is
+    # unknown, so the core deliberately selects the smallest positive tier.
+    cgroup_max = read_uint("/sys/fs/cgroup/memory.max")
+    if cgroup_max is not None:
+        if cgroup_max > 0:
+            cgroup_used = read_uint("/sys/fs/cgroup/memory.current")
+            cgroup_available = (
+                max(1, cgroup_max - cgroup_used)
+                if cgroup_used is not None and cgroup_used < cgroup_max
+                else 1
+            )
+            available = min(available, cgroup_available) if available else cgroup_available
+    else:
+        v1_max = read_uint("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if v1_max is not None and 0 < v1_max < (1 << 60):
+            v1_used = read_uint("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            v1_available = (
+                max(1, v1_max - v1_used)
+                if v1_used is not None and v1_used < v1_max
+                else 1
+            )
+            available = min(available, v1_available) if available else v1_available
+
+    # This mirrors the core's context tiers, including its conservative
+    # fallback when memory cannot be measured.
+    return (16384 if available >= 8 * gib else
+            12288 if available >= 5 * gib else
+            8192 if available >= 3 * gib else
+            4096 if available >= 2 * gib else
+            2048 if available else 4096)
+
+
 def _configured_api_base() -> str:
     """Return only an explicitly approved loopback Ollama endpoint."""
     base = os.environ.get("R2_OLLAMA_BASE_URL", DEFAULT_API_BASE)
@@ -151,21 +206,34 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         return False
 
     options: dict[str, Any] = {
-        "temperature": 0,
-        "num_predict": 128,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repeat_penalty": 1.0,
         "num_batch": 128,
     }
     configured_context = os.environ.get("R2_OLLAMA_NUM_CTX", "").strip()
+    context_tokens = _adaptive_context_tokens()
     if configured_context:
         try:
-            context_tokens = int(configured_context, 10)
+            requested_context = int(configured_context, 10)
         except ValueError:
-            context_tokens = 0
-        # Mirror the core's accepted override range. Invalid values are ignored
-        # by both paths so preflight does not test a context R2 will not use.
-        if 2048 <= context_tokens <= 16384:
-            options["num_ctx"] = context_tokens
-    if gpu_layers != 0:
+            requested_context = 0
+        # Mirror r2_ollama_context_tokens(): only accepted explicit overrides
+        # replace the default adaptive tier.
+        if 2048 <= requested_context <= 16384:
+            context_tokens = requested_context
+    options["num_ctx"] = context_tokens
+    # Exercise reasoning-enabled foreground generation with the real maximum
+    # answer budget. r2.c permits at most 2048 output tokens for a live reply;
+    # its larger context-dependent ceiling is not itself the requested budget.
+    options["num_predict"] = min(2048, max(256, context_tokens - 1536))
+    # Match r2.c exactly: unset and explicit zero both use Ollama's automatic
+    # placement. Only a nonzero explicit layer count becomes a num_gpu option.
+    if ("R2_OLLAMA_NUM_GPU" in os.environ and
+            os.environ["R2_OLLAMA_NUM_GPU"].strip() and gpu_layers != 0):
         options["num_gpu"] = gpu_layers
 
     try:
@@ -179,7 +247,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
                     "content": "Reply with exactly this token and no other text: R2_READY",
                 }],
                 "stream": False,
-                "think": False,
+                "think": True,
                 "keep_alive": "10m",
                 "options": options,
             },
@@ -199,12 +267,18 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     if not isinstance(content, str) or not content.strip():
         thinking = message.get("thinking") if isinstance(message, dict) else None
         if isinstance(thinking, str) and thinking.strip():
-            detail = "Ollama returned thinking output but no final answer text, even with think=false."
+            detail = "Ollama returned thinking output but no final answer text, despite the reasoning-enabled foreground probe."
         else:
             detail = "Ollama returned an empty final answer field."
         print(f"ERROR: Ollama listed {MODEL} but chat generation produced no usable final answer. {detail}", file=sys.stderr)
         return False
 
+    if content.strip() != "R2_READY":
+        print(
+            f"ERROR: Ollama listed {MODEL} but the foreground probe did not return its expected R2_READY marker.",
+            file=sys.stderr,
+        )
+        return False
 
     if not _is_complete_assistant_turn(reply):
         print(
@@ -219,6 +293,14 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     # image-encoder/KV-cache OOMs that text-only readiness can miss.
     vision_context = int(options.get("num_ctx", 4096))
     vision_options = dict(options)
+    # Visual.c does not override num_batch. Do not inherit the foreground
+    # text request's smaller prompt-evaluation batch into this vision probe;
+    # the readiness check must exercise the same inference options as runtime.
+    vision_options.pop("num_batch", None)
+    # Match Visual.c's non-thinking sampler rather than carrying the
+    # foreground reasoning sampler into the image-bearing readiness probe.
+    vision_options["temperature"] = 0.7
+    vision_options["top_p"] = 0.8
     vision_options["num_predict"] = 512 if vision_context >= 8192 else 256
     try:
         vision_reply = _read_json(

@@ -5,11 +5,12 @@ this project accepts text and images, not raw microphone PCM, so microphone
 capture alone cannot make spoken words part of a conversation. The explicit
 `ears listen` command connects the layers:
 
-1. Capture a bounded 1–15 second microphone utterance as 48 kHz, stereo, 16-bit PCM.
-2. Write a temporary WAV in a private `0700` directory.
-3. Run a local `whisper.cpp` `whisper-cli` executable against a local GGML Whisper model.
-4. Remove the temporary WAV and transcript.
-5. Pass the recognized text to the same `r2_talk()` conversation path used by typed messages.
+1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects one exact 1–15 second interval without changing either live source.
+2. Write that captured interval to a temporary raw WAV in a private `0700` directory.
+3. Convert **only the completed temporary clip** to 16 kHz, mono, 16-bit PCM WAV for `whisper.cpp` (using an exact 3:1 downsampling ratio and averaging stereo sample groups). The original audio buffers and live capture formats remain unchanged.
+4. Run a local `whisper.cpp` `whisper-cli` executable against the converted WAV and a local GGML Whisper model.
+5. Remove both temporary WAV files and the transcript.
+6. Pass the recognized text to the same `r2_talk()` conversation path used by typed messages.
 
 No audio is uploaded to a remote service, and temporary raw audio/transcript
 files are removed after processing. The sensory event records that a
@@ -40,10 +41,21 @@ The launcher explicitly passes both variables through to R2's dedicated user.
 
 At the R2 prompt:
 
-- `ears listen` — record five seconds, transcribe locally, and send the result to chat.
-- `ears listen 8` — record eight seconds.
+- `ears start` — open the microphone and continuously receive raw PCM into a
+  16-second in-memory rolling buffer. The capture worker does not transcribe,
+  classify, or interpret the audio.
+- `ears listen` — deliberately capture the next five seconds from the live
+  input (or directly record five seconds if continuous Ears is not already
+  running), transcribe that interval locally, and send the resulting text to chat.
+- `ears listen 8` — deliberately record and transcribe the next eight-second interval.
 - `ears status` — inspect whether the raw Ears source is currently open.
-- `ears start` / `ears stop` — open/close raw microphone capture; these commands alone do not transcribe speech.
+
+When the brain itself decides that a real sound deserves attention, it can request
+`[EARS_LISTEN] recent|5` to inspect the most recent five seconds already in the
+rolling buffer, or `[EARS_LISTEN] live|5` to listen to the next five seconds.
+This is a deliberate tool action, not an automatic consequence of microphone
+capture. Recent-buffer listening requires Ears continuous capture to be active.
+- `ears stop` — stop continuous capture and clear its transient audio buffer.
 
 The capture duration is limited to 1–15 seconds. Local transcription is
 terminated if it exceeds 90 seconds or R2 begins shutting down. If the model
@@ -52,26 +64,30 @@ instead of pretending it understood audio.
 
 ## Watch coordinator
 
-- `watch` or `watch start` starts a background coordinator after validating the
-  local Whisper model, CLI, and default microphone.
-- Watch captures non-overlapping five-second microphone chunks. A usable
-  transcript is sent through the same serialized shell chat path as typed
-  text; silence does not create a turn.
-- `watch status` reports the coordinator thread, speech input, and visual
-  observation states. `watch stop` cancels microphone capture/Whisper work and
-  joins the worker; if a user-facing chat turn has already begun, Watch waits
-  for that turn to finish rather than corrupting conversation state.
-- If Eyes is already open and the visual subsystem is available, Watch attaches
-  the periodic visual observer. Watch never opens a camera or media source by
-  itself.
+- `watch` or `watch start` opens continuous raw microphone capture and starts
+  a coordinator that keeps sensory input active. It does not require Whisper.
+- Watch refuses to start while Ears already has an active source, because that
+  source could be a file or desktop monitor rather than the microphone. Stop
+  the existing Ears source first; Watch does not silently replace it.
+- While Watch is active, standalone `ears start`, `ears listen`, and
+  `ears stop` commands are refused so they cannot compete with Watch's source.
+  `ears status` remains available.
+- Watch does not automatically transcribe speech or create chat turns from
+  whatever happens to be audible. R2 must deliberately request a listening
+  action to inspect an audio interval.
+- `watch status` reports the coordinator thread, raw audio input, and visual
+  input states. `watch stop` stops continuous microphone capture and joins the
+  coordinator worker.
+- If Eyes is already open, Watch may join its existing raw-frame capture.
+  Watch never opens a camera or media source by itself and does not start a
+  background image-description loop.
 
-This is bounded chunked listening, not yet uninterrupted streaming or
-voice-activity-detected turn segmentation. While a chunk is being transcribed
-or R2 is generating its reply, subsequent speech may not be captured. That is
-a known next step for the coordinator, not something the current implementation
-claims to solve.
+This provides continuous raw PCM capture plus deliberate speech recognition.
+It is not yet semantic perception of non-speech sounds: Qwen 3.5 9B does not
+accept raw audio, and the current explicit Whisper bridge recognizes speech
+rather than classifying every environmental sound.
 
-This wiring is covered by a static CI regression check. A passing CI build
+The WAV conversion is exercised by a compiled C regression that checks the resulting file header, exact sample count, stereo-to-mono signal values, original source integrity, and failure on incomplete input; static wiring tests check the normal chat handoff. A passing CI build
 does not prove that a particular microphone, PulseAudio/PipeWire setup, Whisper
 binary, or model works on the target machine; those still need a local test.
 

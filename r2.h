@@ -18,8 +18,10 @@
  *   - autonomous thinking
  *   - tools
  *   - diary integration
- *   - Eyes (frame capture; Visual.c sends frames to the unified Qwen 3.5 model)
- *   - Ears (raw PCM capture; speech-to-text is a separate capability)
+ *   - Eyes (continuous raw-frame capture; the conversation brain receives images
+ *     directly and chooses what to attend to; explicit inspection is separate)
+ *   - Ears (continuous raw PCM capture; explicit speech recognition is separate,
+ *     and capture itself never transcribes or classifies sound)
  *
  * This header is the PUBLIC bridge used by other R2 components,
  * especially shell.c.
@@ -288,6 +290,10 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt, int 
  */
 int r2_eyes_start(void);
 int r2_eyes_stop(void);
+/* Watch-only release; disappearance is not a chosen sensory shutdown. */
+int r2_eyes_release_source(void);
+int r2_sense_auto_allowed(int which); /* 1=camera/vision, 2=mic, 3=desktop */
+void r2_sense_set_auto_allowed(int which, int allowed);
 int r2_eyes_status(void);
 
 /* ============================================================
@@ -304,6 +310,20 @@ char *r2_vision_see(const char *question);
 char *r2_vision_recent(int limit);
 char *r2_vision_search(const char *query, int limit);
 int r2_vision_set_model(const char *model);
+int r2_vision_camera_available(void);
+int r2_vision_vlc_available(void);
+/* Generic X11 rendering window published by an active media source. */
+int r2_vision_window_available(unsigned long window_id);
+unsigned long r2_vision_window_for_pid(long pid);
+int r2_vision_open_window(unsigned long window_id);
+/* Media is a separately observed display, not a replacement for Eyes. */
+int r2_vision_media_open_window(unsigned long window_id);
+int r2_vision_media_status(void);
+/* R2's deliberate visual attention selection; media capture remains separate. */
+int r2_vision_media_attention_status(void);
+int r2_vision_media_set_attention(int watching);
+int r2_vision_media_stop(void);
+char *r2_vision_media_see(const char *question);
 int r2_vision_open_vlc(void);
 int r2_vision_open_file(const char *path);
 int r2_vision_close(void);
@@ -320,6 +340,11 @@ int r2_vision_close(void);
  * The implementation must call the EXISTING Ears subsystem.
  */
 int r2_ears_start(void);
+/* Capture the default sink monitor instead of the microphone. */
+int r2_ears_start_desktop(void);
+/* Independent desktop playback receiver; never replaces microphone capture. */
+int r2_ears_stop_desktop(void);
+int r2_ears_status_desktop(void);
 int r2_ears_stop(void);
 int r2_ears_status(void);
 /* Capture a short utterance and return a malloc-owned local ASR transcript.

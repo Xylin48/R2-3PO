@@ -15,6 +15,9 @@ void r2_sj_shutdown(void);
 void r2_sj_index_event(int64_t event_id, const char *category,
                        const char *event_type, const char *source);
 
+/* Exact diary-entry ID to Life Log ID relationship, never a prose match. */
+int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id);
+
 /* Record a journal note as a real thinking/journal event. */
 int64_t r2_sj_note(const char *note, const char *details);
 

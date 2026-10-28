@@ -58,6 +58,38 @@ int main(void)
     sqlite3_close(db);
 
     assert(r2_addiction_init() == 0);
+
+    /* A failed second write must roll back the target upsert and event insert
+       together; otherwise the model can learn a choice it never recorded. */
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER fail_addiction_choice_timestamp "
+        "BEFORE UPDATE OF last_chosen ON addiction_targets "
+        "BEGIN SELECT RAISE(ABORT,'injected choice timestamp failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+    assert(r2_addiction_record_choice("old target", "activity", 22,
+                                      "failure-injection", "must roll back") == -1);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_events WHERE source='failure-injection'") == 0);
+    assert(scalar_int(db, "SELECT enjoyment FROM addiction_targets WHERE target='old target'") == 73);
+    assert(sqlite3_exec(db, "DROP TRIGGER fail_addiction_choice_timestamp;", NULL, NULL, NULL) == SQLITE_OK);
+
+    /* A failed event insert must not leave a changed enjoyment score behind. */
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER fail_addiction_enjoyment_event "
+        "BEFORE INSERT ON addiction_events WHEN NEW.event_kind='enjoyment' "
+        "BEGIN SELECT RAISE(ABORT,'injected enjoyment event failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+    assert(r2_addiction_rate_enjoyment("old target", "activity", 11,
+                                       "failure-injection", "must roll back") == -1);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(scalar_int(db, "SELECT enjoyment FROM addiction_targets WHERE target='old target'") == 73);
+    assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_events WHERE event_kind='enjoyment'") == 0);
+    assert(sqlite3_exec(db, "DROP TRIGGER fail_addiction_enjoyment_event;", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(db);
+
     assert(r2_addiction_record_choice("old target", "activity", 73,
                                       "legacy-smoke", "new write after migration") == 0);
     r2_addiction_shutdown();

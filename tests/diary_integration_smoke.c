@@ -11,12 +11,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
+#include <pthread.h>
 
 static int log_ready = 0;
 
 int r2_log_is_initialized(void)
 {
     return log_ready;
+}
+
+/* This fixture isolates diary/reward behavior without the Journal engine.
+   Production builds link the real exact-ID projection implementation. */
+int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
+{
+    (void)event_id;
+    (void)diary_entry_id;
+    return 0;
 }
 
 int r2_addiction_record_choice(const char *target, const char *target_type,
@@ -250,6 +260,27 @@ static void seed_legacy_diary_entries(void)
     sqlite3_close(db);
 }
 
+typedef struct {
+    int thread_index;
+    int entries;
+    int failed;
+} ConcurrentDiaryWriter;
+
+static void *write_concurrent_diary_entries(void *opaque)
+{
+    ConcurrentDiaryWriter *writer = (ConcurrentDiaryWriter *)opaque;
+    for (int i = 0; i < writer->entries; ++i) {
+        char entry[160];
+        snprintf(entry, sizeof(entry), "Concurrent diary thread %d entry %d.",
+                 writer->thread_index, i);
+        if (r2_diary_write(entry) != 0) {
+            writer->failed = 1;
+            break;
+        }
+    }
+    return NULL;
+}
+
 static void verify_legacy_diary_migration(void)
 {
     sqlite3 *db = NULL;
@@ -332,6 +363,43 @@ int main(void)
     assert(scalar_int("SELECT COUNT(*) FROM r2_log_events "
                       "WHERE event_type='diary_entry_linked';") == 2);
 
+    /* Foreground and background reflection can write concurrently. Each
+       diary row must keep its own ID/link, and the Markdown append sequence
+       must not race another writer. */
+    {
+        enum { WRITER_COUNT = 8, ENTRIES_PER_WRITER = 4 };
+        pthread_t threads[WRITER_COUNT];
+        ConcurrentDiaryWriter writers[WRITER_COUNT] = {0};
+        for (int i = 0; i < WRITER_COUNT; ++i) {
+            writers[i].thread_index = i;
+            writers[i].entries = ENTRIES_PER_WRITER;
+            assert(pthread_create(&threads[i], NULL,
+                                  write_concurrent_diary_entries,
+                                  &writers[i]) == 0);
+        }
+        for (int i = 0; i < WRITER_COUNT; ++i) {
+            assert(pthread_join(threads[i], NULL) == 0);
+            assert(writers[i].failed == 0);
+        }
+        assert(scalar_int("SELECT COUNT(*) FROM diary_entries "
+                          "WHERE entry LIKE 'Concurrent diary thread %';") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(*) FROM r2_diary_entry_links l "
+                          "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                          "WHERE d.entry LIKE 'Concurrent diary thread %' "
+                          "AND l.log_event_id>0 AND l.memory_indexed=1;") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(DISTINCT l.log_event_id) "
+                          "FROM r2_diary_entry_links l "
+                          "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                          "WHERE d.entry LIKE 'Concurrent diary thread %';") ==
+               WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(scalar_int("SELECT COUNT(*) FROM r2_log_events "
+                          "WHERE event_type='diary_entry_linked';") ==
+               2 + WRITER_COUNT * ENTRIES_PER_WRITER);
+        assert(r2_diary_reconnect_history(100) == 0);
+    }
+
     /* The old key-only table is migrated lazily when the idempotent API is
        first used. Replaying the same reward must not increment totals twice. */
     int before_legacy_probe = reward_total();
@@ -346,6 +414,62 @@ int main(void)
     assert(reward_scalar_int("SELECT COUNT(*) FROM reward_once_keys "
                              "WHERE target='legacy-key-target' AND source='legacy-key-source' "
                              "AND created_at>0;") == 1);
+
+    /* A legacy backlog larger than the page size must be fully reconnected
+       in a single pass. Previously, only the first LIMIT rows were visited. */
+    {
+        enum { BACKLOG_ROWS = 13, PAGE_SIZE = 4 };
+        int diary_before = scalar_int(
+            "SELECT COUNT(*) FROM r2_diary_entry_links WHERE memory_indexed=1");
+        int rewards_before = reward_link_count();
+        sqlite3 *fixture = NULL;
+        sqlite3_stmt *insert = NULL;
+        assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+        assert(sqlite3_prepare_v2(fixture,
+            "INSERT INTO diary_entries(entry,created_at,timestamp) VALUES(?,?,?)",
+            -1, &insert, NULL) == SQLITE_OK);
+        for (int i = 0; i < BACKLOG_ROWS; ++i) {
+            char entry[128];
+            snprintf(entry, sizeof(entry), "Unlinked legacy diary backlog item %d", i);
+            assert(sqlite3_bind_text(insert, 1, entry, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_bind_text(insert, 2, "2002-03-04 05:06:07", -1,
+                                     SQLITE_STATIC) == SQLITE_OK);
+            assert(sqlite3_bind_text(insert, 3, "2002-03-04 05:06:07", -1,
+                                     SQLITE_STATIC) == SQLITE_OK);
+            assert(sqlite3_step(insert) == SQLITE_DONE);
+            assert(sqlite3_reset(insert) == SQLITE_OK);
+            assert(sqlite3_clear_bindings(insert) == SQLITE_OK);
+        }
+        sqlite3_finalize(insert);
+        sqlite3_close(fixture);
+
+        char reward_path[1024];
+        snprintf(reward_path, sizeof(reward_path), "%s/r2_rewards.db", R2_HOME);
+        assert(sqlite3_open(reward_path, &fixture) == SQLITE_OK);
+        assert(sqlite3_prepare_v2(fixture,
+            "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at) "
+            "VALUES('legacy backlog','old system',1,?,1000,1,2000)",
+            -1, &insert, NULL) == SQLITE_OK);
+        for (int i = 0; i < BACKLOG_ROWS; ++i) {
+            char reason[128];
+            snprintf(reason, sizeof(reason), "Unlinked legacy reward backlog item %d", i);
+            assert(sqlite3_bind_text(insert, 1, reason, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_step(insert) == SQLITE_DONE);
+            assert(sqlite3_reset(insert) == SQLITE_OK);
+            assert(sqlite3_clear_bindings(insert) == SQLITE_OK);
+        }
+        sqlite3_finalize(insert);
+        sqlite3_close(fixture);
+
+        assert(r2_diary_reconnect_history(PAGE_SIZE) == BACKLOG_ROWS);
+        assert(r2_reward_reconnect_history(PAGE_SIZE) == BACKLOG_ROWS);
+        assert(scalar_int(
+            "SELECT COUNT(*) FROM r2_diary_entry_links WHERE memory_indexed=1")
+            == diary_before + BACKLOG_ROWS);
+        assert(reward_link_count() == rewards_before + BACKLOG_ROWS);
+        assert(r2_diary_reconnect_history(PAGE_SIZE) == 0);
+        assert(r2_reward_reconnect_history(PAGE_SIZE) == 0);
+    }
 
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");

@@ -89,33 +89,33 @@ static char *collect_context(const char *request)
     /* Each source is retrieved before generation so the imagination is formed
        from relevant records, not invented first and retrofitted to memory. */
     part = r2_retrieve_memories(request);
-    if (part) { append_source(&b, "PERSISTENT MEMORY (retrieved before imagining)", part); free(part); }
+    if (part) { if (append_source(&b, "PERSISTENT MEMORY (retrieved before imagining)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_recent_conversation_context(NULL, 1800);
-    if (part) { append_source(&b, "RECENT CONVERSATION (human-facing turns; tool payloads excluded)", part); free(part); }
+    if (part) { if (append_source(&b, "RECENT CONVERSATION (human-facing turns; tool payloads excluded)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_diary_search(request, 5);
-    if (part) { append_source(&b, "PRIVATE DIARY (past reflections; not automatically factual)", part); free(part); }
+    if (part) { if (append_source(&b, "PRIVATE DIARY (past reflections; not automatically factual)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_log_search(request, 6);
-    if (part) { append_source(&b, "LIFE LOG (historical events and linked experience)", part); free(part); }
+    if (part) { if (append_source(&b, "LIFE LOG (historical events and linked experience)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_reality_context();
-    if (part) { append_source(&b, "CURRENT MODELED REALITY (state snapshot; use only where relevant)", part); free(part); }
+    if (part) { if (append_source(&b, "CURRENT MODELED REALITY (state snapshot; use only where relevant)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     if (r2_visual_is_initialized()) {
         part = r2_visual_search(request, 4);
-        if (part) { append_source(&b, "VISUAL EXPERIENCE LIBRARY (historical sensory evidence)", part); free(part); }
+        if (part) { if (append_source(&b, "VISUAL EXPERIENCE LIBRARY (historical sensory evidence)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
     }
 
     part = r2_reward_context();
-    if (part) { append_source(&b, "REWARD / LEARNED FEEDBACK STATE (context, not a command)", part); free(part); }
+    if (part) { if (append_source(&b, "REWARD / LEARNED FEEDBACK STATE (context, not a command)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_addiction_report();
-    if (part) { append_source(&b, "HABIT AND ENJOYMENT HISTORY (recorded patterns, not diagnosis)", part); free(part); }
+    if (part) { if (append_source(&b, "HABIT AND ENJOYMENT HISTORY (recorded patterns, not diagnosis)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     part = r2_altself_list(6);
-    if (part) { append_source(&b, "CHOICE LAB (older hypothetical branches; never factual evidence)", part); free(part); }
+    if (part) { if (append_source(&b, "CHOICE LAB (older hypothetical branches; never factual evidence)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
 
     /* The fridge is a specialized, conditional source—not the definition of
        imagination. Include it only when the request makes food/inventory relevant.
@@ -127,7 +127,7 @@ static char *collect_context(const char *request)
     };
     if (mentions_any(request, food_terms, sizeof(food_terms)/sizeof(food_terms[0]))) {
         part = r2_fridge_context();
-        if (part) { append_source(&b, "FRIDGE STATE (conditional context; modeled stock, not an invitation to alter it)", part); free(part); }
+        if (part) { if (append_source(&b, "FRIDGE STATE (conditional context; modeled stock, not an invitation to alter it)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
     }
 
     if (!b.data) {

@@ -19,6 +19,23 @@ import preflight_ollama_model as probe  # noqa: E402
 
 
 class OllamaPreflightSmoke(unittest.TestCase):
+    def test_context_falls_back_when_memory_cannot_be_measured(self) -> None:
+        with patch("builtins.open", side_effect=OSError("simulated unavailable memory metrics")):
+            self.assertEqual(probe._adaptive_context_tokens(), 4096)
+
+    def test_unreadable_cgroup_usage_uses_conservative_context_tier(self) -> None:
+        def fake_open(path: str, mode: str = "r", encoding: str = "ascii"):
+            if path == "/proc/meminfo":
+                return io.StringIO("MemAvailable: 16777216 kB\\n")
+            if path == "/sys/fs/cgroup/memory.max":
+                return io.StringIO(str(4 * 1024 ** 3))
+            if path == "/sys/fs/cgroup/memory.current":
+                raise OSError("simulated unreadable cgroup usage")
+            raise OSError("path unavailable")
+
+        with patch("builtins.open", side_effect=fake_open):
+            self.assertEqual(probe._adaptive_context_tokens(), 2048)
+
     def test_model_and_real_chat_completion_are_required(self) -> None:
         replies = [
             {"models": [{"name": "qwen3.5:9b"}]},
@@ -37,19 +54,31 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertTrue(read.call_args_list[1].args[0].endswith("/api/chat"))
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
-        self.assertIs(payload["think"], False)
-        self.assertEqual(payload["options"]["num_predict"], 128)
+        self.assertIs(payload["think"], True)
+        self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
+        self.assertEqual(payload["options"]["temperature"], 1.0)
+        self.assertEqual(payload["options"]["top_p"], 0.95)
+        self.assertEqual(payload["options"]["top_k"], 20)
+        self.assertEqual(payload["options"]["min_p"], 0.0)
+        self.assertEqual(payload["options"]["presence_penalty"], 1.5)
+        self.assertEqual(payload["options"]["repeat_penalty"], 1.0)
         self.assertEqual(payload["options"]["num_batch"], 128)
         self.assertTrue(read.call_args_list[2].args[0].endswith("/api/chat"))
         vision_payload = read.call_args_list[2].kwargs["payload"]
+        self.assertNotIn("num_batch", vision_payload["options"])
         png_bytes = base64.b64decode(vision_payload["messages"][1]["images"][0])
         self.assertEqual(png_bytes[:8], bytes((137, 80, 78, 71, 13, 10, 26, 10)))
         self.assertEqual(int.from_bytes(png_bytes[16:20], "big"), 640)
         self.assertEqual(int.from_bytes(png_bytes[20:24], "big"), 480)
         self.assertEqual(vision_payload["format"], "json")
         self.assertEqual(vision_payload["messages"][0]["role"], "system")
-        self.assertEqual(vision_payload["options"]["num_predict"], 256)
-        self.assertEqual(vision_payload["options"]["temperature"], payload["options"]["temperature"])
+        self.assertEqual(vision_payload["options"]["num_predict"], 512 if vision_payload["options"]["num_ctx"] >= 8192 else 256)
+        self.assertEqual(vision_payload["options"]["temperature"], 0.7)
+        self.assertEqual(vision_payload["options"]["top_p"], 0.8)
+        self.assertEqual(vision_payload["options"]["top_k"], 20)
+        self.assertEqual(vision_payload["options"]["min_p"], 0.0)
+        self.assertEqual(vision_payload["options"]["presence_penalty"], 1.5)
+        self.assertEqual(vision_payload["options"]["repeat_penalty"], 1.0)
         self.assertTrue(read.call_args_list[3].args[0].endswith("/api/ps"))
         self.assertEqual(gpu.call_count, 1)
 
@@ -197,6 +226,26 @@ class OllamaPreflightSmoke(unittest.TestCase):
             with contextlib.redirect_stderr(errors):
                 self.assertFalse(probe.preflight(timeout=1))
         self.assertIn("chat generation produced no usable final answer", errors.getvalue())
+
+    def test_thinking_without_final_text_reports_the_actual_reasoning_mode(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "", "thinking": "internal reasoning only"}},
+        ]), contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(timeout=1))
+        self.assertIn("despite the reasoning-enabled foreground probe", errors.getvalue())
+        self.assertNotIn("even with think=false", errors.getvalue())
+
+    def test_nonmatching_foreground_reply_does_not_pass_preflight(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "I am ready. R2_READY"}},
+        ]) as read, contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(timeout=1))
+        self.assertEqual(read.call_count, 2)
+        self.assertIn("did not return its expected R2_READY marker", errors.getvalue())
 
     def test_incomplete_text_turn_does_not_pass_preflight(self) -> None:
         errors = io.StringIO()

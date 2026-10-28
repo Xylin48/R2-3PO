@@ -94,7 +94,8 @@ jobs:
           python3 tests/r2_hardware_preflight_smoke.py
       - name: Check deployment audit utilities and read-only database behavior
         run: |
-          python3 -m py_compile tools/audit_r2_databases.py tools/audit_r2_sound_assets.py
+          python3 -m py_compile tools/audit_r2_databases.py tools/audit_r2_sound_assets.py tests/database_connection_audit_smoke.py
+          python3 tests/database_connection_audit_smoke.py
           ROOT="$(mktemp -d)"
           set +e
           python3 tools/audit_r2_databases.py --root "$ROOT" --json > "$ROOT/report.json"
@@ -151,17 +152,63 @@ jobs:
 
       - name: Check microphone speech-to-chat bridge
         run: |
-          python3 -m py_compile tests/ears_speech_bridge_smoke.py
+          python3 -m py_compile tests/ears_speech_bridge_smoke.py tests/ears_attention_tool_smoke.py
           python3 tests/ears_speech_bridge_smoke.py
+          python3 tests/ears_attention_tool_smoke.py
+
+      - name: Verify Whisper WAV conversion and exact clip duration
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_whisper_wav_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-whisper-wav-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-ears-whisper-wav-test
+
+
+      - name: Exercise source discovery with synthetic microphone and desktop playback
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c Ears.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
+          /tmp/r2-ears-source-discovery-smoke
+
+      - name: Exercise independent microphone and desktop PCM capture objects
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread -Wl,--wrap=pa_simple_new -Wl,--wrap=pa_simple_read -Wl,--wrap=pa_simple_free
+          /tmp/r2-ears-dual-sources-test
+
+      - name: Require source-specific raw hearing, deliberate attention, and shutdown
+        run: python3 tests/ears_dual_attention_wiring_smoke.py
+
+      - name: Trace live audio-producer window discovery to Eyes
+        run: python3 tests/visual_audio_producer_bridge_smoke.py
+
+      - name: Exercise playback producer to live X11 window geometry lookup
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c Eyes.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
+          /tmp/r2-eyes-window-discovery-test
 
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
+
+      - name: Verify primary camera and independent media attention
+        run: python3 tests/camera_media_attention_contract_smoke.py
+
+      - name: Regress chosen display focus with dual-camera/media imagery
+        run: python3 tests/media_focus_bridge_smoke.py
+
+      - name: Verify camera-first media image order in a real JSON payload
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/media_focus_payload_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-media-focus-payload-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-media-focus-payload-test
+
+      - name: Exercise independent raw camera and auxiliary media frames
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_primary_media_runtime.c Eyes.c -o /tmp/r2-eyes-primary-media-test -lpthread -lm
+          /tmp/r2-eyes-primary-media-test
 
       - name: Require open Eyes before starting visual observation
         run: python3 tests/vision_watch_requires_open_eyes_smoke.py
 
       - name: Cancel visual inference when stopping Watch
         run: python3 tests/vision_watch_cancellation_smoke.py
+      - name: Exercise continuous Eyes frame handoff to Qwen
+        run: python3 tests/vision_watch_continuous_feed_smoke.py
 
       - name: Check transactional vision JSON construction
         run: python3 tests/visual_payload_allocation_smoke.py
@@ -309,6 +356,10 @@ jobs:
           python3 -m py_compile GameBoyAdvance.py tests/gameboy_console_smoke.py
           python3 tests/gameboy_console_smoke.py
 
+      - name: Exercise writes against legacy Game Boy database schemas
+        run: |
+          python3 -m py_compile GameBoyAdvance.py tests/gameboy_legacy_schema_smoke.py
+          python3 tests/gameboy_legacy_schema_smoke.py
       - name: Require fail-closed Game Boy JSON response contracts
         run: |
           python3 -m py_compile tests/gameboy_json_contract_smoke.py
@@ -405,6 +456,20 @@ jobs:
             tests/sensory_journal_search_smoke.c SensoryJournal.c -lsqlite3 -lpthread \
             -o /tmp/r2-sensory-journal-search-smoke
           /tmp/r2-sensory-journal-search-smoke
+
+      - name: Prove exact diary identity survives duplicate prose and restart
+        run: |
+          ROOT=/tmp/r2-sj-identity-smoke
+          rm -rf "$ROOT"
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. \
+            -DR2_ROOT='"'"$ROOT"'"' \
+            -DR2_HOME='"'"$ROOT/R2"'"' \
+            -DR2_WORKSPACE='"'"$ROOT"'"' \
+            -DR2_DIARY_DATABASE='"'"$ROOT/R2/r2_memory.db"'"' \
+            -DR2_DIARY_DIR='"'"$ROOT/R2_Diary"'"' \
+            tests/sensory_journal_diary_identity_runtime.c SensoryJournal.c -lsqlite3 -lpthread \
+            -o /tmp/r2-sensory-journal-identity-smoke
+          /tmp/r2-sensory-journal-identity-smoke
 
       - name: Exercise Reality hunger, sleepiness, and energy progression
         run: |

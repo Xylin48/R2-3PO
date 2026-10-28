@@ -54,8 +54,9 @@ int r2_diary_init(void);
 
 void r2_diary_shutdown(void);
 
-/* Reconcile existing and pending diary entries with Life Log/memory.
- * Work is bounded per call; returns linked-entry count or -1 on error. */
+/* Reconcile all existing/pending diary entries with Life Log and memory.
+ * Uses bounded pages rather than stopping at the first legacy batch; returns
+ * linked-entry count or -1 on query/allocation error. */
 int r2_diary_reconnect_history(int limit);
 
 

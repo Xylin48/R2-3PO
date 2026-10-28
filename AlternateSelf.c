@@ -59,6 +59,110 @@ static int altself_ensure_column(const char *column, const char *definition)
     return sqlite3_exec(as_db, sql, NULL, NULL, NULL);
 }
 
+static int altself_restore_missing_log_links(void)
+{
+    /*
+     * Early Alternate-Self schemas gained log_event_id with DEFAULT 0. Those
+     * rows retained their hypothetical content but were disconnected from the
+     * shared Life Log. Create/reuse a migration event and repair the link before
+     * exposing the organ as initialized.
+     */
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(as_db,
+            "SELECT b.id,b.name,b.scenario,b.status FROM r2_alternate_self_branches b "
+            "WHERE b.log_event_id IS NULL OR b.log_event_id<=0 OR NOT EXISTS "
+            "(SELECT 1 FROM r2_log_events e WHERE e.id=b.log_event_id) "
+            "ORDER BY b.id LIMIT 1;", -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not find unlinked legacy branches: %s\n",
+                    sqlite3_errmsg(as_db));
+            return -1;
+        }
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return 0;
+        }
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not read legacy branch linkage: %s\n",
+                    sqlite3_errmsg(as_db));
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_int64 branch_id = sqlite3_column_int64(st, 0);
+        const unsigned char *name_text = sqlite3_column_text(st, 1);
+        const unsigned char *scenario_text = sqlite3_column_text(st, 2);
+        const unsigned char *status_text = sqlite3_column_text(st, 3);
+        char name[256], scenario[512], status[64], summary[512], details[1200];
+        snprintf(name, sizeof(name), "%s", name_text ? (const char *)name_text : "");
+        snprintf(scenario, sizeof(scenario), "%s",
+                 scenario_text ? (const char *)scenario_text : "");
+        snprintf(status, sizeof(status), "%s",
+                 status_text ? (const char *)status_text : "active");
+        sqlite3_finalize(st);
+
+        snprintf(summary, sizeof(summary),
+                 "Restored Life Log link for legacy Alternate-Self branch #%lld: %.180s",
+                 (long long)branch_id, name);
+        snprintf(details, sizeof(details),
+                 "branch_id=%lld; name=%s; status=%s; scenario=%s; "
+                 "migration=restored missing Life Log relationship without changing the hypothetical",
+                 (long long)branch_id, name, status, scenario);
+
+        int64_t event_id = -1;
+        rc = sqlite3_prepare_v2(as_db,
+            "SELECT id FROM r2_log_events WHERE event_type=? AND summary=? "
+            "ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, "alternate_self_legacy_link_restored",
+                          -1, SQLITE_STATIC);
+        sqlite3_bind_text(st, 2, summary, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW)
+            event_id = sqlite3_column_int64(st, 0);
+        else if (rc != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_finalize(st);
+
+        if (event_id <= 0)
+            event_id = r2_log_event(R2_LOG_THINKING,
+                                    "alternate_self_legacy_link_restored",
+                                    summary, details, "AlternateSelf");
+        if (event_id <= 0) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not create Life Log link for legacy branch #%lld.\n",
+                    (long long)branch_id);
+            return -1;
+        }
+
+        rc = sqlite3_prepare_v2(as_db,
+            "UPDATE r2_alternate_self_branches SET log_event_id=? WHERE id=? "
+            "AND (log_event_id IS NULL OR log_event_id<=0 OR NOT EXISTS "
+            "(SELECT 1 FROM r2_log_events e WHERE e.id=log_event_id));",
+            -1, &st, NULL);
+        if (rc != SQLITE_OK) {
+            if (st) sqlite3_finalize(st);
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, event_id);
+        sqlite3_bind_int64(st, 2, branch_id);
+        rc = sqlite3_step(st);
+        int changed = sqlite3_changes(as_db);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE || changed != 1) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Could not restore branch #%lld Life Log relationship.\n",
+                    (long long)branch_id);
+            return -1;
+        }
+    }
+}
+
 static int migrate_altself_schema(void)
 {
     const char *columns[][2] = {
@@ -80,7 +184,7 @@ static int migrate_altself_schema(void)
             return -1;
         }
     }
-    return as_exec(
+    if (as_exec(
         "UPDATE r2_alternate_self_branches SET created_utc=CURRENT_TIMESTAMP "
         "WHERE created_utc IS NULL OR created_utc='';"
         "UPDATE r2_alternate_self_branches SET updated_utc=CURRENT_TIMESTAMP "
@@ -88,7 +192,9 @@ static int migrate_altself_schema(void)
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_status_idx "
         "ON r2_alternate_self_branches(status,id);"
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_log_event_idx "
-        "ON r2_alternate_self_branches(log_event_id);");
+        "ON r2_alternate_self_branches(log_event_id);") != 0)
+        return -1;
+    return altself_restore_missing_log_links();
 }
 
 int r2_altself_init(void)
@@ -103,9 +209,13 @@ int r2_altself_init(void)
         pthread_mutex_unlock(&as_lock);
         return -1;
     }
-    sqlite3_busy_timeout(as_db, 5000);
-    sqlite3_exec(as_db, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
-                 NULL, NULL, NULL);
+    if (sqlite3_busy_timeout(as_db, 5000) != SQLITE_OK ||
+        as_exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") != 0) {
+        sqlite3_close(as_db);
+        as_db = NULL;
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
     const char *schema =
         "CREATE TABLE IF NOT EXISTS r2_alternate_self_branches ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -166,10 +276,8 @@ int64_t r2_altself_create(const char *name, const char *scenario,
         sqlite3_stmt *check = NULL;
         int check_rc = sqlite3_prepare_v2(as_db,
             "SELECT 1 FROM r2_log_events WHERE id=?;", -1, &check, NULL);
-        if (check_rc == SQLITE_OK) {
-            sqlite3_bind_int64(check, 1, evidence_event_id);
-            check_rc = sqlite3_step(check);
-        }
+        if (check_rc == SQLITE_OK) check_rc = sqlite3_bind_int64(check, 1, evidence_event_id);
+        if (check_rc == SQLITE_OK) check_rc = sqlite3_step(check);
         sqlite3_finalize(check);
         if (check_rc != SQLITE_ROW) {
             pthread_mutex_unlock(&as_lock);
@@ -187,18 +295,16 @@ int64_t r2_altself_create(const char *name, const char *scenario,
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id)"
-        " VALUES(?,?,?,?,?,'active',?,?);", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st,1,name,-1,SQLITE_TRANSIENT);
-        sqlite3_bind_text(st,2,scenario,-1,SQLITE_TRANSIENT);
-        if (assumptions) sqlite3_bind_text(st,3,assumptions,-1,SQLITE_TRANSIENT); else sqlite3_bind_null(st,3);
-        if (predicted_outcome) sqlite3_bind_text(st,4,predicted_outcome,-1,SQLITE_TRANSIENT); else sqlite3_bind_null(st,4);
-        if (conclusion) sqlite3_bind_text(st,5,conclusion,-1,SQLITE_TRANSIENT); else sqlite3_bind_null(st,5);
-        if (evidence_event_id > 0) sqlite3_bind_int64(st,6,evidence_event_id); else sqlite3_bind_null(st,6);
-        sqlite3_bind_int64(st,7,event_id);
-        rc = sqlite3_step(st);
-    }
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
+    if (rc == SQLITE_OK) rc = predicted_outcome ? sqlite3_bind_text(st, 4, predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 5, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);
+    if (rc == SQLITE_OK) rc = evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, evidence_event_id) : sqlite3_bind_null(st, 6);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(as_db) : -1;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
@@ -231,53 +337,53 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
         "AND COALESCE(predicted_outcome,'')=COALESCE(?,'') "
         "AND COALESCE(conclusion,'')=COALESCE(?,'') AND status!='discarded' "
         "ORDER BY id LIMIT 1;", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, scenario, -1, SQLITE_TRANSIENT);
-        if (assumptions) sqlite3_bind_text(st, 2, assumptions, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 2);
-        if (predicted_outcome) sqlite3_bind_text(st, 3, predicted_outcome, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 3);
-        if (conclusion) sqlite3_bind_text(st, 4, conclusion, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 4);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            int64_t existing = sqlite3_column_int64(st, 0);
-            int64_t original_event = sqlite3_column_int64(st, 1);
-            sqlite3_finalize(st);
-            pthread_mutex_unlock(&as_lock);
-            if (original_event > 0 && original_event != hypothetical_event_id)
-                r2_log_link(hypothetical_event_id, original_event,
-                            "same_hypothesis_as",
-                            "The same counterfactual was already retained as a branch; this occurrence remains in the Life Log.");
-            return existing;
-        }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, scenario, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 2, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 2);
+    if (rc == SQLITE_OK) rc = predicted_outcome ? sqlite3_bind_text(st, 3, predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
+    if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 4, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        int64_t existing = sqlite3_column_int64(st, 0);
+        int64_t original_event = sqlite3_column_int64(st, 1);
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&as_lock);
+        if (original_event > 0 && original_event != hypothetical_event_id)
+            r2_log_link(hypothetical_event_id, original_event,
+                        "same_hypothesis_as",
+                        "The same counterfactual was already retained as a branch; this occurrence remains in the Life Log.");
+        return existing;
     }
     sqlite3_finalize(st);
     st = NULL;
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
     rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id)"
-        " VALUES(?,?,?,?,?,'active',?,?);", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
-        if (assumptions) sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 3);
-        if (predicted_outcome) sqlite3_bind_text(st, 4, predicted_outcome, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 4);
-        if (conclusion) sqlite3_bind_text(st, 5, conclusion, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 5);
-        if (evidence_event_id > 0) sqlite3_bind_int64(st, 6, evidence_event_id); else sqlite3_bind_null(st, 6);
-        sqlite3_bind_int64(st, 7, hypothetical_event_id);
-        rc = sqlite3_step(st);
-    }
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
+    if (rc == SQLITE_OK) rc = predicted_outcome ? sqlite3_bind_text(st, 4, predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 5, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);
+    if (rc == SQLITE_OK) rc = evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, evidence_event_id) : sqlite3_bind_null(st, 6);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, hypothetical_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(as_db) : -1;
     if (rc == SQLITE_DONE && sqlite3_changes(as_db) == 0) {
         sqlite3_stmt *existing = NULL;
-        if (sqlite3_prepare_v2(as_db,
-                "SELECT id FROM r2_alternate_self_branches WHERE log_event_id=?;",
-                -1, &existing, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(existing, 1, hypothetical_event_id);
-            if (sqlite3_step(existing) == SQLITE_ROW)
-                id = sqlite3_column_int64(existing, 0);
-            else
-                id = -1;
-        } else {
+        int existing_rc = sqlite3_prepare_v2(as_db,
+            "SELECT id FROM r2_alternate_self_branches WHERE log_event_id=?;",
+            -1, &existing, NULL);
+        if (existing_rc == SQLITE_OK)
+            existing_rc = sqlite3_bind_int64(existing, 1, hypothetical_event_id);
+        if (existing_rc == SQLITE_OK) existing_rc = sqlite3_step(existing);
+        if (existing_rc == SQLITE_ROW)
+            id = sqlite3_column_int64(existing, 0);
+        else
             id = -1;
-        }
         sqlite3_finalize(existing);
     }
     sqlite3_finalize(st);
@@ -294,11 +400,9 @@ static int as_set_status(int64_t id, const char *status)
     int rc = sqlite3_prepare_v2(as_db,
         "UPDATE r2_alternate_self_branches SET status=?,updated_utc=CURRENT_TIMESTAMP "
         "WHERE id=? AND status!='discarded';", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(st,1,status,-1,SQLITE_STATIC);
-        sqlite3_bind_int64(st,2,id);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, status, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int changed = rc == SQLITE_DONE ? sqlite3_changes(as_db) : 0;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
@@ -328,21 +432,18 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_event_links"
-        "(branch_id,event_id,relation,details) "
-        "SELECT ?,?,?,? WHERE "
+        "(branch_id,event_id,relation,details,created_utc) "
+        "SELECT ?,?,?,?,CURRENT_TIMESTAMP WHERE "
         "EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=?) AND "
         "EXISTS(SELECT 1 FROM r2_log_events WHERE id=?);",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, branch_id);
-        sqlite3_bind_int64(st, 2, event_id);
-        sqlite3_bind_text(st, 3, relation, -1, SQLITE_TRANSIENT);
-        if (details) sqlite3_bind_text(st, 4, details, -1, SQLITE_TRANSIENT);
-        else sqlite3_bind_null(st, 4);
-        sqlite3_bind_int64(st, 5, branch_id);
-        sqlite3_bind_int64(st, 6, event_id);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, branch_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, relation, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = details ? sqlite3_bind_text(st, 4, details, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, branch_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 6, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     int linked = rc == SQLITE_DONE && sqlite3_changes(as_db) > 0;
     pthread_mutex_unlock(&as_lock);
@@ -361,14 +462,22 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
         pthread_mutex_unlock(&as_lock); return NULL;
     }
     int param_count = sqlite3_bind_parameter_count(st);
-    if (param_count >= 1) sqlite3_bind_int64(st,1,first);
-    if (param_count >= 2) sqlite3_bind_int64(st,2,second);
-    if (param_count >= 3) sqlite3_bind_int(st,3,limit);
+    int bind_rc = SQLITE_OK;
+    if (param_count >= 1) bind_rc = sqlite3_bind_int64(st, 1, first);
+    if (bind_rc == SQLITE_OK && param_count >= 2) bind_rc = sqlite3_bind_int64(st, 2, second);
+    if (bind_rc == SQLITE_OK && param_count >= 3) bind_rc = sqlite3_bind_int(st, 3, limit);
+    if (bind_rc != SQLITE_OK) {
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&as_lock);
+        return NULL;
+    }
     size_t cap=4096,len=0;
     char *out=malloc(cap);
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&as_lock); return NULL; }
     out[0]='\0';
     int rc;
+    int intentionally_truncated = 0;
+    int serialization_failed = 0;
     while ((rc=sqlite3_step(st))==SQLITE_ROW) {
         int64_t id=sqlite3_column_int64(st,0);
         const unsigned char *name=sqlite3_column_text(st,1);
@@ -391,7 +500,11 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
             conclusion?(const char*)conclusion:"(not specified)",
             (long long)evidence,
             created?(const char*)created:"unknown");
-        if (needed<0 || len+(size_t)needed+2>1024*1024) break;
+        if (needed < 0) { serialization_failed = 1; break; }
+        if (len + (size_t)needed + 2 > 1024 * 1024) {
+            intentionally_truncated = 1;
+            break;
+        }
         if (len+(size_t)needed+2>cap) {
             size_t next=cap; while(next<len+(size_t)needed+2) next*=2;
             char *grown=realloc(out,next); if(!grown){free(out);out=NULL;break;}
@@ -413,7 +526,16 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
+    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+        free(out);
+        return NULL;
+    }
     if (out && !len) snprintf(out,cap,"No Alternate-Self branches found.\n");
+    if (out && intentionally_truncated) {
+        const char *note = "[Alternate-Self output truncated at 1 MiB; all branches remain stored.]\n";
+        size_t note_len = strlen(note);
+        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+    }
     return out;
 }
 char *r2_altself_list(int limit)

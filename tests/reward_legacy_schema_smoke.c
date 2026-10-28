@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
@@ -81,6 +82,10 @@ int main(void)
         "INSERT INTO reward_once_keys(target,source) VALUES('old target','old key');",
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(legacy);
+
+    /* A missing Life Log is an unavailable connection, not evidence that a
+       reward never had an event. Do not create duplicate history on retry. */
+    assert(find_existing_log_event(42) == -1);
 
     /* Opening an older ledger must add missing fields without replacing history. */
     assert(r2_reward_init() == 0);

@@ -43,9 +43,16 @@ def send_control_command(command: str) -> str:
         path = command[11:]
         valid = Path(path).is_absolute() and "\n" not in path and "\r" not in path and len(command) <= 1199
     if command.startswith("media "):
-        action, separator, path = command[6:].partition("|")
+        action, separator, path_and_window = command[6:].partition("|")
+        path, marker, window_id = path_and_window.rpartition("|x11=")
+        # The window locator is optional for older renderers; a supplied
+        # locator is numeric X11 metadata, not part of the media filename.
+        valid_window = not marker or (window_id.isdecimal() and int(window_id) > 0)
+        if not marker:
+            path = path_and_window
         valid = (
             separator != ""
+            and valid_window
             and action in {
                 "vcr_playback_started", "vcr_playback_paused",
                 "vcr_playback_stopped", "vcr_playback_ended",
@@ -337,7 +344,13 @@ class CRTDisplay:
 
     def _send_media_event(self, action: str, path: str) -> bool:
         try:
-            send_control_command(f"media {action}|{path}")
+            # Report the actual video-surface window only when libVLC has
+            # entered playback. Watch can then observe the real rendered
+            # frames without inferring a movie from a filename or window title.
+            window = (self.video_surface.winfo_id()
+                      if action == "vcr_playback_started" else 0)
+            suffix = f"|x11={window}" if window > 0 else ""
+            send_control_command(f"media {action}|{path}{suffix}")
             return True
         except (OSError, RuntimeError, ValueError):
             # The player must remain usable if the Life Log socket is unavailable.
