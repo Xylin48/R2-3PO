@@ -10337,8 +10337,18 @@ int r2_eyes_status(void)
     return eyes ? (r2_eyes_is_open(eyes) ? 1 : 0) : 0;
 }
 
-/* Serialize explicit microphone capture against start/stop requests. */
+/* Serialize Ears source lifecycle against explicit capture requests. */
 static pthread_mutex_t ears_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+#define R2_EARS_RECENT_SECONDS 15U
+#define R2_EARS_BYTES_PER_SECOND (48000U * 2U * 2U)
+#define R2_EARS_RECENT_CAPACITY ((size_t)R2_EARS_BYTES_PER_SECOND * R2_EARS_RECENT_SECONDS)
+static unsigned char ears_recent_audio[R2_EARS_RECENT_CAPACITY];
+static pthread_mutex_t ears_recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t ears_recent_length = 0;
+static size_t ears_recent_write_position = 0;
+static pthread_t ears_capture_thread;
+static int ears_capture_thread_started = 0;
+static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
 
 static void r2_wav_put_u16(unsigned char *p, uint16_t value)
 {
@@ -10352,6 +10362,81 @@ static void r2_wav_put_u32(unsigned char *p, uint32_t value)
     p[1] = (unsigned char)((value >> 8) & 0xffU);
     p[2] = (unsigned char)((value >> 16) & 0xffU);
     p[3] = (unsigned char)((value >> 24) & 0xffU);
+}
+
+static void *r2_ears_capture_worker(void *unused)
+{
+    (void)unused;
+    unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
+    while (!shutting_down && atomic_load(&ears_capture_running)) {
+        ssize_t got = r2_ears_read(ears, pcm, sizeof(pcm));
+        if (got <= 0 || ((size_t)got % 4U) != 0U)
+            break;
+        pthread_mutex_lock(&ears_recent_lock);
+        size_t count = (size_t)got;
+        size_t first = R2_EARS_RECENT_CAPACITY - ears_recent_write_position;
+        if (first > count) first = count;
+        memcpy(ears_recent_audio + ears_recent_write_position, pcm, first);
+        if (count > first)
+            memcpy(ears_recent_audio, pcm + first, count - first);
+        ears_recent_write_position =
+            (ears_recent_write_position + count) % R2_EARS_RECENT_CAPACITY;
+        if (count >= R2_EARS_RECENT_CAPACITY)
+            ears_recent_length = R2_EARS_RECENT_CAPACITY;
+        else {
+            ears_recent_length += count;
+            if (ears_recent_length > R2_EARS_RECENT_CAPACITY)
+                ears_recent_length = R2_EARS_RECENT_CAPACITY;
+        }
+        pthread_mutex_unlock(&ears_recent_lock);
+    }
+    atomic_store(&ears_capture_running, 0);
+    return NULL;
+}
+
+/* Copy recent PCM without consuming or interpreting it. */
+static int r2_ears_write_recent_audio(uint32_t bytes_needed, FILE *wav,
+                                      int (*cancelled)(void *), void *userdata)
+{
+    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+        return -1;
+    unsigned char *snapshot = malloc(bytes_needed);
+    if (!snapshot) return -1;
+    for (;;) {
+        if (shutting_down || (cancelled && cancelled(userdata))) {
+            free(snapshot);
+            return -1;
+        }
+        pthread_mutex_lock(&ears_recent_lock);
+        if (ears_recent_length >= bytes_needed) {
+            size_t start = (ears_recent_write_position +
+                            R2_EARS_RECENT_CAPACITY - bytes_needed) %
+                           R2_EARS_RECENT_CAPACITY;
+            size_t first = R2_EARS_RECENT_CAPACITY - start;
+            if (first > bytes_needed) first = bytes_needed;
+            memcpy(snapshot, ears_recent_audio + start, first);
+            if (bytes_needed > first)
+                memcpy(snapshot + first, ears_recent_audio, bytes_needed - first);
+            pthread_mutex_unlock(&ears_recent_lock);
+            break;
+        }
+        int still_capturing = atomic_load(&ears_capture_running);
+        pthread_mutex_unlock(&ears_recent_lock);
+        if (!still_capturing) {
+            free(snapshot);
+            return -1;
+        }
+        struct timespec pause = {0, 100000000L};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+            if (shutting_down || (cancelled && cancelled(userdata))) {
+                free(snapshot);
+                return -1;
+            }
+        }
+    }
+    int rc = fwrite(snapshot, 1, bytes_needed, wav) == bytes_needed ? 0 : -1;
+    free(snapshot);
+    return rc;
 }
 
 static int r2_ears_write_wav_header(FILE *fp, uint32_t pcm_bytes)
@@ -10442,38 +10527,47 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         goto cleanup;
 
     pthread_mutex_lock(&ears_capture_lock);
-    if (!ears || r2_ears_open_microphone(ears) != 0) {
+    if (atomic_load(&ears_capture_running)) {
         pthread_mutex_unlock(&ears_capture_lock);
-        fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
-        goto cleanup;
-    }
-    own_mic = 1;
-    uint32_t captured_bytes = 0;
-    while (captured_bytes < total_bytes && !shutting_down &&
-           !(cancelled && cancelled(userdata))) {
-        size_t wanted = total_bytes - captured_bytes;
-        if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
-        ssize_t got = r2_ears_read(ears, pcm, wanted);
-        if (got <= 0 || ((size_t)got % 4U) != 0U) {
-            fprintf(stderr, "[Ears] Microphone capture ended early or returned invalid PCM.\n");
-            break;
+        if (r2_ears_write_recent_audio(total_bytes, wav, cancelled, userdata) == 0 &&
+            !shutting_down && !(cancelled && cancelled(userdata)) &&
+            r2_ears_write_wav_header(wav, total_bytes) == 0 &&
+            fflush(wav) == 0)
+            capture_ok = 1;
+    } else {
+        if (!ears || r2_ears_open_microphone(ears) != 0) {
+            pthread_mutex_unlock(&ears_capture_lock);
+            fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
+            goto cleanup;
         }
-        if (fwrite(pcm, 1, (size_t)got, wav) != (size_t)got) {
-            fprintf(stderr, "[Ears] Could not write captured audio to the temporary WAV file.\n");
-            break;
+        own_mic = 1;
+        uint32_t captured_bytes = 0;
+        while (captured_bytes < total_bytes && !shutting_down &&
+               !(cancelled && cancelled(userdata))) {
+            size_t wanted = total_bytes - captured_bytes;
+            if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
+            ssize_t got = r2_ears_read(ears, pcm, wanted);
+            if (got <= 0 || ((size_t)got % 4U) != 0U) {
+                fprintf(stderr, "[Ears] Microphone capture ended early or returned invalid PCM.\n");
+                break;
+            }
+            if (fwrite(pcm, 1, (size_t)got, wav) != (size_t)got) {
+                fprintf(stderr, "[Ears] Could not write captured audio to the temporary WAV file.\n");
+                break;
+            }
+            captured_bytes += (uint32_t)got;
         }
-        captured_bytes += (uint32_t)got;
+        if (own_mic) {
+            r2_ears_close(ears);
+            own_mic = 0;
+        }
+        pthread_mutex_unlock(&ears_capture_lock);
+        if (captured_bytes == total_bytes && !shutting_down &&
+            !(cancelled && cancelled(userdata)) &&
+            r2_ears_write_wav_header(wav, total_bytes) == 0 &&
+            fflush(wav) == 0)
+            capture_ok = 1;
     }
-    if (own_mic) {
-        r2_ears_close(ears);
-        own_mic = 0;
-    }
-    pthread_mutex_unlock(&ears_capture_lock);
-    if (captured_bytes == total_bytes && !shutting_down &&
-        !(cancelled && cancelled(userdata)) &&
-        r2_ears_write_wav_header(wav, total_bytes) == 0 &&
-        fflush(wav) == 0)
-        capture_ok = 1;
     if (fclose(wav) != 0) capture_ok = 0;
     wav = NULL;
     if (!capture_ok) goto cleanup;
@@ -10583,11 +10677,32 @@ char *r2_ears_listen(unsigned seconds)
 int r2_ears_start(void)
 {
     pthread_mutex_lock(&ears_capture_lock);
+    if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        return 0;
+    }
     int rc = ears ? r2_ears_open_microphone(ears) : -1;
+    if (rc == 0) {
+        pthread_mutex_lock(&ears_recent_lock);
+        ears_recent_length = 0;
+        ears_recent_write_position = 0;
+        pthread_mutex_unlock(&ears_recent_lock);
+        atomic_store(&ears_capture_running, 1);
+        if (pthread_create(&ears_capture_thread, NULL,
+                           r2_ears_capture_worker, NULL) != 0) {
+            atomic_store(&ears_capture_running, 0);
+            r2_ears_close(ears);
+            rc = -1;
+        } else {
+            ears_capture_thread_started = 1;
+        }
+    }
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_started" : "ears_start_failed",
-                 rc == 0 ? "R2 Ears microphone was opened." : "R2 Ears microphone could not be opened.",
-                 NULL, "r2_ears_start");
+                 rc == 0 ? "R2 Ears is continuously receiving raw microphone PCM."
+                         : "R2 Ears could not start continuous microphone capture.",
+                 rc == 0 ? "No transcription or semantic interpretation is performed by the capture worker."
+                         : NULL, "r2_ears_start");
     return rc;
 }
 
@@ -10595,10 +10710,19 @@ int r2_ears_stop(void)
 {
     if (!ears) return -1;
     pthread_mutex_lock(&ears_capture_lock);
+    atomic_store(&ears_capture_running, 0);
+    if (ears_capture_thread_started) {
+        pthread_join(ears_capture_thread, NULL);
+        ears_capture_thread_started = 0;
+    }
     r2_ears_close(ears);
+    pthread_mutex_lock(&ears_recent_lock);
+    ears_recent_length = 0;
+    ears_recent_write_position = 0;
+    pthread_mutex_unlock(&ears_recent_lock);
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, "ears_stopped",
-                 "R2 Ears microphone was closed.", NULL, "r2_ears_stop");
+                 "R2 Ears stopped continuous raw-audio input.", NULL, "r2_ears_stop");
     return 0;
 }
 
@@ -11892,6 +12016,7 @@ int r2_init(void)
             &messages_lock
         );
 
+        (void)r2_ears_stop();
         r2_ears_shutdown(ears);
         ears = NULL;
 
@@ -12257,6 +12382,7 @@ void r2_shutdown(void)
     r2_sounds_shutdown();
 
     if (ears) {
+        (void)r2_ears_stop();
         r2_ears_shutdown(ears);
         ears = NULL;
     }
