@@ -24,6 +24,8 @@ media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
                   core.index("int r2_vision_media_stop(void)")]
 assert "atomic_exchange(&media_attention_selected, 0)" in media_stop
 assert "media_attention_source_lost" in media_stop
+assert "pthread_cond_broadcast(&media_frame_cond)" in media_stop
+assert "media_frame_generation = 0;" in media_stop
 assert "r2_eyes_close(media_eyes)" in media_stop
 assert "r2_eyes_close(eyes)" not in media_stop
 
@@ -35,6 +37,10 @@ capture = core[core.index("static void *r2_media_capture_worker(void *unused)"):
 assert "r2_vision_media_set_attention(" not in watch
 assert "r2_vision_media_set_attention(" not in capture
 assert "r2_visual_analyze_frame(" not in capture
+assert "++media_frame_generation;" in capture
+assert "pthread_cond_broadcast(&media_frame_cond);" in capture
+assert "media_capture_done = 1;" in capture
+assert "atomic_exchange(&media_attention_selected, 0)" in capture
 
 # Deliberate current-turn focus is a separate action from a one-off frame look.
 tool = core[core.index("/* R2 may choose to watch for subsequent model turns."):
@@ -43,10 +49,16 @@ assert 'extract_marker(reply, "[MEDIA_FOCUS]"' in tool
 assert "r2_process_media_focus_request(trim(request))" in tool
 assert 'extract_marker(reply, "[MEDIA_SEE]"' in tool
 
+copy = core[core.index("static int r2_vision_copy_media_frame(R2VisionFrame *frame,\n"):
+            core.index("char *r2_vision_media_see(const char *question)")]
+assert "pthread_mutex_lock(&media_frame_lock)" in copy
+assert "pthread_cond_wait(&media_frame_cond, &media_frame_lock)" in copy
+assert "media_frame_generation == 0 && !media_capture_done" in copy
+assert "!media_capture_done && media_frame_generation > 0" in copy
+assert "memcpy(copy, media_latest_data, media_latest_frame.size)" in copy
 media = core[core.index("static char *r2_vision_media_current_frame_base64(void)\n{"):
              core.index("/* Capture and inference are separate workers.")]
-assert "pthread_mutex_lock(&media_frame_lock)" in media
-assert "memcpy(copy, frame.data, frame.size)" in media
+assert "r2_vision_copy_media_frame(&frame, &event, &copy)" in media
 assert "r2_visual_frame_base64(&frame)" in media
 assert "r2_visual_analyze_frame(" not in media
 assert "!r2_vision_media_attention_status()" in media
