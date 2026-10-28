@@ -9162,7 +9162,8 @@ static void *autonomous_thinking(void *arg)
             "If Eyes is already open, a current image may be attached as raw visual input. "
             "Its presence is not an instruction to describe the image; decide whether it matters "
             "to your reflection, and attend only to what you choose. Never open Eyes from this reflection. "
-            "If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds or desktop_live|seconds "
+            "Your camera is your primary eyesight. A movie is a separate visible display, not replacement eyes. Raw change notices may attract your attention without proving what happened. You can choose [SENSE] eyes|close or eyes|open, microphone|close or microphone|open, desktop|close or desktop|open as a standalone deliberate decision; Watch will respect it. You may choose [MEDIA_SEE] question on its own line to examine a real media display, but never invent contents if unavailable. "
+"If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds or desktop_live|seconds "
             "marker on its own line. The system will return the listening result and request a final reflection; "
             "do not use listening for a hypothetical or merely because Ears is active.\n"
             "\n"
@@ -9196,7 +9197,7 @@ static void *autonomous_thinking(void *arg)
             "\n"
             "Write naturally in first person as R2.\n"
             "\n"
-            "If no tool action is needed, return only the private diary reflection. If you deliberately choose a hearing action, return the single [EARS_LISTEN] marker on its own line so the system can provide the result and ask for the final reflection.";
+            "If no tool action is needed, return only the private diary reflection. If you choose to perform a sensory action, return one [EARS_LISTEN], [MEDIA_SEE] or [SENSE] marker on its own line, so the system can execute it and supply the result for the final reflection.";
 
         Message m = { "user", ctx, 0, 0 };
         int previous_background_mode = ollama_background_mode;
@@ -9206,52 +9207,62 @@ static void *autonomous_thinking(void *arg)
         char *reflection = ollama_chat_with_limit(
             &m, 1, prompt, 1024, 600L);
 
-        /* A deliberate hearing request from autonomous thought is executed as
-           a tool action, then the brain is asked for its final reflection with
-           the actual listening result. Tool markers are never diary content. */
+        /* Autonomous reflection can deliberately use the SAME sensor decision,
+           media attention or listening tools as the conversation brain. Raw
+           variation alone never forces a visual description or transcription. */
         if (reflection) {
-            size_t ears_pos = 0;
-            char *ears_request = extract_marker(
-                reflection, "[EARS_LISTEN]", "\n", &ears_pos);
-            if (ears_request) {
-                char *listen_result = r2_process_ears_listen_request(ears_request);
-                free(ears_request);
-                if (!listen_result) {
-                    free(reflection);
-                    reflection = NULL;
-                } else {
-                    char *followup = NULL;
-                    if (asprintf(&followup,
+            size_t sense_pos = 0, media_pos = 0, ears_pos = 0;
+            char *sense_request = extract_marker(reflection, "[SENSE]", "\n", &sense_pos);
+            char *media_request = extract_marker(reflection, "[MEDIA_SEE]", "\n", &media_pos);
+            char *ears_request = extract_marker(reflection, "[EARS_LISTEN]", "\n", &ears_pos);
+            const char *heading = NULL;
+            char *action_result = NULL;
+            if (sense_request) {
+                heading = "RESULT OF YOUR DELIBERATE SENSE DECISION:";
+                action_result = r2_process_sense_request(trim(sense_request));
+            } else if (media_request) {
+                heading = "RESULT OF YOUR DELIBERATE MEDIA OBSERVATION:";
+                action_result = r2_process_media_see_request(trim(media_request));
+            } else if (ears_request) {
+                heading = "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:";
+                action_result = r2_process_ears_listen_request(ears_request);
+            }
+            free(sense_request);
+            free(media_request);
+            free(ears_request);
+            if (heading) {
+                char *followup = NULL;
+                if (action_result &&
+                    asprintf(&followup,
                         "AUTONOMOUS REFLECTION CONTEXT:\n%s\n\n"
-                        "INITIAL DRAFT (not final; it may contain a hearing request):\n%s\n\n"
-                        "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:\n%s\n\n"
-                        "Now write the final private diary reflection using the supplied context "
-                        "and the real listening result. Do not emit tool markers. If the listening "
-                        "result is an error, treat the sound as unknown; do not invent speech.",
-                        ctx, reflection, listen_result) < 0) {
-                        free(followup);
-                        followup = NULL;
-                    }
-                    free(listen_result);
-                    if (!followup) {
+                        "INITIAL DRAFT (not final, might contain a sensory decision):\n%s\n\n"
+                        "%s\n%s\n\n"
+                        "Write a final private diary reflection about this real outcome. "
+                        "Do not emit tool markers. Failed or unavailable observations are "
+                        "unknown; do not invent speech, images or action success.",
+                        ctx, reflection, heading, action_result) < 0)
+                    followup = NULL;
+                free(action_result);
+                free(reflection);
+                reflection = NULL;
+                if (followup) {
+                    Message followup_message = { "user", followup, 0, 0 };
+                    reflection = ollama_chat_with_limit(
+                        &followup_message, 1, prompt, 1024, 600L);
+                    free(followup);
+                    if (reflection &&
+                        (strstr(reflection, "[EARS_LISTEN]") ||
+                         strstr(reflection, "[MEDIA_SEE]") ||
+                         strstr(reflection, "[SENSE]"))) {
+                        int repeated_hearing = strstr(reflection, "[EARS_LISTEN]") != NULL;
                         free(reflection);
                         reflection = NULL;
-                    } else {
-                        Message followup_message = { "user", followup, 0, 0 };
-                        char *final_reflection = ollama_chat_with_limit(
-                            &followup_message, 1, prompt, 1024, 600L);
-                        free(followup);
-                        free(reflection);
-                        reflection = final_reflection;
-                        if (reflection && strstr(reflection, "[EARS_LISTEN]")) {
-                            free(reflection);
-                            reflection = NULL;
-                            r2_log_event(R2_LOG_ERROR,
-                                         "reflection_repeated_hearing_request",
-                                         "Autonomous reflection emitted another hearing request instead of a final diary entry.",
-                                         "No tool marker was written to the diary.",
-                                         "autonomous_thinking");
-                        }
+                        r2_log_event(R2_LOG_ERROR,
+                                     repeated_hearing ? "reflection_repeated_hearing_request" :
+                                         "reflection_repeated_sensory_request",
+                                     "Autonomous reflection emitted another sensory tool marker instead of a final diary entry.",
+                                     "No tool marker was written to the diary.",
+                                     "autonomous_thinking");
                     }
                 }
             }
