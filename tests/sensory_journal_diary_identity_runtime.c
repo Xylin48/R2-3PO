@@ -95,6 +95,18 @@ int main(void)
     assert(r2_sj_init() == 0);
     expect_link("Exact first diary entry", "Diary link: 101");
     expect_link("Exact second diary entry", "Diary link: 102");
+
+    /* A legacy database might already contain a prose-guessed link. Keep
+       historical rows, but never present an ambiguous link as certain. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    /* The table's newer linked_utc field requires its default timestamp. */
+    char existing_link[512];
+    snprintf(existing_link, sizeof(existing_link),
+             "INSERT INTO r2_sensory_journal_diary_links"
+             "(event_id,diary_entry_id,linked_utc) VALUES(%lld,102,CURRENT_TIMESTAMP);",
+             (long long)ambiguous);
+    sql(db, existing_link);
+    sqlite3_close(db);
     expect_link("Ambiguous older entry", "Diary link: none");
 
     /* The direct diary->journal path works after initialization too. */
@@ -105,6 +117,8 @@ int main(void)
     authoritative_link(db, 103, third);
     sqlite3_close(db);
     r2_sj_index_event(third, "thinking", "diary_entry_linked", "diary");
+    /* A mismatched ID pair must not be projected as real diary history. */
+    assert(r2_sj_link_diary_event(third, 101) == -1);
     assert(r2_sj_link_diary_event(third, 103) == 0);
     expect_link("Exact new diary entry", "Diary link: 103");
 
