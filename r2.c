@@ -9905,14 +9905,49 @@ static pthread_mutex_t vision_watch_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t vision_watch_frame_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t vision_watch_frame_generation = 0;
 static int vision_watch_capture_done = 0;
+static R2VisionFrame vision_watch_latest_frame;
+static R2VisionEvent vision_watch_latest_event;
+static unsigned char *vision_watch_latest_frame_data = NULL;
+static size_t vision_watch_latest_frame_capacity = 0;
 
 static void *vision_watch_capture_worker(void *unused)
 {
     (void)unused;
     while (!shutting_down && atomic_load(&vision_watch_running)) {
+        R2VisionFrame frame;
+        R2VisionEvent event;
+        memset(&frame, 0, sizeof(frame));
+        memset(&event, 0, sizeof(event));
+
         pthread_mutex_lock(&visual_capture_lock);
         int captured = (eyes && r2_eyes_is_open(eyes))
             ? r2_eyes_capture(eyes) : -1;
+        int frame_ready = captured == 1 && eyes &&
+            r2_eyes_get_frame(eyes, &frame) == 0 &&
+            r2_eyes_get_event(eyes, &event) == 0 &&
+            frame.data && frame.size > 0;
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        if (frame_ready) {
+            if (frame.size > vision_watch_latest_frame_capacity) {
+                unsigned char *resized = realloc(vision_watch_latest_frame_data,
+                                                  frame.size);
+                if (resized) {
+                    vision_watch_latest_frame_data = resized;
+                    vision_watch_latest_frame_capacity = frame.size;
+                } else {
+                    frame_ready = 0;
+                }
+            }
+            if (frame_ready) {
+                memcpy(vision_watch_latest_frame_data, frame.data, frame.size);
+                vision_watch_latest_frame = frame;
+                vision_watch_latest_frame.data = vision_watch_latest_frame_data;
+                vision_watch_latest_event = event;
+                ++vision_watch_frame_generation;
+                pthread_cond_broadcast(&vision_watch_frame_cond);
+            }
+        }
+        pthread_mutex_unlock(&vision_watch_frame_lock);
         pthread_mutex_unlock(&visual_capture_lock);
 
         if (captured != 1) {
@@ -9928,11 +9963,6 @@ static void *vision_watch_capture_worker(void *unused)
                                "Eyes");
             break;
         }
-
-        pthread_mutex_lock(&vision_watch_frame_lock);
-        ++vision_watch_frame_generation;
-        pthread_cond_broadcast(&vision_watch_frame_cond);
-        pthread_mutex_unlock(&vision_watch_frame_lock);
     }
 
     pthread_mutex_lock(&vision_watch_frame_lock);
@@ -9941,7 +9971,6 @@ static void *vision_watch_capture_worker(void *unused)
     pthread_mutex_unlock(&vision_watch_frame_lock);
     return NULL;
 }
-
 static void *vision_watch_worker(void *unused)
 {
     (void)unused;
@@ -9988,19 +10017,18 @@ static void *vision_watch_worker(void *unused)
         memset(&event, 0, sizeof(event));
         unsigned char *frame_copy = NULL;
 
-        pthread_mutex_lock(&visual_capture_lock);
-        int frame_ready = eyes && r2_eyes_is_open(eyes) &&
-            r2_eyes_get_frame(eyes, &frame) == 0 &&
-            r2_eyes_get_event(eyes, &event) == 0 &&
-            frame.data && frame.size > 0;
-        if (frame_ready) {
-            frame_copy = malloc(frame.size);
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        if (vision_watch_latest_frame.data && vision_watch_latest_frame.size > 0) {
+            frame_copy = malloc(vision_watch_latest_frame.size);
             if (frame_copy) {
-                memcpy(frame_copy, frame.data, frame.size);
+                memcpy(frame_copy, vision_watch_latest_frame_data,
+                       vision_watch_latest_frame.size);
+                frame = vision_watch_latest_frame;
                 frame.data = frame_copy;
+                event = vision_watch_latest_event;
             }
         }
-        pthread_mutex_unlock(&visual_capture_lock);
+        pthread_mutex_unlock(&vision_watch_frame_lock);
 
         if (!frame_copy) {
             if (capture_done)
@@ -10072,6 +10100,11 @@ int r2_vision_watch_start(void)
     pthread_mutex_lock(&vision_watch_frame_lock);
     vision_watch_frame_generation = 0;
     vision_watch_capture_done = 0;
+    memset(&vision_watch_latest_frame, 0, sizeof(vision_watch_latest_frame));
+    memset(&vision_watch_latest_event, 0, sizeof(vision_watch_latest_event));
+    free(vision_watch_latest_frame_data);
+    vision_watch_latest_frame_data = NULL;
+    vision_watch_latest_frame_capacity = 0;
     pthread_mutex_unlock(&vision_watch_frame_lock);
 
     atomic_store(&vision_watch_running, 1);
