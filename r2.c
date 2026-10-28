@@ -1426,34 +1426,14 @@ static int save_memory(
             NULL
         );
 
-    if (rc == SQLITE_OK) {
-
-        sqlite3_bind_text(
-            st,
-            1,
-            now,
-            -1,
-            SQLITE_TRANSIENT
-        );
-
-        sqlite3_bind_text(
-            st,
-            2,
-            memory,
-            -1,
-            SQLITE_TRANSIENT
-        );
-
-        sqlite3_bind_text(
-            st,
-            3,
-            category,
-            -1,
-            SQLITE_TRANSIENT
-        );
-
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 1, now, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 2, memory, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 3, category, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
         rc = sqlite3_step(st);
-    }
 
     int changed =
         (rc == SQLITE_DONE)
@@ -7512,13 +7492,16 @@ static int64_t gameboy_find_life_event_for_console_event(int64_t console_event_i
         return 0;
     }
     sqlite3_busy_timeout(log_db, 3000);
-    if (sqlite3_prepare_v2(log_db,
-            "SELECT id FROM r2_log_events "
-            "WHERE event_type IN ('gameboy_game_event','virtual_game_event') "
-            "AND details LIKE ? ORDER BY id LIMIT 1",
-            -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) == SQLITE_ROW)
+    int lookup_rc = sqlite3_prepare_v2(log_db,
+        "SELECT id FROM r2_log_events "
+        "WHERE event_type IN ('gameboy_game_event','virtual_game_event') "
+        "AND details LIKE ? ORDER BY id LIMIT 1",
+        -1, &stmt, NULL);
+    if (lookup_rc == SQLITE_OK)
+        lookup_rc = sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
+    if (lookup_rc == SQLITE_OK) {
+        lookup_rc = sqlite3_step(stmt);
+        if (lookup_rc == SQLITE_ROW)
             life_event_id = sqlite3_column_int64(stmt, 0);
     }
     if (stmt) sqlite3_finalize(stmt);
