@@ -119,6 +119,7 @@ int r2_eyes_open_source(R2Eyes *eyes,
 
 /* Live video-rendering window supplied by a playback source. */
 int r2_eyes_window_available(unsigned long window_id);
+unsigned long r2_eyes_window_for_pid(long pid);
 int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
 
 /* VLC window input */
