@@ -7767,7 +7767,7 @@ static char *r2_process_media_see_request(const char *question)
         "MEDIA OBSERVATION ERROR: no visible media frame is available or Eyes is closed. "
         "Do not invent visual content.");
     char *result = NULL;
-    if (asprintf(&result, "MEDIA OBSERVATION RESULT (chosen attention to a real display):\\n%s",
+    if (asprintf(&result, "MEDIA OBSERVATION RESULT (chosen attention to a real display):\n%s",
                  observed) < 0)
         result = NULL;
     free(observed);
@@ -8618,10 +8618,10 @@ static char *process_tools_with_status(
     /* Decisions to open/close sensors override Watch discovery. */
     size_t sense_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[SENSE]", "\\n", &sense_pos);
+        char *request = extract_marker(reply, "[SENSE]", "\n", &sense_pos);
         if (!request) break;
         char *result = r2_process_sense_request(trim(request));
-        if (result) { APPEND("%s\\n", result); free(result); }
+        if (result) { APPEND("%s\n", result); free(result); }
         free(request);
     }
 
@@ -8629,10 +8629,10 @@ static char *process_tools_with_status(
        that display. Primary camera frames remain a distinct image source. */
     size_t media_see_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[MEDIA_SEE]", "\\n", &media_see_pos);
+        char *request = extract_marker(reply, "[MEDIA_SEE]", "\n", &media_see_pos);
         if (!request) break;
         char *result = r2_process_media_see_request(trim(request));
-        if (result) { APPEND("%s\\n", result); free(result); }
+        if (result) { APPEND("%s\n", result); free(result); }
         free(request);
     }
 
