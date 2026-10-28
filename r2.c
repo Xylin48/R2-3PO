@@ -10212,6 +10212,7 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
         pthread_mutex_unlock(&media_capture_lock);
         return -1;
     }
+    r2_eyes_set_auxiliary(media_eyes, 1);
     int rc = kind == 1 ? r2_eyes_open_window(media_eyes, window) :
              kind == 2 ? r2_eyes_open_vlc(media_eyes) :
                          r2_eyes_open_file(media_eyes, path);
