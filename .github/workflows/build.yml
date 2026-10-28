@@ -156,6 +156,11 @@ jobs:
           python3 tests/ears_speech_bridge_smoke.py
           python3 tests/ears_attention_tool_smoke.py
 
+      - name: Exercise source discovery with synthetic microphone and desktop playback
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c Ears.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
+          /tmp/r2-ears-source-discovery-smoke
+
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
