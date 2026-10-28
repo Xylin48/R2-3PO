@@ -421,6 +421,77 @@ static int r2_ears_source_exists(const char *source)
 }
 
 
+/* Availability discovery is separate from sound capture. Both USB and built-in
+ * microphone names come from the active Pulse/PipeWire server, not an app list.
+ * A monitor is desktop playback, not a physical microphone. */
+static int r2_ears_is_monitor(const char *name)
+{
+    if (!name) return 1;
+    size_t n = strlen(name);
+    return n >= 8 && strcmp(name + n - 8, ".monitor") == 0;
+}
+
+static int r2_ears_find_microphone(char *out, size_t capacity)
+{
+    char preferred[512] = {0}, fallback[512] = {0}, line[2048];
+    char *default_name = r2_ears_get_default_source();
+    FILE *pipe = popen("pactl list short sources 2>/dev/null", "r");
+    if (!out || capacity == 0) {
+        free(default_name);
+        if (pipe) pclose(pipe);
+        return -1;
+    }
+    out[0] = '\0';
+    if (!pipe) {
+        free(default_name);
+        return -1;
+    }
+    while (fgets(line, sizeof(line), pipe)) {
+        char name[512] = {0};
+        if (sscanf(line, "%*u %511s", name) != 1 ||
+            r2_ears_is_monitor(name))
+            continue;
+        if (!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", name);
+        if (default_name && strcmp(name, default_name) == 0) {
+            snprintf(preferred, sizeof(preferred), "%s", name);
+            break;
+        }
+    }
+    int closed = pclose(pipe);
+    free(default_name);
+    if (closed != 0) return -1;
+    const char *selected = preferred[0] ? preferred : fallback;
+    if (!*selected || snprintf(out, capacity, "%s", selected) >= (int)capacity)
+        return -1;
+    return 0;
+}
+
+int r2_ears_microphone_available(void)
+{
+    char source[512];
+    return r2_ears_find_microphone(source, sizeof(source)) == 0;
+}
+
+/* A live, uncorked playback stream is an audio source regardless of whether
+ * it belongs to a browser, movie player, audio player or game. Paused/corked
+ * streams do not keep the continuous desktop listener alive. */
+int r2_ears_desktop_playing(void)
+{
+    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
+    if (!pipe) return 0;
+    char line[2048];
+    int playing = 0, have_input = 0;
+    while (fgets(line, sizeof(line), pipe)) {
+        if (strstr(line, "Sink Input #")) have_input = 1;
+        if (have_input && strstr(line, "Corked: no")) {
+            playing = 1;
+            break;
+        }
+    }
+    if (pclose(pipe) != 0) return 0;
+    return playing;
+}
+
 /* ---------------------------------------------------------
  * File process handling
  * --------------------------------------------------------- */
@@ -771,13 +842,11 @@ int r2_ears_open_source(
 
 int r2_ears_open_microphone(R2Ears *ears)
 {
-    if (!ears)
+    if (!ears) return -1;
+    char source[512];
+    if (r2_ears_find_microphone(source, sizeof(source)) != 0)
         return -1;
-
-    return r2_ears_open_source(
-        ears,
-        NULL
-    );
+    return r2_ears_open_source(ears, source);
 }
 
 
