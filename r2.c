@@ -10406,6 +10406,11 @@ int r2_vision_set_model(const char *model)
 int r2_vision_camera_available(void) { return r2_eyes_camera_available(); }
 int r2_vision_vlc_available(void) { return r2_eyes_vlc_available(); }
 
+unsigned long r2_vision_window_for_pid(long pid)
+{
+    return r2_eyes_window_for_pid(pid);
+}
+
 int r2_vision_window_available(unsigned long window_id)
 {
     return r2_eyes_window_available(window_id);
