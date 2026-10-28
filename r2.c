@@ -8469,10 +8469,8 @@ static char *process_tools_with_status(
         if (!request) break;
         char *seconds_text = trim(request);
         char *end = NULL;
-        errno = 0;
-        unsigned long seconds = strtoul(seconds_text, &end, 10);
-        int valid = !errno && end != seconds_text && end && *end == '\0' &&
-                    seconds >= 1UL && seconds <= 15UL;
+        unsigned long seconds = 0;
+        int valid = 1;
         int recent = 0;
         char *mode_separator = strchr(seconds_text, '|');
         if (mode_separator) {
