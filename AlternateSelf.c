@@ -189,8 +189,8 @@ int64_t r2_altself_create(const char *name, const char *scenario,
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id)"
-        " VALUES(?,?,?,?,?,'active',?,?);", -1, &st, NULL);
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
@@ -255,8 +255,8 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     }
     rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id)"
-        " VALUES(?,?,?,?,?,'active',?,?);", -1, &st, NULL);
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
@@ -326,8 +326,8 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_event_links"
-        "(branch_id,event_id,relation,details) "
-        "SELECT ?,?,?,? WHERE "
+        "(branch_id,event_id,relation,details,created_utc) "
+        "SELECT ?,?,?,?,CURRENT_TIMESTAMP WHERE "
         "EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=?) AND "
         "EXISTS(SELECT 1 FROM r2_log_events WHERE id=?);",
         -1, &st, NULL);
