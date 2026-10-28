@@ -103,6 +103,8 @@ typedef struct R2Eyes R2Eyes;
 /* Initialization / shutdown */
 int r2_eyes_init(R2Eyes **eyes);
 void r2_eyes_shutdown(R2Eyes *eyes);
+/* Auxiliary media streams cannot overwrite the primary Eyes viewer. */
+void r2_eyes_set_auxiliary(R2Eyes *eyes, int auxiliary);
 
 /* Probe physical camera readiness without starting continuous capture. */
 int r2_eyes_camera_available(void);
