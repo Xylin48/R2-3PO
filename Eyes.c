@@ -740,6 +740,12 @@ static int r2_eyes_find_vlc_window(
     return 0;
 }
 
+int r2_eyes_vlc_available(void)
+{
+    unsigned long window_id = 0;
+    return r2_eyes_find_vlc_window(&window_id) == 0;
+}
+
 /*
  * Determine the current VLC window dimensions.
  *
