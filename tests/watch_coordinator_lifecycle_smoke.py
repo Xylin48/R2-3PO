@@ -38,7 +38,8 @@ assert "r2_ears_status_desktop()" in worker
 assert "wanted_audio" not in worker, "desktop playback must never displace microphone hearing"
 assert "if (managed_eyes)" in worker and "r2_eyes_stop()" in worker
 assert "r2_vision_watch_start()" in worker
-assert "r2_vision_open_window(media_window)" in worker
+assert "r2_vision_open_window(wanted_window_id)" in worker
+assert "managed_window_id != wanted_window_id" in worker
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
