@@ -6,6 +6,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -1120,13 +1123,58 @@ int r2_eyes_open_file(
     );
 }
 
-int r2_eyes_open_camera(
-    R2Eyes *eyes)
+/* Find actual video-capture devices, rather than assuming /dev/video0.
+ * A single camera can expose multiple V4L2 nodes (e.g. capture + metadata).
+ * Query capabilities to avoid treating a metadata-only node as an eye. */
+static int r2_eyes_camera_path(char *out, size_t capacity)
 {
-    const char *device = getenv("R2_CAMERA_DEVICE");
-    if (!device || !*device)
-        device = "/dev/video0";
-    return r2_eyes_open_device(eyes, device);
+    const char *configured = getenv("R2_CAMERA_DEVICE");
+    glob_t candidates = {0};
+    if (!out || capacity == 0) return -1;
+    out[0] = '\0';
+    if (!configured || !*configured) {
+        if (glob("/dev/video*", 0, NULL, &candidates) != 0)
+            return -1;
+    }
+    size_t count = (configured && *configured) ? 1 : candidates.gl_pathc;
+    for (size_t i = 0; i < count; ++i) {
+        const char *path = (configured && *configured)
+            ? configured : candidates.gl_pathv[i];
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISCHR(st.st_mode))
+            continue;
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        struct v4l2_capability caps = {0};
+        int rc = ioctl(fd, VIDIOC_QUERYCAP, &caps);
+        close(fd);
+        if (rc != 0) continue;
+        uint32_t effective = (caps.capabilities & V4L2_CAP_DEVICE_CAPS)
+            ? caps.device_caps : caps.capabilities;
+        if (!(effective & (V4L2_CAP_VIDEO_CAPTURE |
+                           V4L2_CAP_VIDEO_CAPTURE_MPLANE)))
+            continue;
+        if (snprintf(out, capacity, "%s", path) >= (int)capacity)
+            break;
+        globfree(&candidates);
+        return 0;
+    }
+    globfree(&candidates);
+    return -1;
+}
+
+int r2_eyes_camera_available(void)
+{
+    char camera[512];
+    return r2_eyes_camera_path(camera, sizeof(camera)) == 0;
+}
+
+int r2_eyes_open_camera(R2Eyes *eyes)
+{
+    char camera[512];
+    if (r2_eyes_camera_path(camera, sizeof(camera)) != 0)
+        return -1;
+    return r2_eyes_open_device(eyes, camera);
 }
 
 int r2_eyes_open_device(
