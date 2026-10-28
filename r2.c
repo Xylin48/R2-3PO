@@ -10747,6 +10747,8 @@ int r2_ears_stop(void)
 
 int r2_ears_status(void)
 {
+    if (atomic_load(&ears_capture_running))
+        return 1;
     return ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0;
 }
 
