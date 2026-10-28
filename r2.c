@@ -12143,6 +12143,29 @@ finalize_reply:
                 r2_log_link(turn_event_id, association_id,
                             "conversation_occurred_during_audio", hearing_event.source_name);
         }
+        /* Preserve the desktop playback event independently of microphone
+           audio, without claiming either stream was interpreted. */
+        R2HearingEvent desktop_event = {0};
+        pthread_mutex_lock(&ears_desktop_capture_lock);
+        int desktop_connected = ears_desktop &&
+            atomic_load(&ears_desktop_capture_running) &&
+            r2_ears_is_open(ears_desktop) &&
+            r2_ears_get_event(ears_desktop, &desktop_event) == 0;
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        if (desktop_connected) {
+            char details[1200];
+            snprintf(details, sizeof(details),
+                     "conversation_event_id=%lld\naudio_source=%s\naudio_origin=desktop_playback\n"
+                     "An independent desktop PCM source was active, without automatic transcription.",
+                     (long long)turn_event_id, desktop_event.source_name);
+            int64_t association_id = r2_log_event(
+                R2_LOG_CONVERSATION, "conversation_during_audio_input",
+                "A conversation occurred while desktop playback audio was active.",
+                details, desktop_event.source_name);
+            if (association_id > 0)
+                r2_log_link(turn_event_id, association_id,
+                            "conversation_occurred_during_audio", desktop_event.source_name);
+        }
     }
 
     /* Deliver the generated answer immediately; model-assisted bookkeeping
