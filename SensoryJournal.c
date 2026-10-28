@@ -113,13 +113,13 @@ int r2_sj_init(void)
             "WHERE indexed_utc IS NULL OR indexed_utc='';"
             "UPDATE r2_sensory_journal_diary_links SET linked_utc=CURRENT_TIMESTAMP "
             "WHERE linked_utc IS NULL OR linked_utc='';"
-            "INSERT OR IGNORE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id) "
-            "SELECT e.id,d.id FROM r2_log_events e "
+            "INSERT OR IGNORE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
+            "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
             "WHERE e.category='thinking' "
             "AND e.event_type IN ('diary_entry_written','reflection_completed');"
-            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind) "
-            "SELECT id,category FROM r2_log_events "
+            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
+            "SELECT id,category,CURRENT_TIMESTAMP FROM r2_log_events "
             "WHERE category IN ('sensory','thinking','conversation');") != 0) {
         sqlite3_close(sj_db);
         sj_db = NULL;
@@ -158,7 +158,8 @@ void r2_sj_index_event(int64_t event_id, const char *category,
     }
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(sj_db,
-            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind) VALUES(?,?);",
+            "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
+            "VALUES(?,?,CURRENT_TIMESTAMP);",
             -1, &st, NULL) == SQLITE_OK) {
         int bind_rc = sqlite3_bind_int64(st, 1, event_id);
         if (bind_rc == SQLITE_OK)
@@ -175,8 +176,8 @@ void r2_sj_index_event(int64_t event_id, const char *category,
          !strcmp(event_type, "reflection_completed"))) {
         sqlite3_stmt *link = NULL;
         int link_rc = sqlite3_prepare_v2(sj_db,
-            "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id) "
-            "SELECT e.id,d.id FROM r2_log_events e "
+            "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
+            "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
             "WHERE e.id=? ORDER BY d.id DESC LIMIT 1;",
             -1, &link, NULL);
