@@ -639,9 +639,10 @@ int r2_reward_current_modifier(const char *target)
             "SELECT modifier,occurred_at,expires_at FROM reward_events "
             "WHERE target=? COLLATE NOCASE AND expires_at>? ORDER BY id DESC LIMIT 1",
             -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 2, now);
-        if (sqlite3_step(st) == SQLITE_ROW) {
+        int rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
             int modifier = sqlite3_column_int(st, 0);
             sqlite3_int64 start = sqlite3_column_int64(st, 1);
             sqlite3_int64 end = sqlite3_column_int64(st, 2);
