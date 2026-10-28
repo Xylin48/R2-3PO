@@ -1271,7 +1271,7 @@ static void shell_watch_status(void)
         "============================================================\n"
         "\n",
         shell_watch_thread_started ? "RUNNING" : "STOPPED",
-        watch_running ? "ENABLED" : "DISABLED",
+        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "UNAVAILABLE"),
         r2_vision_watch_active() ? "ACTIVE" : "INACTIVE",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
@@ -1296,7 +1296,9 @@ static void *shell_watch_worker(void *unused)
         fprintf(stderr, "[Watch] Raw visual input attached to the already-open Eyes source.\n");
     }
 
-    while (!shell_watch_cancelled(NULL) && r2_ears_status() > 0) {
+    while (!shell_watch_cancelled(NULL)) {
+        /* Keep coordinator lifecycle stable if a device disconnects. Status
+           reports the missing source; Watch does not silently reopen it. */
         struct timespec pause = {1, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
             if (shell_watch_cancelled(NULL)) break;
