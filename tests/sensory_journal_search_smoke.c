@@ -111,25 +111,7 @@ int main(void)
     sqlite3_close(db);
 
     assert(r2_sj_init() == 0);
-    long journal_count = r2_sj_count();
-    fprintf(stderr, "DEBUG sensory journal count=%ld\\n", journal_count);
-    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
-    sqlite3_stmt *debug_st = NULL;
-    assert(sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM r2_log_events WHERE category='thinking' AND source='legacy-schema-smoke'",
-        -1, &debug_st, NULL) == SQLITE_OK);
-    assert(sqlite3_step(debug_st) == SQLITE_ROW);
-    fprintf(stderr, "DEBUG legacy thinking source rows=%d\\n", sqlite3_column_int(debug_st, 0));
-    sqlite3_finalize(debug_st);
-    assert(sqlite3_prepare_v2(db,
-        "SELECT COUNT(*) FROM r2_sensory_journal WHERE event_id IN "
-        "(SELECT id FROM r2_log_events WHERE source='legacy-schema-smoke')",
-        -1, &debug_st, NULL) == SQLITE_OK);
-    assert(sqlite3_step(debug_st) == SQLITE_ROW);
-    fprintf(stderr, "DEBUG legacy thinking indexed rows=%d\\n", sqlite3_column_int(debug_st, 0));
-    sqlite3_finalize(debug_st);
-    sqlite3_close(db);
-    assert(journal_count == 6);
+    assert(r2_sj_count() == 6);
 
     /* Legacy journal tables predate timestamp columns. Migration must add
        them before any backfill or new event-link write is attempted. */
@@ -202,9 +184,9 @@ int main(void)
     assert(diary_event_id > 0);
     sqlite3_close(db);
     r2_sj_index_event(diary_event_id, "thinking", "diary_entry_written", "diary");
-    assert(r2_sj_count() == 6);
+    assert(r2_sj_count() == 7);
     r2_sj_index_event(diary_event_id, "thinking", "diary_entry_written", "diary");
-    assert(r2_sj_count() == 6);
+    assert(r2_sj_count() == 7);
 
     found = r2_sj_search("fresh reflective", 20);
     assert(found && strstr(found, "thinking/diary_entry_written"));
