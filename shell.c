@@ -1005,7 +1005,7 @@ static void shell_eyes(const char *argument)
     }
 
     if (!strcasecmp(argument, "stop")) {
-
+        r2_sense_set_auto_allowed(1, 0);
         int result =
             r2_eyes_stop();
 
@@ -1068,6 +1068,21 @@ static void shell_vision(const char *argument)
         return;
     }
 
+    if (!strcasecmp(argument, "media see") ||
+        shell_starts_with(argument, "media see ")) {
+        const char *question = shell_starts_with(argument, "media see ")
+            ? shell_trim((char *)argument + strlen("media see ")) :
+              "What can be observed in this media display?";
+        char *result = r2_vision_media_see(question);
+        if (result) {
+            printf("[Media display observation] %s\n", result);
+            free(result);
+        } else {
+            printf("[Media display input unavailable or deliberately closed.]\n");
+        }
+        return;
+    }
+
     if (!strcasecmp(argument, "see")) {
         char *result = r2_vision_see(
             "Describe what is visible in the current frame. Identify objects, visible text, "
@@ -1094,8 +1109,9 @@ static void shell_vision(const char *argument)
     }
 
     if (!strcasecmp(argument, "watch stop")) {
-        r2_vision_watch_stop();
-        printf("[Visual observation stopped.]\n");
+        r2_sense_set_auto_allowed(1, 0);
+        (void)r2_eyes_stop();
+        printf("[Visual observation deliberately stopped; Watch will not reopen Eyes.]\n");
         return;
     }
 
@@ -1106,8 +1122,9 @@ static void shell_vision(const char *argument)
     }
 
     if (!strcasecmp(argument, "vlc")) {
+        r2_sense_set_auto_allowed(1, 1);
         if (r2_vision_open_vlc() == 0)
-            printf("[Eyes connected to the visible VLC window. Use 'vision see' or 'vision watch start' after it opens.]\n");
+            printf("[Independent VLC display connected; camera eyesight is unchanged. Use 'vision media see' to inspect it.]\n");
         else
             printf("[Could not open VLC capture. Ensure VLC is visible in the graphical desktop session.]\n");
         return;
@@ -1115,8 +1132,9 @@ static void shell_vision(const char *argument)
 
     if (shell_starts_with(argument, "file ")) {
         const char *path = shell_trim((char *)argument + 5);
+        r2_sense_set_auto_allowed(1, 1);
         if (r2_vision_open_file(path) == 0)
-            printf("[Eyes opened visual file: %s]\n", path);
+            printf("[Independent media file opened without replacing camera Eyes: %s]\n", path);
         else
             printf("[Could not open visual file: %s]\n", path);
         return;
@@ -1155,13 +1173,8 @@ static void shell_vision(const char *argument)
 
 static void shell_ears(const char *argument)
 {
-    /* Watch owns the microphone/ASR capture loop while active. Do not let
-       standalone Ears commands replace or close its source mid-utterance. */
-    if (watch_running && argument && *argument &&
-        strcasecmp(argument, "status") != 0) {
-        printf("[Ears] Watch owns continuous raw microphone capture. Stop Watch before using standalone Ears commands.\n");
-        return;
-    }
+    /* An explicit sensory decision is valid even while Watch discovers sources.
+       A deliberately closed microphone or desktop remains closed. */
 
     if (!argument || !*argument) {
 
@@ -1181,7 +1194,7 @@ static void shell_ears(const char *argument)
     }
 
     if (!strcasecmp(argument, "start")) {
-
+        r2_sense_set_auto_allowed(2, 1);
         int result =
             r2_ears_start();
 
@@ -1230,7 +1243,7 @@ static void shell_ears(const char *argument)
     }
 
     if (!strcasecmp(argument, "stop")) {
-
+        r2_sense_set_auto_allowed(2, 0);
         int result =
             r2_ears_stop();
 
@@ -1239,6 +1252,20 @@ static void shell_ears(const char *argument)
         else
             printf("[Ears] Failed to stop.\n");
 
+        return;
+    }
+
+    if (!strcasecmp(argument, "desktop stop")) {
+        r2_sense_set_auto_allowed(3, 0);
+        (void)r2_ears_stop_desktop();
+        printf("[Ears] Desktop playback listening deliberately closed.\n");
+        return;
+    }
+    if (!strcasecmp(argument, "desktop start")) {
+        r2_sense_set_auto_allowed(3, 1);
+        printf(r2_ears_start_desktop() == 0
+               ? "[Ears] Independent desktop listening started.\n"
+               : "[Ears] Could not open desktop listening.\n");
         return;
     }
 
