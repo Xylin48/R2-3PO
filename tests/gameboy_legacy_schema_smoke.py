@@ -56,7 +56,7 @@ def main() -> int:
                     'legacy event with non-colliding ID', 'source database history');
 
             CREATE TABLE cartridge_inventory (filename TEXT PRIMARY KEY COLLATE NOCASE);
-            INSERT INTO cartridge_inventory(filename) VALUES ('Legacy.gba');
+            INSERT INTO cartridge_inventory(filename) VALUES ('Target.gba');
         """)
         cartridge_db.commit()
         cartridge_db.close()
@@ -135,6 +135,9 @@ def main() -> int:
             assert old_cartridge["filename"] == "Legacy.gba"
             assert old_cartridge["title"] == ""
             assert old_cartridge["location"] == "pockets"
+            assert db.execute(
+                "SELECT COUNT(*) FROM cartridge_inventory WHERE filename='Target.gba'"
+            ).fetchone()[0] == 1
 
             # Exercise real post-migration writes, not just column presence.
             module.record_event(db, "system", "post_migration_write",
@@ -160,8 +163,8 @@ def main() -> int:
             ).fetchone()
             assert slot is not None and slot["rom_title"] == "Legacy Cartridge"
             assert db.execute(
-                "SELECT COUNT(*) FROM cartridge_inventory WHERE filename IN ('Legacy.gba','New.gba')"
-            ).fetchone()[0] == 2
+                "SELECT COUNT(*) FROM cartridge_inventory WHERE filename IN ('Legacy.gba','Target.gba','New.gba')"
+            ).fetchone()[0] == 3
             assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert db.execute("PRAGMA cartridge.integrity_check").fetchone()[0] == "ok"
 
