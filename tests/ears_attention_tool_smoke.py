@@ -14,7 +14,7 @@ worker_end = watch.index("static void shell_watch_start(void)", worker_start)
 worker = watch[worker_start:worker_end]
 
 assert "[EARS_LISTEN] recent|seconds" in prompt and "[EARS_LISTEN] live|seconds" in prompt
-assert "do not use this tool for hypothetical situations" in prompt.lower()
+assert "do not use it for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in tool
 assert "seconds >= 1UL && seconds <= 15UL" in tool
