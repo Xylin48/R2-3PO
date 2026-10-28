@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """R2's persistent virtual Game Boy console.
 
-This is the device layer, not an emulator. It delegates game execution to mGBA
-and stores only the inserted cartridge plus console/session state in gameboy.db.
+This is the device layer, not an emulator. It delegates game execution to mGBA.
+The cartridge slot lives in gameboy.db; console/session state and event history
+live in State/console_state.db. Older combined gameboy.db state is imported
+transactionally and retained in the source database for recovery.
 No emulator save-state or rewind commands are exposed by this interface.
 """
 from __future__ import annotations
