@@ -10004,21 +10004,12 @@ static void *vision_watch_worker(void *unused)
             pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
         uint64_t generation = vision_watch_frame_generation;
         int capture_done = vision_watch_capture_done;
-        pthread_mutex_unlock(&vision_watch_frame_lock);
-
-        if (shutting_down || !atomic_load(&vision_watch_running))
-            break;
-        if (generation == last_generation && capture_done)
-            break;
-        last_generation = generation;
 
         R2VisionFrame frame;
         R2VisionEvent event;
         memset(&frame, 0, sizeof(frame));
         memset(&event, 0, sizeof(event));
         unsigned char *frame_copy = NULL;
-
-        pthread_mutex_lock(&vision_watch_frame_lock);
         if (vision_watch_latest_frame.data && vision_watch_latest_frame.size > 0) {
             frame_copy = malloc(vision_watch_latest_frame.size);
             if (frame_copy) {
@@ -10031,6 +10022,11 @@ static void *vision_watch_worker(void *unused)
         }
         pthread_mutex_unlock(&vision_watch_frame_lock);
 
+        if (shutting_down || !atomic_load(&vision_watch_running))
+            break;
+        if (generation == last_generation && capture_done)
+            break;
+        last_generation = generation;
         if (!frame_copy) {
             if (capture_done)
                 break;
@@ -10166,6 +10162,15 @@ int r2_vision_watch_stop(void)
         pthread_join(vision_watch_capture_thread, NULL);
         vision_watch_capture_thread_started = 0;
     }
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    free(vision_watch_latest_frame_data);
+    vision_watch_latest_frame_data = NULL;
+    vision_watch_latest_frame_capacity = 0;
+    memset(&vision_watch_latest_frame, 0, sizeof(vision_watch_latest_frame));
+    memset(&vision_watch_latest_event, 0, sizeof(vision_watch_latest_event));
+    vision_watch_frame_generation = 0;
+    vision_watch_capture_done = 0;
+    pthread_mutex_unlock(&vision_watch_frame_lock);
     pthread_mutex_unlock(&vision_watch_lock);
     return 0;
 }
