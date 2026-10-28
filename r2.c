@@ -10590,88 +10590,37 @@ int r2_vision_window_available(unsigned long window_id)
 
 int r2_vision_open_window(unsigned long window_id)
 {
-    if (!eyes || !r2_visual_is_initialized() || window_id == 0) return -1;
-    pthread_mutex_lock(&visual_capture_lock);
-    int rc = r2_eyes_open_window(eyes, window_id);
-    pthread_mutex_unlock(&visual_capture_lock);
-    if (rc != 0) return rc;
-    if (r2_vision_watch_start() != 0) {
-        pthread_mutex_lock(&visual_capture_lock);
-        r2_eyes_close(eyes);
-        pthread_mutex_unlock(&visual_capture_lock);
-        return -1;
-    }
-    r2_log_media_event("opened_for_observation", "video_window",
-                       "visible video renderer",
-                       "A real playback source reported a rendering window; its actual frames are available to R2.");
-    return 0;
+    return r2_vision_media_open_window(window_id);
 }
 
 int r2_vision_open_vlc(void)
 {
-    if (!eyes || !r2_visual_is_initialized()) return -1;
-    pthread_mutex_lock(&visual_capture_lock);
-    int rc = r2_eyes_open_vlc(eyes);
-    pthread_mutex_unlock(&visual_capture_lock);
-    if (rc == 0) {
-        R2VisionEvent event;
-        const char *source = "VLC window";
-        if (r2_eyes_get_event(eyes, &event) == 0 && event.source_name[0])
-            source = event.source_name;
-        r2_log_media_event("opened_for_observation", "video", source,
-                           "R2 began sampling the visible VLC playback window; the window title is source metadata, not proof of the video contents.");
-        if (r2_vision_watch_start() != 0) {
-            pthread_mutex_lock(&visual_capture_lock);
-            r2_eyes_close(eyes);
-            pthread_mutex_unlock(&visual_capture_lock);
-            r2_log_sensory("vision_watch_start_failed",
-                           "R2 could not start continuous raw-frame capture for VLC input.",
-                           "VLC input was closed because continuous Eyes capture did not start.",
-                           source);
-            return -1;
-        }
-    }
-    return rc;
+    return r2_vision_media_open(2, 0, NULL);
 }
 
 int r2_vision_open_file(const char *path)
 {
-    if (!eyes || !path || !*path || !r2_visual_is_initialized()) return -1;
-    pthread_mutex_lock(&visual_capture_lock);
-    int rc = r2_eyes_open_file(eyes, path);
-    pthread_mutex_unlock(&visual_capture_lock);
-    if (rc == 0) {
-        r2_log_media_event("opened_for_observation", "video_or_image", path,
-                           "R2 opened this source through Eyes; filename is a clue, not proof of content.");
-        if (r2_vision_watch_start() != 0) {
-            pthread_mutex_lock(&visual_capture_lock);
-            r2_eyes_close(eyes);
-            pthread_mutex_unlock(&visual_capture_lock);
-            r2_log_sensory("vision_watch_start_failed",
-                           "R2 could not start continuous raw-frame capture for the visual file.",
-                           "The file source was closed because continuous Eyes capture did not start.",
-                           path);
-            return -1;
-        }
-    }
-    return rc;
+    return path && *path ? r2_vision_media_open(3, 0, path) : -1;
 }
 
 int r2_vision_close(void)
 {
-    if (!eyes) return -1;
-    /* Stop the raw-frame consumer before closing media, so it cannot read a closed source. */
-    r2_vision_watch_stop();
+    r2_sense_set_auto_allowed(1, 0);
+    (void)r2_vision_media_stop();
+    (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
-    r2_eyes_close(eyes);
+    if (eyes) r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
     r2_log_sensory("vision_input_closed",
-                   "R2 visual input was closed on request.", NULL, "r2_vision_close");
+                   "R2 closed Eyes and media attention by choice.",
+                   "Watch discovery will not reopen the eyes until that choice is reversed.",
+                   "r2_vision_close");
     return 0;
 }
 
 int r2_eyes_start(void)
 {
+    r2_sense_set_auto_allowed(1, 1);
     pthread_mutex_lock(&visual_capture_lock);
     int rc = eyes ? r2_eyes_open_camera(eyes) : -1;
     pthread_mutex_unlock(&visual_capture_lock);
@@ -10688,16 +10637,26 @@ int r2_eyes_start(void)
     return rc;
 }
 
-int r2_eyes_stop(void)
+/* Hardware disappearance/Watch teardown does not express R2's intent. */
+int r2_eyes_release_source(void)
 {
     if (!eyes) return -1;
     (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
-    r2_log_event(R2_LOG_SENSORY, "eyes_stopped",
-                 "R2 Eyes input was closed.", NULL, "r2_eyes_stop");
     return 0;
+}
+
+int r2_eyes_stop(void)
+{
+    r2_sense_set_auto_allowed(1, 0);
+    (void)r2_vision_media_stop();
+    int rc = r2_eyes_release_source();
+    r2_log_event(R2_LOG_SENSORY, "eyes_stopped",
+                 "R2 deliberately closed his eyes; Watch will respect the decision.",
+                 NULL, "r2_eyes_stop");
+    return rc;
 }
 
 int r2_eyes_status(void)
