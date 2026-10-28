@@ -10868,10 +10868,47 @@ static void r2_wav_put_u32(unsigned char *p, uint32_t value)
     p[3] = (unsigned char)((value >> 24) & 0xffU);
 }
 
+/* A low-level audio-level change can be noticed without deciding it was
+   speech, music, a person, an object or a command. Both streams use their own
+   previous energy and notice timestamps. */
+static void r2_ears_notice_pcm_change(const unsigned char *pcm, size_t size,
+                                      unsigned *previous, int *have_previous,
+                                      uint64_t *last_notice, const char *source)
+{
+    if (!pcm || size < 2 || !previous || !have_previous || !last_notice) return;
+    uint64_t total = 0;
+    size_t samples = size / 2U;
+    for (size_t i = 0; i < samples; ++i) {
+        uint16_t value = (uint16_t)pcm[i * 2U] |
+                         (uint16_t)((uint16_t)pcm[i * 2U + 1U] << 8U);
+        int amplitude = (int)(int16_t)value;
+        total += (uint64_t)(amplitude < 0 ? -amplitude : amplitude);
+    }
+    unsigned level = (unsigned)(total / samples);
+    unsigned difference = level > *previous ? level - *previous : *previous - level;
+    uint64_t now = r2_log_elapsed_ms();
+    if (*have_previous && difference >= 1500 &&
+        (!*last_notice || (now >= *last_notice && now - *last_notice >= 5000))) {
+        char details[256];
+        snprintf(details, sizeof(details),
+                 "mean_absolute_pcm_level=%u; previous_level=%u; meaning=unknown",
+                 level, *previous);
+        r2_log_sensory("audio_level_change_notice",
+                       "An available audio stream changed level; content remains unknown.",
+                       details, source);
+        *last_notice = now;
+    }
+    *previous = level;
+    *have_previous = 1;
+}
+
 static void *r2_ears_capture_worker(void *unused)
 {
     (void)unused;
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
+    unsigned prior_audio_level = 0;
+    int have_prior_audio = 0;
+    uint64_t last_audio_notice = 0;
     while (!shutting_down && atomic_load(&ears_capture_running)) {
         ssize_t got = r2_ears_read(ears, pcm, sizeof(pcm));
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
@@ -10882,6 +10919,9 @@ static void *r2_ears_capture_worker(void *unused)
                                "Ears");
             break;
         }
+        r2_ears_notice_pcm_change(pcm, (size_t)got,
+                                   &prior_audio_level, &have_prior_audio,
+                                   &last_audio_notice, "microphone");
         pthread_mutex_lock(&ears_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_recent_write_position;
@@ -10910,6 +10950,9 @@ static void *r2_ears_desktop_capture_worker(void *unused)
 {
     (void)unused;
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
+    unsigned prior_audio_level = 0;
+    int have_prior_audio = 0;
+    uint64_t last_audio_notice = 0;
     while (!shutting_down && atomic_load(&ears_desktop_capture_running)) {
         ssize_t got = r2_ears_read(ears_desktop, pcm, sizeof(pcm));
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
@@ -10920,6 +10963,9 @@ static void *r2_ears_desktop_capture_worker(void *unused)
                                "Ears desktop");
             break;
         }
+        r2_ears_notice_pcm_change(pcm, (size_t)got,
+                                   &prior_audio_level, &have_prior_audio,
+                                   &last_audio_notice, "desktop_playback");
         pthread_mutex_lock(&ears_desktop_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_desktop_recent_write_position;
