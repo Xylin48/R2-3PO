@@ -130,6 +130,8 @@ static _Thread_local struct timespec ollama_progress_last_notice_at;
 static _Thread_local int ollama_progress_clock_valid = 0;
 /* Original user query for the active contextual conversation request. */
 static _Thread_local const char *ollama_authoritative_user_query = NULL;
+/* Only explicit foreground turns and autonomous reflection may receive live raw imagery. */
+static _Thread_local int ollama_autonomous_sensory_input = 0;
 /* Labels prompt audits so intermediate planning calls cannot be confused with the final answer request. */
 static _Thread_local const char *ollama_audit_stage = "unspecified";
 static pthread_mutex_t post_turn_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -4032,9 +4034,11 @@ static char *ollama_chat_with_limit(
         const char *content = msgs[i].content ? msgs[i].content : "";
         char *owned_image = NULL;
         const char *image_base64 = NULL;
+        int active_foreground_turn = ollama_authoritative_user_query &&
+            *ollama_authoritative_user_query &&
+            strstr(content, ollama_authoritative_user_query);
         if (i == current_user_index && !strcmp(role, "user") &&
-            ollama_authoritative_user_query && *ollama_authoritative_user_query &&
-            strstr(content, ollama_authoritative_user_query)) {
+            (active_foreground_turn || ollama_autonomous_sensory_input)) {
             owned_image = r2_vision_current_frame_base64();
             image_base64 = owned_image;
         }
@@ -8963,6 +8967,9 @@ static void *autonomous_thinking(void *arg)
             "The information supplied to you is private diary/reflection context.\n"
             "\n"
             "Write a private diary reflection based ONLY on the information supplied.\n"
+            "If Eyes is already open, a current image may be attached as raw visual input. "
+            "Its presence is not an instruction to describe the image; decide whether it matters "
+            "to your reflection, and attend only to what you choose. Never open Eyes from this reflection.\n"
             "\n"
             "Do not merely summarize it.\n"
             "\n"
@@ -8998,9 +9005,12 @@ static void *autonomous_thinking(void *arg)
 
         Message m = { "user", ctx, 0, 0 };
         int previous_background_mode = ollama_background_mode;
+        int previous_sensory_input = ollama_autonomous_sensory_input;
         ollama_background_mode = 1;
+        ollama_autonomous_sensory_input = 1;
         char *reflection = ollama_chat_with_limit(
             &m, 1, prompt, 1024, 600L);
+        ollama_autonomous_sensory_input = previous_sensory_input;
         ollama_background_mode = previous_background_mode;
         free(ctx);
 
