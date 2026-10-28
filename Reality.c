@@ -2748,8 +2748,8 @@ static int reality_table_exists(const char *table)
     if (sqlite3_prepare_v2(reality_db,
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
             -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, table, -1, SQLITE_TRANSIENT);
-        exists = sqlite3_step(st) == SQLITE_ROW;
+        int rc = sqlite3_bind_text(st, 1, table, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) exists = sqlite3_step(st) == SQLITE_ROW;
     }
     if (st) sqlite3_finalize(st);
     return exists;
@@ -3156,10 +3156,10 @@ int r2_reality_init(void)
                 "INSERT INTO r2_reality_ticks(previous_tick,current_tick,elapsed_seconds) VALUES(?,?,?)",
                 -1, &st, NULL);
             if (catchup_rc == SQLITE_OK) {
-                sqlite3_bind_int64(st, 1, last);
-                sqlite3_bind_int64(st, 2, now);
-                sqlite3_bind_int64(st, 3, now - last);
-                catchup_rc = sqlite3_step(st);
+                catchup_rc = sqlite3_bind_int64(st, 1, last);
+                if (catchup_rc == SQLITE_OK) catchup_rc = sqlite3_bind_int64(st, 2, now);
+                if (catchup_rc == SQLITE_OK) catchup_rc = sqlite3_bind_int64(st, 3, now - last);
+                if (catchup_rc == SQLITE_OK) catchup_rc = sqlite3_step(st);
             }
             if (st) sqlite3_finalize(st);
             st = NULL;
@@ -3171,8 +3171,8 @@ int r2_reality_init(void)
             "UPDATE r2_reality_self SET last_tick=?, updated_at=CURRENT_TIMESTAMP WHERE id=1",
             -1, &st, NULL);
         if (catchup_rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, now);
-            catchup_rc = sqlite3_step(st);
+            catchup_rc = sqlite3_bind_int64(st, 1, now);
+            if (catchup_rc == SQLITE_OK) catchup_rc = sqlite3_step(st);
             if (catchup_rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
                 catchup_rc = SQLITE_NOTFOUND;
         }
@@ -3350,10 +3350,10 @@ int r2_reality_tick(void)
                 "INSERT INTO r2_reality_ticks(previous_tick,current_tick,elapsed_seconds) VALUES(?,?,?)",
                 -1, &st, NULL);
             if (rc == SQLITE_OK) {
-                sqlite3_bind_int64(st, 1, last);
-                sqlite3_bind_int64(st, 2, now);
-                sqlite3_bind_int64(st, 3, now - last);
-                rc = sqlite3_step(st);
+                rc = sqlite3_bind_int64(st, 1, last);
+                if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now);
+                if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, now - last);
+                if (rc == SQLITE_OK) rc = sqlite3_step(st);
             }
             if (st) sqlite3_finalize(st);
             st = NULL;
@@ -3365,9 +3365,9 @@ int r2_reality_tick(void)
             "UPDATE r2_reality_item_memory SET precision='vague', exact_quantity=NULL, approximate_quantity=NULL, last_decay_at=? WHERE precision!='vague' AND collected_at<=?",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, now);
-            sqlite3_bind_int64(st, 2, now - 30 * 86400);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_int64(st, 1, now);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now - 30 * 86400);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
@@ -3378,9 +3378,9 @@ int r2_reality_tick(void)
             "UPDATE r2_reality_item_memory SET precision='approximate', approximate_quantity=MAX(1,CAST((exact_quantity+2)/5 AS INTEGER)*5), exact_quantity=NULL, last_decay_at=? WHERE precision='exact' AND collected_at<=?",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, now);
-            sqlite3_bind_int64(st, 2, now - 7 * 86400);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_int64(st, 1, now);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, now - 7 * 86400);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
@@ -3391,8 +3391,8 @@ int r2_reality_tick(void)
             "UPDATE r2_reality_self SET last_tick=?, updated_at=CURRENT_TIMESTAMP WHERE id=1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, now);
-            rc = sqlite3_step(st);
+            rc = sqlite3_bind_int64(st, 1, now);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_NOTFOUND;
         }
         if (st) sqlite3_finalize(st);
@@ -5083,9 +5083,10 @@ char *r2_reality_tv_status(void)
             "SELECT name FROM r2_tv_devices WHERE connected=1 AND connection_kind=? AND port=? LIMIT 1",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
-            bind_text(st, 1, !strcmp(kind, "rf") ? "rf" : "input");
-            sqlite3_bind_int(st, 2, value);
-            rc = sqlite3_step(st);
+            rc = bind_text(st, 1, !strcmp(kind, "rf") ? "rf" : "input") == 0
+                ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, value);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_ROW) {
                 signal = 1;
                 rc = SQLITE_OK;
@@ -5281,10 +5282,10 @@ int r2_reality_tv_connect(const char *name, const char *kind, int port)
         "INSERT INTO r2_tv_devices(name,connection_kind,port,connected,updated_at) VALUES(?,?,?,1,CURRENT_TIMESTAMP) "
         "ON CONFLICT(name) DO UPDATE SET connection_kind=excluded.connection_kind,port=excluded.port,connected=1,updated_at=CURRENT_TIMESTAMP",
         -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        bind_text(st, 1, name); bind_text(st, 2, rf ? "rf" : "input"); sqlite3_bind_int(st, 3, port);
-        rc = sqlite3_step(st);
-    }
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, name) == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_text(st, 2, rf ? "rf" : "input") == 0 ? SQLITE_OK : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, port);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
     if (rc != SQLITE_DONE) return -1;
