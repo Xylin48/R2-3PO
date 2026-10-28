@@ -180,6 +180,9 @@ jobs:
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
+      - name: Verify primary camera and independent media attention
+        run: python3 tests/camera_media_attention_contract_smoke.py
+
       - name: Require open Eyes before starting visual observation
         run: python3 tests/vision_watch_requires_open_eyes_smoke.py
 
