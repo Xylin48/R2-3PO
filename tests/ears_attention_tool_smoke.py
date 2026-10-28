@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
-prompt = core[core.index("static const char r2_tool_system_prompt[]"):core.index("static char *r2_build_retry_system_prompt")]
+prompt = core[core.index("static const char *SYSTEM_PROMPT ="):core.index("static const char r2_conversation_system_prompt[]")]
 tools_start = core.index("/* Deliberate hearing is an action chosen by the brain")
 tools_end = core.index("/* Persistent room, object, inventory and self-continuity actions.", tools_start)
 tool = core[tools_start:tools_end]
@@ -14,7 +14,7 @@ worker_end = watch.index("static void shell_watch_start(void)", worker_start)
 worker = watch[worker_start:worker_end]
 
 assert "[EARS_LISTEN] seconds" in prompt
-assert "do not use this tool for hypothetical situations" in prompt
+assert "do not use this tool for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in tool
 assert "seconds >= 1UL && seconds <= 15UL" in tool
