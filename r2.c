@@ -10355,6 +10355,9 @@ static size_t vision_watch_latest_frame_capacity = 0;
 static void *vision_watch_capture_worker(void *unused)
 {
     (void)unused;
+    unsigned char previous[256] = {0};
+    int have_previous = 0;
+    uint64_t last_notice_ms = 0;
     while (!shutting_down && atomic_load(&vision_watch_running)) {
         R2VisionFrame frame;
         R2VisionEvent event;
@@ -10368,6 +10371,26 @@ static void *vision_watch_capture_worker(void *unused)
             r2_eyes_get_frame(eyes, &frame) == 0 &&
             r2_eyes_get_event(eyes, &event) == 0 &&
             frame.data && frame.size > 0;
+        /* Raw temporal difference belongs to pre-attentive awareness. A
+           changed pixel is not a recognized object, command or meaning. */
+        unsigned changed_samples = 0;
+        int notice_change = 0;
+        if (frame_ready) {
+            for (unsigned i = 0; i < 256; ++i) {
+                unsigned char sample = frame.data[(size_t)i * frame.size / 256U];
+                if (have_previous && abs((int)sample - (int)previous[i]) > 24)
+                    changed_samples++;
+                previous[i] = sample;
+            }
+            if (have_previous && changed_samples >= 12 &&
+                (last_notice_ms == 0 ||
+                 (frame.timestamp >= last_notice_ms &&
+                  frame.timestamp - last_notice_ms >= 5000))) {
+                notice_change = 1;
+                last_notice_ms = frame.timestamp;
+            }
+            have_previous = 1;
+        }
         pthread_mutex_lock(&vision_watch_frame_lock);
         if (frame_ready) {
             if (frame.size > vision_watch_latest_frame_capacity) {
@@ -10391,6 +10414,15 @@ static void *vision_watch_capture_worker(void *unused)
         }
         pthread_mutex_unlock(&vision_watch_frame_lock);
         pthread_mutex_unlock(&visual_capture_lock);
+        if (notice_change && frame_ready) {
+            char details[256];
+            snprintf(details, sizeof(details),
+                     "changed_sample_positions=%u/256; timestamp_ms=%llu; meaning=unknown",
+                     changed_samples, (unsigned long long)frame.timestamp);
+            r2_log_sensory("camera_visual_change_notice",
+                           "R2's visual field varied; attention may be directed there.",
+                           details, event.source_name);
+        }
 
         if (captured == 1 && !frame_ready) {
             r2_log_sensory("vision_watch_frame_snapshot_failed",
