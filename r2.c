@@ -7688,6 +7688,63 @@ static int r2_parse_control_positive_id_pair(const char *text,
     return 0;
 }
 
+static char *r2_process_ears_listen_request(const char *request)
+{
+    if (!request) return NULL;
+    char *copy = strdup(request);
+    if (!copy) return NULL;
+    char *seconds_text = trim(copy);
+    char *end = NULL;
+    unsigned long seconds = 0;
+    int valid = 1;
+    int recent = 0;
+    char *mode_separator = strchr(seconds_text, '|');
+    if (mode_separator) {
+        *mode_separator = '\0';
+        char *mode = trim(seconds_text);
+        seconds_text = trim(mode_separator + 1);
+        if (!strcasecmp(mode, "recent")) recent = 1;
+        else if (strcasecmp(mode, "live")) valid = 0;
+    }
+    errno = 0;
+    seconds = strtoul(seconds_text, &end, 10);
+    valid = valid && !errno && end != seconds_text && end && *end == '\0' &&
+            seconds >= 1UL && seconds <= 15UL;
+    if (!valid) {
+        free(copy);
+        return strdup("EARS LISTEN ERROR: use recent|1..15 to inspect buffered real audio or live|1..15 to listen to the next live interval. No capture was started.");
+    }
+    if (recent && !atomic_load(&ears_capture_running)) {
+        free(copy);
+        return strdup("EARS LISTEN ERROR: no continuously buffered audio is available to inspect. No microphone was opened.");
+    }
+    if (r2_ears_status() > 0 && !atomic_load(&ears_capture_running)) {
+        free(copy);
+        return strdup("EARS LISTEN ERROR: Ears is already connected to a non-continuous source. That source was left untouched; stop or change it explicitly before microphone listening.");
+    }
+
+    r2_ears_recent_requested = recent;
+    char *transcript = r2_ears_listen_cancelable((unsigned)seconds, NULL, NULL);
+    r2_ears_recent_requested = 0;
+    free(copy);
+    if (!transcript || !*transcript) {
+        free(transcript);
+        return strdup("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.");
+    }
+    size_t transcript_length = strlen(transcript);
+    if (transcript_length > SIZE_MAX - 96U) {
+        free(transcript);
+        return strdup("EARS LISTEN ERROR: the recognized result was too large to record.");
+    }
+    char *result = malloc(transcript_length + 96U);
+    if (result)
+        snprintf(result, transcript_length + 96U,
+                 "EARS LISTEN RESULT (locally recognized speech from real audio):\n%s",
+                 transcript);
+    free(transcript);
+    return result;
+}
+
 static char *process_tools_with_status(
     const char *reply,
     int *world_action_succeeded)
@@ -8470,38 +8527,12 @@ static char *process_tools_with_status(
     while (1) {
         char *request = extract_marker(reply, "[EARS_LISTEN]", "\n", &ears_listen_pos);
         if (!request) break;
-        char *seconds_text = trim(request);
-        char *end = NULL;
-        unsigned long seconds = 0;
-        int valid = 1;
-        int recent = 0;
-        char *mode_separator = strchr(seconds_text, '|');
-        if (mode_separator) {
-            *mode_separator = '\0';
-            char *mode = trim(seconds_text);
-            seconds_text = trim(mode_separator + 1);
-            if (!strcasecmp(mode, "recent")) recent = 1;
-            else if (strcasecmp(mode, "live")) valid = 0;
-        }
-        errno = 0;
-        seconds = strtoul(seconds_text, &end, 10);
-        valid = valid && !errno && end != seconds_text && end && *end == '\0' &&
-                seconds >= 1UL && seconds <= 15UL;
-        if (!valid) {
-            APPEND("EARS LISTEN ERROR: use [EARS_LISTEN] recent|1..15 to inspect already-buffered real audio or [EARS_LISTEN] live|1..15 to listen to the next live interval. No capture was started.\n");
-        } else if (recent && !atomic_load(&ears_capture_running)) {
-            APPEND("EARS LISTEN ERROR: no continuously buffered audio is available to inspect. No microphone was opened.\n");
-        } else if (r2_ears_status() > 0 && !atomic_load(&ears_capture_running)) {
-            APPEND("EARS LISTEN ERROR: Ears is already connected to a non-continuous source. That source was left untouched; stop or change it explicitly before microphone listening.\n");
+        char *result = r2_process_ears_listen_request(request);
+        if (result) {
+            APPEND("%s\n", result);
+            free(result);
         } else {
-            r2_ears_recent_requested = recent;
-            char *transcript = r2_ears_listen_cancelable((unsigned)seconds, NULL, NULL);
-            r2_ears_recent_requested = 0;
-            if (transcript && *transcript)
-                APPEND("EARS LISTEN RESULT (locally recognized speech from real audio):\n%s\n", transcript);
-            else
-                APPEND("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.\n");
-            free(transcript);
+            APPEND("EARS LISTEN ERROR: the result could not be allocated; verify the current audio/Whisper state before retrying.\n");
         }
         free(request);
     }
