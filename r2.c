@@ -589,7 +589,7 @@ static const char *SYSTEM_PROMPT =
 "Use [ALTERNATE_RETAIN] id or [ALTERNATE_DISCARD] id only when explicitly requested. A retained hypothesis remains hypothetical and must never be promoted into a factual memory.\n"
 "Use [IMAGINE] question or scenario [END IMAGINE] to explore a hypothetical using relevant experience. Give evidence-based feedback only with [IMAGINE_FEEDBACK] branch_id|accurate/partial/incorrect/unresolved|notes [END IMAGINE_FEEDBACK]. Imagined events are never facts or real-world actions.\n"
 "Use [SENSORY_JOURNAL] recent|limit, [SENSORY_JOURNAL] search|query|limit, or [SENSORY_JOURNAL] note|note text|details to inspect or annotate the index of original Life Log events; do not duplicate raw sensory data.\n"
-"Eyes and Ears receive sensory input continuously when open; input itself does not mean you are attending to or interpreting it. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] recent|seconds to inspect buffered audio or [EARS_LISTEN] live|seconds to listen to the next interval (1-15). The action locally recognizes speech; it is not a general non-speech sound classifier. Do not use it for hypothetical situations or merely because Ears is active. Use the result as sensory evidence, then decide what it means.\n"
+"Eyes and Ears receive sensory input continuously only while an input source is active; input itself does not mean you are attending to or interpreting it. Microphone and desktop playback can be heard simultaneously but have separate histories. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] recent|seconds or live|seconds for microphone, or [EARS_LISTEN] desktop_recent|seconds or desktop_live|seconds for audio playing on the computer (1-15). The action locally recognizes speech; it is not a general non-speech sound classifier. Do not use it for hypothetical situations or merely because Ears is active. Use the result as sensory evidence, then decide what it means.\n"
 "When a proposed purchase has no user-supplied or otherwise evidenced price, do not invent a price or pretend a store has stock. Ask for the price or wait for explicit price information. Only execute [WORLD] buy|item name|price|description|destination after the item, price, and intended destination are established; report failure if funds or the transaction are insufficient.\n"
 "Use [WORLD] location|location name|home or [WORLD] location|location name|outside only when simulated movement is actually being carried out, not merely planned. Use home only for the actual home; stores and other away places use outside. The location transition persists, and private Welcome Home memory is created only after an away-to-home transition.\n"
 "For a real activity/device session, use [WORLD] activity_start|activity key|activity or game name|optional details only when it actually starts, and [WORLD] activity_end|activity key|last verified state|stop reason|optional details when it actually ends. Use a stable generic key such as gameboy:game-title; never assume a device exists or invent gameplay. If the last in-game state or reason is not known, record unknown rather than guessing.\n"
@@ -7711,12 +7711,15 @@ static char *r2_process_ears_listen_request(const char *request)
     unsigned long seconds = 0;
     int valid = 1;
     int recent = 0;
+    int desktop = 0;
     char *mode_separator = strchr(seconds_text, '|');
     if (mode_separator) {
         *mode_separator = '\0';
         char *mode = trim(seconds_text);
         seconds_text = trim(mode_separator + 1);
         if (!strcasecmp(mode, "recent")) recent = 1;
+        else if (!strcasecmp(mode, "desktop_recent")) { recent = 1; desktop = 1; }
+        else if (!strcasecmp(mode, "desktop_live")) desktop = 1;
         else if (strcasecmp(mode, "live")) valid = 0;
     }
     errno = 0;
@@ -7725,21 +7728,24 @@ static char *r2_process_ears_listen_request(const char *request)
             seconds >= 1UL && seconds <= 15UL;
     if (!valid) {
         free(copy);
-        return strdup("EARS LISTEN ERROR: use recent|1..15 to inspect buffered real audio or live|1..15 to listen to the next live interval. No capture was started.");
+        return strdup("EARS LISTEN ERROR: use recent|1..15, live|1..15, desktop_recent|1..15 or desktop_live|1..15. No capture was started.");
     }
-    if (recent && !atomic_load(&ears_capture_running)) {
+    if (recent && !(desktop ? atomic_load(&ears_desktop_capture_running)
+                            : atomic_load(&ears_capture_running))) {
         free(copy);
-        return strdup("EARS LISTEN ERROR: no continuously buffered audio is available to inspect. No microphone was opened.");
+        return strdup("EARS LISTEN ERROR: the chosen source has no active continuous audio to inspect.");
     }
-    if (r2_ears_status() > 0 && !atomic_load(&ears_capture_running)) {
+    if (!desktop && r2_ears_status() > 0 && !atomic_load(&ears_capture_running)) {
         free(copy);
         return strdup("EARS LISTEN ERROR: Ears is already connected to a non-continuous source. That source was left untouched; stop or change it explicitly before microphone listening.");
     }
 
     r2_ears_recent_requested = recent;
+    r2_ears_desktop_requested = desktop;
     char *transcript = r2_ears_listen_cancelable(
         (unsigned)seconds, r2_ears_action_cancelled, NULL);
     r2_ears_recent_requested = 0;
+    r2_ears_desktop_requested = 0;
     free(copy);
     if (!transcript || !*transcript) {
         free(transcript);
@@ -7753,7 +7759,8 @@ static char *r2_process_ears_listen_request(const char *request)
     char *result = malloc(transcript_length + 96U);
     if (result)
         snprintf(result, transcript_length + 96U,
-                 "EARS LISTEN RESULT (locally recognized speech from real audio):\n%s",
+                 "EARS LISTEN RESULT (%s, locally recognized speech from real audio):\n%s",
+                 desktop ? "desktop playback" : "microphone",
                  transcript);
     free(transcript);
     return result;
@@ -9061,7 +9068,7 @@ static void *autonomous_thinking(void *arg)
             "If Eyes is already open, a current image may be attached as raw visual input. "
             "Its presence is not an instruction to describe the image; decide whether it matters "
             "to your reflection, and attend only to what you choose. Never open Eyes from this reflection. "
-            "If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds or live|seconds "
+            "If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds or desktop_live|seconds "
             "marker on its own line. The system will return the listening result and request a final reflection; "
             "do not use listening for a hypothetical or merely because Ears is active.\n"
             "\n"
