@@ -1316,6 +1316,7 @@ static void *shell_watch_worker(void *unused)
 {
     (void)unused;
     int managed_eyes = 0;
+    unsigned long managed_window_id = 0;
     int managed_microphone = 0;
     int managed_desktop = 0;
     int attached_visual = 0;
@@ -1329,20 +1330,30 @@ static void *shell_watch_worker(void *unused)
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
+        /* Follow the actual active audio producer, regardless of application.
+           No audio producer/visible X11 window means no generic video source. */
+        long playback_pid = desktop_playing ? r2_ears_playback_pid() : -1;
+        unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
 
         /* Opening Eyes is not a request to interpret frames. Direct camera
            input and accessible playing media are both valid visual sources.
            A user-opened file/window is never silently overwritten. */
         int wanted_eyes = window_available ? 3 :
-            (vlc_available ? 2 : (camera_available ? 1 : 0));
+            (playback_window ? 4 :
+            (vlc_available ? 2 : (camera_available ? 1 : 0)));
+        unsigned long wanted_window_id = wanted_eyes == 3 ? media_window :
+                                         wanted_eyes == 4 ? playback_window : 0;
         if (managed_eyes) {
             int source_gone = (managed_eyes == 3 && !window_available) ||
+                              (managed_eyes == 4 && !playback_window) ||
                               (managed_eyes == 2 && !vlc_available) ||
                               (managed_eyes == 1 && !camera_available);
-            int source_changed = wanted_eyes != managed_eyes;
+            int source_changed = wanted_eyes != managed_eyes ||
+                (managed_eyes >= 3 && managed_window_id != wanted_window_id);
             if (source_gone || source_changed || !r2_vision_watch_active()) {
                 (void)r2_eyes_stop();
                 managed_eyes = 0;
+                managed_window_id = 0;
             }
         }
         if (!managed_eyes && r2_eyes_status() > 0) {
@@ -1351,14 +1362,17 @@ static void *shell_watch_worker(void *unused)
                 r2_vision_watch_start() == 0)
                 attached_visual = 1;
         } else if (!managed_eyes && wanted_eyes && r2_vision_available()) {
-            int opened = wanted_eyes == 3 ? r2_vision_open_window(media_window)
+            int opened = (wanted_eyes == 3 || wanted_eyes == 4)
+                ? r2_vision_open_window(wanted_window_id)
                 : (wanted_eyes == 2 ? r2_vision_open_vlc() : r2_eyes_start());
             if (opened == 0) {
                 managed_eyes = wanted_eyes;
+                managed_window_id = wanted_window_id;
                 r2_log_event(R2_LOG_SENSORY, "watch_visual_source_available",
                              "R2 automatically connected an available visual source.",
                              "Frames are available to cognition; no automatic visual description was requested.",
                              wanted_eyes == 3 ? "active CRT video renderer"
+                                 : wanted_eyes == 4 ? "visible window of active audio producer"
                                  : (wanted_eyes == 2 ? "visible media window" : "camera"));
             }
         }
