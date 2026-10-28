@@ -44,7 +44,7 @@ def send_control_command(command: str) -> str:
         valid = Path(path).is_absolute() and "\n" not in path and "\r" not in path and len(command) <= 1199
     if command.startswith("media "):
         action, separator, path_and_window = command[6:].partition("|")
-        path, marker, window_id = path_and_window.rpartition("|")
+        path, marker, window_id = path_and_window.rpartition("|x11=")
         # The window locator is optional for older renderers; a supplied
         # locator is numeric X11 metadata, not part of the media filename.
         valid_window = not marker or (window_id.isdecimal() and int(window_id) > 0)
@@ -349,7 +349,7 @@ class CRTDisplay:
             # frames without inferring a movie from a filename or window title.
             window = (self.video_surface.winfo_id()
                       if action == "vcr_playback_started" else 0)
-            suffix = f"|{window}" if window > 0 else ""
+            suffix = f"|x11={window}" if window > 0 else ""
             send_control_command(f"media {action}|{path}{suffix}")
             return True
         except (OSError, RuntimeError, ValueError):
