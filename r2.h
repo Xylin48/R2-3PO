@@ -310,6 +310,7 @@ int r2_vision_camera_available(void);
 int r2_vision_vlc_available(void);
 /* Generic X11 rendering window published by an active media source. */
 int r2_vision_window_available(unsigned long window_id);
+unsigned long r2_vision_window_for_pid(long pid);
 int r2_vision_open_window(unsigned long window_id);
 int r2_vision_open_vlc(void);
 int r2_vision_open_file(const char *path);
