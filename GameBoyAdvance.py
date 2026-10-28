@@ -79,6 +79,18 @@ def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
     ).fetchone():
         return
 
+    legacy_tables = {
+        table for table in ("console_state", "console_events", "cartridge_inventory")
+        if db.execute(
+            "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+    }
+    # A fresh cartridge-only DB must not be marked as migrated; an older combined
+    # DB may be restored into this path later and still needs its one-time import.
+    if not legacy_tables:
+        return
+
     db.execute("BEGIN IMMEDIATE")
     try:
         for table in ("console_state", "cartridge_inventory"):
