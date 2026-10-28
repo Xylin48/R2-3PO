@@ -9046,7 +9046,10 @@ static void *autonomous_thinking(void *arg)
             "Write a private diary reflection based ONLY on the information supplied.\n"
             "If Eyes is already open, a current image may be attached as raw visual input. "
             "Its presence is not an instruction to describe the image; decide whether it matters "
-            "to your reflection, and attend only to what you choose. Never open Eyes from this reflection.\n"
+            "to your reflection, and attend only to what you choose. Never open Eyes from this reflection. "
+            "If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds or live|seconds "
+            "marker on its own line. The system will return the listening result and request a final reflection; "
+            "do not use listening for a hypothetical or merely because Ears is active.\n"
             "\n"
             "Do not merely summarize it.\n"
             "\n"
@@ -9087,6 +9090,55 @@ static void *autonomous_thinking(void *arg)
         ollama_autonomous_sensory_input = 1;
         char *reflection = ollama_chat_with_limit(
             &m, 1, prompt, 1024, 600L);
+
+        /* A deliberate hearing request from autonomous thought is executed as
+           a tool action, then the brain is asked for its final reflection with
+           the actual listening result. Tool markers are never diary content. */
+        if (reflection) {
+            size_t ears_pos = 0;
+            char *ears_request = extract_marker(
+                reflection, "[EARS_LISTEN]", "\n", &ears_pos);
+            if (ears_request) {
+                char *listen_result = r2_process_ears_listen_request(ears_request);
+                free(ears_request);
+                if (!listen_result) {
+                    free(reflection);
+                    reflection = NULL;
+                } else {
+                    char *followup = NULL;
+                    if (asprintf(&followup,
+                        "AUTONOMOUS REFLECTION CONTEXT:\n%s\n\n"
+                        "INITIAL DRAFT (not final; it may contain a hearing request):\n%s\n\n"
+                        "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:\n%s\n\n"
+                        "Now write the final private diary reflection using the supplied context "
+                        "and the real listening result. Do not emit tool markers. If the listening "
+                        "result is an error, treat the sound as unknown; do not invent speech.",
+                        ctx, reflection, listen_result) < 0)
+                        followup = NULL;
+                    free(listen_result);
+                    if (!followup) {
+                        free(reflection);
+                        reflection = NULL;
+                    } else {
+                        Message followup_message = { "user", followup, 0, 0 };
+                        char *final_reflection = ollama_chat_with_limit(
+                            &followup_message, 1, prompt, 1024, 600L);
+                        free(followup);
+                        free(reflection);
+                        reflection = final_reflection;
+                        if (reflection && strstr(reflection, "[EARS_LISTEN]")) {
+                            free(reflection);
+                            reflection = NULL;
+                            r2_log_event(R2_LOG_ERROR,
+                                         "reflection_repeated_hearing_request",
+                                         "Autonomous reflection emitted another hearing request instead of a final diary entry.",
+                                         "No tool marker was written to the diary.",
+                                         "autonomous_thinking");
+                        }
+                    }
+                }
+            }
+        }
         ollama_autonomous_sensory_input = previous_sensory_input;
         ollama_background_mode = previous_background_mode;
         free(ctx);
