@@ -9963,6 +9963,13 @@ static void *vision_watch_capture_worker(void *unused)
         pthread_mutex_unlock(&vision_watch_frame_lock);
         pthread_mutex_unlock(&visual_capture_lock);
 
+        if (captured == 1 && !frame_ready) {
+            r2_log_sensory("vision_watch_frame_snapshot_failed",
+                           "R2 captured a frame but could not publish it for visual analysis.",
+                           "Eyes frame metadata or the latest-frame buffer could not be copied.",
+                           "Eyes");
+            break;
+        }
         if (captured != 1) {
             if (captured == 0)
                 r2_log_sensory("vision_source_ended",
