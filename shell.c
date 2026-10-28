@@ -1321,13 +1321,18 @@ static void *shell_watch_worker(void *unused)
         int microphone_available = r2_ears_microphone_available();
         int camera_available = r2_vision_camera_available();
         int vlc_available = r2_vision_vlc_available();
+        unsigned long media_window = atomic_load(&tv_live_video_window);
+        int window_available = media_window &&
+            r2_vision_window_available(media_window);
 
         /* Opening Eyes is not a request to interpret frames. Direct camera
            input and accessible playing media are both valid visual sources.
            A user-opened file/window is never silently overwritten. */
-        int wanted_eyes = vlc_available ? 2 : (camera_available ? 1 : 0);
+        int wanted_eyes = window_available ? 3 :
+            (vlc_available ? 2 : (camera_available ? 1 : 0));
         if (managed_eyes) {
-            int source_gone = (managed_eyes == 2 && !vlc_available) ||
+            int source_gone = (managed_eyes == 3 && !window_available) ||
+                              (managed_eyes == 2 && !vlc_available) ||
                               (managed_eyes == 1 && !camera_available);
             int source_changed = wanted_eyes != managed_eyes;
             if (source_gone || source_changed || !r2_vision_watch_active()) {
@@ -1341,14 +1346,15 @@ static void *shell_watch_worker(void *unused)
                 r2_vision_watch_start() == 0)
                 attached_visual = 1;
         } else if (!managed_eyes && wanted_eyes && r2_vision_available()) {
-            int opened = wanted_eyes == 2
-                ? r2_vision_open_vlc() : r2_eyes_start();
+            int opened = wanted_eyes == 3 ? r2_vision_open_window(media_window)
+                : (wanted_eyes == 2 ? r2_vision_open_vlc() : r2_eyes_start());
             if (opened == 0) {
                 managed_eyes = wanted_eyes;
                 r2_log_event(R2_LOG_SENSORY, "watch_visual_source_available",
                              "R2 automatically connected an available visual source.",
                              "Frames are available to cognition; no automatic visual description was requested.",
-                             wanted_eyes == 2 ? "visible media window" : "camera");
+                             wanted_eyes == 3 ? "active CRT video renderer"
+                                 : (wanted_eyes == 2 ? "visible media window" : "camera"));
             }
         }
 
