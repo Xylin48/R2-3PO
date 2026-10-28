@@ -117,10 +117,28 @@ int r2_sj_init(void)
             "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
             "WHERE e.category='thinking' "
-            "AND e.event_type IN ('diary_entry_written','reflection_completed');"
+            "AND e.event_type IN ('diary_entry_written','reflection_completed') "
+            "AND (SELECT COUNT(*) FROM diary_entries match_row "
+            "WHERE match_row.entry=e.details)=1;"
             "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
             "SELECT id,category,CURRENT_TIMESTAMP FROM r2_log_events "
             "WHERE category IN ('sensory','thinking','conversation');") != 0) {
+        sqlite3_close(sj_db);
+        sj_db = NULL;
+        pthread_mutex_unlock(&sj_lock);
+        return -1;
+    }
+    /* The diary organ's own entry-to-event table is authoritative. Its
+       stable IDs survive identical diary prose and old database schemas. */
+    if (sj_column_exists("r2_diary_entry_links", "diary_entry_id") &&
+        sj_column_exists("r2_diary_entry_links", "log_event_id") &&
+        sj_exec("INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
+                "(event_id,diary_entry_id,linked_utc) "
+                "SELECT e.id,d.id,CURRENT_TIMESTAMP "
+                "FROM r2_diary_entry_links l "
+                "JOIN r2_log_events e ON e.id=l.log_event_id "
+                "JOIN diary_entries d ON d.id=l.diary_entry_id "
+                "WHERE e.category='thinking' AND e.event_type='diary_entry_linked';") != 0) {
         sqlite3_close(sj_db);
         sj_db = NULL;
         pthread_mutex_unlock(&sj_lock);
@@ -179,7 +197,9 @@ void r2_sj_index_event(int64_t event_id, const char *category,
             "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
             "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
-            "WHERE e.id=? ORDER BY d.id DESC LIMIT 1;",
+            "WHERE e.id=? AND (SELECT COUNT(*) FROM diary_entries match_row "
+                "WHERE match_row.entry=e.details)=1 "
+                "ORDER BY d.id DESC LIMIT 1;",
             -1, &link, NULL);
         if (link_rc == SQLITE_OK) {
             link_rc = sqlite3_bind_int64(link, 1, event_id);
@@ -195,6 +215,43 @@ void r2_sj_index_event(int64_t event_id, const char *category,
     }
     pthread_mutex_unlock(&sj_lock);
     (void)source;
+}
+
+/* After diary.c has committed its exact authoritative diary-to-log pointer,
+   establish the Journal projection using IDs, never matching diary prose.
+   Before journal startup, r2_sj_init reconciles this exact link from the
+   durable r2_diary_entry_links table. */
+int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
+{
+    if (event_id <= 0 || diary_entry_id <= 0) return -1;
+    pthread_mutex_lock(&sj_lock);
+    if (!sj_ready || !sj_db) {
+        pthread_mutex_unlock(&sj_lock);
+        return 0; /* The diary link is durable; startup backfill owns it. */
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(sj_db,
+        "INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
+        "(event_id,diary_entry_id,linked_utc) "
+        "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
+        "JOIN diary_entries d ON d.id=? "
+        "WHERE e.id=? AND e.category='thinking' "
+        "AND e.event_type='diary_entry_linked';",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 1, diary_entry_id);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 2, event_id);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_step(st);
+    int changed = rc == SQLITE_DONE ? sqlite3_changes(sj_db) : 0;
+    if (rc != SQLITE_DONE || changed != 1)
+        fprintf(stderr,
+                "[R2 Sensory Journal] Exact diary link failed (event=%lld, entry=%lld): %s\n",
+                (long long)event_id, (long long)diary_entry_id, sqlite3_errmsg(sj_db));
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&sj_lock);
+    return rc == SQLITE_DONE && changed == 1 ? 0 : -1;
 }
 
 int64_t r2_sj_note(const char *note, const char *details)
@@ -216,13 +273,21 @@ static char *sj_query(const char *query, int limit)
 
     const char *sql_recent =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,d.diary_entry_id FROM r2_sensory_journal j "
+        "e.details,e.source,CASE WHEN "
+        "e.event_type IN ('diary_entry_written','reflection_completed') "
+        "AND (SELECT COUNT(*) FROM diary_entries match_row "
+        "WHERE match_row.entry=e.details)<>1 "
+        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "ORDER BY e.id DESC LIMIT ?;";
     const char *sql_search =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,d.diary_entry_id FROM r2_sensory_journal j "
+        "e.details,e.source,CASE WHEN "
+        "e.event_type IN ('diary_entry_written','reflection_completed') "
+        "AND (SELECT COUNT(*) FROM diary_entries match_row "
+        "WHERE match_row.entry=e.details)<>1 "
+        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
