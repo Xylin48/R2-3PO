@@ -290,6 +290,10 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt, int 
  */
 int r2_eyes_start(void);
 int r2_eyes_stop(void);
+/* Watch-only release; disappearance is not a chosen sensory shutdown. */
+int r2_eyes_release_source(void);
+int r2_sense_auto_allowed(int which); /* 1=camera/vision, 2=mic, 3=desktop */
+void r2_sense_set_auto_allowed(int which, int allowed);
 int r2_eyes_status(void);
 
 /* ============================================================
@@ -312,6 +316,11 @@ int r2_vision_vlc_available(void);
 int r2_vision_window_available(unsigned long window_id);
 unsigned long r2_vision_window_for_pid(long pid);
 int r2_vision_open_window(unsigned long window_id);
+/* Media is a separately observed display, not a replacement for Eyes. */
+int r2_vision_media_open_window(unsigned long window_id);
+int r2_vision_media_status(void);
+int r2_vision_media_stop(void);
+char *r2_vision_media_see(const char *question);
 int r2_vision_open_vlc(void);
 int r2_vision_open_file(const char *path);
 int r2_vision_close(void);
