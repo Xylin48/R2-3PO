@@ -257,3 +257,25 @@ This remains a bounded manual review, not a claim that every subsystem has been 
 - **Main branch:** untouched.
 - **Next audit pass:** continue the line-by-line review of SQLite error propagation and transaction boundaries across Reality, rewards, persistent memory/diary, and conversation handling. Review the full exact-head workflow and fix any newly confirmed regressions before closing findings.
 - **Release boundary:** CI cannot verify live Qwen response quality, GTX 1050 Ti allocation, or actual database/device state on the target PC.
+
+### R2-AUD-2026-10-27-003 — unchecked bindings across Reality tick and TV device persistence
+
+- **Area:** `Reality.c`, persistent-time catch-up, normal tick/quantity-decay updates, TV signal lookup, and TV device registration.
+- **Severity:** High / world-state consistency.
+- **Finding:** Several prepared statements ignored SQLite binding results and still executed. A failed bind could make the operation report a result based on incomplete parameters.
+- **Fix:** Propagate each bind result and execute the statement only when all required bindings succeed. Existing transaction rollback and affected-row checks remain in place.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now checks Reality tick and TV-device binding paths. Existing Reality behavior tests exercise normal tick/state persistence.
+- **Validation status:** Pending the latest exact-head CI run; target-host behavior remains unverified.
+
+### R2-AUD-2026-10-27-004 — unchecked bindings in Life Log, memory, and reward lookups/writes
+
+- **Area:** `Log.c` event deduplication, milestone insertion, activity session start/end, location transitions, and system snapshots; `r2.c` persistent memory timestamp update and Game Boy event deduplication; `Reward.c` active modifier lookup.
+- **Severity:** High / persistence and duplicate-event integrity.
+- **Finding:** Several writes and lookups stepped prepared statements after unchecked bindings. In particular, incomplete activity/location/system snapshot writes could be treated as successful, while a memory or Game Boy lookup could use incomplete query parameters.
+- **Fix:** Chain each bind through the SQLite result code, step only after all required bindings succeed, and preserve existing write-success/affected-row checks.
+- **Regression coverage:** `tests/subsystem_wiring_smoke.py` now asserts the updated memory, reward, and Life Log paths. Existing migration and integration tests exercise real writes against SQLite.
+- **Validation status:** Pending the latest exact-head CI run.
+
+### Database backward-compatibility audit checkpoint
+
+The repository currently has targeted legacy-schema tests for the primary memory database, Reality/fridge inventory, rewards, addictions, Life Log, and Visual Experience Library. These tests construct older schemas, open them through production migration paths, verify existing rows remain available, and exercise writes after migration. The isolated Game Boy state/cartridge databases and the shared Sensory Journal / Alternate-Self tables still need explicit legacy-schema coverage review; do not claim those schemas fully validated until that review and the exact-head suite complete.
