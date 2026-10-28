@@ -144,6 +144,7 @@ static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
 static int query_requests_visual_context(const char *query);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
+static char *r2_vision_current_frame_base64(void);
 
 static pthread_mutex_t db_lock =
     PTHREAD_MUTEX_INITIALIZER;
@@ -3338,7 +3339,8 @@ static int ollama_json_object_add_checked(struct json_object *object,
 static int ollama_json_append_message(struct json_object *array,
                                       const char *role,
                                       const char *content,
-                                      size_t content_length)
+                                      size_t content_length,
+                                      const char *image_base64)
 {
     if (!array || !role || !content || content_length > INT_MAX)
         return -1;
@@ -3357,6 +3359,25 @@ static int ollama_json_append_message(struct json_object *array,
     if (json_object_object_add(message, "content", content_value) != 0)
         goto fail;
     content_value = NULL; /* ownership transferred to message */
+
+    if (image_base64 && *image_base64) {
+        struct json_object *images = json_object_new_array();
+        struct json_object *image = json_object_new_string(image_base64);
+        if (!images || !image) {
+            if (images) json_object_put(images);
+            if (image) json_object_put(image);
+            goto fail;
+        }
+        if (json_object_array_add(images, image) != 0) {
+            json_object_put(image);
+            json_object_put(images);
+            goto fail;
+        }
+        if (json_object_object_add(message, "images", images) != 0) {
+            json_object_put(images);
+            goto fail;
+        }
+    }
 
     if (json_object_array_add(array, message) != 0)
         goto fail;
@@ -4009,7 +4030,18 @@ static char *ollama_chat_with_limit(
         size_t i = message_order[pos];
         const char *role = msgs[i].role ? msgs[i].role : "user";
         const char *content = msgs[i].content ? msgs[i].content : "";
-        if (ollama_json_append_message(arr, role, content, limits[i]) != 0) {
+        char *owned_image = NULL;
+        const char *image_base64 = NULL;
+        if (i == current_user_index && !strcmp(role, "user") &&
+            ollama_authoritative_user_query && *ollama_authoritative_user_query &&
+            strstr(content, ollama_authoritative_user_query)) {
+            owned_image = r2_vision_current_frame_base64();
+            image_base64 = owned_image;
+        }
+        int append_rc = ollama_json_append_message(
+            arr, role, content, limits[i], image_base64);
+        free(owned_image);
+        if (append_rc != 0) {
             fprintf(stderr,
                     "[R2 Ollama] refusing inference: could not serialize message %zu/%zu; no partial payload will be sent.\n",
                     pos + 1, ordered_count);
@@ -5897,14 +5929,13 @@ static char *chat_with_relevant_memories(
             history_char_limit);
 
     /*
-     * Perception is available during ordinary conversation, not only
-     * when the user explicitly asks about vision. If Eyes is already
-     * observing a source, provide a fresh sensory description as evidence.
-     * Never activate a camera silently from an ordinary conversation turn.
+     * Historical visual records are memory, not a substitute for current sight.
+     * When Eyes is open, the current raw frame is attached to the active user
+     * message as an image. The conversation brain—not a background watcher—
+     * decides what, if anything, deserves attention. Ordinary conversation
+     * never opens a camera silently.
      */
     int visual_requested = query_requests_visual_context(query);
-    int visual_observation_added = 0;
-    char *visual_context = NULL;
     if (r2_visual_is_initialized() &&
         (visual_requested || (eyes && r2_eyes_is_open(eyes)))) {
         char *prior_visual = r2_visual_recent(3);
@@ -5921,46 +5952,13 @@ static char *chat_with_relevant_memories(
             }
         }
         free(prior_visual);
-
-        /*
-         * If continuous observation is active, it already samples and
-         * records frames. Do not launch a second vision request for every
-         * chat turn; that can contend for local resources and stall text chat.
-         */
-        if (visual_requested && !r2_vision_watch_active()) {
-            /* This is an explicit request to look, not silent camera activation
-               during ordinary chat. Open the configured camera if necessary. */
-            visual_context = vision_analyze_current_frame(
-                "Describe the current frame for R2's active conversation. "
-                "Separate visible facts from inference and uncertainty.", 1);
-        }
     }
-
-    if (visual_context && *visual_context) {
+    if (visual_requested && (!eyes || !r2_eyes_is_open(eyes))) {
+        const char unavailable[] =
+            "CURRENT VISUAL INPUT: no live image is available because Eyes is not open. "
+            "Do not claim to see the current scene from historical memories.";
         size_t old_n = strlen(memory_context);
-        size_t visual_n = strlen(visual_context);
-        char *joined = malloc(old_n + visual_n + 160);
-        if (joined) {
-            snprintf(joined, old_n + visual_n + 160,
-                     "%s%sCURRENT LIVE VISUAL OBSERVATION (newly analyzed frame; "
-                     "use as evidence, but acknowledge uncertainty):\n%s\n",
-                     memory_context, old_n ? "\n\n" : "", visual_context);
-            free(memory_context);
-            memory_context = joined;
-            visual_observation_added = 1;
-        }
-        free(visual_context);
-    }
-
-    if (visual_requested && !visual_observation_added) {
-        /* Never let historical visual memories masquerade as a live view.
-           This explicit evidence also prevents a generic model from pretending
-           that a failed camera/model request succeeded. */
-        const char *unavailable =
-            "CURRENT LIVE VISUAL OBSERVATION: unavailable. No fresh frame was "
-            "obtained for this turn; do not infer the current scene from historical visual memories.";
-        size_t old_n = strlen(memory_context);
-        size_t note_n = strlen(unavailable);
+        size_t note_n = sizeof(unavailable) - 1U;
         char *joined = malloc(old_n + note_n + 4U);
         if (joined) {
             snprintf(joined, old_n + note_n + 4U, "%s%s%s",
@@ -9991,6 +9989,65 @@ static void *vision_watch_capture_worker(void *unused)
     pthread_mutex_unlock(&vision_watch_frame_lock);
     return NULL;
 }
+static char *r2_vision_current_frame_base64(void)
+{
+    if (!eyes || !r2_eyes_is_open(eyes))
+        return NULL;
+
+    R2VisionFrame frame;
+    R2VisionEvent event;
+    memset(&frame, 0, sizeof(frame));
+    memset(&event, 0, sizeof(event));
+    unsigned char *frame_copy = NULL;
+
+    if (atomic_load(&vision_watch_running)) {
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        while (!shutting_down && atomic_load(&vision_watch_running) &&
+               vision_watch_frame_generation == 0 && !vision_watch_capture_done)
+            pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
+        if (vision_watch_latest_frame.data && vision_watch_latest_frame.size > 0) {
+            frame_copy = malloc(vision_watch_latest_frame.size);
+            if (frame_copy) {
+                memcpy(frame_copy, vision_watch_latest_frame_data,
+                       vision_watch_latest_frame.size);
+                frame = vision_watch_latest_frame;
+                frame.data = frame_copy;
+                event = vision_watch_latest_event;
+            }
+        }
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+    } else {
+        pthread_mutex_lock(&visual_capture_lock);
+        int captured = (eyes && r2_eyes_is_open(eyes)) ? r2_eyes_capture(eyes) : -1;
+        if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
+            r2_eyes_get_event(eyes, &event) == 0 && frame.data && frame.size > 0) {
+            frame_copy = malloc(frame.size);
+            if (frame_copy) {
+                memcpy(frame_copy, frame.data, frame.size);
+                frame.data = frame_copy;
+            }
+        }
+        pthread_mutex_unlock(&visual_capture_lock);
+    }
+
+    if (!frame_copy) {
+        r2_log_sensory("visual_input_unavailable",
+                       "R2's active conversation could not obtain a current image from Eyes.",
+                       "No valid fresh frame snapshot was available for direct multimodal input.",
+                       event.source_name[0] ? event.source_name : "Eyes");
+        return NULL;
+    }
+
+    char *encoded = r2_visual_frame_base64(&frame);
+    free(frame_copy);
+    if (!encoded)
+        r2_log_sensory("visual_input_encoding_failed",
+                       "R2's current visual frame could not be encoded for the conversation brain.",
+                       "Frame-to-JPEG/base64 encoding failed; no visual interpretation was substituted.",
+                       event.source_name[0] ? event.source_name : "Eyes");
+    return encoded;
+}
+
 static void *vision_watch_worker(void *unused)
 {
     (void)unused;
@@ -10003,20 +10060,13 @@ static void *vision_watch_worker(void *unused)
         snprintf(source_name, sizeof(source_name), "%s", initial_event.source_name);
     pthread_mutex_unlock(&visual_capture_lock);
 
-    char start_details[768];
-    snprintf(start_details, sizeof(start_details),
-             "source=%s; observation=successive fresh visual frames; "
-             "capture runs continuously while Qwen analyzes copied frames; "
-             "analysis cadence is limited by model processing time.",
-             source_name);
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_started",
-                 "R2 continuous visual observation started.",
-                 start_details, source_name);
+                 "R2 continuous visual input started.",
+                 "Eyes is continuously updating its latest raw-frame snapshot. No background image descriptions or interpretations are generated; the conversation brain receives the latest image with its active turn and decides what to attend to.",
+                 source_name);
 
     uint64_t last_generation = 0;
-    uint64_t previous_frame_number = 0;
-    char previous_observation[1024] = "";
-    char previous_source[512] = "";
+    int logged_first_frame = 0;
     while (!shutting_down && atomic_load(&vision_watch_running)) {
         pthread_mutex_lock(&vision_watch_frame_lock);
         while (!shutting_down && atomic_load(&vision_watch_running) &&
@@ -10025,71 +10075,27 @@ static void *vision_watch_worker(void *unused)
             pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
         uint64_t generation = vision_watch_frame_generation;
         int capture_done = vision_watch_capture_done;
-
-        R2VisionFrame frame;
-        R2VisionEvent event;
-        memset(&frame, 0, sizeof(frame));
-        memset(&event, 0, sizeof(event));
-        unsigned char *frame_copy = NULL;
-        if (vision_watch_latest_frame.data && vision_watch_latest_frame.size > 0) {
-            frame_copy = malloc(vision_watch_latest_frame.size);
-            if (frame_copy) {
-                memcpy(frame_copy, vision_watch_latest_frame_data,
-                       vision_watch_latest_frame.size);
-                frame = vision_watch_latest_frame;
-                frame.data = frame_copy;
-                event = vision_watch_latest_event;
-            }
-        }
         pthread_mutex_unlock(&vision_watch_frame_lock);
 
         if (shutting_down || !atomic_load(&vision_watch_running))
             break;
-        if (generation == last_generation && capture_done)
+        if (generation > last_generation) {
+            last_generation = generation;
+            if (!logged_first_frame) {
+                logged_first_frame = 1;
+                r2_log_event(R2_LOG_SENSORY, "visual_input_available",
+                             "R2 Eyes has a real captured frame available to the conversation brain.",
+                             "Raw frame input is available for the brain to attend to; no semantic description was generated by the capture worker.",
+                             source_name);
+            }
+        }
+        if (capture_done)
             break;
-        last_generation = generation;
-        if (!frame_copy) {
-            if (capture_done)
-                break;
-            continue;
-        }
-        const char *frame_source = event.source_name[0] ? event.source_name : source_name;
-        if (strcmp(previous_source, frame_source) != 0 ||
-            frame.frame_number <= previous_frame_number) {
-            previous_observation[0] = '\0';
-            snprintf(previous_source, sizeof(previous_source), "%s", frame_source);
-        }
-        previous_frame_number = frame.frame_number;
-        char question[2048];
-        if (previous_observation[0]) {
-            snprintf(question, sizeof(question),
-                     "This is the next sampled frame from the same ongoing video source. "
-                     "Previous frame observation: %.900s\n"
-                     "Describe the current frame's visible details, and report meaningful changes "
-                     "only when directly supported. Separate visible facts from uncertainty. "
-                     "Do not choose actions, identify memory matches, or compose what R2 should say.",
-                     previous_observation);
-        } else {
-            snprintf(question, sizeof(question),
-                     "Describe this newly captured video frame for R2. Report visible details and "
-                     "uncertainty. This is the first observation for the current source. "
-                     "Do not choose actions, identify memory matches, or compose what R2 should say.");
-        }
-        char *description = r2_visual_analyze_frame(&frame, frame_source, question);
-        free(frame_copy);
-
-        if (description) {
-            r2_log_event(R2_LOG_SENSORY, "vision_watch_observation",
-                         "R2 analyzed a fresh frame during continuous visual observation.",
-                         description, frame_source);
-            snprintf(previous_observation, sizeof(previous_observation), "%s", description);
-            free(description);
-        }
     }
 
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_stopped",
-                 "R2 continuous visual observation stopped.",
-                 "The frame observer exited; consult visual sensory events to determine whether the source ended or capture failed.",
+                 "R2 continuous visual input stopped.",
+                 "The raw-frame capture worker exited because observation stopped or the source ended.",
                  source_name);
     atomic_store(&vision_watch_running, 0);
     vision_watch_worker_context = 0;
@@ -10161,7 +10167,7 @@ int r2_vision_watch_start(void)
         vision_watch_capture_thread_started = 0;
         pthread_mutex_unlock(&vision_watch_lock);
         r2_log_event(R2_LOG_ERROR, "vision_watch_start_failed",
-                     "Could not start the visual analysis worker.",
+                     "Could not start the visual sensory consumer worker.",
                      NULL, "r2_vision_watch_start");
         return -1;
     }
