@@ -406,6 +406,62 @@ int main(void)
                              "WHERE target='legacy-key-target' AND source='legacy-key-source' "
                              "AND created_at>0;") == 1);
 
+    /* A legacy backlog larger than the page size must be fully reconnected
+       in a single pass. Previously, only the first LIMIT rows were visited. */
+    {
+        enum { BACKLOG_ROWS = 13, PAGE_SIZE = 4 };
+        int diary_before = scalar_int(
+            "SELECT COUNT(*) FROM r2_diary_entry_links WHERE memory_indexed=1");
+        int rewards_before = reward_link_count();
+        sqlite3 *fixture = NULL;
+        sqlite3_stmt *insert = NULL;
+        assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+        assert(sqlite3_prepare_v2(fixture,
+            "INSERT INTO diary_entries(entry,created_at,timestamp) VALUES(?,?,?)",
+            -1, &insert, NULL) == SQLITE_OK);
+        for (int i = 0; i < BACKLOG_ROWS; ++i) {
+            char entry[128];
+            snprintf(entry, sizeof(entry), "Unlinked legacy diary backlog item %d", i);
+            assert(sqlite3_bind_text(insert, 1, entry, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_bind_text(insert, 2, "2002-03-04 05:06:07", -1,
+                                     SQLITE_STATIC) == SQLITE_OK);
+            assert(sqlite3_bind_text(insert, 3, "2002-03-04 05:06:07", -1,
+                                     SQLITE_STATIC) == SQLITE_OK);
+            assert(sqlite3_step(insert) == SQLITE_DONE);
+            assert(sqlite3_reset(insert) == SQLITE_OK);
+            assert(sqlite3_clear_bindings(insert) == SQLITE_OK);
+        }
+        sqlite3_finalize(insert);
+        sqlite3_close(fixture);
+
+        char reward_path[1024];
+        snprintf(reward_path, sizeof(reward_path), "%s/r2_rewards.db", R2_HOME);
+        assert(sqlite3_open(reward_path, &fixture) == SQLITE_OK);
+        assert(sqlite3_prepare_v2(fixture,
+            "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at) "
+            "VALUES('legacy backlog','old system',1,?,1000,1,2000)",
+            -1, &insert, NULL) == SQLITE_OK);
+        for (int i = 0; i < BACKLOG_ROWS; ++i) {
+            char reason[128];
+            snprintf(reason, sizeof(reason), "Unlinked legacy reward backlog item %d", i);
+            assert(sqlite3_bind_text(insert, 1, reason, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+            assert(sqlite3_step(insert) == SQLITE_DONE);
+            assert(sqlite3_reset(insert) == SQLITE_OK);
+            assert(sqlite3_clear_bindings(insert) == SQLITE_OK);
+        }
+        sqlite3_finalize(insert);
+        sqlite3_close(fixture);
+
+        assert(r2_diary_reconnect_history(PAGE_SIZE) == BACKLOG_ROWS);
+        assert(r2_reward_reconnect_history(PAGE_SIZE) == BACKLOG_ROWS);
+        assert(scalar_int(
+            "SELECT COUNT(*) FROM r2_diary_entry_links WHERE memory_indexed=1")
+            == diary_before + BACKLOG_ROWS);
+        assert(reward_link_count() == rewards_before + BACKLOG_ROWS);
+        assert(r2_diary_reconnect_history(PAGE_SIZE) == 0);
+        assert(r2_reward_reconnect_history(PAGE_SIZE) == 0);
+    }
+
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
     return 0;
