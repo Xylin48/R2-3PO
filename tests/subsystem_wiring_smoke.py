@@ -129,6 +129,40 @@ for init_failure in (
     assert init_failure in core, f"core startup silently degrades instead of requiring {init_failure}"
 assert "r2_sj_recent((int)limit)" in core
 assert "r2_sj_search(arg1, (int)limit)" in core
+memory_save_start = core.find("int save_memory(")
+memory_save_end = core.find("\nstatic ", memory_save_start + 1)
+if memory_save_start < 0 or memory_save_end < 0:
+    raise SystemExit("Could not locate persistent memory save implementation.")
+memory_save = core[memory_save_start:memory_save_end]
+for bind in (
+    "rc = sqlite3_bind_text(st, 1, now, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(st, 2, memory, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(st, 3, category, -1, SQLITE_TRANSIENT)",
+):
+    if bind not in memory_save:
+        raise SystemExit(f"Persistent memory update ignores a SQLite binding result: {bind}")
+
+gameboy_link_start = core.find("static int64_t find_gameboy_life_event(")
+gameboy_link_end = core.find("\n/* Pull only adapter-verified virtual events", gameboy_link_start)
+if gameboy_link_start < 0 or gameboy_link_end < 0:
+    raise SystemExit("Could not locate Game Boy Life Log deduplication lookup.")
+gameboy_link = core[gameboy_link_start:gameboy_link_end]
+if "lookup_rc = sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
+    raise SystemExit("Game Boy Life Log deduplication ignores the event lookup binding result.")
+
+reward_modifier_start = reward.find("int r2_reward_current_modifier(")
+reward_modifier_end = reward.find("\nchar *r2_reward_context(", reward_modifier_start)
+if reward_modifier_start < 0 or reward_modifier_end < 0:
+    raise SystemExit("Could not locate reward modifier lookup.")
+reward_modifier = reward[reward_modifier_start:reward_modifier_end]
+for bind in (
+    "int rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_int64(st, 2, now)",
+    "if (rc == SQLITE_OK) rc = sqlite3_step(st)",
+):
+    if bind not in reward_modifier:
+        raise SystemExit(f"Reward modifier lookup ignores a SQLite binding result: {bind}")
+
 assert "r2_sj_note(arg1" in core
 assert 'extract_marker(reply, "[SENSORY_JOURNAL]"' in core
 
