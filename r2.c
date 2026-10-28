@@ -7688,6 +7688,15 @@ static int r2_parse_control_positive_id_pair(const char *text,
     return 0;
 }
 
+static int r2_ears_action_cancelled(void *unused)
+{
+    (void)unused;
+    return shutting_down ||
+           (ollama_background_mode &&
+            (atomic_load(&foreground_conversation_waiting) > 0 ||
+             atomic_load(&foreground_ollama_waiting) > 0));
+}
+
 static char *r2_process_ears_listen_request(const char *request)
 {
     if (!request) return NULL;
@@ -7724,7 +7733,8 @@ static char *r2_process_ears_listen_request(const char *request)
     }
 
     r2_ears_recent_requested = recent;
-    char *transcript = r2_ears_listen_cancelable((unsigned)seconds, NULL, NULL);
+    char *transcript = r2_ears_listen_cancelable(
+        (unsigned)seconds, r2_ears_action_cancelled, NULL);
     r2_ears_recent_requested = 0;
     free(copy);
     if (!transcript || !*transcript) {
