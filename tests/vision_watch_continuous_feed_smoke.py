@@ -47,7 +47,7 @@ direct_start = core.index("static char *vision_analyze_current_frame(const char 
 direct_end = core.index("\nchar *r2_vision_see(", direct_start)
 direct = core[direct_start:direct_end]
 assert "memcpy(frame_copy, frame.data, frame.size)" in direct
-assert direct.index("pthread_mutex_unlock(&visual_capture_lock)") < direct.index("r2_visual_analyze_frame(")
+assert direct.rindex("pthread_mutex_unlock(&visual_capture_lock)") < direct.index("r2_visual_analyze_frame(")
 assert "free(frame_copy);" in direct
 
 print("Continuous Eyes capture, latest-frame handoff, nonblocking Qwen analysis, and dual-worker shutdown passed.")
