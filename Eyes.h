@@ -103,6 +103,9 @@ typedef struct R2Eyes R2Eyes;
 int r2_eyes_init(R2Eyes **eyes);
 void r2_eyes_shutdown(R2Eyes *eyes);
 
+/* Probe physical camera readiness without starting continuous capture. */
+int r2_eyes_camera_available(void);
+
 /* Input sources */
 int r2_eyes_open_file(R2Eyes *eyes, const char *path);
 int r2_eyes_open_camera(R2Eyes *eyes);
