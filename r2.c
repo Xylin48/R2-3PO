@@ -10038,14 +10038,14 @@ static void *vision_watch_worker(void *unused)
         }
         const char *frame_source = event.source_name[0] ? event.source_name : source_name;
         if (strcmp(previous_source, frame_source) != 0) {
-            previous_observation[0] = '\\0';
+            previous_observation[0] = '\0';
             snprintf(previous_source, sizeof(previous_source), "%s", frame_source);
         }
         char question[2048];
         if (previous_observation[0]) {
             snprintf(question, sizeof(question),
                      "This is the next sampled frame from the same ongoing video source. "
-                     "Previous frame observation: %.900s\\n"
+                     "Previous frame observation: %.900s\n"
                      "Describe the current frame's visible details, and report meaningful changes "
                      "only when directly supported. Separate visible facts from uncertainty. "
                      "Do not choose actions, identify memory matches, or compose what R2 should say.",
