@@ -319,6 +319,9 @@ int r2_vision_open_window(unsigned long window_id);
 /* Media is a separately observed display, not a replacement for Eyes. */
 int r2_vision_media_open_window(unsigned long window_id);
 int r2_vision_media_status(void);
+/* R2's deliberate visual attention selection; media capture remains separate. */
+int r2_vision_media_attention_status(void);
+int r2_vision_media_set_attention(int watching);
 int r2_vision_media_stop(void);
 char *r2_vision_media_see(const char *question);
 int r2_vision_open_vlc(void);
