@@ -5954,17 +5954,33 @@ static char *chat_with_relevant_memories(
         free(prior_visual);
     }
     if (visual_requested && (!eyes || !r2_eyes_is_open(eyes))) {
-        const char unavailable[] =
-            "CURRENT VISUAL INPUT: no live image is available because Eyes is not open. "
-            "Do not claim to see the current scene from historical memories.";
-        size_t old_n = strlen(memory_context);
-        size_t note_n = sizeof(unavailable) - 1U;
-        char *joined = malloc(old_n + note_n + 4U);
-        if (joined) {
-            snprintf(joined, old_n + note_n + 4U, "%s%s%s",
-                     memory_context, old_n ? "\n\n" : "", unavailable);
-            free(memory_context);
-            memory_context = joined;
+        /* An explicit request to see permits opening Eyes; ordinary turns do not. */
+        pthread_mutex_lock(&visual_capture_lock);
+        int open_rc = eyes ? r2_eyes_open_camera(eyes) : -1;
+        pthread_mutex_unlock(&visual_capture_lock);
+        if (open_rc == 0 && r2_vision_watch_start() != 0) {
+            pthread_mutex_lock(&visual_capture_lock);
+            if (eyes) r2_eyes_close(eyes);
+            pthread_mutex_unlock(&visual_capture_lock);
+            open_rc = -1;
+        }
+        if (open_rc != 0) {
+            r2_log_sensory("visual_input_unavailable",
+                           "R2 could not open continuous Eyes input for an explicit visual request.",
+                           "The camera could not be opened or the continuous raw-frame capture worker could not start.",
+                           "Eyes");
+            const char unavailable[] =
+                "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request. "
+                "Do not claim to see the current scene from historical memories.";
+            size_t old_n = strlen(memory_context);
+            size_t note_n = sizeof(unavailable) - 1U;
+            char *joined = malloc(old_n + note_n + 4U);
+            if (joined) {
+                snprintf(joined, old_n + note_n + 4U, "%s%s%s",
+                         memory_context, old_n ? "\n\n" : "", unavailable);
+                free(memory_context);
+                memory_context = joined;
+            }
         }
     }
 
@@ -10236,11 +10252,16 @@ int r2_vision_open_vlc(void)
             source = event.source_name;
         r2_log_media_event("opened_for_observation", "video", source,
                            "R2 began sampling the visible VLC playback window; the window title is source metadata, not proof of the video contents.");
-        if (r2_vision_watch_start() != 0)
+        if (r2_vision_watch_start() != 0) {
+            pthread_mutex_lock(&visual_capture_lock);
+            r2_eyes_close(eyes);
+            pthread_mutex_unlock(&visual_capture_lock);
             r2_log_sensory("vision_watch_start_failed",
-                           "R2 opened VLC input but continuous visual observation did not start.",
-                           "The source is open, but no periodic visual analysis thread is running.",
+                           "R2 could not start continuous raw-frame capture for VLC input.",
+                           "VLC input was closed because continuous Eyes capture did not start.",
                            source);
+            return -1;
+        }
     }
     return rc;
 }
@@ -10254,11 +10275,16 @@ int r2_vision_open_file(const char *path)
     if (rc == 0) {
         r2_log_media_event("opened_for_observation", "video_or_image", path,
                            "R2 opened this source through Eyes; filename is a clue, not proof of content.");
-        if (r2_vision_watch_start() != 0)
+        if (r2_vision_watch_start() != 0) {
+            pthread_mutex_lock(&visual_capture_lock);
+            r2_eyes_close(eyes);
+            pthread_mutex_unlock(&visual_capture_lock);
             r2_log_sensory("vision_watch_start_failed",
-                           "R2 opened a visual file but continuous visual observation did not start.",
-                           "The source is open, but no periodic visual analysis thread is running.",
+                           "R2 could not start continuous raw-frame capture for the visual file.",
+                           "The file source was closed because continuous Eyes capture did not start.",
                            path);
+            return -1;
+        }
     }
     return rc;
 }
@@ -10266,7 +10292,7 @@ int r2_vision_open_file(const char *path)
 int r2_vision_close(void)
 {
     if (!eyes) return -1;
-    /* Stop the observer before closing media, so it cannot reopen the camera. */
+    /* Stop the raw-frame consumer before closing media, so it cannot read a closed source. */
     r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     r2_eyes_close(eyes);
@@ -10281,8 +10307,15 @@ int r2_eyes_start(void)
     pthread_mutex_lock(&visual_capture_lock);
     int rc = eyes ? r2_eyes_open_camera(eyes) : -1;
     pthread_mutex_unlock(&visual_capture_lock);
+    if (rc == 0 && r2_vision_watch_start() != 0) {
+        pthread_mutex_lock(&visual_capture_lock);
+        if (eyes) r2_eyes_close(eyes);
+        pthread_mutex_unlock(&visual_capture_lock);
+        rc = -1;
+    }
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "eyes_started" : "eyes_start_failed",
-                 rc == 0 ? "R2 Eyes camera was opened." : "R2 Eyes camera could not be opened.",
+                 rc == 0 ? "R2 Eyes camera and continuous raw-frame input are active."
+                         : "R2 Eyes could not start camera input and continuous capture.",
                  NULL, "r2_eyes_start");
     return rc;
 }
@@ -10290,6 +10323,7 @@ int r2_eyes_start(void)
 int r2_eyes_stop(void)
 {
     if (!eyes) return -1;
+    (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
