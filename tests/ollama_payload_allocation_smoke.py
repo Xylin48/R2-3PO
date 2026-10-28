@@ -26,21 +26,24 @@ require("json_object_new_object()" in helper
         "message, role, and content allocations are all checked")
 require("json_object_object_add(message, \"role\", role_value) != 0" in helper
         and "json_object_object_add(message, \"content\", content_value) != 0" in helper
-        and "json_object_array_add(array, message) != 0" in helper,
+        and "json_object_array_add(array, message) != 0" in helper
+        and "json_object_array_add(images, image) != 0" in helper
+        and 'json_object_object_add(message, "images", images) != 0' in helper,
         "JSON insertion failures are treated as serialization failures")
 require("if (role_value) json_object_put(role_value);" in helper
         and "if (content_value) json_object_put(content_value);" in helper
         and "if (message) json_object_put(message);" in helper,
         "partial JSON objects are cleaned up on failure")
 
-call = source.find("if (ollama_json_append_message(arr, role, content, limits[i]) != 0)")
+call = source.find("int append_rc = ollama_json_append_message(")
 if call < 0:
     raise SystemExit("FAIL: serializer loop does not use checked message helper")
 loop_end = source.find("\n        }\n    }\n    free(message_order);", call)
 if loop_end < 0:
     raise SystemExit("FAIL: could not isolate the complete message serialization loop")
 loop = source[call:loop_end]
-require("return NULL;" in loop
+require("if (append_rc != 0)" in loop
+        and "return NULL;" in loop
         and "json_object_put(arr);" in loop
         and "json_object_put(root);" in loop
         and "continue;" not in loop,
