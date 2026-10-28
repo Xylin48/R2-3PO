@@ -55,6 +55,18 @@ assert "!atomic_load(&eyes_auto_allowed)" in camera_analysis
 assert "r2_eyes_open_window(eyes," not in core, "media must not replace camera"
 assert "r2_eyes_open_vlc(eyes)" not in core
 assert "r2_eyes_open_file(eyes," not in core
+
+# A deliberate camera look shares the continuous worker's published frame.
+# It cannot steal an extra frame from the same FFmpeg pipe while Watch reads.
+explicit_look = core[core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\\n{"):
+                     core.index("char *r2_vision_see(const char *question)")]
+assert "if (atomic_load(&vision_watch_running))" in explicit_look
+assert "r2_vision_copy_watched_frame(&frame, &event, &frame_copy)" in explicit_look
+assert "r2_eyes_capture(eyes)" in explicit_look  # direct fallback when no Watch
+snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\\n"):
+                core.index("static void *vision_watch_capture_worker(void *unused)")]
+assert "pthread_mutex_lock(&vision_watch_frame_lock)" in snapshot
+assert "memcpy(copy, vision_watch_latest_frame_data," in snapshot
 assert "r2_eyes_open_window(media_eyes," in media
 
 tool = core[core.index("/* Decisions to open/close sensors override Watch discovery. */"):
