@@ -1235,6 +1235,46 @@ int r2_eyes_open_source(
    VLC SOURCE
    ============================================================ */
 
+/* A video producer can publish its real X11 rendering window, regardless
+ * of which UI framework hosts the player. Capture the window's pixels, never
+ * a speculative description derived from its filename or player identity. */
+int r2_eyes_window_available(unsigned long window_id)
+{
+    uint32_t width = 0, height = 0;
+    return window_id != 0 &&
+        r2_eyes_probe_vlc_dimensions(window_id, &width, &height) == 0;
+}
+
+int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
+{
+    if (!eyes || window_id == 0) return -1;
+    r2_eyes_close(eyes);
+    uint32_t width = 0, height = 0;
+    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height) != 0 ||
+        r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
+        r2_eyes_allocate_record_buffer(eyes) != 0)
+        return -1;
+    FILE *stream = r2_eyes_start_vlc(window_id);
+    if (!stream) return -1;
+    eyes->stream = stream;
+    eyes->open = 1;
+    eyes->source_is_live = 0;
+    eyes->origin = R2_VISION_WINDOW;
+    eyes->frame_count = 0;
+    eyes->timestamp = 0;
+    snprintf(eyes->source_name, sizeof(eyes->source_name),
+             "video rendering window %lu", window_id);
+    r2_eyes_reset_event(eyes);
+    r2_eyes_reset_frame(eyes);
+    r2_vwebcam_write_status(eyes, 1);
+    r2_vwebcam_start_viewer();
+    r2_log_sensory("vision_source_opened",
+                   "R2 Eyes connected to an active rendered video window.",
+                   "The source supplied a live window ID; frames are raw pixels.",
+                   eyes->source_name);
+    return 0;
+}
+
 int r2_eyes_open_vlc(
     R2Eyes *eyes)
 {
