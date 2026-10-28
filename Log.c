@@ -774,11 +774,9 @@ int r2_log_event_exists(const char *event_type, const char *source)
     rc = sqlite3_prepare_v2(log_db,
         "SELECT 1 FROM r2_log_events WHERE event_type=? AND source=? LIMIT 1",
         -1, &statement, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, event_type, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, source, -1, SQLITE_TRANSIENT);
-        exists = sqlite3_step(statement) == SQLITE_ROW;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, event_type, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, source, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) exists = sqlite3_step(statement) == SQLITE_ROW;
     if (statement) sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
     return exists;
@@ -1044,12 +1042,12 @@ int64_t r2_log_milestone(
         return -1;
     }
     int exists = 0;
-    if (sqlite3_prepare_v2(log_db,
-            "SELECT 1 FROM r2_log_milestones WHERE milestone_key=?;",
-            -1, &statement, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, milestone_key, -1, SQLITE_TRANSIENT);
-        exists = sqlite3_step(statement) == SQLITE_ROW;
-    }
+    int lookup_rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_milestones WHERE milestone_key=?;",
+        -1, &statement, NULL);
+    if (lookup_rc == SQLITE_OK)
+        lookup_rc = sqlite3_bind_text(statement, 1, milestone_key, -1, SQLITE_TRANSIENT);
+    if (lookup_rc == SQLITE_OK) exists = sqlite3_step(statement) == SQLITE_ROW;
     sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
     if (exists)
@@ -1079,16 +1077,14 @@ int64_t r2_log_milestone(
         -1, &statement, NULL
     );
 
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, milestone_key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, description, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 3, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, utc, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, milestone_key, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, description, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3, event_id);
-        sqlite3_bind_text(statement, 4, utc, -1, SQLITE_TRANSIENT);
-
-        if (sqlite3_step(statement) == SQLITE_DONE &&
-            sqlite3_changes(log_db) > 0) {
+        rc = sqlite3_step(statement);
+        if (rc == SQLITE_DONE && sqlite3_changes(log_db) > 0)
             milestone_id = sqlite3_last_insert_rowid(log_db);
-        }
     }
 
     sqlite3_finalize(statement);
@@ -1193,8 +1189,8 @@ int64_t r2_log_activity_start(const char *activity_key,
         "SELECT 1 FROM r2_log_activity_sessions "
         "WHERE activity_key=? AND status='active' LIMIT 1",
         -1, &statement, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
         int step_rc = sqlite3_step(statement);
         if (step_rc == SQLITE_ROW)
             rc = SQLITE_CONSTRAINT;
@@ -1222,16 +1218,15 @@ int64_t r2_log_activity_start(const char *activity_key,
         "(activity_key,activity_name,started_utc,started_local,started_epoch,"
         "start_monotonic_ms,start_event_id,status) VALUES (?,?,?,?,?,?,?,'active')",
         -1, &statement, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, activity_name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 4, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 5, (sqlite3_int64)time(NULL));
-        sqlite3_bind_int64(statement, 6, (sqlite3_int64)r2_log_elapsed_ms());
-        sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
-        rc = sqlite3_step(statement) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, activity_name, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, utc, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, local, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 5, (sqlite3_int64)time(NULL));
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 6, (sqlite3_int64)r2_log_elapsed_ms());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
     if (statement) sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
     if (rc != SQLITE_OK) return -1;
@@ -1269,8 +1264,8 @@ int64_t r2_log_activity_end(const char *activity_key,
         "SELECT activity_name,started_local,started_epoch,start_monotonic_ms "
         "FROM r2_log_activity_sessions WHERE activity_key=? AND status='active' "
         "ORDER BY id DESC LIMIT 1", -1, &statement, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(statement);
         if (rc == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(statement, 0);
@@ -1321,18 +1316,20 @@ int64_t r2_log_activity_end(const char *activity_key,
         "duration_ms=?,last_verified_state=?,stop_reason=?,end_event_id=?,status='ended' "
         "WHERE activity_key=? AND status='active'",
         -1, &statement, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 3, ended_epoch);
+    if (rc == SQLITE_OK) rc = duration_ms >= 0
+        ? sqlite3_bind_int64(statement, 4, duration_ms)
+        : sqlite3_bind_null(statement, 4);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, valid_text(last_verified_state) ? last_verified_state : "unknown", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, valid_text(stop_reason) ? stop_reason : "unknown", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 3, ended_epoch);
-        if (duration_ms >= 0) sqlite3_bind_int64(statement, 4, duration_ms);
-        else sqlite3_bind_null(statement, 4);
-        sqlite3_bind_text(statement, 5, valid_text(last_verified_state) ? last_verified_state : "unknown", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 6, valid_text(stop_reason) ? stop_reason : "unknown", -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
-        sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(log_db) > 0
-            ? SQLITE_OK : SQLITE_ERROR;
+        rc = sqlite3_step(statement);
+        if (rc == SQLITE_DONE && sqlite3_changes(log_db) > 0) rc = SQLITE_OK;
+        else if (rc == SQLITE_DONE) rc = SQLITE_ERROR;
     }
     if (statement) sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
@@ -1379,12 +1376,11 @@ int r2_log_location_transition(const char *location, int is_home)
         "UPDATE r2_log_location_state SET current_location=?,is_home=?,"
         "was_away=?,updated_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=1",
         -1, &statement, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(statement, 1, location, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(statement, 2, is_home ? 1 : 0);
-        sqlite3_bind_int(statement, 3, is_home ? 0 : 1);
-        rc = sqlite3_step(statement) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-    }
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, location, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, is_home ? 1 : 0);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, is_home ? 0 : 1);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
     if (statement) sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
     if (rc != SQLITE_OK) return -1;
@@ -1923,41 +1919,29 @@ int r2_log_system_snapshot(const char *reason)
             -1, &statement, NULL
         );
 
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(statement, 1, event_id);
-            sqlite3_bind_text(statement, 2, hostname, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, 3, os_name, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, 4, kernel, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(statement, 5, machine, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(statement, 6, (int)getpid());
-            sqlite3_bind_int64(statement, 7,
-                               (sqlite3_int64)r2_log_elapsed_ms());
-
-            if (system_uptime >= 0)
-                sqlite3_bind_int64(statement, 8, system_uptime);
-            else
-                sqlite3_bind_null(statement, 8);
-
-            if (total_ram)
-                sqlite3_bind_int64(statement, 9, (sqlite3_int64)total_ram);
-            else
-                sqlite3_bind_null(statement, 9);
-
-            if (free_ram)
-                sqlite3_bind_int64(statement, 10, (sqlite3_int64)free_ram);
-            else
-                sqlite3_bind_null(statement, 10);
-
-            if (have_fs) {
-                sqlite3_bind_int64(statement, 11, (sqlite3_int64)disk_total);
-                sqlite3_bind_int64(statement, 12, (sqlite3_int64)disk_free);
-            } else {
-                sqlite3_bind_null(statement, 11);
-                sqlite3_bind_null(statement, 12);
-            }
-
-            rc = sqlite3_step(statement);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, hostname, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, os_name, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, kernel, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, machine, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 6, (int)getpid());
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)r2_log_elapsed_ms());
+        if (rc == SQLITE_OK) rc = system_uptime >= 0
+            ? sqlite3_bind_int64(statement, 8, system_uptime)
+            : sqlite3_bind_null(statement, 8);
+        if (rc == SQLITE_OK) rc = total_ram
+            ? sqlite3_bind_int64(statement, 9, (sqlite3_int64)total_ram)
+            : sqlite3_bind_null(statement, 9);
+        if (rc == SQLITE_OK) rc = free_ram
+            ? sqlite3_bind_int64(statement, 10, (sqlite3_int64)free_ram)
+            : sqlite3_bind_null(statement, 10);
+        if (rc == SQLITE_OK) rc = have_fs
+            ? sqlite3_bind_int64(statement, 11, (sqlite3_int64)disk_total)
+            : sqlite3_bind_null(statement, 11);
+        if (rc == SQLITE_OK) rc = have_fs
+            ? sqlite3_bind_int64(statement, 12, (sqlite3_int64)disk_free)
+            : sqlite3_bind_null(statement, 12);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
 
         sqlite3_finalize(statement);
         pthread_mutex_unlock(&log_lock);
