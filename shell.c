@@ -715,18 +715,6 @@ static void shell_talk(const char *message)
     pthread_mutex_unlock(&shell_conversation_lock);
 }
 
-static void shell_talk_watch(const char *message)
-{
-    pthread_mutex_lock(&shell_conversation_lock);
-    if (!atomic_load(&shell_watch_stop_requested) && !r2_is_shutting_down()) {
-        printf("\n[Watch] Heard: %s\n", message ? message : "");
-        fflush(stdout);
-        shell_talk_inner(message);
-    }
-    pthread_mutex_unlock(&shell_conversation_lock);
-}
-
-
 /* ============================================================
    NORMAL CONVERSATION
    ============================================================ */
@@ -1151,7 +1139,7 @@ static void shell_ears(const char *argument)
        standalone Ears commands replace or close its source mid-utterance. */
     if (watch_running && argument && *argument &&
         strcasecmp(argument, "status") != 0) {
-        printf("[Ears] Watch owns microphone capture. Stop Watch before using standalone Ears commands.\n");
+        printf("[Ears] Watch owns continuous raw microphone capture. Stop Watch before using standalone Ears commands.\n");
         return;
     }
 
@@ -1261,11 +1249,10 @@ static void shell_ears(const char *argument)
    WATCH COORDINATOR
    ============================================================
  *
- * Watch coordinates bounded microphone capture and local Whisper
- * transcription, then sends each usable transcript through the shared
- * shell conversation path. It may attach to visual observation only when
- * Eyes is already open. Audio capture and visual perception remain owned
- * by their existing subsystems.
+ * Watch coordinates continuous raw sensory input. Ears receives PCM into a
+ * rolling in-memory buffer and Eyes continuously publishes raw frames when
+ * open. Neither sensor automatically transcribes, describes, or interprets
+ * what arrives; R2's brain chooses when to inspect sensory information.
  */
 
 static void shell_watch_status(void)
@@ -1275,12 +1262,12 @@ static void shell_watch_status(void)
         "================ WATCH STATUS =============================\n"
         "\n"
         "Coordinator thread : %s\n"
-        "Speech input       : %s\n"
-        "Visual observation : %s\n"
+        "Audio input        : %s\n"
+        "Visual input       : %s\n"
         "Core Watch state   : %s\n"
         "\n"
-        "Microphone capture uses local Whisper transcription. Visual observation\n"
-        "runs only while an Eyes source is already open; Watch never opens Eyes.\n"
+        "Ears buffers raw microphone PCM without automatic transcription. Visual\n"
+        "input runs only while an Eyes source is already open; Watch never opens Eyes.\n"
         "============================================================\n"
         "\n",
         shell_watch_thread_started ? "RUNNING" : "STOPPED",
@@ -1297,68 +1284,28 @@ static int shell_watch_cancelled(void *unused)
     return atomic_load(&shell_watch_stop_requested) || r2_is_shutting_down();
 }
 
-static int shell_command_available(const char *command)
-{
-    if (!command || !*command) return 0;
-    if (strchr(command, '/')) return access(command, X_OK) == 0;
-    const char *path = getenv("PATH");
-    if (!path) return 0;
-    const char *part = path;
-    while (1) {
-        const char *end = strchr(part, ':');
-        size_t length = end ? (size_t)(end - part) : strlen(part);
-        if (length > 0 && length < PATH_MAX - 2) {
-            char candidate[PATH_MAX];
-            int n = snprintf(candidate, sizeof(candidate), "%.*s/%s",
-                             (int)length, part, command);
-            struct stat st;
-            if (n > 0 && (size_t)n < sizeof(candidate) &&
-                access(candidate, X_OK) == 0 && stat(candidate, &st) == 0 &&
-                S_ISREG(st.st_mode)) return 1;
-        }
-        if (!end) break;
-        part = end + 1;
-    }
-    return 0;
-}
-
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int restore_ears_open = r2_ears_status() > 0;
     int visual_started = 0;
 
-    /* Never open Eyes on Watch's behalf. Only attach to an already-open source. */
+    /* Watch may join an already-open Eyes source, but never opens a camera. */
     if (r2_eyes_status() > 0 && r2_vision_available() &&
-        r2_vision_watch_start() == 0) {
+        !r2_vision_watch_active() && r2_vision_watch_start() == 0) {
         visual_started = 1;
-        fprintf(stderr, "[Watch] Visual observation attached to the already-open Eyes source.\n");
+        fprintf(stderr, "[Watch] Raw visual input attached to the already-open Eyes source.\n");
     }
 
-    while (!shell_watch_cancelled(NULL)) {
-        /* Bounded non-overlapping chunks: one transcript can create at most one chat turn. */
-        char *transcript = r2_ears_listen_cancelable(5, shell_watch_cancelled, NULL);
-        if (shell_watch_cancelled(NULL)) {
-            free(transcript);
-            break;
+    while (!shell_watch_cancelled(NULL) && r2_ears_status() > 0) {
+        struct timespec pause = {1, 0};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
+            if (shell_watch_cancelled(NULL)) break;
         }
-        if (!transcript) {
-            /* Back off if capture/ASR fails immediately; silence is not a turn. */
-            struct timespec retry_delay = {1, 0};
-            while (nanosleep(&retry_delay, &retry_delay) != 0 && errno == EINTR) {
-                if (shell_watch_cancelled(NULL)) break;
-            }
-            continue;
-        }
-        shell_talk_watch(transcript);
-        free(transcript);
     }
 
     if (visual_started)
         (void)r2_vision_watch_stop();
-    /* Restore a microphone state that predated Watch; otherwise leave it closed. */
-    if (restore_ears_open && !r2_is_shutting_down())
-        (void)r2_ears_start();
+    (void)r2_ears_stop();
     return NULL;
 }
 
@@ -1376,45 +1323,28 @@ static void shell_watch_start(void)
         return;
     }
 
-    const char *model = getenv("R2_WHISPER_MODEL");
-    struct stat model_stat;
-    if (!model || !*model || stat(model, &model_stat) != 0 ||
-        !S_ISREG(model_stat.st_mode) || access(model, R_OK) != 0) {
-        printf("[Watch] Cannot start: set R2_WHISPER_MODEL to a readable local Whisper GGML model.\n");
-        return;
-    }
-    const char *cli = getenv("R2_WHISPER_CLI");
-    if (!cli || !*cli) cli = "whisper-cli";
-    if (!shell_command_available(cli)) {
-        printf("[Watch] Cannot start: local Whisper CLI '%s' is not executable or not in PATH.\n", cli);
-        return;
-    }
-
-    /* Prove the default microphone can open before reporting Watch as active. */
-    if (r2_ears_start() != 0) {
-        printf("[Watch] Cannot start: R2 could not open the default microphone.\n");
-        return;
-    }
-    if (r2_ears_stop() != 0) {
-        printf("[Watch] Cannot start: microphone preflight could not close its test capture.\n");
-        return;
-    }
-
     atomic_store(&shell_watch_stop_requested, 0);
     if (r2_watch_start() != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
         printf("[Watch] Core refused to start Watch mode.\n");
         return;
     }
+    if (r2_ears_start() != 0) {
+        atomic_store(&shell_watch_stop_requested, 1);
+        (void)r2_watch_stop();
+        printf("[Watch] Cannot start: continuous raw microphone capture failed.\n");
+        return;
+    }
     if (pthread_create(&shell_watch_thread, NULL, shell_watch_worker, NULL) != 0) {
         atomic_store(&shell_watch_stop_requested, 1);
+        (void)r2_ears_stop();
         (void)r2_watch_stop();
         printf("[Watch] Could not create the sensory coordinator thread.\n");
         return;
     }
     shell_watch_thread_started = 1;
     watch_running = 1;
-    printf("[Watch] ACTIVE. Local microphone transcription is enabled; Eyes is observed only if already open.\n");
+    printf("[Watch] ACTIVE. Ears and any already-open Eyes source provide raw sensory input; no automatic transcription or image descriptions are generated.\n");
 }
 
 
@@ -1424,7 +1354,7 @@ static void shell_watch_stop(void)
         printf("[Watch] Already stopped.\n");
         return;
     }
-    printf("[Watch] Stopping; cancelling capture/transcription and waiting for active work...\n");
+    printf("[Watch] Stopping continuous sensory input and waiting for capture workers...\n");
     atomic_store(&shell_watch_stop_requested, 1);
     (void)r2_watch_stop();
     if (shell_watch_thread_started) {
