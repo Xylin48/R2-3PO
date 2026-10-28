@@ -321,3 +321,12 @@ The repository has targeted legacy-schema tests for the shared memory/Life Log d
 - **GitHub Actions:** [run 40630710375](https://github.com/Xylin48/R2-3PO/actions/runs/40630710375) — passed, 92/92 steps.
 - **Repository-level status:** All configured strict build/regression steps pass, including the primary legacy database tests, Game Boy split-database import, Alternate-Self legacy timestamp constraints, and Sensory Journal legacy timestamp constraints.
 - **Outstanding acceptance boundary:** The user's actual `R2_Home` databases have not been opened or audited in this session, and live Qwen/Ollama/GPU behavior has not been exercised on the target PC. Run the existing read-only preflight against the actual data directory before any on-disk migration or live acceptance.
+
+
+### R2-AUD-2026-10-28-008 — Visual observation blocked capture during Qwen inference
+
+- **Area:** `r2.c` visual watcher and the existing `Eyes.c` frame stream.
+- **Finding:** the observer captured and analyzed on one worker while holding the capture lock across Qwen inference, then waited an additional fixed interval before sampling again. Slow inference could stall the FFmpeg pipe and make the next analyzed frame stale; the nominal 15-second loop was sparse sampling rather than continuous frame acquisition.
+- **Fix:** split continuous Eyes capture from Qwen analysis. The capture worker keeps draining the live stream and publishes the newest frame snapshot; the analysis worker receives an owned copy outside the capture lock and analyzes successive fresh frames at the model's actual processing rate. Each observation includes the previous successful description from the same source so frame-to-frame changes have explicit context; switching sources resets that comparison context. Shutdown joins both workers and releases the retained frame buffer.
+- **Regression coverage:** added `tests/vision_watch_continuous_feed_smoke.py` to verify independent capture/analysis workers, latest-frame handoff, sequential context, and joined shutdown. Full CI result is recorded after the latest branch head finishes.
+- **Scope:** the image-only Qwen model still receives individual images, not a native video tensor. Continuous acquisition plus successive frame analysis is the implemented bridge; model throughput determines observation cadence, and no claim is made that every raw source frame is individually inferred.
