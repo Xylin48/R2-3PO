@@ -10014,6 +10014,7 @@ static void *vision_watch_worker(void *unused)
                  start_details, source_name);
 
     uint64_t last_generation = 0;
+    uint64_t previous_frame_number = 0;
     char previous_observation[1024] = "";
     char previous_source[512] = "";
     while (!shutting_down && atomic_load(&vision_watch_running)) {
@@ -10053,10 +10054,12 @@ static void *vision_watch_worker(void *unused)
             continue;
         }
         const char *frame_source = event.source_name[0] ? event.source_name : source_name;
-        if (strcmp(previous_source, frame_source) != 0) {
+        if (strcmp(previous_source, frame_source) != 0 ||
+            frame.frame_number <= previous_frame_number) {
             previous_observation[0] = '\0';
             snprintf(previous_source, sizeof(previous_source), "%s", frame_source);
         }
+        previous_frame_number = frame.frame_number;
         char question[2048];
         if (previous_observation[0]) {
             snprintf(question, sizeof(question),
