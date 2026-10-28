@@ -5588,6 +5588,7 @@ static int r2_recent_message_is_tool_payload(const char *content)
     static const char *const markers[] = {
         /* World, sensory, device, diary, and task actions. */
         "[WORLD]", "[IMAGINE]", "[IMAGINE_FEEDBACK]", "[SENSORY_JOURNAL]",
+        "[SENSE]", "[MEDIA_SEE]", "[EARS_LISTEN]",
         "[ALTERNATE_CREATE]", "[ALTERNATE_DISCARD]", "[ALTERNATE_RETAIN]",
         "[ALTERNATE_COMPARE]", "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]",
         "[GAMEBOY]", "[TV]", "[DIARY]", "[READ_DIARY]", "[TASK]", "[FRIDGE]",
@@ -12042,6 +12043,7 @@ static int reply_has_visible_text(const char *text)
         "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]", "[ALTERNATE_COMPARE]",
         "[ALTERNATE_RETAIN]", "[ALTERNATE_DISCARD]", "[READ_DIARY]",
         "[READ]", "[LIST]", "[DELETE]", "[SENSORY_JOURNAL]", "[WORLD]",
+        "[SENSE]", "[MEDIA_SEE]", "[EARS_LISTEN]",
         "[HAND]", "[END ALTERNATE_CREATE]", "[END DIARY]", "[END WRITE]",
         "[END HAND_REQUEST]", "[END RUN]", "[END IMAGINE]",
         "[END IMAGINE_FEEDBACK]"
