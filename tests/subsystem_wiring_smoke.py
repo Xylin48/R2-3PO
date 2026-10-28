@@ -62,7 +62,7 @@ if "r2_addiction_shutdown();" not in reality[reality_shutdown_start:reality_shut
 if "r2_addiction_init()" in core or "r2_addiction_shutdown();" in core:
     raise SystemExit("Core must not duplicate the Addiction lifecycle owned by Reality.")
 reality_update_start = reality.find("static int update_hunger_locked(")
-reality_update_end = reality.find("\\nstatic void sync_room_mirrors", reality_update_start)
+reality_update_end = reality.find("\nstatic void sync_room_mirrors", reality_update_start)
 if reality_update_start < 0 or reality_update_end < 0:
     raise SystemExit("Could not locate Reality metric update transaction.")
 reality_update = reality[reality_update_start:reality_update_end]
@@ -74,7 +74,7 @@ for bind in (
     if bind not in reality_update:
         raise SystemExit(f"Reality metric persistence ignores a SQLite bind result: {bind}")
 sleep_start = reality.find("int r2_reality_sleep(")
-sleep_end = reality.find("\\nint r2_reality_record_dream(", sleep_start)
+sleep_end = reality.find("\nint r2_reality_record_dream(", sleep_start)
 if sleep_start < 0 or sleep_end < 0:
     raise SystemExit("Could not locate Reality sleep update.")
 sleep_update = reality[sleep_start:sleep_end]
