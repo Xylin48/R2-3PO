@@ -33,6 +33,7 @@ assert "vision_watch_frame_generation == last_generation" in worker
 assert "previous_observation[1024]" in worker
 assert "Previous frame observation:" in worker
 assert "strcmp(previous_source, frame_source) != 0" in worker
+assert "frame.frame_number <= previous_frame_number" in worker
 assert "interval=approximately 15 seconds" not in worker
 assert "elapsed_seconds >= 15" not in worker
 
