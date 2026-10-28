@@ -112,6 +112,8 @@ static sqlite3 *db = NULL;
 
 static R2Eyes *eyes = NULL;
 static R2Ears *ears = NULL;
+/* Desktop and microphone are independent live hearing organs. */
+static R2Ears *ears_desktop = NULL;
 static pthread_mutex_t visual_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Keep this process from flooding the local text model with concurrent requests. */
 static pthread_mutex_t ollama_request_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -330,7 +332,9 @@ static int watch_running = 0;
 static int diary_initialized = 0;
 /* These flags are consumed by the tool dispatcher before the capture implementation. */
 static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
+static atomic_int ears_desktop_capture_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int r2_ears_recent_requested = 0;
+static _Thread_local int r2_ears_desktop_requested = 0;
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
@@ -10529,6 +10533,15 @@ static size_t ears_recent_write_position = 0;
 static uint64_t ears_recent_total_bytes = 0;
 static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
+/* The desktop sink monitor never shares the microphone's stream or history. */
+static pthread_mutex_t ears_desktop_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t ears_desktop_recent_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char ears_desktop_recent_audio[R2_EARS_RECENT_CAPACITY];
+static size_t ears_desktop_recent_length = 0;
+static size_t ears_desktop_recent_write_position = 0;
+static uint64_t ears_desktop_recent_total_bytes = 0;
+static pthread_t ears_desktop_capture_thread;
+static int ears_desktop_capture_thread_started = 0;
 
 static void r2_wav_put_u16(unsigned char *p, uint16_t value)
 {
