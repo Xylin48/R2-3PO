@@ -87,6 +87,7 @@ static pthread_t tv_control_thread;
 static int tv_control_started = 0;
 static int tv_control_fd = -1;
 static atomic_int tv_control_stop = ATOMIC_VAR_INIT(0);
+static atomic_ulong tv_live_video_window = ATOMIC_VAR_INIT(0);
 static char tv_control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 static void *tv_control_server(void *unused)
