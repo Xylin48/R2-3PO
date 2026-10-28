@@ -11675,11 +11675,22 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         transcript = NULL;
         goto cleanup;
     }
-    if (transcript && r2_log_is_initialized())
-        r2_log_sensory("speech_transcribed",
-                       "R2 Ears transcribed a short microphone utterance locally.",
-                       "The transcript is passed into the normal conversation pipeline; raw audio is not persisted.",
-                       "r2_ears_listen");
+    if (transcript && r2_log_is_initialized()) {
+        const char *source = r2_ears_desktop_requested
+            ? "Ears desktop playback" : "Ears microphone";
+        char observation[256];
+        char details[256];
+        snprintf(observation, sizeof(observation),
+                 "R2 deliberately transcribed %s audio locally.",
+                 r2_ears_desktop_requested ? "desktop playback" : "microphone");
+        snprintf(details, sizeof(details),
+                 "source=%s; duration_seconds=%u; mode=%s; "
+                 "transcript handed to the ordinary conversation path; "
+                 "raw audio not persisted.",
+                 r2_ears_desktop_requested ? "desktop" : "microphone",
+                 seconds, r2_ears_recent_requested ? "recent" : "live");
+        r2_log_sensory("speech_transcribed", observation, details, source);
+    }
     if (!transcript && !cancelled)
         fprintf(stderr, "[Ears] Whisper returned no usable transcript. Try speaking clearly and listening again.\n");
 
