@@ -9868,9 +9868,22 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         return NULL;
     }
 
-    char *description = r2_visual_analyze_frame(
-        &frame, event.source_name, question);
+    unsigned char *frame_copy = malloc(frame.size);
+    if (!frame_copy) {
+        pthread_mutex_unlock(&visual_capture_lock);
+        r2_log_sensory("vision_frame_copy_failed",
+                       "R2 could not copy a frame for independent visual analysis.",
+                       "The frame snapshot allocation failed.", event.source_name);
+        return NULL;
+    }
+    memcpy(frame_copy, frame.data, frame.size);
+    frame.data = frame_copy;
+    char source_name[sizeof(event.source_name)];
+    snprintf(source_name, sizeof(source_name), "%s", event.source_name);
     pthread_mutex_unlock(&visual_capture_lock);
+
+    char *description = r2_visual_analyze_frame(&frame, source_name, question);
+    free(frame_copy);
     return description;
 }
 
