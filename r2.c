@@ -10875,7 +10875,37 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         goto cleanup;
 
     pthread_mutex_lock(&ears_capture_lock);
-    if (atomic_load(&ears_capture_running)) {
+    if (r2_ears_desktop_requested) {
+        pthread_mutex_lock(&ears_desktop_capture_lock);
+        if (!atomic_load(&ears_desktop_capture_running)) {
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
+            pthread_mutex_unlock(&ears_capture_lock);
+            fprintf(stderr, "[Ears] No active desktop audio stream to inspect.\n");
+            goto cleanup;
+        }
+        if (r2_ears_recent_requested) {
+            int audio_rc = r2_ears_write_desktop_buffered_audio(total_bytes, wav);
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
+            pthread_mutex_unlock(&ears_capture_lock);
+            if (audio_rc == 0 && !shutting_down &&
+                !(cancelled && cancelled(userdata)) &&
+                r2_ears_write_wav_header(wav, total_bytes) == 0 &&
+                fflush(wav) == 0)
+                capture_ok = 1;
+        } else {
+            pthread_mutex_lock(&ears_desktop_recent_lock);
+            uint64_t start_desktop_total = ears_desktop_recent_total_bytes;
+            pthread_mutex_unlock(&ears_desktop_recent_lock);
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
+            pthread_mutex_unlock(&ears_capture_lock);
+            if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, wav,
+                                                   cancelled, userdata) == 0 &&
+                !shutting_down && !(cancelled && cancelled(userdata)) &&
+                r2_ears_write_wav_header(wav, total_bytes) == 0 &&
+                fflush(wav) == 0)
+                capture_ok = 1;
+        }
+    } else if (atomic_load(&ears_capture_running)) {
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_capture_lock);
