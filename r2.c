@@ -166,6 +166,9 @@ static int vision_watch_thread_started = 0;
 static int query_requests_visual_context(const char *query);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
+static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
+                                        R2VisionEvent *event,
+                                        unsigned char **owned_data);
 
 static pthread_mutex_t db_lock =
     PTHREAD_MUTEX_INITIALIZER;
@@ -10119,56 +10122,70 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
     if (!r2_visual_is_initialized() || !atomic_load(&eyes_auto_allowed))
         return NULL;
-    pthread_mutex_lock(&visual_capture_lock);
 
-    if ((!eyes || !r2_eyes_is_open(eyes)) && open_camera) {
-        if (!eyes || r2_eyes_open_camera(eyes) != 0) {
-            pthread_mutex_unlock(&visual_capture_lock);
-            r2_log_sensory("vision_camera_start_failed",
-                           "R2 could not start a camera for visual analysis.",
-                           "The camera did not open successfully.", "r2_vision");
+    R2VisionFrame frame = {0};
+    R2VisionEvent event = {0};
+    unsigned char *frame_copy = NULL;
+
+    /* A running camera already has a dedicated continuous frame reader.
+       Explicit attention must observe that reader's latest snapshot rather
+       than consume an extra frame behind its back. */
+    if (atomic_load(&vision_watch_running)) {
+        if (r2_vision_copy_watched_frame(&frame, &event, &frame_copy) != 0) {
+            r2_log_sensory("vision_frame_unavailable",
+                           "R2 could not obtain a current camera frame for deliberate attention.",
+                           "The continuous Eyes worker has not published a valid frame.",
+                           "r2_vision");
             return NULL;
         }
+    } else {
+        /* Direct capture is only for an Eyes source without a running watcher. */
+        pthread_mutex_lock(&visual_capture_lock);
+        if ((!eyes || !r2_eyes_is_open(eyes)) && open_camera) {
+            if (!eyes || r2_eyes_open_camera(eyes) != 0) {
+                pthread_mutex_unlock(&visual_capture_lock);
+                r2_log_sensory("vision_camera_start_failed",
+                               "R2 could not start a camera for visual analysis.",
+                               "The camera did not open successfully.", "r2_vision");
+                return NULL;
+            }
+        }
+        if (!eyes || !r2_eyes_is_open(eyes)) {
+            pthread_mutex_unlock(&visual_capture_lock);
+            return NULL;
+        }
+
+        int captured = r2_eyes_capture(eyes);
+        if (captured != 1) {
+            pthread_mutex_unlock(&visual_capture_lock);
+            r2_log_sensory("vision_frame_unavailable",
+                           "R2 could not obtain a new frame for visual analysis.",
+                           captured == 0 ? "The visual stream reached its end." :
+                                           "Eyes returned a frame-capture error.",
+                           "r2_vision");
+            return NULL;
+        }
+        if (r2_eyes_get_frame(eyes, &frame) != 0 ||
+            r2_eyes_get_event(eyes, &event) != 0 ||
+            !frame.data || frame.size == 0) {
+            pthread_mutex_unlock(&visual_capture_lock);
+            return NULL;
+        }
+        frame_copy = malloc(frame.size);
+        if (!frame_copy) {
+            pthread_mutex_unlock(&visual_capture_lock);
+            r2_log_sensory("vision_frame_copy_failed",
+                           "R2 could not copy a frame for independent visual analysis.",
+                           "The frame snapshot allocation failed.", event.source_name);
+            return NULL;
+        }
+        memcpy(frame_copy, frame.data, frame.size);
+        frame.data = frame_copy;
+        pthread_mutex_unlock(&visual_capture_lock);
     }
 
-    if (!eyes || !r2_eyes_is_open(eyes)) {
-        pthread_mutex_unlock(&visual_capture_lock);
-        return NULL;
-    }
-
-    int captured = r2_eyes_capture(eyes);
-    if (captured != 1) {
-        pthread_mutex_unlock(&visual_capture_lock);
-        r2_log_sensory("vision_frame_unavailable",
-                       "R2 could not obtain a new frame for visual analysis.",
-                       captured == 0 ? "The visual stream reached its end." :
-                                       "Eyes returned a frame-capture error.",
-                       "r2_vision");
-        return NULL;
-    }
-
-    R2VisionFrame frame;
-    R2VisionEvent event;
-    if (r2_eyes_get_frame(eyes, &frame) != 0 ||
-        r2_eyes_get_event(eyes, &event) != 0) {
-        pthread_mutex_unlock(&visual_capture_lock);
-        return NULL;
-    }
-
-    unsigned char *frame_copy = malloc(frame.size);
-    if (!frame_copy) {
-        pthread_mutex_unlock(&visual_capture_lock);
-        r2_log_sensory("vision_frame_copy_failed",
-                       "R2 could not copy a frame for independent visual analysis.",
-                       "The frame snapshot allocation failed.", event.source_name);
-        return NULL;
-    }
-    memcpy(frame_copy, frame.data, frame.size);
-    frame.data = frame_copy;
     char source_name[sizeof(event.source_name)];
     snprintf(source_name, sizeof(source_name), "%s", event.source_name);
-    pthread_mutex_unlock(&visual_capture_lock);
-
     char *description = r2_visual_analyze_frame(&frame, source_name, question);
     free(frame_copy);
     return description;
@@ -10387,6 +10404,31 @@ static R2VisionFrame vision_watch_latest_frame;
 static R2VisionEvent vision_watch_latest_event;
 static unsigned char *vision_watch_latest_frame_data = NULL;
 static size_t vision_watch_latest_frame_capacity = 0;
+
+/* The camera reader is the sole owner of live capture. Copy out its latest
+   complete frame under the snapshot lock so analysis cannot race overwrites. */
+static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
+                                        R2VisionEvent *event,
+                                        unsigned char **owned_data)
+{
+    if (!frame || !event || !owned_data) return -1;
+    *owned_data = NULL;
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    if (vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
+        vision_watch_latest_frame.size > 0) {
+        unsigned char *copy = malloc(vision_watch_latest_frame.size);
+        if (copy) {
+            memcpy(copy, vision_watch_latest_frame_data,
+                   vision_watch_latest_frame.size);
+            *frame = vision_watch_latest_frame;
+            frame->data = copy;
+            *event = vision_watch_latest_event;
+            *owned_data = copy;
+        }
+    }
+    pthread_mutex_unlock(&vision_watch_frame_lock);
+    return *owned_data ? 0 : -1;
+}
 
 static void *vision_watch_capture_worker(void *unused)
 {
