@@ -10339,7 +10339,7 @@ int r2_eyes_status(void)
 
 /* Serialize Ears source lifecycle against explicit capture requests. */
 static pthread_mutex_t ears_capture_lock = PTHREAD_MUTEX_INITIALIZER;
-#define R2_EARS_RECENT_SECONDS 15U
+#define R2_EARS_RECENT_SECONDS 16U
 #define R2_EARS_BYTES_PER_SECOND (48000U * 2U * 2U)
 #define R2_EARS_RECENT_CAPACITY ((size_t)R2_EARS_BYTES_PER_SECOND * R2_EARS_RECENT_SECONDS)
 static unsigned char ears_recent_audio[R2_EARS_RECENT_CAPACITY];
@@ -10396,7 +10396,7 @@ static void *r2_ears_capture_worker(void *unused)
     return NULL;
 }
 
-/* Copy recent PCM without consuming or interpreting it. */
+/* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_total,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
@@ -10691,6 +10691,10 @@ int r2_ears_start(void)
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
         pthread_mutex_unlock(&ears_capture_lock);
         return 0;
+    }
+    if (ears_capture_thread_started) {
+        pthread_join(ears_capture_thread, NULL);
+        ears_capture_thread_started = 0;
     }
     int rc = ears ? r2_ears_open_microphone(ears) : -1;
     if (rc == 0) {
