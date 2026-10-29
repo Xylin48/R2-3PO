@@ -102,6 +102,14 @@ int main(void)
     assert(reward_column_exists("reward_totals", "updated_at"));
     assert(reward_column_exists("reward_events", "log_event_id"));
     assert(reward_column_exists("reward_events", "memory_indexed"));
+    assert(reward_column_exists("reward_events", "voluntary_choice"));
+    assert(reward_column_exists("reward_events", "addiction_choice_indexed"));
+    assert(scalar(reward_db,
+        "SELECT voluntary_choice=0 AND addiction_choice_indexed=0 "
+        "FROM reward_events WHERE target='old target'") == 1);
+    assert(scalar(reward_db,
+        "SELECT voluntary_choice=0 AND addiction_choice_indexed=0 "
+        "FROM reward_events WHERE target='new target'") == 1);
     assert(reward_column_exists("reward_once_keys", "created_at"));
     assert(scalar(reward_db, "SELECT updated_at>0 FROM reward_totals WHERE id=1") == 1);
     assert(scalar(reward_db, "SELECT created_at>0 FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
