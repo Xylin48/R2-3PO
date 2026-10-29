@@ -50,15 +50,24 @@ int main(void)
     assert(strcmp(json_object_get_string(json_object_array_get_idx(images, 1)),
                   "LIVE_MEDIA") == 0);
 
-    /* Without physical Eyes, a media-only image is not mislabeled as camera. */
+    /* The second source is independent of the physical camera. R2 can
+       deliberately watch a display even with no current camera frame. */
     assert(ollama_json_append_message(messages, "user", "No eyes", 7,
                                       NULL, "UNATTACHED_MEDIA") == 0);
-    assert(message_images(messages, 2) == NULL);
+    images = message_images(messages, 2);
+    assert(images && json_object_array_length(images) == 1);
+    assert(strcmp(json_object_get_string(json_object_array_get_idx(images, 0)),
+                  "UNATTACHED_MEDIA") == 0);
+
+    /* No visual source is an ordinary text-only turn. */
+    assert(ollama_json_append_message(messages, "user", "Only text", 9,
+                                      NULL, NULL) == 0);
+    assert(message_images(messages, 3) == NULL);
 
     /* Incomplete records must never be appended to the model request. */
     assert(ollama_json_append_message(messages, NULL, "bad", 3,
                                       "CAMERA", "MEDIA") != 0);
-    assert(json_object_array_length(messages) == 3);
+    assert(json_object_array_length(messages) == 4);
     json_object_put(messages);
     puts("Media focus dual-image payload runtime regression passed.");
     return 0;
