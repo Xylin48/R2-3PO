@@ -1065,7 +1065,9 @@ int64_t r2_log_conversation_turn(const char *user_text,
        replacement for the original user/assistant exchange. */
     const size_t user_len = strlen(user_text);
     const size_t assistant_len = strlen(assistant_text);
-    const size_t preview_cap = R2_LOG_MAX_TEXT / 2 - 128;
+    /* A compact event excerpt is useful for queries; it must never be
+       mistaken for the unabridged durable archive. */
+    const size_t preview_cap = 1800;
     const size_t user_preview_len = user_len < preview_cap ? user_len : preview_cap;
     const size_t assistant_preview_len = assistant_len < preview_cap
         ? assistant_len : preview_cap;
@@ -2358,6 +2360,59 @@ static char *query_events(const char *query, int limit)
                 output = NULL;
                 break;
             }
+        }
+
+        /*
+         * Deep recall must expose a bounded excerpt around the *actual*
+         * full-text archive match. Without this, the Life Log might find a
+         * long conversation via its archive yet show only an unrelated first
+         * paragraph from the event preview.
+         */
+        if (query && type &&
+            strcmp((const char *)type, "conversation_turn") == 0) {
+            sqlite3_stmt *archive = NULL;
+            int archive_rc = sqlite3_prepare_v2(log_db,
+                "SELECT "
+                "CASE WHEN instr(lower(user_text),lower(?))>0 "
+                "THEN substr(user_text,MAX(1,instr(lower(user_text),lower(?))-140),420) END, "
+                "CASE WHEN instr(lower(assistant_text),lower(?))>0 "
+                "THEN substr(assistant_text,MAX(1,instr(lower(assistant_text),lower(?))-140),420) END "
+                "FROM r2_log_conversations WHERE event_id=?",
+                -1, &archive, NULL);
+            if (archive_rc == SQLITE_OK)
+                for (int j = 1; j <= 4 && archive_rc == SQLITE_OK; ++j)
+                    archive_rc = sqlite3_bind_text(archive, j, query, -1,
+                                                   SQLITE_TRANSIENT);
+            if (archive_rc == SQLITE_OK)
+                archive_rc = sqlite3_bind_int64(archive, 5, id);
+            if (archive_rc == SQLITE_OK) {
+                archive_rc = sqlite3_step(archive);
+                if (archive_rc == SQLITE_ROW) {
+                    const unsigned char *user_match = sqlite3_column_text(archive, 0);
+                    const unsigned char *assistant_match = sqlite3_column_text(archive, 1);
+                    if (user_match && append_text(&output, &length, &capacity,
+                        "  Matched full user archive excerpt (event_id=%" PRId64 "): %s\n",
+                        id, (const char *)user_match) != 0) {
+                        free(output);
+                        output = NULL;
+                    }
+                    if (output && assistant_match &&
+                        append_text(&output, &length, &capacity,
+                        "  Matched full R2 archive excerpt (event_id=%" PRId64 "): %s\n",
+                        id, (const char *)assistant_match) != 0) {
+                        free(output);
+                        output = NULL;
+                    }
+                } else if (archive_rc != SQLITE_DONE) {
+                    free(output);
+                    output = NULL;
+                }
+            } else {
+                free(output);
+                output = NULL;
+            }
+            sqlite3_finalize(archive);
+            if (!output) break;
         }
 
         if (append_text(&output, &length, &capacity, "\n") != 0) {
