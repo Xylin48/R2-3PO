@@ -453,13 +453,13 @@ static int reward_apply_internal(const char *target, const char *source, int poi
         st = NULL;
     }
     if (rc == SQLITE_OK && apply_once && once_key_exists && once_event_id == 0) {
-        /* Old keys lacked exact IDs. Reconcile when their original creation
-           time identifies exactly one matching reward; preserve ambiguous
-           records rather than inventing a relationship. A key-only legacy
-           row can be completed by writing its missing reward below. */
+        /* Old keys lacked exact IDs. Match the sole historical reward or
+           a uniquely timestamp-matched record; preserve ambiguous multirow
+           history rather than inventing an ID. A key-only legacy row can
+           still be completed by writing its missing reward below. */
         rc = sqlite3_prepare_v2(reward_db,
-            "SELECT COUNT(*),COALESCE(MAX(CASE WHEN occurred_at=? THEN id END),0),"
-            "SUM(CASE WHEN occurred_at=? THEN 1 ELSE 0 END) "
+            "SELECT COUNT(*),COALESCE(MAX(CASE WHEN occurred_at=? THEN id END),MAX(id),0),"
+            "SUM(CASE WHEN occurred_at=? THEN 1 ELSE 0 END) 
             "FROM reward_events WHERE target=? AND source=?",
             -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, once_key_created);
@@ -473,7 +473,11 @@ static int reward_apply_internal(const char *target, const char *source, int poi
                 sqlite3_int64 matching = sqlite3_column_int64(st, 2);
                 if (total == 0) {
                     once_event_id = 0;
-                } else if (once_key_created > 0 && matching == 1) {
+                } else if (total == 1 ||
+                           (once_key_created > 0 && matching == 1)) {
+                    /* Old one-time keys without timestamps can identify a
+                       sole historical event. Multiple candidates still need
+                       an original timestamp to resolve their identity. */
                     once_event_id = sqlite3_column_int64(st, 1);
                 } else {
                     fprintf(stderr,
