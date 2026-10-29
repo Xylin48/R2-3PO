@@ -3399,8 +3399,10 @@ static int ollama_json_append_message(struct json_object *array,
         goto fail;
     content_value = NULL; /* ownership transferred to message */
 
-    if (image_base64 && *image_base64) {
-        /* Image order is stable: real camera first, chosen media second. */
+    if ((image_base64 && *image_base64) ||
+        (media_image_base64 && *media_image_base64)) {
+        /* Image order is stable: real camera first (if available), then
+           R2's independently chosen display. Media need not borrow a camera. */
         struct json_object *images = json_object_new_array();
         if (!images) goto fail;
         const char *sources[2] = {image_base64, media_image_base64};
@@ -4078,10 +4080,11 @@ static char *ollama_chat_with_limit(
             strstr(content, ollama_authoritative_user_query);
         if (i == current_user_index && !strcmp(role, "user") &&
             (active_foreground_turn || ollama_autonomous_sensory_input)) {
-            /* Live Eyes never becomes the movie. Chosen attention may add its
-               separate display as image two on the same model turn. */
+            /* Camera and display are independent real-world inputs. Camera
+               remains first when present; deliberate display attention still
+               works if the camera is unavailable or not connected. */
             owned_image = r2_vision_current_frame_base64();
-            if (owned_image && atomic_load(&media_attention_selected))
+            if (atomic_load(&media_attention_selected))
                 owned_media_image = r2_vision_media_current_frame_base64();
         }
         int append_rc = ollama_json_append_message(
