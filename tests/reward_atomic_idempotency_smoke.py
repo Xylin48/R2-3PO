@@ -23,8 +23,10 @@ require('FROM reward_events WHERE target=? AND source=? LIMIT 1' in body
         "retry must detect and reconstruct a reward row committed by an earlier attempt")
 require("if (duplicate)" in body and "return 1;" in body,
         "already-recorded once events must not increment totals twice")
-require("prior_event.id > 0" in body and "r2_addiction_record_choice" in body,
-        "duplicate retries must repair missing addiction-choice side effects")
+require("reward_deliver_addiction_choice(&prior_event)" in body,
+        "duplicate retries must use durable and idempotent addiction-choice recovery")
+require("prior_event.voluntary_choice = sqlite3_column_int(st, 8)" in body,
+        "retry must recover the original voluntary choice marker from its reward row")
 require('if (rc != SQLITE_OK) return -1;' in body,
         "database failures must propagate to the caller")
 require("static int reward_apply_internal" in source
@@ -33,9 +35,13 @@ require("static int reward_apply_internal" in source
 require('SELECT 1 FROM addiction_events WHERE target=? COLLATE NOCASE ' in
         (Path(__file__).resolve().parents[1] / "Addiction.c").read_text(encoding="utf-8"),
         "reinforcement choice replay must deduplicate by stable reward event details")
-require("if (voluntary_choice && prior_event.id > 0)" in body
-        and "int choice_rc = r2_addiction_record_choice" in body,
-        "retrying an already committed reward must repair its missing addiction-choice side effect")
+require("reward_deliver_addiction_choice(&event)" in body
+        and "addiction_choice_indexed" in source
+        and "voluntary_choice INTEGER NOT NULL DEFAULT 0" in source,
+        "persist original reward intent and mark completed cross-organ delivery")
+require('OR (voluntary_choice=1 AND addiction_choice_indexed=0)' in source
+        and "reward_deliver_addiction_choice(item)" in source,
+        "startup reconciliation must repair pending Addiction events even when Life Log is indexed")
 require("int r2_reward_reconnect_history(" in source
         and "find_existing_log_event(item->id)" in source,
         "reward history reconciliation must remain available after the refactor")
