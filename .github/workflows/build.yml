@@ -431,6 +431,15 @@ jobs:
           /tmp/r2-log-linked-retrieval-smoke
 
 
+      - name: Verify shared sensory/chat identity, unabridged archive, and deep-text recall
+        run: |
+          ROOT=/tmp/r2-chat-sensory-shared-history
+          rm -rf "$ROOT" /tmp/r2-chat-sensory-shared-history-test
+          mkdir -p "$ROOT"
+          FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\\\"$ROOT\\\" -DR2_HOME=\\\"$ROOT\\\" -DR2_WORKSPACE=\\\"$ROOT\\\" -DR2_DIARY_DATABASE=\\\"$ROOT/r2_memory.db\\\" -DR2_DIARY_DIR=\\\"$ROOT/R2_Diary\\\""
+          cc $FLAGS tests/chat_sensory_shared_history_runtime.c Log.c SensoryJournal.c -o /tmp/r2-chat-sensory-shared-history-test -lsqlite3 -lpthread -lm
+          /tmp/r2-chat-sensory-shared-history-test
+
       - name: Exercise writable Life Log migration from a legacy event schema
         run: |
           ROOT=/tmp/r2-log-legacy-schema-smoke
