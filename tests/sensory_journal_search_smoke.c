@@ -209,7 +209,7 @@ int main(void)
     char *oversized = malloc(oversized_length + 1U);
     assert(oversized);
     memset(oversized, 'x', oversized_length);
-    oversized[oversized_length] = '\\0';
+    oversized[oversized_length] = '\0';
     assert(insert_event(db, "Huge journal observation", oversized) == 0);
     sqlite3_int64 giant_id = sqlite3_last_insert_rowid(db);
     free(oversized);
