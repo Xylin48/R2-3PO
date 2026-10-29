@@ -411,9 +411,15 @@ int main(void)
     assert(reward_total() == before_legacy_probe + 1);
     assert(reward_scalar_int("SELECT COUNT(*) FROM pragma_table_info('reward_once_keys') "
                              "WHERE name='created_at';") == 1);
+    /* The old key never had a trustworthy creation timestamp. Preserve
+       that fact, but bind its newly recovered reward row by exact ID. */
     assert(reward_scalar_int("SELECT COUNT(*) FROM reward_once_keys "
                              "WHERE target='legacy-key-target' AND source='legacy-key-source' "
-                             "AND created_at>0;") == 1);
+                             "AND created_at=0 AND reward_event_id IS NOT NULL;") == 1);
+    assert(reward_scalar_int("SELECT COUNT(*) FROM reward_once_keys k "
+                             "JOIN reward_events e ON e.id=k.reward_event_id "
+                             "WHERE k.target='legacy-key-target' "
+                             "AND k.source='legacy-key-source';") == 1);
 
     /* A legacy backlog larger than the page size must be fully reconnected
        in a single pass. Previously, only the first LIMIT rows were visited. */
