@@ -459,7 +459,7 @@ static int reward_apply_internal(const char *target, const char *source, int poi
            still be completed by writing its missing reward below. */
         rc = sqlite3_prepare_v2(reward_db,
             "SELECT COUNT(*),COALESCE(MAX(CASE WHEN occurred_at=? THEN id END),MAX(id),0),"
-            "SUM(CASE WHEN occurred_at=? THEN 1 ELSE 0 END) 
+            "SUM(CASE WHEN occurred_at=? THEN 1 ELSE 0 END) "
             "FROM reward_events WHERE target=? AND source=?",
             -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, once_key_created);
