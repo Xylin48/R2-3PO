@@ -397,13 +397,23 @@ static char *sj_query(const char *query, int limit)
         free(out);
         return NULL;
     }
-    if (out && len == 0)
-        snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
-                                      "The Sensory Journal contains no entries yet.\n");
+    /* A row too large for the bounded viewer is not an empty journal.
+       Always identify an incomplete response; never silently shorten it. */
+    if (out && len == 0 && !intentionally_truncated)
+        snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\\n" :
+                                       "The Sensory Journal contains no entries yet.\\n");
     if (out && intentionally_truncated) {
-        const char *note = "[Sensory Journal output truncated at 2 MiB; remaining entries are still stored.]\n";
+        const char *note = "[Sensory Journal result incomplete at its 2 MiB display limit; "
+                           "no journal rows were deleted. Search more narrowly to inspect "
+                           "remaining or oversized entries.]\\n";
         size_t note_len = strlen(note);
-        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+        if (len + note_len + 1 > cap) {
+            char *grown = realloc(out, len + note_len + 1);
+            if (!grown) { free(out); return NULL; }
+            out = grown;
+            cap = len + note_len + 1;
+        }
+        memcpy(out + len, note, note_len + 1);
     }
     return out;
 }
