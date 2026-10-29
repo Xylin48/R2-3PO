@@ -161,6 +161,20 @@ int main(void)
         "FROM reward_once_keys WHERE target='shared'") == 1);
     assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 6);
 
+    /* A single older reward can be recovered even if its key never had
+       a timestamp: no alternative event identity exists for that pair. */
+    exec_sql(reward_db,
+        "INSERT INTO reward_events(target,source,points,reason,occurred_at,"
+        "modifier,expires_at,log_event_id,memory_indexed) "
+        "VALUES('oldsingle','once',1,'original',90,2,1900,803,1);"
+        "INSERT INTO reward_once_keys(target,source,created_at) "
+        "VALUES('oldsingle','once',0);");
+    assert(r2_reward_apply_once("oldsingle","once",1,"replayed",0) == 1);
+    assert(scalar(reward_db,
+        "SELECT reward_event_id=(SELECT id FROM reward_events WHERE target='oldsingle') "
+        "FROM reward_once_keys WHERE target='oldsingle'") == 1);
+    assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 6);
+
     /* An ancient key with two candidate rewards and no original timestamp
        must not assign its identity to either row or create a third. */
     exec_sql(reward_db,
