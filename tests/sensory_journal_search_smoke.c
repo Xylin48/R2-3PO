@@ -201,6 +201,30 @@ int main(void)
     assert(found && strstr(found, "Diary link: 100"));
     free(found);
 
+    /* Querying an existing row larger than the viewer's 2 MiB limit
+       must never produce a misleading "no matches" result. Its data stays
+       stored for more targeted retrieval, and the omission is explicit. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    size_t oversized_length = 2U * 1024U * 1024U + 500U;
+    char *oversized = malloc(oversized_length + 1U);
+    assert(oversized);
+    memset(oversized, 'x', oversized_length);
+    oversized[oversized_length] = '\\0';
+    assert(insert_event(db, "Huge journal observation", oversized) == 0);
+    sqlite3_int64 giant_id = sqlite3_last_insert_rowid(db);
+    free(oversized);
+    sqlite3_close(db);
+    r2_sj_index_event(giant_id, "sensory", "observation", "smoke-test");
+    found = r2_sj_search("Huge journal observation", 1);
+    assert(found != NULL);
+    assert(strstr(found, "result incomplete at its 2 MiB display limit") != NULL);
+    assert(strstr(found, "No Sensory Journal entries matched.") == NULL);
+    free(found);
+    found = r2_sj_recent(1);
+    assert(found && strstr(found, "result incomplete at its 2 MiB display limit"));
+    assert(!strstr(found, "contains no entries yet"));
+    free(found);
+
     r2_sj_shutdown();
     remove(R2_DIARY_DATABASE);
     snprintf(sidecar, sizeof(sidecar), "%s-wal", R2_DIARY_DATABASE);
