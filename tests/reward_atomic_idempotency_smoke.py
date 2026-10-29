@@ -13,8 +13,8 @@ def require(condition: bool, message: str) -> None:
 
 begin = body.index('sqlite3_exec(reward_db, "BEGIN IMMEDIATE;"')
 key_insert = body.index('INSERT INTO reward_once_keys')
-key_link = body.index('UPDATE reward_once_keys SET reward_event_id=?', event_insert)
 event_insert = body.index('INSERT INTO reward_events')
+key_link = body.index('UPDATE reward_once_keys SET reward_event_id=?', event_insert)
 total_update = body.index('UPDATE reward_totals SET points=points+?')
 commit = body.index('sqlite3_exec(reward_db, "COMMIT;"')
 require(begin < key_insert < event_insert < key_link < total_update < commit,
