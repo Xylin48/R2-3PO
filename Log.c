@@ -1060,23 +1060,31 @@ int64_t r2_log_conversation_turn(const char *user_text,
     if (!valid_text(user_text) || !valid_text(assistant_text))
         return -1;
 
-    size_t user_len = strlen(user_text);
-    size_t assistant_len = strlen(assistant_text);
-    const size_t max_each = R2_LOG_MAX_TEXT / 2 - 128;
-    if (user_len > max_each) user_len = max_each;
-    if (assistant_len > max_each) assistant_len = max_each;
+    /* Life Log event details are a bounded searchable preview. The complete
+       text belongs in r2_log_conversations, never in a silently shortened
+       replacement for the original user/assistant exchange. */
+    const size_t user_len = strlen(user_text);
+    const size_t assistant_len = strlen(assistant_text);
+    const size_t preview_cap = R2_LOG_MAX_TEXT / 2 - 128;
+    const size_t user_preview_len = user_len < preview_cap ? user_len : preview_cap;
+    const size_t assistant_preview_len = assistant_len < preview_cap
+        ? assistant_len : preview_cap;
+    const char *user_note = user_len > user_preview_len
+        ? "\n[Excerpt only: full user text archived under this conversation event ID.]" : "";
+    const char *assistant_note = assistant_len > assistant_preview_len
+        ? "\n[Excerpt only: full R2 reply archived under this conversation event ID.]" : "";
 
-    size_t details_size = user_len + assistant_len + 128;
+    size_t details_size = user_preview_len + assistant_preview_len + 256;
     char *details = malloc(details_size);
     if (!details) return -1;
 
     snprintf(details, details_size,
-             "USER SAID:\n%.*s\nR2 REPLIED:\n%.*s",
-             (int)user_len, user_text,
-             (int)assistant_len, assistant_text);
+             "USER SAID:\n%.*s%s\nR2 REPLIED:\n%.*s%s",
+             (int)user_preview_len, user_text, user_note,
+             (int)assistant_preview_len, assistant_text, assistant_note);
 
     char summary[1024];
-    size_t preview = user_len;
+    size_t preview = user_preview_len;
     if (preview > 800) preview = 800;
     snprintf(summary, sizeof(summary),
              "Conversation turn: %.*s",
@@ -1100,8 +1108,14 @@ int64_t r2_log_conversation_turn(const char *user_text,
         "(event_id,user_text,assistant_text) VALUES(?,?,?);",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, user_text, (int)user_len, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, assistant_text, (int)assistant_len, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text64(statement, 2, user_text,
+                                 (sqlite3_uint64)user_len,
+                                 SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text64(statement, 3, assistant_text,
+                                 (sqlite3_uint64)assistant_len,
+                                 SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     if (rc != SQLITE_DONE)
         fprintf(stderr, "[R2 Life Log] Conversation archive insert failed: %s\n",
@@ -1109,7 +1123,8 @@ int64_t r2_log_conversation_turn(const char *user_text,
     sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
 
-    /* The searchable event remains authoritative if the archive insert fails. */
+    /* The indexed event survives a failed archive insert; unlike a successful
+       full-text archive it may contain only explicitly labeled excerpts. */
     return event_id;
 }
 
@@ -2209,6 +2224,10 @@ static char *query_events(const char *query, int limit)
         "WHERE summary LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' "
         "OR event_type LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' "
         "OR source LIKE ? ESCAPE '\\' "
+        "OR EXISTS (SELECT 1 FROM r2_log_conversations c "
+        "WHERE c.event_id=r2_log_events.id "
+        "AND (c.user_text LIKE ? ESCAPE '\\' "
+        "OR c.assistant_text LIKE ? ESCAPE '\\')) "
         "ORDER BY id DESC LIMIT ?;";
 
     rc = sqlite3_prepare_v2(
@@ -2249,11 +2268,13 @@ static char *query_events(const char *query, int limit)
         pattern[p++] = '%';
         pattern[p] = '\0';
 
-        for (int i = 1; i <= 5 && rc == SQLITE_OK; ++i)
+        /* Also query the full conversation archive so an event remains
+           discoverable by text beyond the bounded Life Log preview. */
+        for (int i = 1; i <= 7 && rc == SQLITE_OK; ++i)
             rc = sqlite3_bind_text(statement, i, pattern, -1, SQLITE_TRANSIENT);
 
         if (rc == SQLITE_OK)
-            rc = sqlite3_bind_int(statement, 6, limit);
+            rc = sqlite3_bind_int(statement, 8, limit);
         free(pattern);
         if (rc != SQLITE_OK) {
             sqlite3_finalize(statement);
