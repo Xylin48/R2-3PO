@@ -400,12 +400,12 @@ static char *sj_query(const char *query, int limit)
     /* A row too large for the bounded viewer is not an empty journal.
        Always identify an incomplete response; never silently shorten it. */
     if (out && len == 0 && !intentionally_truncated)
-        snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\\n" :
-                                       "The Sensory Journal contains no entries yet.\\n");
+        snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
+                                       "The Sensory Journal contains no entries yet.\n");
     if (out && intentionally_truncated) {
         const char *note = "[Sensory Journal result incomplete at its 2 MiB display limit; "
                            "no journal rows were deleted. Search more narrowly to inspect "
-                           "remaining or oversized entries.]\\n";
+                           "remaining or oversized entries.]\n";
         size_t note_len = strlen(note);
         if (len + note_len + 1 > cap) {
             char *grown = realloc(out, len + note_len + 1);
