@@ -387,6 +387,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/reward_legacy_schema_smoke.c -o /tmp/r2-reward-legacy-schema-smoke-test -lsqlite3 -lpthread -lm
           /tmp/r2-reward-legacy-schema-smoke-test
 
+      - name: Exercise durable Reward-to-Addiction delivery and crash recovery
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/reward_addiction_replay_runtime.c -o /tmp/r2-reward-addiction-replay-test -lsqlite3 -lpthread -lm
+          /tmp/r2-reward-addiction-replay-test
+
       - name: Exercise physical money wallet authority and restart behavior
         run: |
           ROOT=/tmp/r2-wallet-smoke
