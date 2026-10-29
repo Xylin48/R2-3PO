@@ -417,3 +417,19 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - **Area:** `r2.c` explicit Whisper listening results and sensory Life Log, independent microphone and desktop Ears sources.
 - **Evidence:** the same Whisper bridge accepts `desktop_live` and `desktop_recent` as well as microphone modes, but its success event always said a microphone utterance was transcribed. That contradicted actual source provenance in R2's persistent experience history.
 - **Fix:** the sensory event now states whether audio came from the microphone or desktop playback, its live/recent mode and requested duration, without persisting raw PCM or forcing automatic transcription. `tests/ears_dual_attention_wiring_smoke.py` asserts the source-specific event handling.
+
+
+### R2-AUD-2026-10-29-019 — Ordinary Reward falsely recognized as a completed once-only reward
+
+- **Area:** `Reward.c` idempotent reinforcement, `r2_rewards.db`, cross-organ Addiction replay.
+- **Finding:** `r2_reward_apply_once(target,source,...)` found its purported prior event using `SELECT ... FROM reward_events WHERE target=? AND source=? LIMIT 1`. That query ignored the `reward_once_keys` ledger entirely. An earlier *ordinary*, non-idempotent reward with the same target/source could make a later genuine one-time reward return "already applied", attach to the wrong event, and misattribute any voluntary Addiction reinforcement.
+- **Fix:** add a nullable `reward_event_id` column to the existing once-key table with an additive migration, without destroying old reward rows or keys. Under one `BEGIN IMMEDIATE` transaction, newly created one-time keys are bound to the actual inserted reward event ID before commit. A retry identifies its reward **only through that key's exact event ID** and verifies the target/source pair; arbitrary ordinary rows can no longer act as one-time keys. For pre-ID keys, a sole historical candidate or a uniquely creation-time-matched candidate can be linked; key-only legacy rows can complete a missing event. Multirow ambiguous old histories with no distinct timestamp return an explicit error rather than silently choosing an arbitrary row. Old unknown key creation times remain unknown rather than being overwritten with today's date.
+- **Regressions:** `tests/reward_addiction_replay_runtime.c` now verifies ordinary-then-once behavior, retry, exact key ID, restart, single-row pre-ID migration, ambiguous multirow preservation and completion of a key-only old transaction. `tests/reward_legacy_schema_smoke.c` asserts new additive field without alteration of existing data; `tests/reward_atomic_idempotency_smoke.py` checks key/event/total write ordering.
+- **Caveat:** original identity in genuinely ambiguous pre-ID once-keys cannot be reconstructed with certainty from their old schema; R2 preserves such rows for explicit review instead of fabricating history.
+
+### R2-AUD-2026-10-29-020 — Oversized Sensory Journal output could falsely report empty history
+
+- **Area:** `SensoryJournal.c` read-only recent/search serialization and `tests/sensory_journal_search_smoke.c`.
+- **Finding:** an existing record exceeding the Journal's 2 MiB display ceiling set `intentionally_truncated` while `len == 0`, then returned "No Sensory Journal entries matched" (or "no entries yet"). Near the response-buffer boundary the truncation note could be omitted entirely. Neither outcome reflects persistent SQLite contents.
+- **Fix:** never emit empty-history assertions on truncated results; always append an explicit incomplete-result notice, growing just the response buffer needed to show it. Preserve the existing bounded UI view and every original journal row rather than pretending the entire result was returned.
+- **Regression:** compiled Journal search fixture inserts and indexes a real oversized sensory row and checks both search and recent output for an honest incomplete marker and absence of false empty-history claims.
