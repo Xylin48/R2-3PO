@@ -92,6 +92,7 @@ int main(void)
                                 "R2 made a deliberate reading choice", 1) == 0);
     assert(delivery_attempts == 1 && choice_events == 0);
     assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_events") == 1);
+    assert(scalar(reward_db, "SELECT reward_event_id=(SELECT id FROM reward_events LIMIT 1) FROM reward_once_keys") == 1);
     assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 3);
     assert(scalar(reward_db, "SELECT voluntary_choice FROM reward_events") == 1);
     assert(scalar(reward_db, "SELECT addiction_choice_indexed FROM reward_events") == 0);
@@ -131,7 +132,8 @@ int main(void)
     exec_sql(reward_db,
         "INSERT INTO reward_events(target,source,points,reason,occurred_at,"
         "modifier,expires_at,log_event_id,memory_indexed) "
-        "VALUES('legacy','once',2,'prior version',100,4,1900,800,1)");
+        "VALUES('legacy','once',2,'prior version',100,4,1900,800,1);"
+        "INSERT INTO reward_once_keys(target,source,created_at) VALUES('legacy','once',100);");
     assert(scalar(reward_db,
         "SELECT voluntary_choice FROM reward_events WHERE target='legacy'") == 0);
     assert(r2_reward_apply_once("legacy", "once", 2,
@@ -143,6 +145,47 @@ int main(void)
         "SELECT COUNT(*) FROM reward_events WHERE target='legacy'") == 1);
     assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 3);
     assert(choice_events == 2);
+    assert(scalar(reward_db,
+        "SELECT reward_event_id=(SELECT id FROM reward_events WHERE target='legacy') "
+        "FROM reward_once_keys WHERE target='legacy'") == 1);
+
+    /* Ordinary rewards are not one-time keys. The same target/source can
+       have an ordinary reward followed by exactly one idempotent reward. */
+    assert(r2_reward_apply("shared","source",1,"ordinary event",0) == 0);
+    assert(r2_reward_apply_once("shared","source",2,"one-time event",0) == 0);
+    assert(r2_reward_apply_once("shared","source",2,"repeated once",0) == 1);
+    assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_events WHERE target='shared'") == 2);
+    assert(scalar(reward_db,
+        "SELECT reward_event_id=(SELECT id FROM reward_events "
+        "WHERE target='shared' AND reason='one-time event') "
+        "FROM reward_once_keys WHERE target='shared'") == 1);
+    assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 6);
+
+    /* An ancient key with two candidate rewards and no original timestamp
+       must not assign its identity to either row or create a third. */
+    exec_sql(reward_db,
+        "INSERT INTO reward_events(target,source,points,reason,occurred_at,"
+        "modifier,expires_at,log_event_id,memory_indexed) VALUES"
+        "('ambiguous','once',1,'first',101,2,1900,801,1),"
+        "('ambiguous','once',2,'second',102,4,1900,802,1);"
+        "INSERT INTO reward_once_keys(target,source,created_at)"
+        "VALUES('ambiguous','once',0);");
+    assert(r2_reward_apply_once("ambiguous","once",3,"cannot guess",0) == -1);
+    assert(scalar(reward_db,
+        "SELECT COUNT(*) FROM reward_events WHERE target='ambiguous'") == 2);
+    assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 6);
+
+    /* An interrupted old key-only write has no event to claim. Create
+       exactly one, attach its precise ID, and preserve existing key row. */
+    exec_sql(reward_db,
+        "INSERT INTO reward_once_keys(target,source,created_at) "
+        "VALUES('unfinished','once',0)");
+    assert(r2_reward_apply_once("unfinished","once",1,"complete old key",0) == 0);
+    assert(r2_reward_apply_once("unfinished","once",1,"do not duplicate",0) == 1);
+    assert(scalar(reward_db,
+        "SELECT reward_event_id=(SELECT id FROM reward_events "
+        "WHERE target='unfinished') FROM reward_once_keys WHERE target='unfinished'") == 1);
+    assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 7);
     r2_reward_shutdown();
     puts("Reward-to-Addiction crash replay, legacy intent upgrade and no duplicate choices passed.");
     return 0;
