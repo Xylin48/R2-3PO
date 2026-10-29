@@ -111,8 +111,13 @@ int main(void)
         "SELECT voluntary_choice=0 AND addiction_choice_indexed=0 "
         "FROM reward_events WHERE target='new target'") == 1);
     assert(reward_column_exists("reward_once_keys", "created_at"));
+    assert(reward_column_exists("reward_once_keys", "reward_event_id"));
     assert(scalar(reward_db, "SELECT updated_at>0 FROM reward_totals WHERE id=1") == 1);
-    assert(scalar(reward_db, "SELECT created_at>0 FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
+    /* A pre-timestamp legacy key's original time is unknown. Do not replace
+       zero with today's date and pretend it identifies a historic event. */
+    assert(scalar(reward_db, "SELECT created_at=0 FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
+    assert(scalar(reward_db, "SELECT reward_event_id IS NULL FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
+    assert(scalar(reward_db, "SELECT reward_event_id IS NOT NULL FROM reward_once_keys WHERE target='once target' AND source='once source'") == 1);
     assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
     assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_once_keys WHERE target='once target' AND source='once source'") == 1);
 
