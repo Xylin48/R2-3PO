@@ -68,12 +68,14 @@ serializer = core[core.index("static int ollama_json_append_message("):
 assert "const char *media_image_base64" in serializer
 assert "const char *sources[2] = {image_base64, media_image_base64};" in serializer
 assert 'json_object_object_add(message, "images", images) != 0' in serializer
-assert "if (image_base64 && *image_base64)" in serializer
+assert "if ((image_base64 && *image_base64) ||" in serializer
+assert "(media_image_base64 && *media_image_base64))" in serializer
 
 turn = core[core.index("size_t ordered_count = r2_order_inference_messages("):
             core.index("free(message_order);", core.index("size_t ordered_count = r2_order_inference_messages("))]
 assert "owned_image = r2_vision_current_frame_base64()" in turn
-assert "if (owned_image && atomic_load(&media_attention_selected))" in turn
+assert "if (atomic_load(&media_attention_selected))" in turn
+assert "if (owned_image && atomic_load(&media_attention_selected))" not in turn
 assert "owned_media_image = r2_vision_media_current_frame_base64()" in turn
 assert "limits[i], owned_image, owned_media_image)" in turn
 assert "free(owned_media_image);" in turn and "free(owned_image);" in turn
