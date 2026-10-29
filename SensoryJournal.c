@@ -293,7 +293,12 @@ static char *sj_query(const char *query, int limit)
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
         "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
-        "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
+        "OR e.source LIKE ? ESCAPE '!' "
+        "OR EXISTS (SELECT 1 FROM r2_log_conversations c "
+        "WHERE c.event_id=e.id "
+        "AND (c.user_text LIKE ? ESCAPE '!' "
+        "OR c.assistant_text LIKE ? ESCAPE '!')) "
+        "ORDER BY e.id DESC LIMIT ?;";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(sj_db, query ? sql_search : sql_recent, -1, &st, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&sj_lock);
@@ -321,9 +326,9 @@ static char *sj_query(const char *query, int limit)
         pat[pat_len++] = '%';
         pat[pat_len] = '\0';
         int bind_rc = SQLITE_OK;
-        for (int i = 1; i <= 5 && bind_rc == SQLITE_OK; ++i)
+        for (int i = 1; i <= 7 && bind_rc == SQLITE_OK; ++i)
             bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 6, limit);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 8, limit);
         free(pat);
         if (bind_rc != SQLITE_OK) {
             sqlite3_finalize(st);
