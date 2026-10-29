@@ -12,15 +12,22 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(f"FAIL: {message}")
 
 begin = body.index('sqlite3_exec(reward_db, "BEGIN IMMEDIATE;"')
-key_insert = body.index('INSERT OR IGNORE INTO reward_once_keys')
+key_insert = body.index('INSERT INTO reward_once_keys')
+key_link = body.index('UPDATE reward_once_keys SET reward_event_id=?')
 event_insert = body.index('INSERT INTO reward_events')
 total_update = body.index('UPDATE reward_totals SET points=points+?')
 commit = body.index('sqlite3_exec(reward_db, "COMMIT;"')
-require(begin < key_insert < event_insert < total_update < commit,
-        "once-key, reward row, total, and commit must share one transaction")
-require('FROM reward_events WHERE target=? AND source=? LIMIT 1' in body
+require(begin < key_insert < event_insert < key_link < total_update < commit,
+        "once-key, exact reward ID, total, and commit must share one transaction")
+require('FROM reward_once_keys WHERE target=? AND source=?' in body
+        and 'FROM reward_events WHERE id=? AND target=? AND source=?' in body
         and 'prior_event.id = sqlite3_column_int64(st, 0)' in body,
-        "retry must detect and reconstruct a reward row committed by an earlier attempt")
+        "only exact one-time keys may identify completed rewards, not ordinary same-name rows")
+require('reward_event_id INTEGER' in source
+        and 'ALTER TABLE reward_once_keys ADD COLUMN reward_event_id INTEGER' in source,
+        "additive migration must preserve exact key/event relationships")
+require("ambiguous reward history" in body and "rc = SQLITE_CONSTRAINT" in body,
+        "legacy keys without resolvable event IDs must not fabricate a relationship")
 require("if (duplicate)" in body and "return 1;" in body,
         "already-recorded once events must not increment totals twice")
 require("reward_deliver_addiction_choice(&prior_event)" in body,
