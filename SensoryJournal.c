@@ -299,8 +299,30 @@ static char *sj_query(const char *query, int limit)
         "AND (c.user_text LIKE ? ESCAPE '!' "
         "OR c.assistant_text LIKE ? ESCAPE '!')) "
         "ORDER BY e.id DESC LIMIT ?;";
+    /* Standalone/legacy Sensory Journal databases may predate Log's
+       conversation archive table (or its additive column migrations).
+       Deep chat recall is available when those authoritative fields exist;
+       otherwise preserve literal search of already indexed journal events. */
+    const int archive_available = query &&
+        sj_column_exists("r2_log_conversations", "event_id") &&
+        sj_column_exists("r2_log_conversations", "user_text") &&
+        sj_column_exists("r2_log_conversations", "assistant_text");
+    const char *sql_search_legacy =
+        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
+        "e.details,e.source,CASE WHEN "
+        "e.event_type IN ('diary_entry_written','reflection_completed') "
+        "AND (SELECT COUNT(*) FROM diary_entries match_row "
+        "WHERE match_row.entry=e.details)<>1 "
+        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
+        "JOIN r2_log_events e ON e.id=j.event_id "
+        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
+        "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
+        "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
+        "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(sj_db, query ? sql_search : sql_recent, -1, &st, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(sj_db,
+            !query ? sql_recent : archive_available ? sql_search : sql_search_legacy,
+            -1, &st, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&sj_lock);
         return NULL;
     }
@@ -326,9 +348,11 @@ static char *sj_query(const char *query, int limit)
         pat[pat_len++] = '%';
         pat[pat_len] = '\0';
         int bind_rc = SQLITE_OK;
-        for (int i = 1; i <= 7 && bind_rc == SQLITE_OK; ++i)
+        int search_columns = archive_available ? 7 : 5;
+        for (int i = 1; i <= search_columns && bind_rc == SQLITE_OK; ++i)
             bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 8, limit);
+        if (bind_rc == SQLITE_OK)
+            bind_rc = sqlite3_bind_int(st, search_columns + 1, limit);
         free(pat);
         if (bind_rc != SQLITE_OK) {
             sqlite3_finalize(st);
