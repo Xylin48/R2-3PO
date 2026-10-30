@@ -18,18 +18,25 @@ class Model(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        text = next(m['content'] for m in request['messages'] if m['role'] == 'user')
+        users = [m['content'] for m in request['messages'] if m['role'] == 'user']
+        text = users[-1]
         index = len(requests)
         requests.append(text)
         expected = [
-            ('LATEST USER MESSAGE:', 'CHAT_EVIDENCE_TAIL', 'CHAT_RESPONSE_TAIL', 'TOOL_OUTCOME_TAIL', 'Evaluate only this exchange.'),
+            ('LATEST USER MESSAGE:', 'CHAT_EVIDENCE_TAIL', 'CHAT_RESPONSE_TAIL', 'ASR_DEEP_TAIL_🌼', 'Evaluate only this exchange.'),
             ('RECORDED REFLECTION CONTEXT', 'SENSORY_EVIDENCE_TAIL', 'REFLECTION_RESPONSE_TAIL', 'Evaluate only this recorded experience and reflection.'),
             ('RECORDED REFLECTION CONTEXT', 'NOTHING_NEW', 'No new conclusion.', 'Evaluate only this recorded experience and reflection.'),
+            ('HISTORY_CURRENT',),
         ]
         if index >= len(expected) or not all(x in text for x in expected[index]):
             errors.append(f'Unexpected evaluation payload {index}')
+        if index == 0:
+            if request['options']['num_ctx'] <= 16384 or 'a' * 72000 not in text:
+                errors.append('Full long sensory evidence did not reach an expanded request')
+        if index == 3 and len(request['messages']) != 22:
+            errors.append('Fitting history was lost to a fixed turn count')
         result = ['preference | I prefer quiet music.',
-                  '  knowledge  | I noticed the displayed flower opened.\n', 'NONE'][min(index, 2)]
+                  '  knowledge  | I noticed the displayed flower opened.\n', 'NONE', 'HISTORY_RESPONSE'][min(index, 3)]
         body = json.dumps({'message': {'role': 'assistant', 'content': result}, 'done': True}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -43,7 +50,7 @@ thread.start()
 try:
     env = dict(os.environ, R2_OLLAMA_BASE_URL='http://127.0.0.1:11435', R2_OLLAMA_NUM_CTX='16384')
     subprocess.run([sys.argv[1]], env=env, check=True, timeout=60)
-    assert len(requests) == 3, len(requests)
+    assert len(requests) == 4, len(requests)
     assert not errors, errors
 finally:
     server.shutdown()

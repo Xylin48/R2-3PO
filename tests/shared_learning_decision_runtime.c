@@ -33,6 +33,14 @@ int main(void)
         assert(strcmp(input + strlen(input) - strlen(suffix), suffix) == 0);
         free(input);
     }
+    Message long_active = { "user", original, 0, 0 };
+    int expanded = r2_ollama_context_for_input(&long_active, 1, "policy", 128, 4096);
+    assert(expanded > 4096);
+    assert((size_t)(expanded - 128 - 512) * 32U / 10U >= strlen(original) + 2006U);
+    Message tools[2] = {{"user", "Short question", 0, 0}, {"user", original, 0, 1}};
+    assert(r2_ollama_context_for_input(tools, 2, "policy", 128, 4096) > 4096);
+    Message small = { "user", "Short question", 0, 0 };
+    assert(r2_ollama_context_for_input(&small, 1, "policy", 128, 32768) == 32768);
     free(original);
 
     assert(mkdir(R2_ROOT, 0755) == 0 || errno == EEXIST);
@@ -63,15 +71,12 @@ int main(void)
     int64_t full_tool = r2_log_event(R2_LOG_CONVERSATION, "conversation_tool_result",
         "Complete long tool result", tool_output, "r2_talk");
     assert(full_tool > 0);
-    char *full_evidence = build_turn_learning_evidence("original typed message", full_tool);
+    char *full_evidence = build_turn_learning_evidence("CHAT_EVIDENCE_TAIL", full_tool);
     assert(full_evidence && strstr(full_evidence, recognized));
-    free(full_evidence); free(tool_output);
+    free(tool_output);
     free(recognized); free(read_back);
-    int64_t tool = r2_log_event(R2_LOG_CONVERSATION, "conversation_tool_result",
-        "Chosen audio observation result", "REAL EARS RESULT: TOOL_OUTCOME_TAIL", "r2_talk");
-    assert(tool > 0);
-    char *evidence = build_turn_learning_evidence("CHAT_EVIDENCE_TAIL", tool);
-    assert(evidence && strstr(evidence, "TOOL_OUTCOME_TAIL"));
+    char *evidence = full_evidence;
+    assert(evidence && strstr(evidence, "ASR_DEEP_TAIL_🌼"));
     assert(build_turn_learning_evidence("user", INT64_MAX) == NULL);
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     int64_t chat = r2_log_conversation_turn("CHAT_EVIDENCE_TAIL", "CHAT_RESPONSE_TAIL");
@@ -86,6 +91,16 @@ int main(void)
     learn_from_recorded_experience("NOTHING_NEW", "No new conclusion.", reflection, 1);
     assert(scalar("SELECT count(*) FROM memories") == before);
     assert(scalar("SELECT count(*) FROM r2_log_links WHERE relationship='supports_memory'") == 2);
+    /* More than sixteen complete turns fit when the actual context permits. */
+    Message history[21] = {0};
+    for (int i = 0; i < 20; ++i) {
+        history[i].role = (i % 2) ? "assistant" : "user";
+        history[i].content = (i % 2) ? "OLDER_ANSWER" : "OLDER_QUESTION";
+    }
+    history[20].role = "user"; history[20].content = "HISTORY_CURRENT";
+    char *history_reply = ollama_chat_with_limit(history, 21, "History test.", 128, 30L);
+    assert(history_reply && !strcmp(history_reply, "HISTORY_RESPONSE"));
+    free(history_reply);
     r2_sj_shutdown();
     r2_log_shutdown();
     sqlite3_close(db); db = NULL;

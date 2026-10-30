@@ -142,8 +142,8 @@ require(
 )
 require(
     "#define OLLAMA_MAX_SYSTEM_TOTAL_CHARS 42000" in core
-    and "#define OLLAMA_MAX_TOTAL_CHARS 48000" in core
-    and "#define OLLAMA_MAX_RECENT_MESSAGES 16" in core,
+    and "r2_ollama_context_for_input(msgs, count, system_override" in core
+    and "OLLAMA_MAX_RECENT_MESSAGES" not in core,
     "the payload window is expanded so the larger retrieval budget can actually reach the model",
 )
 print("R2 associative retrieval smoke test passed.")

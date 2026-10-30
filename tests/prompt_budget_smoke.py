@@ -17,13 +17,11 @@ def macro(name: str) -> int:
 
 per_message = macro("OLLAMA_MAX_SYSTEM_MESSAGE_CHARS")
 system_total = macro("OLLAMA_MAX_SYSTEM_TOTAL_CHARS")
-history_total = macro("OLLAMA_MAX_TOTAL_CHARS")
 if per_message > 24000 or per_message < 23000:
     raise SystemExit(f"System message cap must preserve the complete pinned prompt: {per_message}")
 if system_total > 42000 or system_total < 40000:
     raise SystemExit(f"Aggregate system context cap must preserve identity and live context: {system_total}")
-if history_total > 48000 or history_total < 46000:
-    raise SystemExit(f"Bounded total history cap should remain finite but preserve the full prompt: {history_total}")
+
 
 start = core.find("static const char *SYSTEM_PROMPT =")
 end = core.find(";\n", start)
@@ -53,8 +51,8 @@ for required in (
 # constrained context, identity, live Reality, current-turn retrieval, and the
 # relevant capability section each get an explicit share.
 for required in (
-    "size_t max_user_reserve = input_budget > 1500",
-    "current_user_reserve > max_user_reserve",
+    "r2_ollama_context_for_input(msgs, count, system_override",
+    "current_user_reserve += tool_length;",
     "static R2SystemContextBudget r2_compute_system_context_budget(",
     "budget.reality_reserve = share + (remainder > 1 ? 1 : 0);",
     "budget.identity_budget = share + (remainder > 0 ? 1 : 0);",
@@ -103,12 +101,10 @@ if boundary_choice < 0 or utf8_alignment <= boundary_choice:
 
 def allocation_for_context(num_ctx: int, num_predict: int, override_length: int,
                            current_user_reserve: int = 1500) -> tuple[int, int, int, int, int, int, int, int]:
+    required_chars = override_length + max(1500, current_user_reserve) + 2000
+    required_tokens = (required_chars * 10 + 31) // 32 + num_predict + 512
+    num_ctx = max(num_ctx, (required_tokens + 1023) // 1024 * 1024)
     input_budget = (num_ctx - num_predict - 512) * 32 // 10
-    input_budget = min(input_budget, history_total)
-    max_user_reserve = (
-        input_budget - 1500 if input_budget > 1500 else input_budget // 2
-    )
-    current_user_reserve = min(current_user_reserve, max_user_reserve)
     system_budget = (
         input_budget - current_user_reserve - 500
         if input_budget > current_user_reserve + 500 else 0
@@ -154,14 +150,13 @@ for num_ctx, num_predict, override_length, requested_user_reserve in (
     if input_budget > 1500 and system_budget < 1000:
         raise SystemExit(f"Long current turn starved system context at context={num_ctx}")
 
-# An oversized override is clipped to the available system budget; no allocation
-# may exceed the context even when the override is longer than the whole budget.
+# A long contract grows the request context and leaves room for other sources.
 system_budget, override, identity, reality, retrieval, capabilities, _, _ = (
     allocation_for_context(2048, 384, 12000, 1500)
 )
-if override != system_budget or any((identity, reality, retrieval, capabilities)):
-    raise SystemExit("Oversized conversation contract must be clipped to the system budget")
+if override != 12000 or not all((identity, reality, retrieval, capabilities)):
+    raise SystemExit("Context growth must retain the complete contract and other source allocations")
 print(
     f"system prompt budget smoke passed: prompt={len(prompt)} chars, "
-    f"per-message={per_message}, aggregate-system={system_total}, history={history_total}"
+    f"per-message={per_message}, aggregate-system={system_total}, history=request-context-derived"
 )

@@ -41,11 +41,8 @@
 #define MIN_MEMORY_KEYWORD_LENGTH 3
 
 /* Bound prompts for local Qwen 3.5 9B: preserve the active turn and useful memory within RAM headroom. */
-#define OLLAMA_MAX_RECENT_MESSAGES 16
-#define OLLAMA_MAX_MESSAGE_CHARS 12000
 #define OLLAMA_MAX_SYSTEM_MESSAGE_CHARS 24000
 #define OLLAMA_MAX_SYSTEM_TOTAL_CHARS 42000
-#define OLLAMA_MAX_TOTAL_CHARS 48000
 #define OLLAMA_MAX_RESPONSE_BYTES (16U * 1024U * 1024U)
 
 
@@ -3037,9 +3034,9 @@ int r2_ollama_context_tokens(void)
         long requested = strtol(configured, &end, 10);
         if (!errno && end != configured && *end == '\0' &&
             requested >= 2048 && requested <= 16384) {
-            /* A configured context is the requested runtime context, not just
-               a ceiling. Keep it identical to the context tested by launcher
-               preflight; RAM-based sizing applies only when it is unspecified. */
+            /* Keep the configured baseline tested by launcher preflight.
+               Per-request sizing may grow it for complete active evidence;
+               RAM-based baseline selection applies only when unspecified. */
             safe_max = (int)requested;
             context_is_configured = 1;
         } else {
@@ -3523,6 +3520,48 @@ static int ollama_response_contract_valid(const char *role, int done)
     return role && strcmp(role, "assistant") == 0 && done == 1;
 }
 
+/* Grow the request's context allocation for complete active evidence. Use
+   the same character/token estimate as the serializer, including output and
+   protocol overhead; baseline host configuration remains the starting size. */
+static int r2_ollama_context_for_input(const Message *msgs, size_t count,
+                                      const char *system_override,
+                                      int num_predict, int baseline)
+{
+    size_t required_chars = system_override ? strlen(system_override) : 0;
+    size_t current = SIZE_MAX;
+    for (size_t i = count; i > 0; --i) {
+        if (msgs[i - 1].role && !strcmp(msgs[i - 1].role, "user") &&
+            !msgs[i - 1].internal_tool_result) { current = i - 1; break; }
+    }
+    size_t active_chars = 1500;
+    if (current != SIZE_MAX) {
+        size_t current_chars = strlen(msgs[current].content ? msgs[current].content : "");
+        if (current_chars > active_chars) active_chars = current_chars;
+        for (size_t i = current + 1; i < count; ++i) {
+            if (!msgs[i].internal_tool_result) continue;
+            size_t n = strlen(msgs[i].content ? msgs[i].content : "");
+            if (n > SIZE_MAX - active_chars) return -1;
+            active_chars += n;
+        }
+    }
+    if (active_chars > SIZE_MAX - required_chars ||
+        active_chars + required_chars > SIZE_MAX - 2000) return -1;
+    required_chars += active_chars + 2000;
+    /* Divide before multiplying so a large allocation request cannot wrap. */
+    size_t input_tokens = required_chars / 32U * 10U +
+        ((required_chars % 32U) * 10U + 31U) / 32U;
+    size_t output_tokens = num_predict > 0 ? (size_t)num_predict
+        : baseline >= 12288 ? 2048U : 1024U;
+    if (input_tokens > INT_MAX - 1023U - 512U ||
+        output_tokens > (size_t)INT_MAX - 1023U - 512U - input_tokens) return -1;
+    size_t required_tokens = input_tokens + output_tokens + 512U;
+    if (required_tokens <= (size_t)baseline) return baseline;
+    int expanded = (int)((required_tokens + 1023U) / 1024U * 1024U);
+    fprintf(stderr, "[R2 Ollama] Context allocation expanded from %d to %d tokens for complete active evidence.\n",
+            baseline, expanded);
+    return expanded;
+}
+
 static char *ollama_chat_with_limit(
     Message *msgs,
     size_t count,
@@ -3557,7 +3596,9 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
-    int num_ctx = r2_ollama_context_tokens();
+    int num_ctx = r2_ollama_context_for_input(msgs, count, system_override,
+                                               num_predict, r2_ollama_context_tokens());
+    if (num_ctx < 0) { json_object_put(root); return NULL; }
     /* Foreground reasoning needs room for both internal deliberation and the
        final answer. Keep generation inside the active context so input-budget
        arithmetic below cannot underflow on a small adaptive context. */
@@ -3588,8 +3629,6 @@ static char *ollama_chat_with_limit(
             prompt_chars = OLLAMA_MAX_SYSTEM_MESSAGE_CHARS;
         size_t query_chars = ollama_authoritative_user_query
             ? strlen(ollama_authoritative_user_query) : 0;
-        if (query_chars > OLLAMA_MAX_MESSAGE_CHARS)
-            query_chars = OLLAMA_MAX_MESSAGE_CHARS;
         if (query_chars < 1500)
             query_chars = 1500;
         size_t required_chars = prompt_chars + query_chars + 1500;
@@ -3684,12 +3723,9 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
-    /*
-     * Old pinned archive turns can be very large. Keep system messages,
-     * plus the newest conversational turns, and cap each message/total
-     * payload. The full history remains in R2's own memory and Life Log;
-     * this is only the bounded inference window sent to Ollama.
-     */
+    /* Select context using the actual request window. Complete active input
+       is reserved first; older whole turns use remaining space. Durable
+       history remains available independently of this inference selection. */
     unsigned char *include = count ? calloc(count, 1) : NULL;
     size_t *limits = count ? calloc(count, sizeof(*limits)) : NULL;
     if (count && (!include || !limits)) {
@@ -3706,8 +3742,6 @@ static char *ollama_chat_with_limit(
      * and count the extra system override which is serialized separately.
      */
     size_t input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
-    if (input_budget > OLLAMA_MAX_TOTAL_CHARS)
-        input_budget = OLLAMA_MAX_TOTAL_CHARS;
     /*
      * Explicitly reserve the newest user turn before selecting recent history.
      * Tool-result and assistant messages may follow that turn during an action
@@ -3788,8 +3822,6 @@ static char *ollama_chat_with_limit(
     size_t current_user_reserve = 1500;
     if (authoritative_query && *authoritative_query) {
         size_t query_length = strlen(authoritative_query);
-        if (query_length > OLLAMA_MAX_MESSAGE_CHARS)
-            query_length = OLLAMA_MAX_MESSAGE_CHARS;
         if (query_length > current_user_reserve)
             current_user_reserve = query_length;
     } else if (current_user_index != SIZE_MAX) {
@@ -3804,23 +3836,26 @@ static char *ollama_chat_with_limit(
             begin += strlen(begin_marker);
             current_length = (size_t)(end - begin);
         }
-        if (current_length > OLLAMA_MAX_MESSAGE_CHARS)
-            current_length = OLLAMA_MAX_MESSAGE_CHARS;
         if (current_length > current_user_reserve)
             current_user_reserve = current_length;
     }
 
-    /*
-     * A very long current turn cannot fit in every adaptive context, but it
-     * must never cause the fallback to allocate the entire input window to
-     * system messages. Keep at least 1000 characters for system context plus
-     * the existing 500-character safety margin when the window permits it.
-     */
-    size_t max_user_reserve = input_budget > 1500
-        ? input_budget - 1500 : input_budget / 2;
-    if (current_user_reserve > max_user_reserve)
-        current_user_reserve = max_user_reserve;
-
+    /* Reserve complete active input and this turn's actual tool outcomes
+       before allocating the remaining inference window to system/history. */
+    if (current_user_index != SIZE_MAX) {
+        size_t active_length = strlen(msgs[current_user_index].content
+            ? msgs[current_user_index].content : "");
+        if (active_length > current_user_reserve) current_user_reserve = active_length;
+        for (size_t i = current_user_index + 1; i < count; ++i) {
+            if (!msgs[i].internal_tool_result) continue;
+            size_t tool_length = strlen(msgs[i].content ? msgs[i].content : "");
+            if (tool_length > SIZE_MAX - current_user_reserve) {
+                free(include); free(limits); json_object_put(arr); json_object_put(root);
+                return NULL;
+            }
+            current_user_reserve += tool_length;
+        }
+    }
     size_t system_budget = input_budget > current_user_reserve + 500
         ? input_budget - current_user_reserve - 500 : 0;
     if (system_budget > OLLAMA_MAX_SYSTEM_TOTAL_CHARS)
@@ -3953,48 +3988,37 @@ static char *ollama_chat_with_limit(
         }
     }
 
-    size_t recent_count = 0;
     /*
-     * Include the current user turn first, even if later tool-result messages
-     * would otherwise push it outside the newest-message count. Its content
-     * is capped exactly like every other message and remains inside the same
-     * serialized input budget.
+     * Include the complete current input first; recent history uses only the
+     * remaining real context allocation, with no fixed message-count ceiling.
      */
     if (current_user_index != SIZE_MAX && total_chars < input_budget) {
         const char *content = msgs[current_user_index].content
             ? msgs[current_user_index].content : "";
         size_t length = strlen(content);
-        if (length > OLLAMA_MAX_MESSAGE_CHARS)
-            length = r2_utf8_safe_prefix_length(
-                content, OLLAMA_MAX_MESSAGE_CHARS);
         size_t remaining = input_budget - total_chars;
         if (length > remaining) length = r2_utf8_safe_prefix_length(content, remaining);
         if (length > 0) {
             include[current_user_index] = 1;
             limits[current_user_index] = length;
             total_chars += length;
-            recent_count = 1;
         }
     }
 
-    for (size_t i = count; i > 0 && recent_count < OLLAMA_MAX_RECENT_MESSAGES; --i) {
+    for (size_t i = count; i > 0; --i) {
         size_t index = i - 1;
         if (include[index]) continue;
         /* System messages were already handled under the explicit priority budget. */
         if (msgs[index].role && !strcmp(msgs[index].role, "system")) continue;
         const char *content = msgs[index].content ? msgs[index].content : "";
         size_t length = strlen(content);
-        if (length > OLLAMA_MAX_MESSAGE_CHARS)
-            length = r2_utf8_safe_prefix_length(
-                content, OLLAMA_MAX_MESSAGE_CHARS);
         if (total_chars >= input_budget) break;
         size_t remaining = input_budget - total_chars;
-        if (length > remaining) length = r2_utf8_safe_prefix_length(content, remaining);
+        if (length > remaining) continue;
         if (length == 0) continue;
         include[index] = 1;
         limits[index] = length;
         total_chars += length;
-        ++recent_count;
     }
 
     /*
@@ -13001,7 +13025,7 @@ int r2_conversation(void)
     if (!core_initialized)
         return -1;
 
-    char *line = malloc((size_t)OLLAMA_MAX_MESSAGE_CHARS + 2U);
+    char *line = malloc((size_t)MAX_LIVE_MESSAGE_BYTES + 2U);
     if (!line) {
         fprintf(stderr, "[R2] Could not allocate bounded conversation input buffer.\n");
         return -1;
@@ -13016,7 +13040,7 @@ int r2_conversation(void)
         errno = 0;
         size_t input_bytes = 0;
         R2InputLineStatus input_status =
-            r2_read_bounded_line(stdin, line, OLLAMA_MAX_MESSAGE_CHARS,
+            r2_read_bounded_line(stdin, line, MAX_LIVE_MESSAGE_BYTES,
                                  &input_bytes);
         if (input_status == R2_INPUT_LINE_EOF)
             break;
@@ -13030,11 +13054,11 @@ int r2_conversation(void)
         }
         if (input_status == R2_INPUT_LINE_TOO_LONG) {
             fprintf(stderr,
-                    "[R2] Direct conversation input exceeded the %d-byte limit.\n",
-                    OLLAMA_MAX_MESSAGE_CHARS);
-            printf("\nR2-3PO: That message is too long for one turn (%d-byte limit). "
+                    "[R2] Direct conversation input exceeded the %zu-byte limit.\n",
+                    (size_t)MAX_LIVE_MESSAGE_BYTES);
+            printf("\nR2-3PO: That message is too long for one turn (%zu-byte limit). "
                    "Nothing from it was sent; please split it into smaller messages.\n\n",
-                   OLLAMA_MAX_MESSAGE_CHARS);
+                   (size_t)MAX_LIVE_MESSAGE_BYTES);
             fflush(stdout);
             continue;
         }
