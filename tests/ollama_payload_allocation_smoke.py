@@ -35,9 +35,9 @@ require("if (role_value) json_object_put(role_value);" in helper
         and "if (message) json_object_put(message);" in helper,
         "partial JSON objects are cleaned up on failure")
 
-call = source.find("int append_rc = ollama_json_append_message(")
+call = source.find("int append_rc = ollama_json_append_visual_source_map(")
 if call < 0:
-    raise SystemExit("FAIL: serializer loop does not use checked message helper")
+    raise SystemExit("FAIL: serializer loop does not check visual source-map allocation")
 loop_end = source.find("\n        }\n    }\n    free(message_order);", call)
 if loop_end < 0:
     raise SystemExit("FAIL: could not isolate the complete message serialization loop")

@@ -3512,6 +3512,27 @@ static size_t r2_safe_prompt_prefix_length(const char *content,
     return r2_utf8_safe_prefix_length(content, cap);
 }
 
+/* An image array alone cannot distinguish media-only input from primary
+   Eyes. Supply source identity next to the actual current images, without
+   rewriting the original user message or interpreting any pixels. */
+static int ollama_json_append_visual_source_map(struct json_object *array,
+                                                const char *primary,
+                                                const char *media)
+{
+    int has_primary = primary && *primary;
+    int has_media = media && *media;
+    if (!has_primary && !has_media) return 0;
+    const char *map = has_primary
+        ? has_media
+            ? "CURRENT IMAGE SOURCE MAP (following user message only):\n"
+              "Image 1: primary Eyes input.\nImage 2: separate media display."
+            : "CURRENT IMAGE SOURCE MAP (following user message only):\n"
+              "Image 1: primary Eyes input. No separate media image is attached."
+        : "CURRENT IMAGE SOURCE MAP (following user message only):\n"
+          "Image 1: separate media display. No primary Eyes frame is attached.";
+    return ollama_json_append_message(array, "system", map, strlen(map), NULL, NULL);
+}
+
 /* Ollama's non-streaming /api/chat contract must represent one complete
    assistant turn. Keep this predicate isolated so malformed-response cases
    can be exercised without a live model server. */
@@ -4113,8 +4134,11 @@ static char *ollama_chat_with_limit(
             if (atomic_load(&media_attention_selected))
                 owned_media_image = r2_vision_media_current_frame_base64();
         }
-        int append_rc = ollama_json_append_message(
-            arr, role, content, limits[i], owned_image, owned_media_image);
+        int append_rc = ollama_json_append_visual_source_map(
+            arr, owned_image, owned_media_image);
+        if (append_rc == 0)
+            append_rc = ollama_json_append_message(
+                arr, role, content, limits[i], owned_image, owned_media_image);
         free(owned_media_image);
         free(owned_image);
         if (append_rc != 0) {

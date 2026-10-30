@@ -68,6 +68,24 @@ int main(void)
     assert(ollama_json_append_message(messages, NULL, "bad", 3,
                                       "CAMERA", "MEDIA") != 0);
     assert(json_object_array_length(messages) == 4);
+    /* Source identity travels with the actual images; a display-only first
+       image must not be mistaken for primary camera Eyes. */
+    struct json_object *maps = json_object_new_array();
+    assert(maps);
+    assert(ollama_json_append_visual_source_map(maps, "CAMERA", "MEDIA") == 0);
+    assert(ollama_json_append_visual_source_map(maps, NULL, "MEDIA") == 0);
+    assert(ollama_json_append_visual_source_map(maps, "CAMERA", NULL) == 0);
+    assert(ollama_json_append_visual_source_map(maps, NULL, NULL) == 0);
+    assert(json_object_array_length(maps) == 3);
+    struct json_object *map_text = NULL;
+    assert(json_object_object_get_ex(json_object_array_get_idx(maps, 0), "content", &map_text));
+    assert(strstr(json_object_get_string(map_text), "Image 2: separate media display"));
+    assert(json_object_object_get_ex(json_object_array_get_idx(maps, 1), "content", &map_text));
+    assert(strstr(json_object_get_string(map_text), "Image 1: separate media display"));
+    assert(strstr(json_object_get_string(map_text), "No primary Eyes frame"));
+    assert(json_object_object_get_ex(json_object_array_get_idx(maps, 2), "content", &map_text));
+    assert(strstr(json_object_get_string(map_text), "Image 1: primary Eyes input"));
+    json_object_put(maps);
     json_object_put(messages);
     puts("Media focus dual-image payload runtime regression passed.");
     return 0;
