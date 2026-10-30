@@ -166,6 +166,9 @@ int64_t r2_log_world_event(
 int r2_log_system_snapshot(const char *reason);
 
 
+/* Exact original event details; malloc-owned, NULL on missing event/read error. */
+char *r2_log_read_details(int64_t event_id);
+
 /* Full conversation record, including exact user and assistant text. */
 int64_t r2_log_conversation_turn(const char *user_text,
                                 const char *assistant_text);

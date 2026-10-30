@@ -1081,31 +1081,23 @@ static char *visual_query(const char *sql, const char *query, int limit)
         const unsigned char *model = sqlite3_column_text(st, 2);
         const unsigned char *desc = sqlite3_column_text(st, 3);
         const unsigned char *path = sqlite3_column_text(st, 4);
-        char line[8192];
-        int n = snprintf(line, sizeof(line), "[%s] source=%s model=%s image=%s\n%s\n\n",
+        char *line = NULL;
+        int n = asprintf(&line, "[%s] source=%s model=%s image=%s\n%s\n\n",
             created ? (const char *)created : "?",
             source ? (const char *)source : "?",
             model ? (const char *)model : "?",
             path ? (const char *)path : "?",
             desc ? (const char *)desc : "(no description)");
-        if (n < 0) {
-            failed = 1;
-            break;
-        }
-
+        if (n < 0) { failed = 1; break; }
         size_t add = (size_t)n;
-        if (add >= sizeof(line)) add = sizeof(line) - 1;
         if (add > SIZE_MAX - b.length - 1) {
-            failed = 1;
-            break;
+            free(line); failed = 1; break;
         }
         char *next = realloc(b.data, b.length + add + 1);
-        if (!next) {
-            failed = 1;
-            break;
-        }
+        if (!next) { free(line); failed = 1; break; }
         b.data = next;
         memcpy(b.data + b.length, line, add);
+        free(line);
         b.length += add;
         b.data[b.length] = '\0';
     }

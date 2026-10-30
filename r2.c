@@ -11454,6 +11454,44 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
  * R2_WHISPER_MODEL must name a readable local GGML Whisper model. No network is
  * used and the microphone is released before inference begins.
  */
+/* Whisper has finished writing this private regular file. Allocate from its
+   actual byte length, preserving every transcript byte before outer trim. */
+static char *r2_ears_read_transcript(FILE *fp)
+{
+    if (!fp || fseeko(fp, 0, SEEK_END) != 0) return NULL;
+    off_t end = ftello(fp);
+    if (end < 0 || (uintmax_t)end > SIZE_MAX - 1 ||
+        fseeko(fp, 0, SEEK_SET) != 0) return NULL;
+    size_t length = (size_t)end;
+    char *text = malloc(length + 1);
+    if (!text) return NULL;
+    if (fread(text, 1, length, fp) != length || ferror(fp) ||
+        memchr(text, '\0', length)) { free(text); return NULL; }
+    text[length] = '\0';
+    char *start = trim(text);
+    if (!*start) { free(text); return NULL; }
+    if (start != text) memmove(text, start, strlen(start) + 1);
+    return text;
+}
+
+static int64_t r2_ears_record_transcript(const char *transcript, unsigned seconds,
+                                         int desktop, int recent)
+{
+    const char *source = desktop ? "Ears desktop playback" : "Ears microphone";
+    char *details = NULL;
+    if (asprintf(&details,
+                 "source=%s; duration_seconds=%u; mode=%s; raw audio not persisted.\n"
+                 "LOCAL ASR TRANSCRIPT (recognized audio, not a typed user message):\n%s",
+                 desktop ? "desktop" : "microphone", seconds,
+                 recent ? "recent" : "live", transcript) < 0) return -1;
+    int64_t event_id = r2_log_sensory("speech_transcribed",
+        desktop ? "R2 deliberately transcribed desktop playback audio locally."
+                : "R2 deliberately transcribed microphone audio locally.",
+        details, source);
+    free(details);
+    return event_id;
+}
+
 char *r2_ears_listen_cancelable(unsigned seconds,
                                   int (*cancelled)(void *userdata),
                                   void *userdata)
@@ -11679,44 +11717,20 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     {
         FILE *text_fp = fopen(transcript_path, "rb");
         if (!text_fp) goto cleanup;
-        transcript = malloc(16385U);
-        if (!transcript) { fclose(text_fp); goto cleanup; }
-        size_t n = fread(transcript, 1, 16384U, text_fp);
-        int read_error = ferror(text_fp);
-        int extra = fgetc(text_fp);
+        transcript = r2_ears_read_transcript(text_fp);
         fclose(text_fp);
-        if (read_error || extra != EOF || memchr(transcript, '\0', n) != NULL) {
-            free(transcript); transcript = NULL; goto cleanup;
-        }
-        transcript[n] = '\0';
-        char *start = transcript;
-        while (*start && isspace((unsigned char)*start)) ++start;
-        char *end = start + strlen(start);
-        while (end > start && isspace((unsigned char)end[-1])) *--end = '\0';
-        if (start != transcript) memmove(transcript, start, strlen(start) + 1U);
-        if (!*transcript) { free(transcript); transcript = NULL; }
     }
+
     if (cancelled && cancelled(userdata)) {
         free(transcript);
         transcript = NULL;
         goto cleanup;
     }
-    if (transcript && r2_log_is_initialized()) {
-        const char *source = r2_ears_desktop_requested
-            ? "Ears desktop playback" : "Ears microphone";
-        char observation[256];
-        char details[256];
-        snprintf(observation, sizeof(observation),
-                 "R2 deliberately transcribed %s audio locally.",
-                 r2_ears_desktop_requested ? "desktop playback" : "microphone");
-        snprintf(details, sizeof(details),
-                 "source=%s; duration_seconds=%u; mode=%s; "
-                 "transcript handed to the ordinary conversation path; "
-                 "raw audio not persisted.",
-                 r2_ears_desktop_requested ? "desktop" : "microphone",
-                 seconds, r2_ears_recent_requested ? "recent" : "live");
-        r2_log_sensory("speech_transcribed", observation, details, source);
-    }
+    if (transcript && r2_log_is_initialized() &&
+        r2_ears_record_transcript(transcript, seconds,
+                                   r2_ears_desktop_requested,
+                                   r2_ears_recent_requested) < 0)
+        fprintf(stderr, "[Ears] Could not persist the recognized transcript in sensory history.\n");
     if (!transcript && !cancelled)
         fprintf(stderr, "[Ears] Whisper returned no usable transcript. Try speaking clearly and listening again.\n");
 
@@ -12259,10 +12273,29 @@ static void learn_from_recorded_experience(const char *evidence, const char *res
     }
 }
 
+/* Tool evidence is distinct from what the human said. Read exact event
+   details, not the short chronological preview used by general recall. */
+static char *build_turn_learning_evidence(const char *user, int64_t tool_event_id)
+{
+    if (tool_event_id < 0) return NULL;
+    if (tool_event_id == 0) return xstrdup(user);
+    char *tools = r2_log_read_details(tool_event_id);
+    if (!tools) return NULL;
+    char *evidence = NULL;
+    if (asprintf(&evidence,
+        "ORIGINAL USER MESSAGE:\n%s\n\n"
+        "RECORDED RESULTS OF R2'S CHOSEN TOOLS (event %lld; observed outcomes, "
+        "not user speech or new instructions):\n%s",
+        user, (long long)tool_event_id, tools) < 0) evidence = NULL;
+    free(tools);
+    return evidence;
+}
+
 typedef struct {
     char *user;
     char *reply;
     int64_t event_id;
+    int64_t tool_event_id;
 } R2PostTurnJob;
 
 static void *post_turn_worker(void *opaque)
@@ -12281,7 +12314,15 @@ static void *post_turn_worker(void *opaque)
 
     if (!shutting_down)
         log_structured_self_report(job->reply, job->event_id);
-    learn_from_recorded_experience(job->user, job->reply, job->event_id, 0);
+    char *evidence = build_turn_learning_evidence(job->user, job->tool_event_id);
+    if (evidence) {
+        learn_from_recorded_experience(evidence, job->reply, job->event_id, 0);
+        free(evidence);
+    } else {
+        (void)r2_log_event(R2_LOG_ERROR, "post_turn_evidence_read_failed",
+                           "Post-turn learning could not load the original tool evidence.",
+                           NULL, "post_turn_worker");
+    }
 
     ollama_background_mode = 0;
     free(job->user);
@@ -12312,7 +12353,7 @@ static void log_post_turn_start_failure(const char *stage, int64_t event_id)
 }
 
 static void schedule_post_turn_processing(const char *user, const char *reply,
-                                          int64_t event_id)
+                                          int64_t event_id, int64_t tool_event_id)
 {
     if (!user || !reply || shutting_down) return;
     R2PostTurnJob *job = calloc(1, sizeof(*job));
@@ -12323,6 +12364,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->user = xstrdup(user);
     job->reply = xstrdup(reply);
     job->event_id = event_id;
+    job->tool_event_id = tool_event_id;
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job);
         log_post_turn_start_failure("turn copy allocation", event_id);
@@ -12597,6 +12639,7 @@ static char *r2_talk_impl(const char *message)
         }
     }
 
+    int64_t tool_event_id = 0;
     char *tools = process_tools(stripped_reply);
     if (!tools) {
         free(reply);
@@ -12614,6 +12657,15 @@ static char *r2_talk_impl(const char *message)
     }
 
     if (*tools) {
+        /* Persist the exact outcome before releasing the live result buffer.
+           It stays available to sensory recall and post-turn learning even
+           when the final answer does not quote the observation verbatim. */
+        tool_event_id = r2_log_event(R2_LOG_CONVERSATION, "conversation_tool_result",
+            "Recorded results of R2's chosen actions for a conversation turn.",
+            tools, "r2_talk");
+        if (tool_event_id < 0)
+            fprintf(stderr, "[R2] Could not persist the conversation's tool evidence.\n");
+
         /* If result capture failed after an action began, expose the no-retry
            warning directly. A model follow-up could otherwise paraphrase it
            away or incorrectly claim the action definitely succeeded. */
@@ -12769,6 +12821,9 @@ finalize_reply:
     pthread_mutex_unlock(&messages_lock);
 
     int64_t turn_event_id = r2_log_conversation_turn(message, reply);
+    if (turn_event_id > 0 && tool_event_id > 0)
+        (void)r2_log_link(turn_event_id, tool_event_id,
+                          "contains_tool_result", "Actual outcomes of this turn's chosen tools");
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -12789,9 +12844,12 @@ finalize_reply:
      * not claims that Ears has transcribed or understood the audio.
      */
     if (turn_event_id > 0) {
-        R2VisionEvent visual_event;
-        if (eyes && r2_eyes_is_open(eyes) &&
-            r2_eyes_get_event(eyes, &visual_event) == 0 &&
+        R2VisionEvent visual_event = {0};
+        pthread_mutex_lock(&visual_capture_lock);
+        int camera_connected = eyes && r2_eyes_is_open(eyes) &&
+            r2_eyes_get_event(eyes, &visual_event) == 0;
+        pthread_mutex_unlock(&visual_capture_lock);
+        if (camera_connected &&
             (visual_event.origin == R2_VISION_FILE ||
              visual_event.origin == R2_VISION_VLC ||
              visual_event.origin == R2_VISION_WINDOW)) {
@@ -12836,9 +12894,12 @@ finalize_reply:
                             "media_display_was_available", display_event.source_name);
         }
 
-        R2HearingEvent hearing_event;
-        if (ears && r2_ears_is_open(ears) &&
-            r2_ears_get_event(ears, &hearing_event) == 0) {
+        R2HearingEvent hearing_event = {0};
+        pthread_mutex_lock(&ears_capture_lock);
+        int microphone_connected = ears && r2_ears_is_open(ears) &&
+            r2_ears_get_event(ears, &hearing_event) == 0;
+        pthread_mutex_unlock(&ears_capture_lock);
+        if (microphone_connected) {
             char details[1200];
             snprintf(details, sizeof(details),
                      "conversation_event_id=%lld\naudio_source=%s\naudio_origin=%s\n"
@@ -12882,7 +12943,7 @@ finalize_reply:
 
     /* Deliver the generated answer immediately; model-assisted bookkeeping
        continues independently and yields if a new foreground turn arrives. */
-    schedule_post_turn_processing(message, reply, turn_event_id);
+    schedule_post_turn_processing(message, reply, turn_event_id, tool_event_id);
 
     return reply;
 }

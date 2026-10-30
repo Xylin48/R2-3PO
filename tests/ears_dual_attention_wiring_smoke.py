@@ -33,10 +33,16 @@ assert "r2_ears_write_buffered_audio" in listen
 assert "r2_ears_write_recent_audio" in listen
 assert "r2_ears_open_microphone(ears)" in listen
 # The Life Log must not mistake desktop playback for microphone perception.
-assert 'r2_ears_desktop_requested ? "Ears desktop playback" : "Ears microphone"' in " ".join(listen.split())
-assert 'r2_ears_desktop_requested ? "desktop" : "microphone"' in listen
-assert 'r2_ears_recent_requested ? "recent" : "live"' in listen
-assert 'r2_log_sensory("speech_transcribed", observation, details, source)' in listen
+record_start = core.index("static int64_t r2_ears_record_transcript(")
+record_end = core.index("char *r2_ears_listen_cancelable(", record_start)
+record = core[record_start:record_end]
+assert 'desktop ? "Ears desktop playback" : "Ears microphone"' in record
+assert 'desktop ? "desktop" : "microphone"' in record
+assert 'recent ? "recent" : "live"' in record
+assert 'r2_log_sensory("speech_transcribed"' in record
+assert 'r2_ears_record_transcript(transcript, seconds,' in listen
+assert 'r2_ears_desktop_requested,' in listen and 'r2_ears_recent_requested)' in listen
+assert 'LOCAL ASR TRANSCRIPT' in record
 assert "short microphone utterance locally" not in listen
 parser_start = core.index("static char *r2_process_ears_listen_request(")
 parser_end = core.index("static char *process_tools_with_status(", parser_start)

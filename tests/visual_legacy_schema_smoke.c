@@ -73,6 +73,23 @@ int main(void)
         assert(strcmp((const char *)sqlite3_column_text(st, i), expected) == 0);
     }
     sqlite3_finalize(st);
+    /* Retrieval must preserve an observation beyond the old 8 KiB row
+       buffer, including UTF-8 and the exact deep search match. */
+    size_t long_n = 24000;
+    char *long_desc = malloc(long_n + 100);
+    assert(long_desc);
+    memset(long_desc, 'v', long_n);
+    strcpy(long_desc + long_n, "VISUAL_DEEP_TAIL_🌼_100%!");
+    assert(visual_insert_compat("2026-10-30T07:00:00Z", "Eyes",
+        "/new/long.jpg", "qwen3.5:9b", NULL, long_desc,
+        640, 480, 8, 123457, 0) == SQLITE_DONE);
+    visual_initialized = 1;
+    char *found = r2_visual_recent(1);
+    assert(found && strstr(found, long_desc)); free(found);
+    found = r2_visual_search("VISUAL_DEEP_TAIL_🌼_100%!", 5);
+    assert(found && strstr(found, long_desc)); free(found);
+    visual_initialized = 0;
+    free(long_desc);
     assert(sqlite3_close(visual_db) == SQLITE_OK);
     visual_db = NULL;
     assert(unlink(path) == 0);

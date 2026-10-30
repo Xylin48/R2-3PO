@@ -103,6 +103,7 @@ int main(void)
     free(found);
     found = r2_sj_search(tail_reply, 5);
     assert(found && contains(found, "conversation_turn"));
+    assert(contains(found, tail_reply) && contains(found, tail_user));
     free(found);
     found = r2_sj_search("oak leaves in daylight", 5);
     assert(found && contains(found, "chosen_visual_observation"));
@@ -119,6 +120,22 @@ int main(void)
     assert(contains(details, "Excerpt only: full R2 reply archived"));
     assert(!contains(details, tail_user));
     sqlite3_finalize(q);
+    sqlite3_close(db);
+    /* Archive failure rolls back the event as well; no false success ID,
+       orphan event, or journal projection may claim a complete turn. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER fail_archive BEFORE INSERT ON r2_log_conversations "
+        "BEGIN SELECT RAISE(ABORT,'injected archive write failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_conversation_turn("ATOMIC_FAILURE_SENTINEL", "reply") < 0);
+    assert(r2_sj_count() == 2);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM r2_log_events WHERE summary LIKE '%ATOMIC_FAILURE_SENTINEL%'",
+        -1, &q, NULL) == SQLITE_OK);
+    assert(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 0);
+    sqlite3_finalize(q);
+    assert(sqlite3_exec(db, "DROP TRIGGER fail_archive;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
     r2_sj_shutdown();
     r2_log_shutdown();

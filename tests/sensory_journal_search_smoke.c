@@ -201,9 +201,8 @@ int main(void)
     assert(found && strstr(found, "Diary link: 100"));
     free(found);
 
-    /* Querying an existing row larger than the viewer's 2 MiB limit
-       must never produce a misleading "no matches" result. Its data stays
-       stored for more targeted retrieval, and the omission is explicit. */
+    /* Allocate a complete result for an existing row larger than the old
+       2 MiB display ceiling; preserve the full record, not an omission note. */
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
     size_t oversized_length = 2U * 1024U * 1024U + 500U;
     char *oversized = malloc(oversized_length + 1U);
@@ -212,18 +211,33 @@ int main(void)
     oversized[oversized_length] = '\0';
     assert(insert_event(db, "Huge journal observation", oversized) == 0);
     sqlite3_int64 giant_id = sqlite3_last_insert_rowid(db);
-    free(oversized);
     sqlite3_close(db);
     r2_sj_index_event(giant_id, "sensory", "observation", "smoke-test");
     found = r2_sj_search("Huge journal observation", 1);
     assert(found != NULL);
-    assert(strstr(found, "result incomplete at its 2 MiB display limit") != NULL);
+    assert(strstr(found, oversized) != NULL);
     assert(strstr(found, "No Sensory Journal entries matched.") == NULL);
     free(found);
     found = r2_sj_recent(1);
-    assert(found && strstr(found, "result incomplete at its 2 MiB display limit"));
+    assert(found && strstr(found, oversized));
+    free(oversized);
     assert(!strstr(found, "contains no entries yet"));
     free(found);
+
+    /* Searches sharing the first 1024 bytes must still be distinct. */
+    char long_query[1402];
+    memset(long_query, 'Q', 1400);
+    long_query[1400] = 'A'; long_query[1401] = '\0';
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(insert_event(db, "Long exact search", long_query) == 0);
+    sqlite3_int64 query_id = sqlite3_last_insert_rowid(db);
+    sqlite3_close(db);
+    r2_sj_index_event(query_id, "sensory", "observation", "smoke-test");
+    found = r2_sj_search(long_query, 1);
+    assert(found && strstr(found, "Long exact search")); free(found);
+    long_query[1400] = 'B';
+    found = r2_sj_search(long_query, 1);
+    assert(found && strstr(found, "No Sensory Journal entries matched.")); free(found);
 
     r2_sj_shutdown();
     remove(R2_DIARY_DATABASE);

@@ -272,94 +272,58 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
 
-    const char *sql_recent =
-        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,CASE WHEN "
-        "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (SELECT COUNT(*) FROM diary_entries match_row "
-        "WHERE match_row.entry=e.details)<>1 "
-        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
-        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "ORDER BY e.id DESC LIMIT ?;";
-    const char *sql_search =
-        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,CASE WHEN "
-        "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (SELECT COUNT(*) FROM diary_entries match_row "
-        "WHERE match_row.entry=e.details)<>1 "
-        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
-        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
-        "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
-        "OR e.source LIKE ? ESCAPE '!' "
-        "OR EXISTS (SELECT 1 FROM r2_log_conversations c "
-        "WHERE c.event_id=e.id "
-        "AND (c.user_text LIKE ? ESCAPE '!' "
-        "OR c.assistant_text LIKE ? ESCAPE '!')) "
-        "ORDER BY e.id DESC LIMIT ?;";
-    /* Standalone/legacy Sensory Journal databases may predate Log's
-       conversation archive table (or its additive column migrations).
-       Deep chat recall is available when those authoritative fields exist;
-       otherwise preserve literal search of already indexed journal events. */
-    const int archive_available = query &&
+    /* Older standalone journals need not have the chat archive table. Keep
+       one query shape and join complete original chat text when available. */
+    const int archive_available =
         sj_column_exists("r2_log_conversations", "event_id") &&
         sj_column_exists("r2_log_conversations", "user_text") &&
         sj_column_exists("r2_log_conversations", "assistant_text");
-    const char *sql_search_legacy =
+    const char *select =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
         "e.details,e.source,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (SELECT COUNT(*) FROM diary_entries match_row "
         "WHERE match_row.entry=e.details)<>1 "
-        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
-        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
-        "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
-        "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(sj_db,
-            !query ? sql_recent : archive_available ? sql_search : sql_search_legacy,
-            -1, &st, NULL) != SQLITE_OK) {
+        "THEN NULL ELSE d.diary_entry_id END,";
+    const char *joins =
+        " FROM r2_sensory_journal j JOIN r2_log_events e ON e.id=j.event_id "
+        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id ";
+    /* instr treats %, _ and ! literally and does not impose LIKE's pattern
+       length limit. Bind the complete original query without shortening it. */
+    const char *where = query
+        ? " WHERE instr(lower(e.summary),lower(?1))>0 "
+          "OR instr(lower(e.details),lower(?1))>0 "
+          "OR instr(lower(e.event_type),lower(?1))>0 "
+          "OR instr(lower(j.journal_kind),lower(?1))>0 "
+          "OR instr(lower(e.source),lower(?1))>0 "
+        : "";
+    char *sql = NULL;
+    if (asprintf(&sql, "%s%s%s%s%s%s ORDER BY e.id DESC LIMIT ?%d;",
+                 select, archive_available ? "c.user_text,c.assistant_text" : "NULL,NULL",
+                 joins, archive_available
+                     ? "LEFT JOIN r2_log_conversations c ON c.event_id=e.id " : "",
+                 where, query && archive_available
+                     ? "OR instr(lower(c.user_text),lower(?1))>0 "
+                       "OR instr(lower(c.assistant_text),lower(?1))>0 " : "",
+                 query ? 2 : 1) < 0) {
         pthread_mutex_unlock(&sj_lock);
         return NULL;
     }
-    if (query) {
-        size_t n = strlen(query);
-        if (n > 1024) n = 1024;
-        /* Treat user search text literally: LIKE's %, _, and our escape
-           character must not silently broaden the requested search. */
-        if (n > ((size_t)-1 - 3) / 2) {
-            sqlite3_finalize(st);
-            pthread_mutex_unlock(&sj_lock);
-            return NULL;
-        }
-        char *pat = malloc(n * 2 + 3);
-        if (!pat) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
-        size_t pat_len = 0;
-        pat[pat_len++] = '%';
-        for (size_t i = 0; i < n; ++i) {
-            if (query[i] == '%' || query[i] == '_' || query[i] == '!')
-                pat[pat_len++] = '!';
-            pat[pat_len++] = query[i];
-        }
-        pat[pat_len++] = '%';
-        pat[pat_len] = '\0';
-        int bind_rc = SQLITE_OK;
-        int search_columns = archive_available ? 7 : 5;
-        for (int i = 1; i <= search_columns && bind_rc == SQLITE_OK; ++i)
-            bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        if (bind_rc == SQLITE_OK)
-            bind_rc = sqlite3_bind_int(st, search_columns + 1, limit);
-        free(pat);
-        if (bind_rc != SQLITE_OK) {
-            sqlite3_finalize(st);
-            pthread_mutex_unlock(&sj_lock);
-            return NULL;
-        }
-    } else if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
+    sqlite3_stmt *st = NULL;
+    int prepare_rc = sqlite3_prepare_v2(sj_db, sql, -1, &st, NULL);
+    free(sql);
+    if (prepare_rc != SQLITE_OK) {
+        pthread_mutex_unlock(&sj_lock);
+        return NULL;
+    }
+    int bind_rc = SQLITE_OK;
+    if (query)
+        bind_rc = sqlite3_bind_text64(st, 1, query,
+                                      (sqlite3_uint64)strlen(query),
+                                      SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (bind_rc == SQLITE_OK)
+        bind_rc = sqlite3_bind_int(st, query ? 2 : 1, limit);
+    if (bind_rc != SQLITE_OK) {
         sqlite3_finalize(st);
         pthread_mutex_unlock(&sj_lock);
         return NULL;
@@ -370,7 +334,6 @@ static char *sj_query(const char *query, int limit)
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
     out[0] = '\0';
     int rc;
-    int intentionally_truncated = 0;
     int serialization_failed = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *utc = sqlite3_column_text(st, 1);
@@ -396,13 +359,16 @@ static char *sj_query(const char *query, int limit)
             serialization_failed = 1;
             break;
         }
-        if (len + (size_t)needed + 1 > 2 * 1024 * 1024) {
-            intentionally_truncated = 1;
+        if ((size_t)needed > SIZE_MAX - len - 1) {
+            serialization_failed = 1;
             break;
         }
         if (len + (size_t)needed + 1 > cap) {
             size_t next = cap;
-            while (next < len + (size_t)needed + 1) next *= 2;
+            while (next < len + (size_t)needed + 1) {
+                if (next > SIZE_MAX / 2) { next = len + (size_t)needed + 1; break; }
+                next *= 2;
+            }
             char *grown = realloc(out, next);
             if (!grown) { free(out); out = NULL; break; }
             out = grown; cap = next;
@@ -419,31 +385,39 @@ static char *sj_query(const char *query, int limit)
             diary_id ? (const char *)diary_id : "none",
             details ? (const char *)details : "");
         len += (size_t)needed;
+        /* The event is only a preview for conversations. Return the exact
+           archived originals as evidence, including a deep-text search hit. */
+        const char *user = (const char *)sqlite3_column_text(st, 9);
+        const char *assistant = (const char *)sqlite3_column_text(st, 10);
+        if (user || assistant) {
+            char *archive = NULL;
+            int n = asprintf(&archive, "  FULL ARCHIVED USER MESSAGE:\n%s\n"
+                                      "  FULL ARCHIVED R2 RESPONSE:\n%s\n\n",
+                             user ? user : "", assistant ? assistant : "");
+            if (n < 0 || (size_t)n > SIZE_MAX - len - 1) {
+                free(archive); serialization_failed = 1; break;
+            }
+            size_t required = len + (size_t)n + 1;
+            if (required > cap) {
+                char *grown = realloc(out, required);
+                if (!grown) { free(archive); serialization_failed = 1; break; }
+                out = grown; cap = required;
+            }
+            memcpy(out + len, archive, (size_t)n + 1);
+            len += (size_t)n;
+            free(archive);
+        }
+
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
-    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+    if (serialization_failed || rc != SQLITE_DONE) {
         free(out);
         return NULL;
     }
-    /* A row too large for the bounded viewer is not an empty journal.
-       Always identify an incomplete response; never silently shorten it. */
-    if (out && len == 0 && !intentionally_truncated)
+    if (out && len == 0)
         snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
                                        "The Sensory Journal contains no entries yet.\n");
-    if (out && intentionally_truncated) {
-        const char *note = "[Sensory Journal result incomplete at its 2 MiB display limit; "
-                           "no journal rows were deleted. Search more narrowly to inspect "
-                           "remaining or oversized entries.]\n";
-        size_t note_len = strlen(note);
-        if (len + note_len + 1 > cap) {
-            char *grown = realloc(out, len + note_len + 1);
-            if (!grown) { free(out); return NULL; }
-            out = grown;
-            cap = len + note_len + 1;
-        }
-        memcpy(out + len, note, note_len + 1);
-    }
     return out;
 }
 

@@ -22,7 +22,7 @@ class Model(BaseHTTPRequestHandler):
         index = len(requests)
         requests.append(text)
         expected = [
-            ('LATEST USER MESSAGE:', 'CHAT_EVIDENCE_TAIL', 'CHAT_RESPONSE_TAIL', 'Evaluate only this exchange.'),
+            ('LATEST USER MESSAGE:', 'CHAT_EVIDENCE_TAIL', 'CHAT_RESPONSE_TAIL', 'TOOL_OUTCOME_TAIL', 'Evaluate only this exchange.'),
             ('RECORDED REFLECTION CONTEXT', 'SENSORY_EVIDENCE_TAIL', 'REFLECTION_RESPONSE_TAIL', 'Evaluate only this recorded experience and reflection.'),
             ('RECORDED REFLECTION CONTEXT', 'NOTHING_NEW', 'No new conclusion.', 'Evaluate only this recorded experience and reflection.'),
         ]

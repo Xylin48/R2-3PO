@@ -159,8 +159,9 @@ static int bind_optional_text(sqlite3_stmt *statement, int index,
                               const char *value)
 {
     if (value)
-        return sqlite3_bind_text(statement, index, value, -1,
-                                 SQLITE_TRANSIENT);
+        return sqlite3_bind_text64(statement, index, value,
+                                   (sqlite3_uint64)strlen(value),
+                                   SQLITE_TRANSIENT, SQLITE_UTF8);
 
     return sqlite3_bind_null(statement, index);
 }
@@ -871,13 +872,9 @@ int r2_log_is_initialized(void)
  * EVENT RECORDING
  * ------------------------------------------------------------ */
 
-int64_t r2_log_event(
-    R2LogCategory category,
-    const char *event_type,
-    const char *summary,
-    const char *details,
-    const char *source
-)
+static int64_t log_insert_event_locked(
+    R2LogCategory category, const char *event_type, const char *summary,
+    const char *details, const char *source)
 {
     sqlite3_stmt *statement = NULL;
     char utc[40];
@@ -888,8 +885,7 @@ int64_t r2_log_event(
     if (!valid_text(event_type) || !valid_text(summary))
         return -1;
 
-    if (strlen(event_type) > 128 || strlen(summary) > 8192 ||
-        (details && strlen(details) > R2_LOG_MAX_TEXT) ||
+    if (strlen(event_type) > 128 ||
         (source && strlen(source) > 512)) {
         errno = E2BIG;
         return -1;
@@ -897,10 +893,7 @@ int64_t r2_log_event(
 
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
 
-    pthread_mutex_lock(&log_lock);
-
     if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
         return -1;
     }
 
@@ -927,7 +920,7 @@ int64_t r2_log_event(
         if (rc == SQLITE_OK)
             rc = sqlite3_bind_text(statement, 5, category_name(category), -1, SQLITE_STATIC);
         if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, event_type, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 7, summary, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = bind_optional_text(statement, 7, summary);
         if (rc == SQLITE_OK) rc = bind_optional_text(statement, 8, details);
         if (rc == SQLITE_OK) rc = bind_optional_text(statement, 9, source);
         if (rc == SQLITE_OK) rc = sqlite3_step(statement);
@@ -943,6 +936,17 @@ int64_t r2_log_event(
     }
 
     sqlite3_finalize(statement);
+
+    return inserted_id;
+}
+
+int64_t r2_log_event(
+    R2LogCategory category, const char *event_type, const char *summary,
+    const char *details, const char *source)
+{
+    pthread_mutex_lock(&log_lock);
+    int64_t inserted_id = log_insert_event_locked(category, event_type, summary,
+                                                  details, source);
     pthread_mutex_unlock(&log_lock);
 
     /* Index original Life Log events without duplicating their text. */
@@ -959,6 +963,28 @@ int64_t r2_log_event(
     }
 
     return inserted_id;
+}
+
+
+/* Read the complete original details for one exact event, without the
+   presentation budgets used by chronological/search result lists. */
+char *r2_log_read_details(int64_t event_id)
+{
+    if (event_id <= 0) return NULL;
+    char *details = NULL;
+    pthread_mutex_lock(&log_lock);
+    sqlite3_stmt *st = NULL;
+    if (log_initialized && log_db &&
+        sqlite3_prepare_v2(log_db, "SELECT details FROM r2_log_events WHERE id=?",
+                           -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_int64(st, 1, event_id) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        const char *text = (const char *)sqlite3_column_text(st, 0);
+        details = strdup(text ? text : "");
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return details;
 }
 
 
@@ -1091,42 +1117,40 @@ int64_t r2_log_conversation_turn(const char *user_text,
     snprintf(summary, sizeof(summary),
              "Conversation turn: %.*s",
              (int)preview, user_text);
-    int64_t event_id = r2_log_event(
-        R2_LOG_CONVERSATION, "conversation_turn",
-        summary, details, "r2_talk");
-    free(details);
-    if (event_id < 0) return -1;
-
-    sqlite3_stmt *statement = NULL;
-    int rc;
+    /* The original archive and its chronological event are one durable
+       operation. No success ID or journal projection may escape a rollback. */
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return event_id; /* Event details still preserve the turn. */
+    int64_t event_id = -1;
+    int rc = SQLITE_ERROR;
+    sqlite3_stmt *statement = NULL;
+    if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0) {
+        event_id = log_insert_event_locked(R2_LOG_CONVERSATION, "conversation_turn",
+                                            summary, details, "r2_talk");
+        if (event_id > 0)
+            rc = sqlite3_prepare_v2(log_db,
+                "INSERT INTO r2_log_conversations "
+                "(event_id,user_text,assistant_text) VALUES(?,?,?);",
+                -1, &statement, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_text64(statement, 2, user_text,
+                                     (sqlite3_uint64)user_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_text64(statement, 3, assistant_text,
+                                     (sqlite3_uint64)assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+        sqlite3_finalize(statement);
+        if (rc != SQLITE_DONE || exec_sql("COMMIT;") != 0) {
+            fprintf(stderr, "[R2 Life Log] Conversation/archive transaction failed: %s\n",
+                    sqlite3_errmsg(log_db));
+            (void)exec_sql("ROLLBACK;");
+            event_id = -1;
+        }
     }
-    rc = sqlite3_prepare_v2(
-        log_db,
-        "INSERT OR REPLACE INTO r2_log_conversations "
-        "(event_id,user_text,assistant_text) VALUES(?,?,?);",
-        -1, &statement, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-    if (rc == SQLITE_OK)
-        rc = sqlite3_bind_text64(statement, 2, user_text,
-                                 (sqlite3_uint64)user_len,
-                                 SQLITE_TRANSIENT, SQLITE_UTF8);
-    if (rc == SQLITE_OK)
-        rc = sqlite3_bind_text64(statement, 3, assistant_text,
-                                 (sqlite3_uint64)assistant_len,
-                                 SQLITE_TRANSIENT, SQLITE_UTF8);
-    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc != SQLITE_DONE)
-        fprintf(stderr, "[R2 Life Log] Conversation archive insert failed: %s\n",
-                sqlite3_errmsg(log_db));
-    sqlite3_finalize(statement);
     pthread_mutex_unlock(&log_lock);
-
-    /* The indexed event survives a failed archive insert; unlike a successful
-       full-text archive it may contain only explicitly labeled excerpts. */
+    free(details);
+    if (event_id > 0)
+        r2_sj_index_event(event_id, "conversation", "conversation_turn", "r2_talk");
     return event_id;
 }
 
