@@ -7895,49 +7895,49 @@ static char *process_tools_with_status(
 
     results[0] = '\0';
 
-#define APPEND(...)                                                   \
-    do {                                                              \
-        char _b[8192];                                                \
-        int _n = snprintf(_b, sizeof(_b), __VA_ARGS__);              \
-        if (_n > 0) {                                                 \
-            /* snprintf reports the required length, which may exceed   \
-               _b. Clamp to stored bytes and make truncation explicit. */\
-            size_t _append_n = (size_t)_n;                            \
-            if (_append_n >= sizeof(_b)) {                            \
-                static const char _truncated[] = "\n[tool output truncated]"; \
-                _append_n = sizeof(_b) - 1 - (sizeof(_truncated) - 1);\
-                memcpy(_b + _append_n, _truncated, sizeof(_truncated) - 1); \
-                _append_n += sizeof(_truncated) - 1;                  \
-            }                                                         \
-            if (len + _append_n + 1 > cap) {                         \
-                size_t _needed = len + _append_n + 1;                  \
-                size_t _new_cap = cap;                                \
-                while (_new_cap < _needed) {                          \
-                    if (_new_cap > SIZE_MAX / 2) {                    \
-                        _new_cap = _needed;                           \
-                        break;                                        \
-                    }                                                 \
-                    _new_cap *= 2;                                    \
-                }                                                     \
-                char *_grown = realloc(results, _new_cap);            \
-                if (!_grown) {                                       \
-                    /* Keep cap unchanged: results still has only cap bytes. */ \
-                    /* A preceding tool may already have changed the world. */ \
-                    static const char _capture_failure[] =             \
-                        "I ran out of memory while recording an action result. " \
-                        "An action may already have completed, so I will not " \
-                        "repeat it automatically. Verify the current state " \
-                        "before retrying the request.";                \
-                    snprintf(results, cap, "%s", _capture_failure);    \
-                    return results;                                   \
-                }                                                     \
-                results = _grown;                                    \
-                cap = _new_cap;                                      \
-            }                                                         \
-            memcpy(results + len, _b, _append_n);                     \
-            len += _append_n;                                         \
-            results[len] = '\0';                                     \
-        }                                                             \
+#define APPEND(...)                                                        \
+    do {                                                                   \
+        char *_b = NULL;                                                   \
+        int _n = asprintf(&_b, __VA_ARGS__);                                \
+        if (_n < 0) {                                                      \
+            snprintf(results, cap, "%s",                                   \
+                "I ran out of memory while recording an action result. "    \
+                "An action may already have completed, so I will not "      \
+                "repeat it automatically. Verify the current state "        \
+                "before retrying the request.");                            \
+            return results;                                                \
+        }                                                                  \
+        size_t _append_n = (size_t)_n;                                      \
+        if (_append_n > SIZE_MAX - len - 1) {                               \
+            free(_b); free(results); return NULL;                           \
+        }                                                                  \
+        if (len + _append_n + 1 > cap) {                                    \
+            size_t _needed = len + _append_n + 1;                           \
+            size_t _new_cap = cap;                                         \
+            while (_new_cap < _needed) {                                   \
+                if (_new_cap > SIZE_MAX / 2) {                             \
+                    _new_cap = _needed; break;                             \
+                }                                                          \
+                _new_cap *= 2;                                             \
+            }                                                              \
+            char *_grown = realloc(results, _new_cap);                      \
+            if (!_grown) {                                                 \
+                free(_b);                                                  \
+                static const char _capture_failure[] =                     \
+                    "I ran out of memory while recording an action result. " \
+                    "An action may already have completed, so I will not "   \
+                    "repeat it automatically. Verify the current state "     \
+                    "before retrying the request.";                          \
+                snprintf(results, cap, "%s", _capture_failure);             \
+                return results;                                            \
+            }                                                              \
+            results = _grown;                                              \
+            cap = _new_cap;                                                \
+        }                                                                  \
+        memcpy(results + len, _b, _append_n);                               \
+        len += _append_n;                                                   \
+        results[len] = '\0';                                               \
+        free(_b);                                                          \
     } while (0)
 
     /*

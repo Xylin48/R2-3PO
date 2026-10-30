@@ -58,6 +58,14 @@ int main(void)
     free(details);
     char *recall = r2_sj_search("ASR_DEEP_TAIL_🌼", 1);
     assert(recall && strstr(recall, recognized)); free(recall);
+    char *tool_output = process_tools("[SENSORY_JOURNAL] search|ASR_DEEP_TAIL_🌼|1\n");
+    assert(tool_output && strstr(tool_output, recognized));
+    int64_t full_tool = r2_log_event(R2_LOG_CONVERSATION, "conversation_tool_result",
+        "Complete long tool result", tool_output, "r2_talk");
+    assert(full_tool > 0);
+    char *full_evidence = build_turn_learning_evidence("original typed message", full_tool);
+    assert(full_evidence && strstr(full_evidence, recognized));
+    free(full_evidence); free(tool_output);
     free(recognized); free(read_back);
     int64_t tool = r2_log_event(R2_LOG_CONVERSATION, "conversation_tool_result",
         "Chosen audio observation result", "REAL EARS RESULT: TOOL_OUTCOME_TAIL", "r2_talk");

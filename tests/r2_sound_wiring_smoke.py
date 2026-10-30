@@ -38,7 +38,7 @@ checks = {
     "sound marker recognition is case-insensitive and ignores Markdown code examples": "strncasecmp(reply + pos, marker_text, marker_length)" in sounds and "inline_ticks == 0" in sounds and "sound_fence_line" in sounds and "if (in_fence)" in sounds,
     "marker cleanup failure returns a visible fallback instead of exposing control text": "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in r2 and "if (!reply_has_visible_text(sound_clean_reply))" in r2,
     "empty or marker-only replies trigger recovery before a visible fallback is returned": "Model output contained no visible reply after marker cleanup; retrying once." in r2 and "Retry still produced no visible reply" in r2 and "Your message hasn't been discarded" in r2,
-    "tool output append clamps snprintf lengths before copying": "if (_append_n >= sizeof(_b))" in r2 and "memcpy(results + len, _b, _append_n)" in r2 and "[tool output truncated]" in r2 and "memcpy(results + len, _b, (size_t)_n)" not in r2,
+    "tool output formatting allocates every returned byte": "int _n = asprintf(&_b, __VA_ARGS__);" in r2 and "memcpy(results + len, _b, _append_n)" in r2 and "[tool output truncated]" not in r2 and "char _b[8192]" not in r2,
     "reply sanitizer rechecks scratch exposed after hidden tags": "visible_looks_private" in reply_module and "Removing a tagged private block" in reply_module,
 }
 failed = [label for label, ok in checks.items() if not ok]
