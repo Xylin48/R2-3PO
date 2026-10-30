@@ -29,7 +29,7 @@ class Model(BaseHTTPRequestHandler):
         if index >= len(expected) or not all(x in text for x in expected[index]):
             errors.append(f'Unexpected evaluation payload {index}')
         result = ['preference | I prefer quiet music.',
-                  'knowledge | I noticed the displayed flower opened.', 'NONE'][min(index, 2)]
+                  '  knowledge  | I noticed the displayed flower opened.\n', 'NONE'][min(index, 2)]
         body = json.dumps({'message': {'role': 'assistant', 'content': result}, 'done': True}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')

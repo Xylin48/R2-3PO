@@ -9605,9 +9605,14 @@ static char *memory_decision(
         }
     }
 
-    *sep = '|';
-
-    return res;
+    /* trim(category) may insert a NUL before the original separator. Merely
+       restoring that separator leaves an embedded terminator and hides the
+       memory from the caller for ordinary "category | memory" responses. */
+    char *normalized = NULL;
+    if (asprintf(&normalized, "%s | %s", category, memory) < 0)
+        normalized = NULL;
+    free(res);
+    return normalized;
 }
 
 
