@@ -45,8 +45,9 @@ learning = core[learning_start:learning_end]
 for source in ("r2_reward_context()", "r2_addiction_report()", "PERSISTENT LEARNING CONTEXT"):
     if source not in learning:
         raise SystemExit(f"Live learning context omits {source}")
-if "size_t cap = 2400" not in learning or "REWARD/REINFORCEMENT SUMMARY:\\n%.900s" not in learning or "REPEATED-INTEREST SUMMARY:\\n%.900s" not in learning:
-    raise SystemExit("Live learning context must fit within the reserved system-prompt budget.")
+if "asprintf(&context" not in learning or "%.900s" in learning or "size_t cap = 2400" in learning:
+    raise SystemExit("Live learning context must allocate complete reward and repeated-interest summaries.")
+
 
 dream_start = core.find("int r2_sleep_and_dream(double hours)")
 dream_end = core.find("static int autonomous_needs_action_allowed", dream_start)
@@ -134,7 +135,11 @@ for marker in (
 ):
     if marker not in retrieval:
         raise SystemExit(f"Current-turn retrieval does not handle {marker!r}.")
-if 'memory_context = xstrdup("");' in core[core.find("char *memory_context = context_cache_get"):core.find("r2_bound_context_records(memory_context")]:
+retrieval_context_start = core.find("char *memory_context = context_cache_get")
+retrieval_context_end = core.find("Conversation continuity: the Life Log retains complete historical", retrieval_context_start)
+if retrieval_context_start < 0 or retrieval_context_end < 0:
+    raise SystemExit("Could not isolate current-turn retrieval context assembly.")
+if 'memory_context = xstrdup("");' in core[retrieval_context_start:retrieval_context_end]:
     raise SystemExit("Current-turn retrieval failure is still being cached as an empty context.")
 if "Persistent-memory retrieval failed; refusing to continue with silently missing evidence." not in core:
     raise SystemExit("Conversation does not surface current-turn memory retrieval failure.")

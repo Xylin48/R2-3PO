@@ -365,6 +365,8 @@ static _Thread_local int r2_ears_desktop_requested = 0;
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
+static void learn_from_recorded_experience(const char *evidence, const char *response,
+                                           int64_t event_id, int reflection);
 static void autonomous_needs_check(void);
 
 
@@ -9302,7 +9304,8 @@ static void *autonomous_thinking(void *arg)
                     Message followup_message = { "user", followup, 0, 0 };
                     reflection = ollama_chat_with_limit(
                         &followup_message, 1, prompt, 1024, 600L);
-                    free(followup);
+                    free(ctx);
+                    ctx = followup; /* retain actual sensory result as learning evidence */
                     if (reflection &&
                         (strstr(reflection, "[EARS_LISTEN]") ||
                          strstr(reflection, "[MEDIA_FOCUS]") ||
@@ -9323,9 +9326,9 @@ static void *autonomous_thinking(void *arg)
         }
         ollama_autonomous_sensory_input = previous_sensory_input;
         ollama_background_mode = previous_background_mode;
-        free(ctx);
 
         if (shutting_down || !atomic_load(&diary_running)) {
+            free(ctx);
             free(reflection);
             break;
         }
@@ -9334,6 +9337,7 @@ static void *autonomous_thinking(void *arg)
                 reflection_activity_ms ||
             atomic_load(&foreground_conversation_waiting) > 0 ||
             atomic_load(&foreground_ollama_waiting) > 0) {
+            free(ctx);
             free(reflection);
             r2_log_event(R2_LOG_SYSTEM,
                          "reflection_discarded_after_user_activity",
@@ -9344,6 +9348,7 @@ static void *autonomous_thinking(void *arg)
         }
 
         if (!reflection) {
+            free(ctx);
             r2_log_event(R2_LOG_ERROR, "reflection_generation_failed",
                          "Autonomous reflection generation failed.",
                          NULL, "autonomous_thinking");
@@ -9357,6 +9362,7 @@ static void *autonomous_thinking(void *arg)
                                 "Autonomous diary reflection was written.",
                                 reflection);
             log_structured_self_report(reflection, reflection_event_id);
+            learn_from_recorded_experience(ctx, reflection, reflection_event_id, 1);
             r2_log_continuity("r2_private_reflection", "routine",
                               "Private autonomous reflection",
                               "R2 periodically reflects on supplied persistent context after a sustained idle period.",
@@ -9374,6 +9380,7 @@ static void *autonomous_thinking(void *arg)
         }
 
         last_reflection_ms = r2_log_elapsed_ms();
+        free(ctx);
         free(reflection);
         char cycle_details[128];
         snprintf(cycle_details, sizeof(cycle_details),
@@ -9391,16 +9398,38 @@ static void *autonomous_thinking(void *arg)
    MEMORY DECISION
    ============================================================ */
 
+/* Allocate the entire labeled input, including its final instruction. Never
+   estimate formatting overhead or clip either original string. */
+static char *build_memory_evaluation_input(const char *evidence,
+                                          const char *response, int reflection)
+{
+    if (!evidence || !response) return NULL;
+    char *input = NULL;
+    const char *format = reflection
+        ? "RECORDED REFLECTION CONTEXT (historical and sensory evidence):\n%s\n\n"
+          "R2 PRIVATE REFLECTION (interpretation, not a new observation):\n%s\n\n"
+          "Evaluate only this recorded experience and reflection."
+        : "LATEST USER MESSAGE:\n%s\n\n"
+          "LATEST R2 RESPONSE:\n%s\n\n"
+          "Evaluate only this exchange.";
+    if (asprintf(&input, format, evidence, response) < 0)
+        return NULL;
+    return input;
+}
+
 static char *memory_decision(
     const char *user,
-    const char *reply)
+    const char *reply, int reflection)
 {
     const char *sys =
         "You are R2-3PO's memory-evaluation system.\n"
         "\n"
-        "Review the latest exchange and determine "
+        "Review the supplied recorded experience and response and determine "
         "whether something should be preserved as "
         "persistent memory.\n"
+        "Inputs may be conversation or private reflection on sensory and historical evidence. "
+        "Use the supplied source labels. A reflection is an interpretation, not proof of a new event; "
+        "rereading an old event is not a new experience. Preserve uncertainty and source attribution.\n"
         "\n"
         "IMPORTANT IDENTITY RULE:\n"
         "Never create a memory that defines R2's identity "
@@ -9451,26 +9480,9 @@ static char *memory_decision(
         "behavior, or experience. Do not use self-memory to "
         "establish an arbitrary identity label.";
 
-    size_t n =
-        strlen(user) +
-        strlen(reply) +
-        64;
-
-    char *u =
-        malloc(n);
-
+    char *u = build_memory_evaluation_input(user, reply, reflection);
     if (!u)
         return NULL;
-
-    snprintf(
-        u,
-        n,
-        "LATEST USER MESSAGE:\n%s\n\n"
-        "LATEST R2 RESPONSE:\n%s\n\n"
-        "Evaluate only this exchange.",
-        user,
-        reply
-    );
 
     Message m = {
         "user",
@@ -9800,11 +9812,17 @@ int r2_write_diary(void)
 
     Message m = { "user", ctx, 0, 0 };
     char *reflection = ollama_chat(&m, 1, prompt);
-    free(ctx);
-
-    if (!reflection) return -1;
+    if (!reflection) { free(ctx); return -1; }
 
     int rc = r2_diary_write(reflection);
+    if (rc == 0) {
+        int64_t event_id = r2_log_thinking("reflection_completed",
+                                          "Requested private diary reflection was written.",
+                                          reflection);
+        log_structured_self_report(reflection, event_id);
+        learn_from_recorded_experience(ctx, reflection, event_id, 1);
+    }
+    free(ctx);
     free(reflection);
     return rc;
 }
@@ -12184,6 +12202,58 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
 }
 
 
+/* Both chat and accepted autonomous reflections use the same model decision
+   and persistent memory store. Source event links preserve provenance. */
+static void learn_from_recorded_experience(const char *evidence, const char *response,
+                                           int64_t event_id, int reflection)
+{
+    if (!shutting_down) {
+        char *decision = memory_decision(evidence, response, reflection);
+        if (!decision) {
+            char details[160];
+            snprintf(details, sizeof(details),
+                     "conversation_event_id=%lld; memory decision returned no result.",
+                     (long long)event_id);
+            fprintf(stderr, "[R2 Post-turn] Memory decision failed; no new persistent memory was saved for event %lld.\n",
+                    (long long)event_id);
+            (void)r2_log_event(R2_LOG_ERROR, "post_turn_memory_decision_failed",
+                               "Post-turn memory evaluation did not return a decision.",
+                               details, reflection ? "autonomous_thinking" : "post_turn_worker");
+        } else {
+            char *p = trim(decision);
+            if (strcasecmp(p, "NONE") && strchr(p, '|')) {
+                char *sep = strchr(p, '|');
+                *sep = '\0';
+                char *category = trim(p);
+                char *memory = trim(sep + 1);
+                if (*memory) {
+                    if (save_memory(memory, category) == 0) {
+                        int64_t memory_event_id = r2_log_event(R2_LOG_MEMORY, "memory_saved",
+                                     reflection
+                                         ? "A persistent memory was selected from a recorded private reflection."
+                                         : "A persistent memory was saved after the conversation response was delivered.",
+                                     memory, category);
+                        if (event_id > 0 && memory_event_id > 0)
+                            (void)r2_log_link(event_id, memory_event_id,
+                                              "supports_memory", category);
+                    } else {
+                        char details[1200];
+                        snprintf(details, sizeof(details),
+                                 "conversation_event_id=%lld; category=%s; proposed_memory=%.900s",
+                                 (long long)event_id, category, memory);
+                        fprintf(stderr, "[R2 Post-turn] Persistent memory write failed for event %lld.\n",
+                                (long long)event_id);
+                        (void)r2_log_event(R2_LOG_ERROR, "memory_save_failed",
+                                           "A valid post-turn memory decision could not be persisted.",
+                                           details, reflection ? "autonomous_thinking" : "post_turn_worker");
+                    }
+                }
+            }
+            free(decision);
+        }
+    }
+}
+
 typedef struct {
     char *user;
     char *reply;
@@ -12206,46 +12276,7 @@ static void *post_turn_worker(void *opaque)
 
     if (!shutting_down)
         log_structured_self_report(job->reply, job->event_id);
-    if (!shutting_down) {
-        char *decision = memory_decision(job->user, job->reply);
-        if (!decision) {
-            char details[160];
-            snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld; memory decision returned no result.",
-                     (long long)job->event_id);
-            fprintf(stderr, "[R2 Post-turn] Memory decision failed; no new persistent memory was saved for event %lld.\n",
-                    (long long)job->event_id);
-            (void)r2_log_event(R2_LOG_ERROR, "post_turn_memory_decision_failed",
-                               "Post-turn memory evaluation did not return a decision.",
-                               details, "post_turn_worker");
-        } else {
-            char *p = trim(decision);
-            if (strcasecmp(p, "NONE") && strchr(p, '|')) {
-                char *sep = strchr(p, '|');
-                *sep = '\0';
-                char *category = trim(p);
-                char *memory = trim(sep + 1);
-                if (*memory) {
-                    if (save_memory(memory, category) == 0) {
-                        r2_log_event(R2_LOG_MEMORY, "memory_saved",
-                                     "A persistent memory was saved after the conversation response was delivered.",
-                                     memory, category);
-                    } else {
-                        char details[1200];
-                        snprintf(details, sizeof(details),
-                                 "conversation_event_id=%lld; category=%s; proposed_memory=%.900s",
-                                 (long long)job->event_id, category, memory);
-                        fprintf(stderr, "[R2 Post-turn] Persistent memory write failed for event %lld.\n",
-                                (long long)job->event_id);
-                        (void)r2_log_event(R2_LOG_ERROR, "memory_save_failed",
-                                           "A valid post-turn memory decision could not be persisted.",
-                                           details, "post_turn_worker");
-                    }
-                }
-            }
-            free(decision);
-        }
-    }
+    learn_from_recorded_experience(job->user, job->reply, job->event_id, 0);
 
     ollama_background_mode = 0;
     free(job->user);
@@ -12315,16 +12346,14 @@ static char *build_learning_context(void)
 {
     char *reward = r2_reward_context();
     char *addiction = r2_addiction_report();
-    size_t cap = 2400;
-    char *context = malloc(cap);
-    if (context) {
-        snprintf(context, cap,
+    char *context = NULL;
+    if (asprintf(&context,
             "PERSISTENT LEARNING CONTEXT\n"
-            "REWARD/REINFORCEMENT SUMMARY:\n%.900s\n\n"
-            "REPEATED-INTEREST SUMMARY:\n%.900s\n",
+            "REWARD/REINFORCEMENT SUMMARY:\n%s\n\n"
+            "REPEATED-INTEREST SUMMARY:\n%s\n",
             reward ? reward : "(reinforcement context unavailable)",
-            addiction ? addiction : "(repeated-interest history unavailable)");
-    }
+            addiction ? addiction : "(repeated-interest history unavailable)") < 0)
+        context = NULL;
     free(reward);
     free(addiction);
     return context;

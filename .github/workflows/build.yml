@@ -440,6 +440,14 @@ jobs:
           cc $FLAGS tests/chat_sensory_shared_history_runtime.c Log.c SensoryJournal.c -o /tmp/r2-chat-sensory-shared-history-test -lsqlite3 -lpthread -lm
           /tmp/r2-chat-sensory-shared-history-test
 
+      - name: Exercise shared chat and reflection memory decisions
+        run: |
+          ROOT=/tmp/r2-shared-learning-decision
+          rm -rf "$ROOT" /tmp/r2-shared-learning-decision-test
+          FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT\" -DR2_WORKSPACE=\"$ROOT\""
+          cc $FLAGS tests/shared_learning_decision_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-shared-learning-decision-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          python3 tests/shared_learning_decision_runtime.py /tmp/r2-shared-learning-decision-test
+
       - name: Exercise writable Life Log migration from a legacy event schema
         run: |
           ROOT=/tmp/r2-log-legacy-schema-smoke
