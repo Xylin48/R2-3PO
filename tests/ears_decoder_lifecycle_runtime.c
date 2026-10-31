@@ -20,7 +20,7 @@ static int cancel_after_poll(void *userdata)
  * argument transfer, pipe, read, wait, cancellation and cleanup implementation. */
 static int decoder(int argc, char **argv)
 {
-    assert(argc == 18);
+    assert(argc == 17);
     assert(!strcmp(argv[5], "-i") && !strcmp(argv[6], getenv("R2_TEST_MEDIA")));
     assert(!strcmp(argv[10], "-ar") && !strcmp(argv[11], "48000"));
     assert(!strcmp(argv[12], "-ac") && !strcmp(argv[13], "2"));

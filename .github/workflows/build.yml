@@ -182,6 +182,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_decoder_lifecycle_runtime.c -o /tmp/r2-ears-decoder-test -lpulse -lpthread
           timeout 30 /tmp/r2-ears-decoder-test
 
+      - name: Stop paused native microphone and desktop workers
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_worker_stop_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-worker-stop-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse -lm
+          timeout 30 /tmp/r2-ears-worker-stop-test
+
       - name: Require source-specific raw hearing, deliberate attention, and shutdown
         run: python3 tests/ears_dual_attention_wiring_smoke.py
 
