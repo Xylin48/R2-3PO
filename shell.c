@@ -1216,8 +1216,8 @@ static void shell_ears(const char *argument)
             errno = 0;
             unsigned long parsed = strtoul(duration, &end, 10);
             while (end && *end && isspace((unsigned char)*end)) ++end;
-            if (errno || !end || end == duration || *end || parsed < 1UL || parsed > 15UL) {
-                printf("Usage: ears listen [1-15 seconds]\n");
+            if (errno || !end || end == duration || *end || parsed < 1UL || parsed > R2_EARS_MAX_WAV_SECONDS) {
+                printf("Usage: ears listen [seconds]\n");
                 return;
             }
             seconds = (unsigned)parsed;
@@ -1287,7 +1287,7 @@ static void shell_ears(const char *argument)
     }
 
     printf(
-        "Usage: ears [start|listen [1-15 seconds]|stop|status]\n"
+        "Usage: ears [start|listen [seconds]|stop|status]\n"
     );
 }
 

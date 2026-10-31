@@ -88,6 +88,20 @@ int main(void)
     fclose(raw);
     fclose(whisper);
 
+    /* Long real listening choices retain their entire normalized duration. */
+    raw = source_wav(30U * 48000U);
+    whisper = tmpfile(); assert(whisper);
+    assert(r2_ears_write_whisper_wav(raw, whisper, 30U * 192000U) == 0);
+    assert(fseek(whisper, 0, SEEK_SET) == 0);
+    assert(fread(header, 1, sizeof(header), whisper) == sizeof(header));
+    assert(read_u32(header + 40) == 30U * 32000U);
+    assert(fseek(whisper, 0, SEEK_END) == 0);
+    assert(ftell(whisper) == 44L + 30L * 32000L);
+    fclose(raw); fclose(whisper);
+    raw = tmpfile(); assert(raw);
+    assert(r2_ears_write_wav_header(raw, UINT32_MAX) < 0);
+    fclose(raw);
+
     puts("Whisper-compatible 16 kHz mono audio conversion and duration regression passed.");
     return 0;
 }

@@ -5,7 +5,7 @@ this project accepts text and images, not raw microphone PCM, so microphone
 capture alone cannot make spoken words part of a conversation. The explicit
 `ears listen` command connects the layers:
 
-1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects one exact 1–15 second interval without changing either live source.
+1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects the complete chosen listening interval without changing either live source.
 2. Write that captured interval to a temporary raw WAV in a private `0700` directory.
 3. Convert **only the completed temporary clip** to 16 kHz, mono, 16-bit PCM WAV for `whisper.cpp` (using an exact 3:1 downsampling ratio and averaging stereo sample groups). The original audio buffers and live capture formats remain unchanged.
 4. Run a local `whisper.cpp` `whisper-cli` executable against the converted WAV and a local GGML Whisper model.
@@ -57,8 +57,13 @@ This is a deliberate tool action, not an automatic consequence of microphone
 capture. Recent-buffer listening requires Ears continuous capture to be active.
 - `ears stop` — stop continuous capture and clear its transient audio buffer.
 
-The capture duration is limited to 1–15 seconds. Local transcription is
-terminated if it exceeds 90 seconds or R2 begins shutting down. If the model
+Live listening consumes the complete chosen duration in chunks as PCM arrives,
+so a clip can exceed the rolling history's 16 seconds without shortening it.
+Microphone and desktop clips track their source generation: a restart cannot
+splice replacement audio into an old request. Recent listening can only use
+samples actually retained in that source's history. Durations must be positive
+and fit the PCM WAV format's 32-bit length fields. Local transcription runs to
+completion unless explicitly cancelled or R2 begins shutting down. If the model
 or executable is missing, R2 reports that speech recognition is unavailable
 instead of pretending it understood audio.
 

@@ -2,6 +2,7 @@
 #define R2_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * ============================================================
@@ -37,6 +38,11 @@ extern "C" {
 
 /* Single source of truth for every local Ollama inference in R2. */
 #define R2_OLLAMA_MODEL "qwen3.5:9b"
+
+/* PCM capture uses RIFF/WAV's 32-bit data length; this is the format's
+   representable duration, not an attention or transcription policy limit. */
+#define R2_EARS_PCM_BYTES_PER_SECOND (48000U * 2U * 2U)
+#define R2_EARS_MAX_WAV_SECONDS ((UINT32_MAX - 36U) / R2_EARS_PCM_BYTES_PER_SECOND)
 
 /* Shared RAM-aware context sizing for text and multimodal inference. */
 int r2_ollama_context_tokens(void);
