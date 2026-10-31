@@ -341,7 +341,8 @@ static int r2_ears_discovery_wait(R2Ears *connection, pa_operation *operation,
     return 0;
 }
 
-int r2_ears_discover(R2EarsDiscovery *out, int (*cancelled)(void *), void *userdata)
+static int r2_ears_discover_selected(R2EarsDiscovery *out, int microphone, int desktop,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (!out) { errno = EINVAL; return -1; }
     /* Caller supplies an empty result and owns its strings after success. */
@@ -365,6 +366,7 @@ int r2_ears_discover(R2EarsDiscovery *out, int (*cancelled)(void *), void *userd
             r2_ears_pulse_step(connection) < 0) goto cleanup;
     }
     for (int query = 0; query < 4; ++query) {
+        if ((query == 1 && !microphone) || (query >= 2 && !desktop)) continue;
         pa_operation *operation = NULL;
         q.done = 0;
         if (query == 0) operation = pa_context_get_server_info(connection->pulse_context, r2_ears_server_info, &q);
@@ -389,10 +391,15 @@ cleanup:
     return rc;
 }
 
+int r2_ears_discover(R2EarsDiscovery *out, int (*cancelled)(void *), void *userdata)
+{
+    return r2_ears_discover_selected(out, 1, 1, cancelled, userdata);
+}
+
 int r2_ears_microphone_available(void)
 {
     R2EarsDiscovery result = {0};
-    if (r2_ears_discover(&result, NULL, NULL) != 0) return 0;
+    if (r2_ears_discover_selected(&result, 1, 0, NULL, NULL) != 0) return 0;
     int available = result.microphone_source != NULL;
     r2_ears_discovery_clear(&result);
     return available;
@@ -401,7 +408,7 @@ int r2_ears_microphone_available(void)
 int r2_ears_desktop_playing(void)
 {
     R2EarsDiscovery result = {0};
-    if (r2_ears_discover(&result, NULL, NULL) != 0) return 0;
+    if (r2_ears_discover_selected(&result, 0, 1, NULL, NULL) != 0) return 0;
     int playing = result.desktop_playing;
     r2_ears_discovery_clear(&result);
     return playing;
@@ -410,7 +417,7 @@ int r2_ears_desktop_playing(void)
 long r2_ears_playback_pid(void)
 {
     R2EarsDiscovery result = {0};
-    if (r2_ears_discover(&result, NULL, NULL) != 0) return -1;
+    if (r2_ears_discover_selected(&result, 0, 1, NULL, NULL) != 0) return -1;
     long pid = result.playback_pid;
     r2_ears_discovery_clear(&result);
     return pid;
@@ -726,7 +733,7 @@ int r2_ears_open_microphone_cancelable(R2Ears *ears,
 {
     if (!ears) return -1;
     R2EarsDiscovery result = {0};
-    if (r2_ears_discover(&result, cancelled, userdata) != 0) return -1;
+    if (r2_ears_discover_selected(&result, 1, 0, cancelled, userdata) != 0) return -1;
     int rc = -1;
     if (result.microphone_source)
         rc = r2_ears_open_source_cancelable(ears, result.microphone_source, cancelled, userdata);
@@ -752,7 +759,7 @@ int r2_ears_open_desktop_cancelable(R2Ears *ears,
 {
     if (!ears) return -1;
     R2EarsDiscovery result = {0};
-    if (r2_ears_discover(&result, cancelled, userdata) != 0) return -1;
+    if (r2_ears_discover_selected(&result, 0, 1, cancelled, userdata) != 0) return -1;
     int rc = -1;
     if (result.desktop_monitor)
         rc = r2_ears_open_source_cancelable(ears, result.desktop_monitor, cancelled, userdata);

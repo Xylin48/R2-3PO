@@ -86,6 +86,12 @@ int main(void)
     assert(open_count == 0 && close_count == 0);
     assert(r2_ears_microphone_available() == 1);
     assert(r2_ears_desktop_playing() == 1 && r2_ears_playback_pid() == 3141);
+    /* Explicit inputs remain independent of unrelated discovery failures. */
+    fake_error_stage = 3;
+    assert(r2_ears_microphone_available() == 1);
+    fake_error_stage = 2;
+    assert(r2_ears_desktop_playing() == 1 && r2_ears_playback_pid() == 3141);
+    fake_error_stage = 0;
     assert(contexts == 0 && fake_operations == 0);
     puts("Native discovery: full names, actual routing, PID identity, cancellation and query failure passed.");
     return 0;
