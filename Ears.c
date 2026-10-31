@@ -35,6 +35,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <poll.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +47,9 @@
 #include <unistd.h>
 
 #include <pulse/error.h>
-#include <pulse/simple.h>
+#include <pulse/pulseaudio.h>
+
+extern char **environ;
 
 
 /* ---------------------------------------------------------
@@ -110,14 +116,19 @@ struct R2Ears
      * PipeWire normally exposes its PulseAudio compatibility
      * layer through libpulse, so this works for both systems.
      */
-    pa_simple *pulse_stream;
+    pa_mainloop *pulse_loop;
+    pa_context *pulse_context;
+    pa_stream *pulse_stream;
+    const unsigned char *pulse_data;
+    size_t pulse_remaining;
+    pthread_mutex_t event_lock;
 
     /*
      * FFmpeg process for file/media decoding.
      *
      * FFmpeg outputs canonical raw PCM through this pipe.
      */
-    FILE *file_stream;
+    int file_fd;
 
     pid_t file_pid;
 
@@ -537,78 +548,41 @@ static int r2_ears_start_ffmpeg(
     const char *path
 )
 {
-    char *quoted_path;
-    char command[4096];
-    int written;
-
-    if (!ears || !path || path[0] == '\0')
-        return -1;
-
-    quoted_path =
-        r2_ears_shell_quote(path);
-
-    if (!quoted_path)
-        return -1;
-
-    /*
-     * FFmpeg decodes any supported media source into the
-     * canonical R2 PCM format.
-     *
-     * No speaker playback is required.
-     *
-     * This means R2 can directly hear:
-     *
-     *     WAV
-     *     MP3
-     *     FLAC
-     *     OGG
-     *     AAC
-     *     M4A
-     *     MP4
-     *     MKV
-     *     AVI
-     *     etc.
-     *
-     * whenever FFmpeg can decode the source's audio stream.
-     */
-    written = snprintf(
-        command,
-        sizeof(command),
-
-        "ffmpeg "
-        "-nostdin "
-        "-hide_banner "
-        "-loglevel error "
-        "-i %s "
-        "-vn "
-        "-f s16le "
-        "-ar %u "
-        "-ac %u "
-        "-acodec pcm_s16le "
-        "pipe:1",
-
-        quoted_path,
-        R2_EARS_SAMPLE_RATE,
-        R2_EARS_CHANNELS
-    );
-
-    free(quoted_path);
-
-    if (written < 0 ||
-        (size_t)written >= sizeof(command))
-    {
-        return -1;
+    int descriptors[2];
+    pid_t child = -1;
+    posix_spawn_file_actions_t actions;
+    if (!ears || !path || !*path) return -1;
+    if (pipe2(descriptors, O_CLOEXEC) != 0) return -1;
+    /* Keep child actions correct even when stdin/stdout were closed by host. */
+    for (int i = 0; i < 2; ++i) {
+        if (descriptors[i] <= STDERR_FILENO) {
+            int fd = fcntl(descriptors[i], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+            if (fd < 0) {
+                close(descriptors[0]); close(descriptors[1]); return -1;
+            }
+            close(descriptors[i]); descriptors[i] = fd;
+        }
     }
-
-    ears->file_stream =
-        popen(command, "r");
-
-    if (!ears->file_stream)
-        return -1;
-
-    ears->file_pid = -1;
-
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) goto fail;
+    rc = posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&actions, descriptors[0]);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&actions, descriptors[1]);
+    char *argv[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-i", (char *)path, "-vn", "-f", "s16le", "-ar", "48000",
+                    "-ac", "2", "-acodec", "pcm_s16le", "pipe:1", NULL};
+    if (rc == 0) rc = posix_spawnp(&child, "ffmpeg", &actions,
+                                   NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) goto fail;
+    close(descriptors[1]);
+    ears->file_fd = descriptors[0];
+    ears->file_pid = child;
     return 0;
+fail:
+    close(descriptors[0]); close(descriptors[1]);
+    errno = rc;
+    return -1;
 }
 
 
@@ -642,7 +616,10 @@ int r2_ears_init(R2Ears **ears)
 
     new_ears->open = 0;
     new_ears->pulse_stream = NULL;
-    new_ears->file_stream = NULL;
+    new_ears->file_fd = -1;
+    if (pthread_mutex_init(&new_ears->event_lock, NULL) != 0) {
+        free(new_ears); return -1;
+    }
     new_ears->file_pid = -1;
     new_ears->using_file = 0;
 
@@ -663,24 +640,34 @@ void r2_ears_close(R2Ears *ears)
     if (!ears)
         return;
 
-    if (ears->pulse_stream)
-    {
-        pa_simple_free(
-            ears->pulse_stream
-        );
-
+    /* Caller joins its reader before close/reopen; read errors close themselves. */
+    if (ears->pulse_stream) {
+        pa_stream_disconnect(ears->pulse_stream);
+        pa_stream_unref(ears->pulse_stream);
         ears->pulse_stream = NULL;
     }
-
-    if (ears->file_stream)
-    {
-        pclose(
-            ears->file_stream
-        );
-
-        ears->file_stream = NULL;
+    ears->pulse_data = NULL;
+    ears->pulse_remaining = 0;
+    if (ears->pulse_context) {
+        pa_context_disconnect(ears->pulse_context);
+        pa_context_unref(ears->pulse_context);
+        ears->pulse_context = NULL;
     }
-
+    if (ears->pulse_loop) {
+        pa_mainloop_free(ears->pulse_loop);
+        ears->pulse_loop = NULL;
+    }
+    if (ears->file_fd >= 0) {
+        close(ears->file_fd);
+        ears->file_fd = -1;
+    }
+    if (ears->file_pid > 0) {
+        /* Explicit source close cancels the owned decoder, then reaps it. */
+        kill(ears->file_pid, SIGKILL);
+        while (waitpid(ears->file_pid, NULL, 0) < 0 && errno == EINTR) {}
+        ears->file_pid = -1;
+    }
+    pthread_mutex_lock(&ears->event_lock);
     if (ears->open) {
         char details[768];
         snprintf(details, sizeof(details),
@@ -700,6 +687,7 @@ void r2_ears_close(R2Ears *ears)
     ears->last_log_timestamp_us = 0;
 
     r2_ears_reset_event(ears);
+    pthread_mutex_unlock(&ears->event_lock);
 }
 
 
@@ -714,6 +702,7 @@ void r2_ears_shutdown(R2Ears *ears)
 
     r2_ears_close(ears);
 
+    pthread_mutex_destroy(&ears->event_lock);
     free(ears);
 }
 
@@ -722,9 +711,18 @@ void r2_ears_shutdown(R2Ears *ears)
  * Open generic Pulse/PipeWire source
  * --------------------------------------------------------- */
 
-int r2_ears_open_source(
-    R2Ears *ears,
-    const char *source_name
+/* A poll cycle is bounded only to observe caller cancellation. There is no
+ * source, silence, clip-length, or inference deadline. */
+static int r2_ears_pulse_step(R2Ears *ears)
+{
+    if (pa_mainloop_prepare(ears->pulse_loop, 100) < 0) return -1;
+    if (pa_mainloop_poll(ears->pulse_loop) < 0) return -1;
+    return pa_mainloop_dispatch(ears->pulse_loop);
+}
+
+int r2_ears_open_source_cancelable(
+    R2Ears *ears, const char *source_name,
+    int (*cancelled)(void *), void *userdata
 )
 {
     pa_sample_spec spec;
@@ -735,6 +733,7 @@ int r2_ears_open_source(
 
     if (!ears)
         return -1;
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
 
     /*
      * NULL means:
@@ -794,36 +793,29 @@ int r2_ears_open_source(
     buffer_attr.fragsize =
         (uint32_t)R2_EARS_FRAME_BYTES;
 
-    ears->pulse_stream =
-        pa_simple_new(
-            NULL,
-            "R2-3PO",
-            PA_STREAM_RECORD,
-            actual_source,
-            "R2 Hearing",
-            &spec,
-            NULL,
-            &buffer_attr,
-            &error
-        );
-
-    if (!ears->pulse_stream)
-    {
-        fprintf(
-            stderr,
-            "R2 Ears: could not open audio source '%s': %s\n",
-            actual_source,
-            pa_strerror(error)
-        );
-
-        r2_log_sensory("audio_source_open_failed",
-                       "R2 Ears could not open the live audio source.",
-                       pa_strerror(error), actual_source);
-        free(resolved_source);
-
-        return -1;
+    ears->pulse_loop = pa_mainloop_new();
+    if (!ears->pulse_loop) goto pulse_failed;
+    ears->pulse_context = pa_context_new(pa_mainloop_get_api(ears->pulse_loop), "R2-3PO");
+    if (!ears->pulse_context ||
+        pa_context_connect(ears->pulse_context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0)
+        goto pulse_failed;
+    while (pa_context_get_state(ears->pulse_context) != PA_CONTEXT_READY) {
+        if (cancelled && cancelled(userdata)) goto pulse_cancelled;
+        if (!PA_CONTEXT_IS_GOOD(pa_context_get_state(ears->pulse_context)) ||
+            r2_ears_pulse_step(ears) < 0) goto pulse_failed;
+    }
+    ears->pulse_stream = pa_stream_new(ears->pulse_context, "R2 Hearing", &spec, NULL);
+    if (!ears->pulse_stream ||
+        pa_stream_connect_record(ears->pulse_stream, actual_source, &buffer_attr,
+                                 PA_STREAM_NOFLAGS) < 0) goto pulse_failed;
+    while (pa_stream_get_state(ears->pulse_stream) != PA_STREAM_READY) {
+        if (cancelled && cancelled(userdata)) goto pulse_cancelled;
+        if (!PA_STREAM_IS_GOOD(pa_stream_get_state(ears->pulse_stream)) ||
+            !PA_CONTEXT_IS_GOOD(pa_context_get_state(ears->pulse_context)) ||
+            r2_ears_pulse_step(ears) < 0) goto pulse_failed;
     }
 
+    pthread_mutex_lock(&ears->event_lock);
     ears->format.sample_rate =
         R2_EARS_SAMPLE_RATE;
 
@@ -866,31 +858,57 @@ int r2_ears_open_source(
                        details, ears->event.source_name);
     }
 
+    pthread_mutex_unlock(&ears->event_lock);
     free(resolved_source);
-
     return 0;
+pulse_cancelled:
+    r2_ears_close(ears);
+    free(resolved_source);
+    errno = ECANCELED;
+    return -1;
+pulse_failed:
+    error = ears->pulse_context ? pa_context_errno(ears->pulse_context) : PA_ERR_INTERNAL;
+    fprintf(stderr, "R2 Ears: could not open audio source '%s': %s\n",
+            actual_source, pa_strerror(error));
+    r2_log_sensory("audio_source_open_failed", "R2 Ears could not open the live audio source.",
+                   pa_strerror(error), actual_source);
+    r2_ears_close(ears);
+    free(resolved_source);
+    return -1;
 }
 
+
+int r2_ears_open_source(R2Ears *ears, const char *source_name)
+{
+    return r2_ears_open_source_cancelable(ears, source_name, NULL, NULL);
+}
 
 /* ---------------------------------------------------------
  * Open default microphone / recording source
  * --------------------------------------------------------- */
 
-int r2_ears_open_microphone(R2Ears *ears)
+int r2_ears_open_microphone_cancelable(R2Ears *ears,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (!ears) return -1;
     char source[512];
     if (r2_ears_find_microphone(source, sizeof(source)) != 0)
         return -1;
-    return r2_ears_open_source(ears, source);
+    return r2_ears_open_source_cancelable(ears, source, cancelled, userdata);
 }
 
+
+int r2_ears_open_microphone(R2Ears *ears)
+{
+    return r2_ears_open_microphone_cancelable(ears, NULL, NULL);
+}
 
 /* ---------------------------------------------------------
  * Open desktop/system audio
  * --------------------------------------------------------- */
 
-int r2_ears_open_desktop(R2Ears *ears)
+int r2_ears_open_desktop_cancelable(R2Ears *ears,
+                                   int (*cancelled)(void *), void *userdata)
 {
     char *sink;
     char monitor[1024];
@@ -948,19 +966,17 @@ int r2_ears_open_desktop(R2Ears *ears)
          * ways that make pactl's listing differ from what
          * libpulse can actually open.
          *
-         * Let pa_simple_new() make the final determination.
+         * Let the native Pulse stream make the final determination.
          */
     }
 
     result =
-        r2_ears_open_source(
-            ears,
-            monitor
-        );
+        r2_ears_open_source_cancelable(ears, monitor, cancelled, userdata);
 
     if (result != 0)
         return result;
 
+    pthread_mutex_lock(&ears->event_lock);
     ears->event.origin =
         R2_HEARING_WORLD;
 
@@ -969,9 +985,15 @@ int r2_ears_open_desktop(R2Ears *ears)
         "desktop-audio"
     );
 
+    pthread_mutex_unlock(&ears->event_lock);
     return 0;
 }
 
+
+int r2_ears_open_desktop(R2Ears *ears)
+{
+    return r2_ears_open_desktop_cancelable(ears, NULL, NULL);
+}
 
 /* ---------------------------------------------------------
  * Open arbitrary audio file
@@ -1008,6 +1030,7 @@ int r2_ears_open_file(
         return -1;
     }
 
+    pthread_mutex_lock(&ears->event_lock);
     ears->format.sample_rate =
         R2_EARS_SAMPLE_RATE;
 
@@ -1056,6 +1079,7 @@ int r2_ears_open_file(
                        details, path);
     }
 
+    pthread_mutex_unlock(&ears->event_lock);
     return 0;
 }
 
@@ -1064,156 +1088,115 @@ int r2_ears_open_file(
  * Read PCM audio
  * --------------------------------------------------------- */
 
-ssize_t r2_ears_read(
-    R2Ears *ears,
-    void *buffer,
-    size_t buffer_size
-)
+static void r2_ears_record_samples(R2Ears *ears, size_t bytes)
 {
-    if (!ears ||
-        !buffer ||
-        buffer_size == 0)
-    {
-        errno = EINVAL;
-        return -1;
+    pthread_mutex_lock(&ears->event_lock);
+    ears->event.timestamp = r2_ears_timestamp();
+    ears->bytes_since_log += bytes;
+    if (ears->last_log_timestamp_us == 0 ||
+        ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
+        char details[768];
+        snprintf(details, sizeof(details),
+                 "source=%s; bytes_received_since_last_entry=%llu; "
+                 "sample_rate=%u; channels=%u; bits_per_sample=%u; "
+                 "audio_interpretation=not_performed_by_Ears",
+                 ears->event.source_name, (unsigned long long)ears->bytes_since_log,
+                 ears->format.sample_rate, ears->format.channels, ears->format.bits_per_sample);
+        r2_log_sensory("audio_samples_received", "R2 Ears received real PCM audio samples.",
+                       details, ears->event.source_name);
+        ears->bytes_since_log = 0;
+        ears->last_log_timestamp_us = ears->event.timestamp;
     }
+    pthread_mutex_unlock(&ears->event_lock);
+}
 
-    if (!ears->open)
-    {
-        errno = EBADF;
-        return -1;
+ssize_t r2_ears_read_cancelable(R2Ears *ears, void *buffer, size_t buffer_size,
+                               int (*cancelled)(void *), void *userdata)
+{
+    if (!ears || !buffer || !buffer_size || buffer_size > SSIZE_MAX) {
+        errno = EINVAL; return -1;
     }
-
-
-    /* -----------------------------------------------------
-     * File source
-     * ----------------------------------------------------- */
-
-    if (ears->using_file)
-    {
-        size_t bytes_read;
-
-        if (!ears->file_stream)
-        {
-            errno = EBADF;
-            return -1;
-        }
-
-        bytes_read =
-            fread(
-                buffer,
-                1,
-                buffer_size,
-                ears->file_stream
-            );
-
-        if (bytes_read > 0)
-        {
-            ears->event.timestamp =
-                r2_ears_timestamp();
-            ears->bytes_since_log += bytes_read;
-
-            if (ears->last_log_timestamp_us == 0 ||
-                ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
-                char details[768];
-                snprintf(details, sizeof(details),
-                         "source=%s; bytes_received_since_last_entry=%llu; "
-                         "sample_rate=%u; channels=%u; bits_per_sample=%u; "
-                         "audio_interpretation=not_performed_by_Ears",
-                         ears->event.source_name,
-                         (unsigned long long)ears->bytes_since_log,
-                         ears->format.sample_rate, ears->format.channels,
-                         ears->format.bits_per_sample);
-                r2_log_sensory("audio_samples_received",
-                               "R2 Ears received real PCM audio samples.",
-                               details, ears->event.source_name);
-                ears->bytes_since_log = 0;
-                ears->last_log_timestamp_us = ears->event.timestamp;
+    if (!r2_ears_is_open(ears)) { errno = EBADF; return -1; }
+    size_t copied = 0;
+    while (copied < buffer_size) {
+        if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+        if (ears->using_file) {
+            struct pollfd fd = { .fd = ears->file_fd, .events = POLLIN };
+            int ready = poll(&fd, 1, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) goto read_failed;
+            if (!ready) continue;
+            ssize_t got = read(ears->file_fd, (unsigned char *)buffer + copied,
+                               buffer_size - copied);
+            if (got < 0 && errno == EINTR) continue;
+            if (got < 0) goto read_failed;
+            if (got == 0) {
+                int status = 0;
+                for (;;) {
+                    pid_t done = waitpid(ears->file_pid, &status, WNOHANG);
+                    if (done == ears->file_pid) { ears->file_pid = -1; break; }
+                    if (done < 0 && errno == EINTR) continue;
+                    if (done < 0) goto read_failed;
+                    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+                    (void)poll(NULL, 0, 100);
+                }
+                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    errno = EIO; goto read_failed;
+                }
+                if (copied) r2_ears_record_samples(ears, copied);
+                r2_ears_close(ears);
+                return (ssize_t)copied;
             }
-
-            return (ssize_t)bytes_read;
+            copied += (size_t)got;
+        } else {
+            if (!ears->pulse_stream ||
+                pa_stream_get_state(ears->pulse_stream) != PA_STREAM_READY ||
+                pa_context_get_state(ears->pulse_context) != PA_CONTEXT_READY) {
+                errno = EIO; goto read_failed;
+            }
+            if (!ears->pulse_remaining) {
+                const void *data = NULL;
+                size_t bytes = 0;
+                if (pa_stream_peek(ears->pulse_stream, &data, &bytes) < 0) {
+                    errno = EIO; goto read_failed;
+                }
+                if (!bytes) {
+                    if (r2_ears_pulse_step(ears) < 0) { errno = EIO; goto read_failed; }
+                    continue;
+                }
+                /* A Pulse hole is lost capture data, not observed silence. */
+                if (!data) { errno = EPIPE; goto read_failed; }
+                ears->pulse_data = data;
+                ears->pulse_remaining = bytes;
+            }
+            size_t count = buffer_size - copied;
+            if (count > ears->pulse_remaining) count = ears->pulse_remaining;
+            memcpy((unsigned char *)buffer + copied, ears->pulse_data, count);
+            ears->pulse_data += count;
+            ears->pulse_remaining -= count;
+            copied += count;
+            if (!ears->pulse_remaining && pa_stream_drop(ears->pulse_stream) < 0) {
+                errno = EIO; goto read_failed;
+            }
         }
-
-        if (feof(ears->file_stream))
-        {
-            r2_ears_close(ears);
-
-            return 0;
-        }
-
-        if (ferror(ears->file_stream))
-        {
-            r2_log_sensory("audio_read_failed",
-                           "R2 Ears encountered an error reading audio-file samples.",
-                           "The decoded PCM stream reported a read error.",
-                           ears->event.source_name);
-            r2_ears_close(ears);
-
-            return -1;
-        }
-
-        return 0;
     }
-
-
-    /* -----------------------------------------------------
-     * PulseAudio / PipeWire source
-     * ----------------------------------------------------- */
-
-    if (ears->pulse_stream)
-    {
-        int error = 0;
-
-        if (pa_simple_read(
-                ears->pulse_stream,
-                buffer,
-                buffer_size,
-                &error
-            ) < 0)
-        {
-            fprintf(
-                stderr,
-                "R2 Ears: audio read failed: %s\n",
-                pa_strerror(error)
-            );
-            r2_log_sensory("audio_read_failed",
-                           "R2 Ears encountered a live audio capture error.",
-                           pa_strerror(error), ears->event.source_name);
-            /* A failed Pulse/PipeWire read invalidates this stream. Close it
-               now so callers cannot accidentally keep treating it as usable. */
-            r2_ears_close(ears);
-            return -1;
-        }
-
-        ears->event.timestamp =
-            r2_ears_timestamp();
-        ears->bytes_since_log += buffer_size;
-
-        if (ears->last_log_timestamp_us == 0 ||
-            ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
-            char details[768];
-            snprintf(details, sizeof(details),
-                     "source=%s; bytes_received_since_last_entry=%llu; "
-                     "sample_rate=%u; channels=%u; bits_per_sample=%u; "
-                     "audio_interpretation=not_performed_by_Ears",
-                     ears->event.source_name,
-                     (unsigned long long)ears->bytes_since_log,
-                     ears->format.sample_rate, ears->format.channels,
-                     ears->format.bits_per_sample);
-            r2_log_sensory("audio_samples_received",
-                           "R2 Ears received real PCM audio samples.",
-                           details, ears->event.source_name);
-            ears->bytes_since_log = 0;
-            ears->last_log_timestamp_us = ears->event.timestamp;
-        }
-
-        return (ssize_t)buffer_size;
-    }
-
-
-    errno = EBADF;
-
+    r2_ears_record_samples(ears, copied);
+    return (ssize_t)copied;
+read_failed: {
+    int saved = errno;
+    R2HearingEvent event;
+    r2_ears_get_event(ears, &event);
+    r2_log_sensory("audio_read_failed", "R2 Ears could not complete a real PCM read.",
+                   strerror(saved), event.source_name);
+    r2_ears_close(ears);
+    errno = saved;
     return -1;
+}
+}
+
+ssize_t r2_ears_read(R2Ears *ears, void *buffer, size_t buffer_size)
+{
+    return r2_ears_read_cancelable(ears, buffer, buffer_size, NULL, NULL);
 }
 
 
@@ -1229,11 +1212,13 @@ int r2_ears_get_event(
     if (!ears || !event)
         return -1;
 
+    pthread_mutex_lock(&ears->event_lock);
     memcpy(
         event,
         &ears->event,
         sizeof(R2HearingEvent)
     );
+    pthread_mutex_unlock(&ears->event_lock);
 
     return 0;
 }
@@ -1251,11 +1236,13 @@ int r2_ears_get_format(
     if (!ears || !format)
         return -1;
 
+    pthread_mutex_lock(&ears->event_lock);
     memcpy(
         format,
         &ears->format,
         sizeof(R2AudioFormat)
     );
+    pthread_mutex_unlock(&ears->event_lock);
 
     return 0;
 }
@@ -1270,7 +1257,10 @@ int r2_ears_is_open(R2Ears *ears)
     if (!ears)
         return 0;
 
-    return ears->open;
+    pthread_mutex_lock(&ears->event_lock);
+    int open = ears->open;
+    pthread_mutex_unlock(&ears->event_lock);
+    return open;
 }
 
 
@@ -1279,5 +1269,8 @@ R2HearingOrigin r2_ears_get_origin(R2Ears *ears)
     if (!ears)
         return R2_HEARING_NONE;
 
-    return ears->event.origin;
+    pthread_mutex_lock(&ears->event_lock);
+    R2HearingOrigin origin = ears->event.origin;
+    pthread_mutex_unlock(&ears->event_lock);
+    return origin;
 }

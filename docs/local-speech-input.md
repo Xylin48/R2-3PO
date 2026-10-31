@@ -111,3 +111,27 @@ The selected V4L2 device must support the current capture mode (640×480 at
 approximately 10 frames per second) and be readable/writable by the `r2`
 runtime user. Use the hardware preflight to enumerate available devices, then
 test `vision see` and a visual question in chat on the actual machine.
+
+
+### Audio source lifecycle
+
+Live capture uses the native PulseAudio event loop. Microphone and desktop keep
+separate connections and preserve partial native fragments across caller reads.
+Connection setup and PCM waits observe caller cancellation; the 100 ms event-loop
+poll cycle is for cancellation checks, not an audio-duration or silence deadline.
+The core connects continuous-worker stop/shutdown and explicit listen cancellation
+to these checks before joining or closing the source. A reported Pulse capture
+hole fails the interval rather than manufacturing observed silence.
+
+File input launches an owned FFmpeg process with an argument array. Full media
+arguments no longer pass through a fixed-size shell command. EOF checks the
+child's exit status; failed decoding is not reported as clean completion. Closing
+a file source terminates and reaps its decoder and closes its pipe. Reads can be
+cancelled while the decoder has no output. Metadata snapshots are synchronized
+with capture publication. Callers serialize open/read/close and join readers
+before destroying an Ears object; metadata getters can run concurrently.
+
+Runtime fixtures use controlled Pulse endpoints and a real spawned test decoder.
+Physical Pulse/PipeWire hardware, real FFmpeg media and local Whisper acceptance
+still need host testing. The separate `pactl` discovery subprocesses are not yet
+covered by the cancellable native connection/read API.

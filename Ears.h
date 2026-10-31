@@ -245,6 +245,21 @@ ssize_t r2_ears_read(
 );
 
 
+/* Cancel a pending native Pulse connection as well as PCM waits. */
+int r2_ears_open_source_cancelable(R2Ears *ears, const char *source_name,
+                                  int (*cancelled)(void *), void *userdata);
+int r2_ears_open_microphone_cancelable(R2Ears *ears,
+                                      int (*cancelled)(void *), void *userdata);
+int r2_ears_open_desktop_cancelable(R2Ears *ears,
+                                   int (*cancelled)(void *), void *userdata);
+
+/* One owner opens/closes an object and serializes its reads. Join the reader
+ * before close/reopen/shutdown. Metadata getters may run concurrently.
+ * Cancellation is checked while waiting for PCM; returns -1/ECANCELED.
+ * The owner closes a cancelled source after its reader has returned. */
+ssize_t r2_ears_read_cancelable(R2Ears *ears, void *buffer, size_t buffer_size,
+                               int (*cancelled)(void *), void *userdata);
+
 /*
  * Retrieve information about the current hearing event.
  *

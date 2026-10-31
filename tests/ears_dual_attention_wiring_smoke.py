@@ -10,8 +10,8 @@ desktop = core.index("static void *r2_ears_desktop_capture_worker(void *unused)"
 capture = core[start:desktop]
 desktop_end = core.index("static int r2_ears_write_buffered_audio(", desktop)
 desktop_capture = core[desktop:desktop_end]
-assert "r2_ears_read(ears, pcm, sizeof(pcm))" in capture
-assert "r2_ears_read(ears_desktop, pcm, sizeof(pcm))" in desktop_capture
+assert "r2_ears_read_cancelable(ears, pcm, sizeof(pcm)," in capture
+assert "r2_ears_read_cancelable(ears_desktop, pcm, sizeof(pcm)," in desktop_capture
 assert "ears_recent_audio" in capture and "ears_recent_audio" not in desktop_capture
 assert "ears_desktop_recent_audio" in desktop_capture
 assert "ears_desktop_recent_total_bytes += count" in desktop_capture
@@ -31,7 +31,7 @@ assert "r2_ears_write_desktop_buffered_audio" in listen
 assert "r2_ears_write_desktop_recent_audio" in listen
 assert "r2_ears_write_buffered_audio" in listen
 assert "r2_ears_write_recent_audio" in listen
-assert "r2_ears_open_microphone(ears)" in listen
+assert "r2_ears_open_microphone_cancelable(ears," in listen
 # The Life Log must not mistake desktop playback for microphone perception.
 record_start = core.index("static int64_t r2_ears_record_transcript(")
 record_end = core.index("char *r2_ears_listen_cancelable(", record_start)

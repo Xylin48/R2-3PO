@@ -11159,6 +11159,28 @@ static void r2_ears_notice_pcm_change(const unsigned char *pcm, size_t size,
     *have_previous = 1;
 }
 
+static int r2_ears_open_cancelled(void *unused)
+{
+    (void)unused;
+    return shutting_down;
+}
+
+static int r2_ears_capture_cancelled(void *userdata)
+{
+    return shutting_down || !atomic_load((atomic_int *)userdata);
+}
+
+typedef struct {
+    int (*cancelled)(void *);
+    void *userdata;
+} R2EarsReadCancellation;
+
+static int r2_ears_listen_read_cancelled(void *userdata)
+{
+    R2EarsReadCancellation *request = userdata;
+    return shutting_down || (request->cancelled && request->cancelled(request->userdata));
+}
+
 static void *r2_ears_capture_worker(void *unused)
 {
     (void)unused;
@@ -11167,7 +11189,8 @@ static void *r2_ears_capture_worker(void *unused)
     int have_prior_audio = 0;
     uint64_t last_audio_notice = 0;
     while (!shutting_down && atomic_load(&ears_capture_running)) {
-        ssize_t got = r2_ears_read(ears, pcm, sizeof(pcm));
+        ssize_t got = r2_ears_read_cancelable(ears, pcm, sizeof(pcm),
+                                               r2_ears_capture_cancelled, &ears_capture_running);
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
             if (!shutting_down && atomic_load(&ears_capture_running))
                 r2_log_sensory("audio_capture_ended",
@@ -11215,7 +11238,8 @@ static void *r2_ears_desktop_capture_worker(void *unused)
     int have_prior_audio = 0;
     uint64_t last_audio_notice = 0;
     while (!shutting_down && atomic_load(&ears_desktop_capture_running)) {
-        ssize_t got = r2_ears_read(ears_desktop, pcm, sizeof(pcm));
+        ssize_t got = r2_ears_read_cancelable(ears_desktop, pcm, sizeof(pcm),
+                                               r2_ears_capture_cancelled, &ears_desktop_capture_running);
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
             if (!shutting_down && atomic_load(&ears_desktop_capture_running))
                 r2_log_sensory("audio_capture_ended",
@@ -11644,7 +11668,8 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No continuously buffered audio is available to inspect.\n");
             goto cleanup;
         }
-        if (!ears || r2_ears_open_microphone(ears) != 0) {
+        R2EarsReadCancellation read_cancel = { cancelled, userdata };
+        if (!ears || r2_ears_open_microphone_cancelable(ears, r2_ears_listen_read_cancelled, &read_cancel) != 0) {
             pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
             goto cleanup;
@@ -11655,7 +11680,8 @@ char *r2_ears_listen_cancelable(unsigned seconds,
                !(cancelled && cancelled(userdata))) {
             size_t wanted = total_bytes - captured_bytes;
             if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
-            ssize_t got = r2_ears_read(ears, pcm, wanted);
+            ssize_t got = r2_ears_read_cancelable(ears, pcm, wanted,
+                                                   r2_ears_listen_read_cancelled, &read_cancel);
             if (got <= 0 || ((size_t)got % 4U) != 0U) {
                 fprintf(stderr, "[Ears] Microphone capture ended early or returned invalid PCM.\n");
                 break;
@@ -11804,7 +11830,7 @@ static int r2_ears_start_input(void)
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? r2_ears_open_microphone(ears) : -1;
+    int rc = ears ? r2_ears_open_microphone_cancelable(ears, r2_ears_open_cancelled, NULL) : -1;
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
@@ -11855,7 +11881,7 @@ int r2_ears_start_desktop(void)
         pthread_mutex_unlock(&ears_desktop_capture_lock);
         return -1;
     }
-    int rc = r2_ears_open_desktop(ears_desktop);
+    int rc = r2_ears_open_desktop_cancelable(ears_desktop, r2_ears_open_cancelled, NULL);
     if (rc == 0) {
         pthread_mutex_lock(&ears_desktop_recent_lock);
         ears_desktop_recent_length = 0;

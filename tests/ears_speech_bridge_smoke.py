@@ -15,12 +15,12 @@ start = core.index("char *r2_ears_listen_cancelable(unsigned seconds,")
 end = core.index("int r2_ears_start(void)", start)
 bridge = core[start:end]
 
-assert "r2_ears_read(ears, pcm, wanted)" in bridge
+assert "r2_ears_read_cancelable(ears, pcm, wanted," in bridge
 assert "r2_ears_write_recent_audio(total_bytes, start_total, microphone_generation, wav, cancelled, userdata)" in bridge
 capture_start = core.index("static void *r2_ears_capture_worker(void *unused)")
 capture_end = core.index("static int r2_ears_write_recent_audio(", capture_start)
 capture_worker = core[capture_start:capture_end]
-assert "r2_ears_read(ears, pcm, sizeof(pcm))" in capture_worker
+assert "r2_ears_read_cancelable(ears, pcm, sizeof(pcm)," in capture_worker
 assert "ears_recent_audio" in capture_worker
 assert "ears_recent_total_bytes += count" in capture_worker
 assert "No transcription or semantic interpretation is performed by the capture worker." in core
@@ -88,19 +88,14 @@ assert 'R2_WHISPER_CLI="${R2_WHISPER_CLI:-}"' in launcher
 assert "Local Whisper is not configured" in launcher
 assert "docs/local-speech-input.md" in launcher
 assert "r2_ears_read(" in ears and "ssize_t r2_ears_read(" in ears_header
-read_start = ears.index("ssize_t r2_ears_read(")
+read_start = ears.index("ssize_t r2_ears_read_cancelable(")
 read_end = ears.index("int r2_ears_get_event(", read_start)
 read_impl = ears[read_start:read_end]
-live_error_start = read_impl.index("if (pa_simple_read(")
-live_error_end = read_impl.index("ears->event.timestamp =", live_error_start)
-live_error = read_impl[live_error_start:live_error_end]
-assert "r2_ears_close(ears);" in live_error, (
-    "a failed live microphone read must close its dead stream"
-)
-assert "if (feof(ears->file_stream))" in read_impl
-assert "r2_ears_close(ears);" in read_impl[
-    read_impl.index("if (feof(ears->file_stream))"):
-    read_impl.index("if (ferror(ears->file_stream))")
-], "decoded audio EOF must close the finished stream"
+assert "pa_simple_read(" not in ears
+assert "pa_stream_peek(" in read_impl and "pa_stream_drop(" in read_impl
+assert "errno = ECANCELED" in read_impl
+assert "WEXITSTATUS(status) != 0" in read_impl
+assert "r2_ears_close(ears);" in read_impl[read_impl.index("read_failed: {"):]
+assert "r2_ears_close(ears);" in read_impl[read_impl.index("if (got == 0)"):]
 assert "Qwen 3.5 9B accepts text and images, not raw microphone PCM" in ears_header
 print("Local microphone capture, Whisper transcription, and normal chat handoff smoke checks passed.")
