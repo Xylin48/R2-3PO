@@ -35,9 +35,24 @@ int main(void)
         assert(ears_desktop_recent_generation == desktop_generation + 1);
         assert(ears_recent_total_bytes == 0 && ears_desktop_recent_total_bytes == 0);
     }
+    /* Exact discovered names, including names beyond legacy metadata capacity,
+       reach the actual native stream on initial start and a routed restart. */
+    fake_pause_new = 1;
+    char full_source[8192];
+    memset(full_source, 'a', sizeof(full_source) - 1);
+    full_source[sizeof(full_source) - 1] = 0;
+    for (int route = 0; route < 2; ++route) {
+        full_source[0] = (char)('a' + route);
+        assert(r2_ears_start_source_cancelable(full_source, 0, NULL, NULL) == 0);
+        assert(!strcmp(last_stream->device, full_source));
+        assert(r2_ears_start_source_cancelable(full_source, 1, NULL, NULL) == 0);
+        assert(!strcmp(last_stream->device, full_source));
+        assert(r2_ears_stop() == 0 && r2_ears_status_desktop() == 1);
+        assert(r2_ears_stop_desktop() == 0);
+    }
     r2_ears_shutdown(ears); ears = NULL;
     r2_ears_shutdown(ears_desktop); ears_desktop = NULL;
-    assert(contexts == 0 && open_count == close_count && open_count == 6);
+    assert(contexts == 0 && open_count == close_count && open_count == 10);
     puts("Production stop joins paused native workers, isolates sources and permits restart.");
     return 0;
 }

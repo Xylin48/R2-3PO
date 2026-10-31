@@ -346,6 +346,9 @@ int r2_vision_close(void);
  * The implementation must call the EXISTING Ears subsystem.
  */
 int r2_ears_start(void);
+/* Start an exact discovered source; caller stops its owned old source first. */
+int r2_ears_start_source_cancelable(const char *source, int desktop,
+                                    int (*cancelled)(void *), void *userdata);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */

@@ -2,78 +2,91 @@
 #include "Ears.h"
 #include "Log.h"
 #include <assert.h>
-#include <limits.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "ears_native_test_endpoints.h"
 
-/* Discovery must work without opening any real microphone or speaker. */
-int64_t r2_log_sensory(const char *sense, const char *observation,
-                      const char *details, const char *source)
+int64_t r2_log_sensory(const char *type, const char *summary,
+                       const char *details, const char *source)
 {
-    (void)sense; (void)observation; (void)details; (void)source;
+    (void)type; (void)summary; (void)details; (void)source;
     return 0;
 }
-
+static int cancel_query(void *data)
+{
+    if (!connecting && fake_stall_stage != fake_last_stage) return 0;
+    return ++*(int *)data >= 4;
+}
+static void check_empty(const R2EarsDiscovery *d)
+{
+    assert(!d->microphone_source && !d->desktop_monitor && !d->desktop_playing);
+    assert(d->playback_pid == -1 && contexts == 0 && fake_operations == 0);
+}
 int main(void)
 {
-    char root[] = "/tmp/r2-source-discovery-XXXXXX";
-    assert(mkdtemp(root) != NULL);
-    char script[PATH_MAX], augmented_path[PATH_MAX * 2];
-    assert(snprintf(script, sizeof(script), "%s/pactl", root) < (int)sizeof(script));
-    FILE *fp = fopen(script, "w");
-    assert(fp);
-    const char *body =
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"get-default-source\" ]; then\n"
-        "  echo alsa_input.test_mic\n"
-        "elif [ \"$1\" = \"list\" ] && [ \"$2\" = \"short\" ]; then\n"
-        "  echo '0 alsa_output.test.monitor module-null-sink.c'\n"
-        "  if [ \"$R2_TEST_MIC\" = \"1\" ]; then\n"
-        "    echo '1 alsa_input.test_mic module-alsa-card.c'\n"
-        "  fi\n"
-        "elif [ \"$1\" = \"list\" ] && [ \"$2\" = \"sink-inputs\" ]; then\n"
-        "  echo 'Sink Input #21'\n"
-        "  if [ \"$R2_TEST_PLAYING\" = \"1\" ]; then echo '    Corked: no'\n"
-        "  else echo '    Corked: yes'; fi\n"
-        "  echo '    application.process.id = \"3141\"'\n"
-        "  echo 'Sink Input #22'\n"
-        "  echo '    Corked: yes'\n"
-        "  echo '    application.process.id = \"2718\"'\n"
-        "fi\n";
-    assert(fputs(body, fp) >= 0);
-    assert(fclose(fp) == 0);
-    assert(chmod(script, 0700) == 0);
-    const char *old_path = getenv("PATH");
-    assert(snprintf(augmented_path, sizeof(augmented_path), "%s:%s", root,
-                    old_path ? old_path : "/usr/bin") < (int)sizeof(augmented_path));
-    assert(setenv("PATH", augmented_path, 1) == 0);
-
-    assert(setenv("R2_TEST_MIC", "0", 1) == 0);
-    assert(setenv("R2_TEST_PLAYING", "0", 1) == 0);
-    assert(r2_ears_microphone_available() == 0);
-    assert(r2_ears_desktop_playing() == 0);
-    assert(r2_ears_playback_pid() == -1);
-
-    assert(setenv("R2_TEST_MIC", "1", 1) == 0);
+    R2EarsDiscovery d = {0};
+    fake_source_name = NULL; fake_playing = 0;
+    assert(r2_ears_discover(&d, NULL, NULL) == 0);
+    assert(!d.microphone_source && !d.desktop_playing && d.playback_pid == -1);
+    assert(!strcmp(d.desktop_monitor, "default.monitor"));
+    r2_ears_discovery_clear(&d);
+    /* Native monitor identity, not a name suffix, excludes this monitor. */
+    fake_source_name = "physical.monitor"; fake_default_source = fake_source_name;
+    fake_alt_source = "another-input";
+    fake_playing = 1;
+    assert(r2_ears_discover(&d, NULL, NULL) == 0);
+    assert(!strcmp(d.microphone_source, fake_source_name));
+    assert(d.desktop_playing && d.playback_pid == 3141);
+    assert(!strcmp(d.desktop_monitor, fake_monitor_name));
+    r2_ears_discovery_clear(&d);
+    fake_default_source = "monitor-without-suffix";
+    assert(r2_ears_discover(&d, NULL, NULL) == 0);
+    assert(!strcmp(d.microphone_source, fake_alt_source));
+    r2_ears_discovery_clear(&d);
+    /* Preserve arbitrary full server strings beyond the old 512/1024 caps. */
+    char long_source[9000], long_monitor[11000];
+    memset(long_source, 's', sizeof(long_source) - 1); long_source[sizeof(long_source) - 1] = 0;
+    memset(long_monitor, 'm', sizeof(long_monitor) - 1); long_monitor[sizeof(long_monitor) - 1] = 0;
+    fake_source_name = fake_default_source = long_source; fake_monitor_name = long_monitor;
+    fake_first_anonymous = 1;
+    assert(r2_ears_discover(&d, NULL, NULL) == 0);
+    assert(!strcmp(d.microphone_source, long_source));
+    assert(!strcmp(d.desktop_monitor, long_monitor) && d.playback_pid == 3141);
+    r2_ears_discovery_clear(&d);
+    fake_first_anonymous = 0;
+    const char *bad_pids[] = {"3141x", "3141 ", "-42", "1", "9999999999999999999999999999", NULL};
+    for (size_t i = 0; i < sizeof(bad_pids)/sizeof(*bad_pids); ++i) {
+        fake_pid = bad_pids[i];
+        assert(r2_ears_discover(&d, NULL, NULL) == 0);
+        assert(d.desktop_playing && d.playback_pid == -1);
+        assert(!strcmp(d.desktop_monitor, long_monitor));
+        r2_ears_discovery_clear(&d);
+    }
+    fake_pid = "3141";
+    for (int stage = 1; stage <= 4; ++stage) {
+        fake_error_stage = stage;
+        assert(r2_ears_discover(&d, NULL, NULL) == -1 && errno == EIO);
+        check_empty(&d);
+        fake_error_stage = 0; fake_stall_stage = stage; fake_last_stage = 0;
+        int calls = 0;
+        assert(r2_ears_discover(&d, cancel_query, &calls) == -1 && errno == ECANCELED);
+        check_empty(&d);
+        fake_stall_stage = 0;
+    }
+    assert(fake_cancelled_operations == 4);
+    fake_sink_missing = 1;
+    assert(r2_ears_discover(&d, NULL, NULL) == -1);
+    check_empty(&d); fake_sink_missing = 0;
+    connecting = 1;
+    int calls = 0;
+    assert(r2_ears_discover(&d, cancel_query, &calls) == -1 && errno == ECANCELED);
+    check_empty(&d); connecting = 0;
+    assert(open_count == 0 && close_count == 0);
     assert(r2_ears_microphone_available() == 1);
-    assert(r2_ears_desktop_playing() == 0);
-    assert(r2_ears_playback_pid() == -1);
-
-    assert(setenv("R2_TEST_PLAYING", "1", 1) == 0);
-    assert(r2_ears_microphone_available() == 1);
-    assert(r2_ears_desktop_playing() == 1);
-    assert(r2_ears_playback_pid() == 3141);
-
-    assert(setenv("R2_TEST_MIC", "0", 1) == 0);
-    assert(r2_ears_microphone_available() == 0);
-    assert(r2_ears_desktop_playing() == 1);
-    assert(r2_ears_playback_pid() == 3141);
-
-    assert(unlink(script) == 0);
-    assert(rmdir(root) == 0);
-    puts("Watch audio source probes distinguish hotplugged microphones and uncorked playback.");
+    assert(r2_ears_desktop_playing() == 1 && r2_ears_playback_pid() == 3141);
+    assert(contexts == 0 && fake_operations == 0);
+    puts("Native discovery: full names, actual routing, PID identity, cancellation and query failure passed.");
     return 0;
 }

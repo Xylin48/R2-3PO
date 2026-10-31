@@ -133,5 +133,13 @@ before destroying an Ears object; metadata getters can run concurrently.
 
 Runtime fixtures use controlled Pulse endpoints and a real spawned test decoder.
 Physical Pulse/PipeWire hardware, real FFmpeg media and local Whisper acceptance
-still need host testing. The separate `pactl` discovery subprocesses are not yet
-covered by the cancellable native connection/read API.
+still need host testing. Source discovery now uses the native Pulse introspection API, with cancellation
+through connection and each query. A scan returns owned full-length microphone
+and monitor names and a playback PID associated with the selected output sink.
+Watch uses that monitor even when playback is routed away from the default sink,
+and restarts its owned source when the discovered routing changes. A query error
+is distinct from a confirmed absent source; existing capture is not discarded
+solely because a scan failed. Discovery never opens a recording stream or invokes
+speech recognition. With concurrent playback on several output sinks, discovery
+currently selects one active sink, preferring one with a valid producer PID; it
+does not mix or capture all output sinks simultaneously.

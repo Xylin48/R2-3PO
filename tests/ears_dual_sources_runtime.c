@@ -58,26 +58,6 @@ static void check_pcm(R2Ears *stream, unsigned char expected)
 
 int main(void)
 {
-    char temp[] = "/tmp/r2-dual-ear-XXXXXX";
-    assert(mkdtemp(temp));
-    char path[PATH_MAX], environment[PATH_MAX * 2];
-    assert(snprintf(path, sizeof(path), "%s/pactl", temp) < (int)sizeof(path));
-    FILE *fp = fopen(path, "w");
-    assert(fp);
-    assert(fputs(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"get-default-source\" ]; then echo alsa_input.test_mic\n"
-        "elif [ \"$1\" = \"get-default-sink\" ]; then echo alsa_output.test\n"
-        "elif [ \"$1\" = \"list\" ]; then\n"
-        "  echo '1 alsa_input.test_mic x'\n"
-        "  echo '2 alsa_output.test.monitor x'\n"
-        "fi\n", fp) >= 0);
-    assert(fclose(fp) == 0 && chmod(path, 0700) == 0);
-    const char *old_path = getenv("PATH");
-    assert(snprintf(environment, sizeof(environment), "%s:%s", temp,
-                    old_path ? old_path : "/usr/bin") < (int)sizeof(environment));
-    assert(setenv("PATH", environment, 1) == 0);
-
     R2Ears *mic = NULL, *desktop = NULL;
     assert(r2_ears_init(&mic) == 0 && r2_ears_init(&desktop) == 0);
     assert(r2_ears_open_microphone(mic) == 0);
@@ -131,7 +111,7 @@ int main(void)
     r2_ears_shutdown(desktop);
     r2_ears_shutdown(mic);
     assert(open_count == close_count && open_count == 7 && contexts == 0);
-    assert(unlink(path) == 0 && rmdir(temp) == 0);
+    assert(fake_operations == 0);
     puts("Native fragmented PCM, dual sources, cancellation, loss/error cleanup and concurrent metadata passed.");
     return 0;
 }

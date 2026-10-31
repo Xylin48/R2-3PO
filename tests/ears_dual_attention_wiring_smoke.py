@@ -62,7 +62,8 @@ watch = shell[shell.index("static void *shell_watch_worker(void *unused)"):
               shell.index("static void shell_watch_start(void)")]
 assert "managed_microphone" in watch and "managed_desktop" in watch
 assert "wanted_audio" not in watch
-assert "r2_ears_start_desktop()" in watch and "r2_ears_start()" in watch
+assert "r2_ears_start_source_cancelable(desktop_source, 1," in watch
+assert "r2_ears_start_source_cancelable(microphone_source, 0," in watch
 assert "r2_ears_stop_desktop()" in watch and "r2_ears_stop()" in watch
 assert "r2_ears_status_desktop()" in watch and "r2_ears_status()" in watch
 assert "audio_origin=desktop_playback" in core

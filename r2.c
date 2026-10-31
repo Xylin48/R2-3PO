@@ -11819,7 +11819,7 @@ char *r2_ears_listen(unsigned seconds)
 
 /* Microphone retains the existing Ears bridge and its history, including
  * direct speech capture. It never takes over the separate desktop monitor. */
-static int r2_ears_start_input(void)
+static int r2_ears_start_input(const char *source, int (*cancelled)(void *), void *userdata)
 {
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
@@ -11830,7 +11830,9 @@ static int r2_ears_start_input(void)
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? r2_ears_open_microphone_cancelable(ears, r2_ears_open_cancelled, NULL) : -1;
+    int rc = !ears ? -1 : source
+        ? r2_ears_open_source_cancelable(ears, source, cancelled, userdata)
+        : r2_ears_open_microphone_cancelable(ears, cancelled, userdata);
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
@@ -11860,12 +11862,12 @@ static int r2_ears_start_input(void)
 
 int r2_ears_start(void)
 {
-    return r2_ears_start_input();
+    return r2_ears_start_input(NULL, r2_ears_open_cancelled, NULL);
 }
 
 /* Playback monitor has its own Pulse stream, worker and rolling history.
  * It can run alongside the microphone and shuts down independently. */
-int r2_ears_start_desktop(void)
+static int r2_ears_start_desktop_input(const char *source, int (*cancelled)(void *), void *userdata)
 {
     pthread_mutex_lock(&ears_desktop_capture_lock);
     if (atomic_load(&ears_desktop_capture_running) &&
@@ -11881,7 +11883,9 @@ int r2_ears_start_desktop(void)
         pthread_mutex_unlock(&ears_desktop_capture_lock);
         return -1;
     }
-    int rc = r2_ears_open_desktop_cancelable(ears_desktop, r2_ears_open_cancelled, NULL);
+    int rc = source
+        ? r2_ears_open_source_cancelable(ears_desktop, source, cancelled, userdata)
+        : r2_ears_open_desktop_cancelable(ears_desktop, cancelled, userdata);
     if (rc == 0) {
         pthread_mutex_lock(&ears_desktop_recent_lock);
         ears_desktop_recent_length = 0;
@@ -11907,6 +11911,19 @@ int r2_ears_start_desktop(void)
                  rc == 0 ? "No automatic transcription or semantic interpretation."
                          : NULL, "r2_ears_start_desktop");
     return rc;
+}
+
+int r2_ears_start_desktop(void)
+{
+    return r2_ears_start_desktop_input(NULL, r2_ears_open_cancelled, NULL);
+}
+
+int r2_ears_start_source_cancelable(const char *source, int desktop,
+                                    int (*cancelled)(void *), void *userdata)
+{
+    if (!source || !*source) { errno = EINVAL; return -1; }
+    return desktop ? r2_ears_start_desktop_input(source, cancelled, userdata)
+                   : r2_ears_start_input(source, cancelled, userdata);
 }
 
 int r2_ears_stop_desktop(void)

@@ -164,71 +164,6 @@ static uint64_t r2_ears_timestamp(void)
 }
 
 
-/*
- * Safely quote a string for use as one shell argument.
- *
- * This matters for:
- *
- *     /home/x/My Music/song.mp3
- *     /home/x/Movie's Audio/movie.mkv
- *
- * and also prevents a filename from becoming shell syntax.
- */
-static char *r2_ears_shell_quote(const char *input)
-{
-    size_t length;
-    size_t max_size;
-    char *output;
-    char *p;
-
-    if (!input)
-        return NULL;
-
-    length = strlen(input);
-
-    /*
-     * Worst case:
-     *
-     * every character is a single quote and therefore becomes
-     *
-     *     '\''
-     *
-     * plus surrounding quotes.
-     */
-    if (length > (SIZE_MAX - 3) / 4)
-        return NULL;
-
-    max_size = (length * 4) + 3;
-
-    output = malloc(max_size);
-
-    if (!output)
-        return NULL;
-
-    p = output;
-
-    *p++ = '\'';
-
-    for (size_t i = 0; i < length; ++i)
-    {
-        if (input[i] == '\'')
-        {
-            memcpy(p, "'\\''", 4);
-            p += 4;
-        }
-        else
-        {
-            *p++ = input[i];
-        }
-    }
-
-    *p++ = '\'';
-    *p = '\0';
-
-    return output;
-}
-
-
 static void r2_ears_reset_event(R2Ears *ears)
 {
     if (!ears)
@@ -294,249 +229,191 @@ static pa_sample_spec r2_ears_sample_spec(void)
 }
 
 
-/*
- * Get the system's default Pulse/PipeWire sink.
- *
- * Example:
- *
- *     alsa_output.pci-0000_00_1f.3.analog-stereo
- *
- * The corresponding monitor source is:
- *
- *     alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
- *
- * This is what allows R2 to hear what the desktop itself
- * is playing.
- */
-static char *r2_ears_get_default_sink(void)
+/* Discovery owns a native connection but never opens a recording stream. */
+typedef struct {
+    R2EarsDiscovery result;
+    char *default_source, *default_sink;
+    uint32_t playback_sink;
+    int done, failed;
+} R2EarsDiscoveryQuery;
+
+static int r2_ears_pulse_step(R2Ears *ears);
+
+void r2_ears_discovery_clear(R2EarsDiscovery *result)
 {
-    FILE *pipe;
-    char buffer[1024];
-
-    pipe = popen(
-        "pactl get-default-sink 2>/dev/null",
-        "r"
-    );
-
-    if (!pipe)
-        return NULL;
-
-    if (!fgets(
-            buffer,
-            sizeof(buffer),
-            pipe
-        ))
-    {
-        pclose(pipe);
-        return NULL;
-    }
-
-    pclose(pipe);
-
-    buffer[strcspn(buffer, "\r\n")] = '\0';
-
-    if (buffer[0] == '\0')
-        return NULL;
-
-    return strdup(buffer);
+    if (!result) return;
+    free(result->microphone_source);
+    free(result->desktop_monitor);
+    memset(result, 0, sizeof(*result));
+    result->playback_pid = -1;
 }
 
-
-/*
- * Get the default Pulse/PipeWire recording source.
- *
- * This is more robust than simply assuming the microphone
- * has a particular device name.
- */
-static char *r2_ears_get_default_source(void)
+static void r2_ears_discovery_copy(R2EarsDiscoveryQuery *q, char **out, const char *value)
 {
-    FILE *pipe;
-    char buffer[1024];
-
-    pipe = popen(
-        "pactl get-default-source 2>/dev/null",
-        "r"
-    );
-
-    if (!pipe)
-        return NULL;
-
-    if (!fgets(
-            buffer,
-            sizeof(buffer),
-            pipe
-        ))
-    {
-        pclose(pipe);
-        return NULL;
-    }
-
-    pclose(pipe);
-
-    buffer[strcspn(buffer, "\r\n")] = '\0';
-
-    if (buffer[0] == '\0')
-        return NULL;
-
-    return strdup(buffer);
+    if (!value || !*value) return;
+    char *copy = strdup(value);
+    if (!copy) { q->failed = ENOMEM; return; }
+    free(*out);
+    *out = copy;
 }
 
-
-/*
- * Verify that a Pulse/PipeWire source exists.
- *
- * This is deliberately lightweight. The actual opening is still
- * performed by pa_simple_new().
- */
-static int r2_ears_source_exists(const char *source)
+static void r2_ears_server_info(pa_context *context, const pa_server_info *info, void *userdata)
 {
-    FILE *pipe;
-    char *quoted_source;
-    char command[2048];
-    int found = 0;
-
-    if (!source || source[0] == '\0')
-        return 0;
-
-    quoted_source =
-        r2_ears_shell_quote(source);
-
-    if (!quoted_source)
-        return 0;
-
-    int command_length = snprintf(
-        command,
-        sizeof(command),
-        "pactl list short sources 2>/dev/null | "
-        "grep -F -- %s >/dev/null 2>&1",
-        quoted_source
-    );
-
-    free(quoted_source);
-
-    if (command_length < 0 || (size_t)command_length >= sizeof(command))
-        return 0;
-
-    pipe = popen(command, "r");
-
-    if (!pipe)
-        return 0;
-
-    /*
-     * grep's exit status is not directly portable through the
-     * stdio API, but pclose() gives us enough information here.
-     */
-    if (pclose(pipe) == 0)
-        found = 1;
-
-    return found;
+    (void)context;
+    R2EarsDiscoveryQuery *q = userdata;
+    q->done = 1;
+    if (!info) { q->failed = EIO; return; }
+    r2_ears_discovery_copy(q, &q->default_source, info->default_source_name);
+    r2_ears_discovery_copy(q, &q->default_sink, info->default_sink_name);
 }
 
-
-/* Availability discovery is separate from sound capture. Both USB and built-in
- * microphone names come from the active Pulse/PipeWire server, not an app list.
- * A monitor is desktop playback, not a physical microphone. */
-static int r2_ears_is_monitor(const char *name)
+static void r2_ears_source_info(pa_context *context, const pa_source_info *info,
+                                int eol, void *userdata)
 {
-    if (!name) return 1;
-    size_t n = strlen(name);
-    return n >= 8 && strcmp(name + n - 8, ".monitor") == 0;
+    (void)context;
+    R2EarsDiscoveryQuery *q = userdata;
+    if (eol) { q->done = 1; if (eol < 0) q->failed = EIO; return; }
+    if (!info || !info->name || info->monitor_of_sink != PA_INVALID_INDEX) return;
+    if (!q->result.microphone_source ||
+        (q->default_source && !strcmp(info->name, q->default_source)))
+        r2_ears_discovery_copy(q, &q->result.microphone_source, info->name);
 }
 
-static int r2_ears_find_microphone(char *out, size_t capacity)
+static void r2_ears_sink_input_info(pa_context *context, const pa_sink_input_info *info,
+                                    int eol, void *userdata)
 {
-    char preferred[512] = {0}, fallback[512] = {0}, line[2048];
-    char *default_name = r2_ears_get_default_source();
-    FILE *pipe = popen("pactl list short sources 2>/dev/null", "r");
-    if (!out || capacity == 0) {
-        free(default_name);
-        if (pipe) pclose(pipe);
-        return -1;
+    (void)context;
+    R2EarsDiscoveryQuery *q = userdata;
+    if (eol) { q->done = 1; if (eol < 0) q->failed = EIO; return; }
+    if (!info || info->corked || info->sink == PA_INVALID_INDEX) return;
+    const char *pid_text = info->proplist ?
+        pa_proplist_gets(info->proplist, PA_PROP_APPLICATION_PROCESS_ID) : NULL;
+    long pid = -1;
+    if (pid_text && *pid_text && strspn(pid_text, "0123456789") == strlen(pid_text)) {
+        char *end = NULL;
+        errno = 0;
+        long parsed = strtol(pid_text, &end, 10);
+        if (!errno && end && !*end && parsed > 1 && parsed <= INT_MAX) pid = parsed;
     }
-    out[0] = '\0';
-    if (!pipe) {
-        free(default_name);
-        return -1;
+    /* Select one actual output and its producer together. Prefer a producer
+       identity when the first active stream did not supply one. */
+    if (!q->result.desktop_playing || (q->result.playback_pid < 0 && pid > 1)) {
+        q->playback_sink = info->sink;
+        q->result.playback_pid = pid;
     }
-    while (fgets(line, sizeof(line), pipe)) {
-        char name[512] = {0};
-        if (sscanf(line, "%*u %511s", name) != 1 ||
-            r2_ears_is_monitor(name))
-            continue;
-        if (!fallback[0]) snprintf(fallback, sizeof(fallback), "%s", name);
-        if (default_name && strcmp(name, default_name) == 0)
-            snprintf(preferred, sizeof(preferred), "%s", name);
+    q->result.desktop_playing = 1;
+}
+
+static void r2_ears_sink_info(pa_context *context, const pa_sink_info *info,
+                              int eol, void *userdata)
+{
+    (void)context;
+    R2EarsDiscoveryQuery *q = userdata;
+    if (eol) { q->done = 1; if (eol < 0) q->failed = EIO; return; }
+    if (!info) return;
+    int selected = q->result.desktop_playing ? info->index == q->playback_sink :
+        (q->default_sink && info->name && !strcmp(info->name, q->default_sink));
+    if (selected)
+        r2_ears_discovery_copy(q, &q->result.desktop_monitor, info->monitor_source_name);
+}
+
+static int r2_ears_discovery_wait(R2Ears *connection, pa_operation *operation,
+                                  R2EarsDiscoveryQuery *q,
+                                  int (*cancelled)(void *), void *userdata)
+{
+    if (!operation) { errno = EIO; return -1; }
+    int error = 0;
+    for (;;) {
+        if (cancelled && cancelled(userdata)) { error = ECANCELED; break; }
+        if (q->failed) { error = q->failed; break; }
+        pa_operation_state_t state = pa_operation_get_state(operation);
+        if (state != PA_OPERATION_RUNNING) {
+            if (state != PA_OPERATION_DONE || !q->done) error = EIO;
+            break;
+        }
+        if (pa_context_get_state(connection->pulse_context) != PA_CONTEXT_READY ||
+            r2_ears_pulse_step(connection) < 0) { error = EIO; break; }
     }
-    int closed = pclose(pipe);
-    free(default_name);
-    if (closed != 0) return -1;
-    const char *selected = preferred[0] ? preferred : fallback;
-    if (!*selected || snprintf(out, capacity, "%s", selected) >= (int)capacity)
-        return -1;
+    if (pa_operation_get_state(operation) == PA_OPERATION_RUNNING)
+        pa_operation_cancel(operation);
+    pa_operation_unref(operation);
+    if (error) { errno = error; return -1; }
     return 0;
+}
+
+int r2_ears_discover(R2EarsDiscovery *out, int (*cancelled)(void *), void *userdata)
+{
+    if (!out) { errno = EINVAL; return -1; }
+    /* Caller supplies an empty result and owns its strings after success. */
+    memset(out, 0, sizeof(*out)); out->playback_pid = -1;
+    R2EarsDiscoveryQuery q = { .result.playback_pid = -1,
+                               .playback_sink = PA_INVALID_INDEX };
+    R2Ears *connection = NULL;
+    int rc = -1, error = EIO;
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+    if (r2_ears_init(&connection) != 0) { errno = ENOMEM; return -1; }
+    connection->pulse_loop = pa_mainloop_new();
+    if (!connection->pulse_loop) { error = ENOMEM; goto cleanup; }
+    connection->pulse_context = pa_context_new(pa_mainloop_get_api(connection->pulse_loop),
+                                               "R2 source discovery");
+    if (!connection->pulse_context) { error = ENOMEM; goto cleanup; }
+    if (pa_context_connect(connection->pulse_context, NULL, PA_CONTEXT_NOFLAGS, NULL) < 0)
+        goto cleanup;
+    while (pa_context_get_state(connection->pulse_context) != PA_CONTEXT_READY) {
+        if (cancelled && cancelled(userdata)) { error = ECANCELED; goto cleanup; }
+        if (!PA_CONTEXT_IS_GOOD(pa_context_get_state(connection->pulse_context)) ||
+            r2_ears_pulse_step(connection) < 0) goto cleanup;
+    }
+    for (int query = 0; query < 4; ++query) {
+        pa_operation *operation = NULL;
+        q.done = 0;
+        if (query == 0) operation = pa_context_get_server_info(connection->pulse_context, r2_ears_server_info, &q);
+        if (query == 1) operation = pa_context_get_source_info_list(connection->pulse_context, r2_ears_source_info, &q);
+        if (query == 2) operation = pa_context_get_sink_input_info_list(connection->pulse_context, r2_ears_sink_input_info, &q);
+        if (query == 3) operation = pa_context_get_sink_info_list(connection->pulse_context, r2_ears_sink_info, &q);
+        if (r2_ears_discovery_wait(connection, operation, &q, cancelled, userdata) != 0) {
+            error = errno; goto cleanup;
+        }
+    }
+    /* A routed sink disappearing during enumeration is an incomplete query,
+       not evidence that there was no playback. Retry on the next Watch scan. */
+    if (q.result.desktop_playing && !q.result.desktop_monitor) goto cleanup;
+    *out = q.result;
+    memset(&q.result, 0, sizeof(q.result));
+    rc = 0;
+cleanup:
+    free(q.default_source); free(q.default_sink);
+    r2_ears_discovery_clear(&q.result);
+    r2_ears_shutdown(connection);
+    if (rc != 0) errno = error;
+    return rc;
 }
 
 int r2_ears_microphone_available(void)
 {
-    char source[512];
-    return r2_ears_find_microphone(source, sizeof(source)) == 0;
+    R2EarsDiscovery result = {0};
+    if (r2_ears_discover(&result, NULL, NULL) != 0) return 0;
+    int available = result.microphone_source != NULL;
+    r2_ears_discovery_clear(&result);
+    return available;
 }
 
-/* A live, uncorked playback stream is an audio source regardless of whether
- * it belongs to a browser, movie player, audio player or game. Paused/corked
- * streams do not keep the continuous desktop listener alive. */
 int r2_ears_desktop_playing(void)
 {
-    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
-    if (!pipe) return 0;
-    char line[2048];
-    int playing = 0, have_input = 0;
-    while (fgets(line, sizeof(line), pipe)) {
-        if (strstr(line, "Sink Input #")) have_input = 1;
-        if (have_input && strstr(line, "Corked: no"))
-            playing = 1;
-    }
-    if (pclose(pipe) != 0) return 0;
+    R2EarsDiscovery result = {0};
+    if (r2_ears_discover(&result, NULL, NULL) != 0) return 0;
+    int playing = result.desktop_playing;
+    r2_ears_discovery_clear(&result);
     return playing;
 }
 
-/* Resolve the real process responsible for an uncorked output stream.
- * It is evidence of desktop playback, not evidence that a video exists.
- * The optional Eyes bridge can look for a visible window owned by this PID. */
 long r2_ears_playback_pid(void)
 {
-    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
-    if (!pipe) return -1;
-    char line[2048];
-    long current_pid = -1, selected = -1;
-    int active = 0, seen_input = 0;
-    while (fgets(line, sizeof(line), pipe)) {
-        if (strstr(line, "Sink Input #")) {
-            if (seen_input && active && current_pid > 1 && selected < 0)
-                selected = current_pid;
-            seen_input = 1;
-            active = 0;
-            current_pid = -1;
-        } else if (seen_input && strstr(line, "Corked: ")) {
-            active = strstr(line, "Corked: no") != NULL;
-        } else if (seen_input) {
-            char *key = strstr(line, "application.process.id = ");
-            if (key) {
-                key += strlen("application.process.id = ");
-                if (*key == '"') ++key;
-                char *end = NULL;
-                errno = 0;
-                long value = strtol(key, &end, 10);
-                if (!errno && end != key && value > 1 && value <= INT_MAX &&
-                    (*end == '"' || *end == '\n' || *end == '\0'))
-                    current_pid = value;
-            }
-        }
-    }
-    if (seen_input && active && current_pid > 1 && selected < 0)
-        selected = current_pid;
-    if (pclose(pipe) != 0) return -1;
-    return selected;
+    R2EarsDiscovery result = {0};
+    if (r2_ears_discover(&result, NULL, NULL) != 0) return -1;
+    long pid = result.playback_pid;
+    r2_ears_discovery_clear(&result);
+    return pid;
 }
 
 /* ---------------------------------------------------------
@@ -728,49 +605,9 @@ int r2_ears_open_source_cancelable(
     pa_sample_spec spec;
     pa_buffer_attr buffer_attr;
     int error = 0;
-    char *resolved_source = NULL;
-    const char *actual_source;
-
-    if (!ears)
-        return -1;
+    const char *actual_source = source_name && *source_name ? source_name : NULL;
+    if (!ears) return -1;
     if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
-
-    /*
-     * NULL means:
-     *
-     *     "use the system's default recording source."
-     *
-     * Usually this is the microphone.
-     */
-    if (!source_name ||
-        source_name[0] == '\0')
-    {
-        resolved_source =
-            r2_ears_get_default_source();
-
-        actual_source =
-            resolved_source;
-    }
-    else
-    {
-        actual_source = source_name;
-    }
-
-    if (!actual_source ||
-        actual_source[0] == '\0')
-    {
-        free(resolved_source);
-
-        fprintf(
-            stderr,
-            "R2 Ears: no default audio source available.\n"
-        );
-        r2_log_sensory("audio_source_open_failed",
-                       "R2 Ears could not resolve the requested audio source.",
-                       "No explicit source was supplied and no default source was available.",
-                       "Ears.c");
-        return -1;
-    }
 
     r2_ears_close(ears);
 
@@ -839,7 +676,7 @@ int r2_ears_open_source_cancelable(
 
     r2_ears_set_source_name(
         ears,
-        actual_source
+        pa_stream_get_device_name(ears->pulse_stream)
     );
 
     ears->using_file = 0;
@@ -859,21 +696,18 @@ int r2_ears_open_source_cancelable(
     }
 
     pthread_mutex_unlock(&ears->event_lock);
-    free(resolved_source);
     return 0;
 pulse_cancelled:
     r2_ears_close(ears);
-    free(resolved_source);
     errno = ECANCELED;
     return -1;
 pulse_failed:
     error = ears->pulse_context ? pa_context_errno(ears->pulse_context) : PA_ERR_INTERNAL;
     fprintf(stderr, "R2 Ears: could not open audio source '%s': %s\n",
-            actual_source, pa_strerror(error));
+            actual_source ? actual_source : "default source", pa_strerror(error));
     r2_log_sensory("audio_source_open_failed", "R2 Ears could not open the live audio source.",
                    pa_strerror(error), actual_source);
     r2_ears_close(ears);
-    free(resolved_source);
     return -1;
 }
 
@@ -891,10 +725,16 @@ int r2_ears_open_microphone_cancelable(R2Ears *ears,
                                       int (*cancelled)(void *), void *userdata)
 {
     if (!ears) return -1;
-    char source[512];
-    if (r2_ears_find_microphone(source, sizeof(source)) != 0)
-        return -1;
-    return r2_ears_open_source_cancelable(ears, source, cancelled, userdata);
+    R2EarsDiscovery result = {0};
+    if (r2_ears_discover(&result, cancelled, userdata) != 0) return -1;
+    int rc = -1;
+    if (result.microphone_source)
+        rc = r2_ears_open_source_cancelable(ears, result.microphone_source, cancelled, userdata);
+    else errno = ENODEV;
+    int error = errno;
+    r2_ears_discovery_clear(&result);
+    errno = error;
+    return rc;
 }
 
 
@@ -910,83 +750,22 @@ int r2_ears_open_microphone(R2Ears *ears)
 int r2_ears_open_desktop_cancelable(R2Ears *ears,
                                    int (*cancelled)(void *), void *userdata)
 {
-    char *sink;
-    char monitor[1024];
-    int result;
-
-    if (!ears)
-        return -1;
-
-    sink =
-        r2_ears_get_default_sink();
-
-    if (!sink)
-    {
-        fprintf(
-            stderr,
-            "R2 Ears: could not determine the default "
-            "desktop audio sink.\n"
-        );
-
-        return -1;
+    if (!ears) return -1;
+    R2EarsDiscovery result = {0};
+    if (r2_ears_discover(&result, cancelled, userdata) != 0) return -1;
+    int rc = -1;
+    if (result.desktop_monitor)
+        rc = r2_ears_open_source_cancelable(ears, result.desktop_monitor, cancelled, userdata);
+    else errno = ENODEV;
+    int error = errno;
+    r2_ears_discovery_clear(&result);
+    if (rc == 0) {
+        pthread_mutex_lock(&ears->event_lock);
+        r2_ears_set_source_name(ears, "desktop-audio");
+        pthread_mutex_unlock(&ears->event_lock);
     }
-
-    /*
-     * The Pulse/PipeWire monitor source represents the audio
-     * being sent through the sink.
-     *
-     * Therefore:
-     *
-     *     MP3 playing on desktop
-     *     YouTube playing in browser
-     *     game audio
-     *     movie audio
-     *     system sounds
-     *
-     * all appear here.
-     */
-    snprintf(
-        monitor,
-        sizeof(monitor),
-        "%s.monitor",
-        sink
-    );
-
-    free(sink);
-
-    /*
-     * Give a useful diagnostic before attempting to open it.
-     */
-    if (!r2_ears_source_exists(monitor))
-    {
-        /*
-         * Do NOT immediately fail.
-         *
-         * PipeWire/Pulse implementations can expose sources in
-         * ways that make pactl's listing differ from what
-         * libpulse can actually open.
-         *
-         * Let the native Pulse stream make the final determination.
-         */
-    }
-
-    result =
-        r2_ears_open_source_cancelable(ears, monitor, cancelled, userdata);
-
-    if (result != 0)
-        return result;
-
-    pthread_mutex_lock(&ears->event_lock);
-    ears->event.origin =
-        R2_HEARING_WORLD;
-
-    r2_ears_set_source_name(
-        ears,
-        "desktop-audio"
-    );
-
-    pthread_mutex_unlock(&ears->event_lock);
-    return 0;
+    errno = error;
+    return rc;
 }
 
 

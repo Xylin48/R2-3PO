@@ -1348,16 +1348,29 @@ static void *shell_watch_worker(void *unused)
     int managed_microphone = 0;
     int managed_desktop = 0;
     int attached_visual = 0;
+    char *microphone_source = NULL, *desktop_source = NULL;
+    R2EarsDiscovery audio = { .playback_pid = -1 };
 
     while (!shell_watch_cancelled(NULL)) {
-        int desktop_playing = r2_ears_desktop_playing();
-        int microphone_available = r2_ears_microphone_available();
+        R2EarsDiscovery discovered = {0};
+        int audio_known = r2_ears_discover(&discovered, shell_watch_cancelled, NULL) == 0;
+        if (audio_known) {
+            r2_ears_discovery_clear(&audio);
+            audio = discovered;
+        } else {
+            r2_ears_discovery_clear(&discovered);
+        }
+        if (shell_watch_cancelled(NULL)) break;
+        /* Query failure means unknown, not unplugged. Retain the last complete
+           routing observation until discovery succeeds or the user stops it. */
+        int desktop_playing = audio.desktop_playing;
+        int microphone_available = audio.microphone_source != NULL;
         int camera_available = r2_vision_camera_available();
         int vlc_available = r2_vision_vlc_available() && desktop_playing;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
-        long playback_pid = desktop_playing ? r2_ears_playback_pid() : -1;
+        long playback_pid = desktop_playing ? audio.playback_pid : -1;
         unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
 
         /* The physical camera is the Eyes organ. Movies are separate displays.
@@ -1409,26 +1422,38 @@ static void *shell_watch_worker(void *unused)
         /* Both audio sources operate independently; the decision to close one
            must not be overridden by mere availability of that source. */
         if (managed_microphone &&
-            (!r2_sense_auto_allowed(2) || !microphone_available ||
-             r2_ears_status() <= 0)) {
+            (!r2_sense_auto_allowed(2) || r2_ears_status() <= 0 ||
+             (audio_known && (!microphone_available ||
+              strcmp(microphone_source, audio.microphone_source))))) {
             (void)r2_ears_stop();
             managed_microphone = 0;
+            free(microphone_source); microphone_source = NULL;
         }
-        if (!managed_microphone && r2_sense_auto_allowed(2) &&
-            microphone_available && r2_ears_status() <= 0 &&
-            r2_ears_start() == 0)
-            managed_microphone = 1;
+        if (audio_known && !managed_microphone && r2_sense_auto_allowed(2) &&
+            microphone_available && r2_ears_status() <= 0) {
+            microphone_source = strdup(audio.microphone_source);
+            if (microphone_source && r2_ears_start_source_cancelable(microphone_source, 0,
+                                                                      shell_watch_cancelled, NULL) == 0)
+                managed_microphone = 1;
+            else { free(microphone_source); microphone_source = NULL; }
+        }
 
         if (managed_desktop &&
-            (!r2_sense_auto_allowed(3) || !desktop_playing ||
-             r2_ears_status_desktop() <= 0)) {
+            (!r2_sense_auto_allowed(3) || r2_ears_status_desktop() <= 0 ||
+             (audio_known && (!desktop_playing || !audio.desktop_monitor ||
+              strcmp(desktop_source, audio.desktop_monitor))))) {
             (void)r2_ears_stop_desktop();
             managed_desktop = 0;
+            free(desktop_source); desktop_source = NULL;
         }
-        if (!managed_desktop && r2_sense_auto_allowed(3) &&
-            desktop_playing && r2_ears_status_desktop() <= 0 &&
-            r2_ears_start_desktop() == 0)
-            managed_desktop = 1;
+        if (audio_known && !managed_desktop && r2_sense_auto_allowed(3) &&
+            desktop_playing && audio.desktop_monitor && r2_ears_status_desktop() <= 0) {
+            desktop_source = strdup(audio.desktop_monitor);
+            if (desktop_source && r2_ears_start_source_cancelable(desktop_source, 1,
+                                                                   shell_watch_cancelled, NULL) == 0)
+                managed_desktop = 1;
+            else { free(desktop_source); desktop_source = NULL; }
+        }
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
@@ -1445,6 +1470,9 @@ static void *shell_watch_worker(void *unused)
         (void)r2_ears_stop();
     if (managed_desktop)
         (void)r2_ears_stop_desktop();
+    free(microphone_source);
+    free(desktop_source);
+    r2_ears_discovery_clear(&audio);
     return NULL;
 }
 

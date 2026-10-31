@@ -26,12 +26,13 @@ assert "r2_ears_start()" not in start_body
 assert "r2_ears_stop()" not in start_body
 assert "shell_watch_start();" in shell[shell.index("int r2_shell_run(void)"):]
 assert "while (!shell_watch_cancelled(NULL))" in worker
-assert "r2_ears_microphone_available()" in worker
-assert "r2_ears_desktop_playing()" in worker
+assert "r2_ears_discover(&discovered, shell_watch_cancelled, NULL)" in worker
+assert "audio.desktop_playing" in worker
 assert "r2_vision_camera_available()" in worker
 assert "r2_vision_vlc_available()" in worker
 assert "r2_vision_window_available(media_window)" in worker
-assert "r2_ears_start_desktop()" in worker and "r2_ears_start()" in worker
+assert "r2_ears_start_source_cancelable(desktop_source, 1," in worker
+assert "r2_ears_start_source_cancelable(microphone_source, 0," in worker
 assert "if (managed_microphone)" in worker and "r2_ears_stop()" in worker
 assert "if (managed_desktop)" in worker and "r2_ears_stop_desktop()" in worker
 assert "r2_ears_status_desktop()" in worker
@@ -68,3 +69,12 @@ assert "shell_watch_stop();" in shell[
     shell.index("static void shell_restart"):shell.index("static int shell_parse_amount")
 ]
 print("Watch startup, continuous raw sensory capture, explicit-only interpretation, and shutdown joins passed.")
+
+# A failed discovery is unknown, not proof that an existing input vanished.
+assert "int audio_known = r2_ears_discover" in worker
+assert "if (audio_known) {" in worker
+assert "(audio_known && (!microphone_available" in worker
+assert "(audio_known && (!desktop_playing" in worker
+assert "strcmp(microphone_source, audio.microphone_source)" in worker
+assert "strcmp(desktop_source, audio.desktop_monitor)" in worker
+assert "r2_ears_discovery_clear(&audio)" in worker

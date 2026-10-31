@@ -162,6 +162,18 @@ int r2_ears_init(R2Ears **ears);
 void r2_ears_shutdown(R2Ears *ears);
 
 
+/* Read-only native discovery. Initialize to zero, clear before reuse. No
+ * capture stream is opened. On error/cancellation no partial result is returned.
+ * A successful empty result means absent inputs; -1 means unknown state. */
+typedef struct {
+    char *microphone_source;
+    char *desktop_monitor;
+    int desktop_playing;
+    long playback_pid;
+} R2EarsDiscovery;
+int r2_ears_discover(R2EarsDiscovery *result, int (*cancelled)(void *), void *userdata);
+void r2_ears_discovery_clear(R2EarsDiscovery *result);
+
 /* Read-only input discovery. Never starts a stream or interprets sound. */
 int r2_ears_microphone_available(void);
 int r2_ears_desktop_playing(void);
