@@ -120,9 +120,29 @@ int main(void)
     assert(strstr(new_record, "new event after legacy migration") != NULL);
     free(new_record);
 
+    char long_source[1600];
+    memset(long_source, 'Z', sizeof(long_source) - 1);
+    long_source[0] = 'S';
+    long_source[sizeof(long_source) - 1] = '\0';
+    int64_t audio_id = r2_log_event(
+        R2_LOG_SENSORY, "long_audio_source_identity",
+        "Long microphone monitor identity must survive persistence.",
+        NULL, long_source);
+    assert(audio_id > 0);
+
     sqlite3 *db = NULL;
     assert(sqlite3_open_v2(R2_DIARY_DATABASE, &db,
         SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *source_statement = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT source FROM r2_log_events WHERE id=?;",
+        -1, &source_statement, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(source_statement, 1, audio_id) == SQLITE_OK);
+    assert(sqlite3_step(source_statement) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(source_statement, 0),
+                  long_source) == 0);
+    sqlite3_finalize(source_statement);
+
     assert(scalar(db,
         "SELECT COUNT(*) FROM r2_log_events WHERE id=7 "
         "AND summary='legacy preserved identity record'") == 1);
