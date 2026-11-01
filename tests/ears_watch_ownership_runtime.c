@@ -14,6 +14,19 @@
 
 static atomic_int mic_closes = ATOMIC_VAR_INIT(0);
 static atomic_int desktop_closes = ATOMIC_VAR_INIT(0);
+static atomic_int synthetic_reads = ATOMIC_VAR_INIT(0);
+
+static void *direct_listen_worker(void *unused)
+{
+    (void)unused;
+    return r2_ears_listen_cancelable(15U, NULL, NULL);
+}
+
+static double duration_seconds(struct timespec before, struct timespec after)
+{
+    return (double)(after.tv_sec - before.tv_sec) +
+           (double)(after.tv_nsec - before.tv_nsec) / 1000000000.0;
+}
 
 int __wrap_r2_ears_open_microphone(R2Ears *receiver)
 {
@@ -32,6 +45,7 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *samples, size_t bytes)
     assert(receiver == ears || receiver == ears_desktop);
     assert(bytes == 1920U);
     memset(samples, 0, bytes);
+    atomic_fetch_add(&synthetic_reads, 1);
     struct timespec short_sample = {.tv_sec = 0, .tv_nsec = 2000000L};
     (void)nanosleep(&short_sample, NULL);
     return (ssize_t)bytes;
@@ -91,11 +105,39 @@ int main(void)
     assert(atomic_load(&desktop_closes) == 2 &&
            r2_ears_status_desktop() == 0);
 
+    /*
+     * Explicit stop must announce cancellation before waiting for the lock
+     * held across a one-shot microphone capture. A synthetic 15-second
+     * listening request must not run to completion after stop is requested.
+     */
+    char model_path[] = "/tmp/r2-audio-test-model-XXXXXX";
+    int model_fd = mkstemp(model_path);
+    assert(model_fd >= 0);
+    assert(close(model_fd) == 0);
+    assert(setenv("R2_WHISPER_MODEL", model_path, 1) == 0);
+    atomic_store(&synthetic_reads, 0);
+    pthread_t listener;
+    assert(pthread_create(&listener, NULL, direct_listen_worker, NULL) == 0);
+    for (int i = 0; i < 2000 && atomic_load(&synthetic_reads) == 0; ++i) {
+        struct timespec tick = {.tv_sec = 0, .tv_nsec = 1000000L};
+        (void)nanosleep(&tick, NULL);
+    }
+    assert(atomic_load(&synthetic_reads) > 0);
+    struct timespec before_stop, after_stop;
+    assert(clock_gettime(CLOCK_MONOTONIC, &before_stop) == 0);
+    assert(r2_ears_stop() == 0);
+    assert(clock_gettime(CLOCK_MONOTONIC, &after_stop) == 0);
+    void *transcript = (void *)1;
+    assert(pthread_join(listener, &transcript) == 0);
+    assert(transcript == NULL);
+    assert(duration_seconds(before_stop, after_stop) < 2.0);
+    assert(unlink(model_path) == 0);
+
     r2_ears_shutdown(ears_desktop);
     ears_desktop = NULL;
     r2_ears_shutdown(ears);
     ears = NULL;
 
-    puts("Watch generations do not claim or close externally owned Ears streams.");
+    puts("Watch ownership is generation-safe and explicit stop cancels active one-shot PCM capture.");
     return 0;
 }
