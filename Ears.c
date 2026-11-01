@@ -419,82 +419,22 @@ long r2_ears_playback_pid(void)
  * File process handling
  * --------------------------------------------------------- */
 
-static int r2_ears_start_ffmpeg(
-    R2Ears *ears,
-    const char *path
-)
+static int r2_ears_start_ffmpeg(R2Ears *ears, const char *path)
 {
-    char *quoted_path;
-    char command[4096];
-    int written;
-
-    if (!ears || !path || path[0] == '\0')
-        return -1;
-
-    quoted_path =
-        r2_ears_shell_quote(path);
-
-    if (!quoted_path)
-        return -1;
-
-    /*
-     * FFmpeg decodes any supported media source into the
-     * canonical R2 PCM format.
-     *
-     * No speaker playback is required.
-     *
-     * This means R2 can directly hear:
-     *
-     *     WAV
-     *     MP3
-     *     FLAC
-     *     OGG
-     *     AAC
-     *     M4A
-     *     MP4
-     *     MKV
-     *     AVI
-     *     etc.
-     *
-     * whenever FFmpeg can decode the source's audio stream.
-     */
-    written = snprintf(
-        command,
-        sizeof(command),
-
-        "ffmpeg "
-        "-nostdin "
-        "-hide_banner "
-        "-loglevel error "
-        "-i %s "
-        "-vn "
-        "-f s16le "
-        "-ar %u "
-        "-ac %u "
-        "-acodec pcm_s16le "
-        "pipe:1",
-
-        quoted_path,
-        R2_EARS_SAMPLE_RATE,
-        R2_EARS_CHANNELS
-    );
-
+    if (!ears || !path || !*path) return -1;
+    char *quoted_path = r2_ears_shell_quote(path);
+    if (!quoted_path) return -1;
+    char *command = NULL;
+    int written = asprintf(&command,
+        "ffmpeg -nostdin -hide_banner -loglevel error "
+        "-i %s -vn -f s16le -ar %u -ac %u -acodec pcm_s16le pipe:1",
+        quoted_path, R2_EARS_SAMPLE_RATE, R2_EARS_CHANNELS);
     free(quoted_path);
-
-    if (written < 0 ||
-        (size_t)written >= sizeof(command))
-    {
-        return -1;
-    }
-
-    ears->file_stream =
-        popen(command, "r");
-
-    if (!ears->file_stream)
-        return -1;
-
+    if (written < 0 || !command) return -1;
+    ears->file_stream = popen(command, "r");
+    free(command);
+    if (!ears->file_stream) return -1;
     ears->file_pid = -1;
-
     return 0;
 }
 
@@ -942,10 +882,9 @@ ssize_t r2_ears_read(
                 ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
                 char details[768];
                 snprintf(details, sizeof(details),
-                         "source=%s; bytes_received_since_last_entry=%llu; "
+                         "bytes_received_since_last_entry=%llu; "
                          "sample_rate=%u; channels=%u; bits_per_sample=%u; "
                          "audio_interpretation=not_performed_by_Ears",
-                         ears->event.source_name,
                          (unsigned long long)ears->bytes_since_log,
                          ears->format.sample_rate, ears->format.channels,
                          ears->format.bits_per_sample);
@@ -1018,10 +957,9 @@ ssize_t r2_ears_read(
             ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
             char details[768];
             snprintf(details, sizeof(details),
-                     "source=%s; bytes_received_since_last_entry=%llu; "
+                     "bytes_received_since_last_entry=%llu; "
                      "sample_rate=%u; channels=%u; bits_per_sample=%u; "
                      "audio_interpretation=not_performed_by_Ears",
-                     ears->event.source_name,
                      (unsigned long long)ears->bytes_since_log,
                      ears->format.sample_rate, ears->format.channels,
                      ears->format.bits_per_sample);
