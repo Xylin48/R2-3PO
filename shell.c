@@ -1345,8 +1345,8 @@ static void *shell_watch_worker(void *unused)
     int managed_camera = 0;
     int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
     unsigned long managed_window_id = 0;
-    int managed_microphone = 0;
-    int managed_desktop = 0;
+    uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
+    uint64_t managed_desktop = 0;
     int attached_visual = 0;
 
     while (!shell_watch_cancelled(NULL)) {
@@ -1411,24 +1411,22 @@ static void *shell_watch_worker(void *unused)
         if (managed_microphone &&
             (!r2_sense_auto_allowed(2) || !microphone_available ||
              r2_ears_status() <= 0)) {
-            (void)r2_ears_stop();
+            (void)r2_ears_stop_if_watch_owned(managed_microphone);
             managed_microphone = 0;
         }
         if (!managed_microphone && r2_sense_auto_allowed(2) &&
-            microphone_available && r2_ears_status() <= 0 &&
-            r2_ears_start() == 0)
-            managed_microphone = 1;
+            microphone_available && r2_ears_status() <= 0)
+            managed_microphone = r2_ears_start_for_watch();
 
         if (managed_desktop &&
             (!r2_sense_auto_allowed(3) || !desktop_playing ||
              r2_ears_status_desktop() <= 0)) {
-            (void)r2_ears_stop_desktop();
+            (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
             managed_desktop = 0;
         }
         if (!managed_desktop && r2_sense_auto_allowed(3) &&
-            desktop_playing && r2_ears_status_desktop() <= 0 &&
-            r2_ears_start_desktop() == 0)
-            managed_desktop = 1;
+            desktop_playing && r2_ears_status_desktop() <= 0)
+            managed_desktop = r2_ears_start_desktop_for_watch();
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
@@ -1442,9 +1440,9 @@ static void *shell_watch_worker(void *unused)
     if (managed_media)
         (void)r2_vision_media_stop();
     if (managed_microphone)
-        (void)r2_ears_stop();
+        (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)
-        (void)r2_ears_stop_desktop();
+        (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
     return NULL;
 }
 
