@@ -65,17 +65,30 @@ int main(void)
 {
     char temp[] = "/tmp/r2-dual-ear-XXXXXX";
     assert(mkdtemp(temp));
+    /* Exercise actual source identities beyond all old 512-byte metadata quotas. */
+    char microphone_name[1024] = "alsa_input.test_mic.";
+    char sink_name[1024] = "alsa_output.test.";
+    size_t m = strlen(microphone_name), n = strlen(sink_name);
+    memset(microphone_name + m, 'm', 850);
+    microphone_name[m + 850] = '\0';
+    memset(sink_name + n, 's', 850);
+    sink_name[n + 850] = '\0';
+    assert(setenv("R2_TEST_MIC_NAME", microphone_name, 1) == 0);
+    assert(setenv("R2_TEST_SINK_NAME", sink_name, 1) == 0);
+    char monitor_name[1200];
+    assert(snprintf(monitor_name, sizeof(monitor_name), "%s.monitor", sink_name) <
+           (int)sizeof(monitor_name));
     char path[PATH_MAX], environment[PATH_MAX * 2];
     assert(snprintf(path, sizeof(path), "%s/pactl", temp) < (int)sizeof(path));
     FILE *fp = fopen(path, "w");
     assert(fp);
     assert(fputs(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"get-default-source\" ]; then echo alsa_input.test_mic\n"
-        "elif [ \"$1\" = \"get-default-sink\" ]; then echo alsa_output.test\n"
+        "if [ \"$1\" = \"get-default-source\" ]; then printf '%s\\n' \"$R2_TEST_MIC_NAME\"\n"
+        "elif [ \"$1\" = \"get-default-sink\" ]; then printf '%s\\n' \"$R2_TEST_SINK_NAME\"\n"
         "elif [ \"$1\" = \"list\" ]; then\n"
-        "  echo '1 alsa_input.test_mic x'\n"
-        "  echo '2 alsa_output.test.monitor x'\n"
+        "  printf '1\\t%s\\tx\\n' \"$R2_TEST_MIC_NAME\"\n"
+        "  printf '2\\t%s.monitor\\tx\\n' \"$R2_TEST_SINK_NAME\"\n"
         "fi\n", fp) >= 0);
     assert(fclose(fp) == 0 && chmod(path, 0700) == 0);
     const char *old_path = getenv("PATH");
@@ -91,17 +104,21 @@ int main(void)
     R2HearingEvent event_mic = {0}, event_desktop = {0};
     assert(r2_ears_get_event(mic, &event_mic) == 0);
     assert(r2_ears_get_event(desktop, &event_desktop) == 0);
-    assert(strstr(event_mic.source_name, "test_mic"));
-    assert(!strcmp(event_desktop.source_name, "desktop-audio"));
+    assert(!strcmp(event_mic.source_name, microphone_name));
+    assert(!strcmp(event_desktop.source_name, monitor_name));
     check_pcm(mic, 0xa5);
     check_pcm(desktop, 0x5a);
     r2_ears_close(mic);
+    /* An event snapshot remains owned by its caller after the live source closes. */
+    assert(!strcmp(event_mic.source_name, microphone_name));
     assert(!r2_ears_is_open(mic) && r2_ears_is_open(desktop));
     check_pcm(desktop, 0x5a);
     assert(r2_ears_open_microphone(mic) == 0);
     r2_ears_close(desktop);
     assert(r2_ears_is_open(mic) && !r2_ears_is_open(desktop));
     check_pcm(mic, 0xa5);
+    r2_ears_release_event(&event_mic);
+    r2_ears_release_event(&event_desktop);
     r2_ears_shutdown(desktop);
     r2_ears_shutdown(mic);
     assert(open_count == close_count && open_count == 3);
