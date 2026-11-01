@@ -355,6 +355,10 @@ static int watch_running = 0;
 static int diary_initialized = 0;
 /* These flags are consumed by the tool dispatcher before the capture implementation. */
 static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
+/* Send stop intent before waiting for a one-shot microphone read's mutex.
+ * Cooperative cancellation is bounded by the next successful PCM read;
+ * a stuck pa_simple_read still requires an asynchronously cancelable backend. */
+static atomic_uint ears_stop_requesters = ATOMIC_VAR_INIT(0);
 static atomic_int ears_desktop_capture_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int r2_ears_recent_requested = 0;
 static _Thread_local int r2_ears_desktop_requested = 0;
@@ -11405,7 +11409,8 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     uint32_t total_bytes;
     int capture_ok = 0;
 
-    if (cancelled && cancelled(userdata)) return NULL;
+    if ((cancelled && cancelled(userdata)) ||
+        atomic_load(&ears_stop_requesters) != 0) return NULL;
     if (seconds < 1U || seconds > 15U) {
         fprintf(stderr, "[Ears] Listen duration must be between 1 and 15 seconds.\n");
         return NULL;
@@ -11451,6 +11456,10 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         goto cleanup;
 
     pthread_mutex_lock(&ears_capture_lock);
+    if (atomic_load(&ears_stop_requesters) != 0) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        goto cleanup;
+    }
     if (r2_ears_desktop_requested) {
         pthread_mutex_lock(&ears_desktop_capture_lock);
         if (!atomic_load(&ears_desktop_capture_running)) {
@@ -11515,6 +11524,7 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         own_mic = 1;
         uint32_t captured_bytes = 0;
         while (captured_bytes < total_bytes && !shutting_down &&
+               atomic_load(&ears_stop_requesters) == 0 &&
                !(cancelled && cancelled(userdata))) {
             size_t wanted = total_bytes - captured_bytes;
             if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
@@ -11535,6 +11545,7 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         }
         pthread_mutex_unlock(&ears_capture_lock);
         if (captured_bytes == total_bytes && !shutting_down &&
+            atomic_load(&ears_stop_requesters) == 0 &&
             !(cancelled && cancelled(userdata)) &&
             r2_ears_write_wav_header(wav, total_bytes) == 0 &&
             fflush(wav) == 0)
@@ -11835,6 +11846,9 @@ int r2_ears_status_desktop(void)
 static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
 {
     if (!ears) return -1;
+    /* Only explicit unconditional stops should interrupt direct listening.
+     * A Watch cleanup cannot cancel another caller's one-shot capture. */
+    if (!watch_only) atomic_fetch_add(&ears_stop_requesters, 1);
     pthread_mutex_lock(&ears_capture_lock);
     if (watch_only && (!watch_token || ears_microphone_watch_token != watch_token)) {
         pthread_mutex_unlock(&ears_capture_lock);
@@ -11853,6 +11867,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
     ears_recent_total_bytes = 0;
     pthread_mutex_unlock(&ears_recent_lock);
     pthread_mutex_unlock(&ears_capture_lock);
+    if (!watch_only) atomic_fetch_sub(&ears_stop_requesters, 1);
     r2_log_event(R2_LOG_SENSORY, "ears_stopped",
                  "R2 Ears stopped continuous raw-audio input.", NULL, "r2_ears_stop");
     return 0;
