@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,7 +101,7 @@ struct R2Ears
 {
     R2HearingEvent event;
 
-    int open;
+    atomic_int open; /* read failures may be signaled from a worker thread */
 
     /*
      * PulseAudio/PipeWire live capture.
@@ -467,7 +468,7 @@ int r2_ears_init(R2Ears **ears)
     new_ears->format.bits_per_sample =
         R2_EARS_BITS_PER_SAMPLE;
 
-    new_ears->open = 0;
+    atomic_init(&new_ears->open, 0);
     new_ears->pulse_stream = NULL;
     new_ears->file_stream = NULL;
     new_ears->file_pid = -1;
@@ -874,12 +875,15 @@ ssize_t r2_ears_read(
 
         if (bytes_read > 0)
         {
-            ears->event.timestamp =
-                r2_ears_timestamp();
+            /* Keep the hearing event timestamp fixed at source open;
+             * another thread may snapshot the stable source metadata.
+             * Sample timing is private to this reader. */
+            uint64_t sample_time = r2_ears_timestamp();
             ears->bytes_since_log += bytes_read;
 
             if (ears->last_log_timestamp_us == 0 ||
-                ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
+                sample_time < ears->last_log_timestamp_us ||
+                sample_time - ears->last_log_timestamp_us >= 5000000ULL) {
                 char details[768];
                 snprintf(details, sizeof(details),
                          "bytes_received_since_last_entry=%llu; "
@@ -892,7 +896,7 @@ ssize_t r2_ears_read(
                                "R2 Ears received real PCM audio samples.",
                                details, ears->event.source_name);
                 ears->bytes_since_log = 0;
-                ears->last_log_timestamp_us = ears->event.timestamp;
+                ears->last_log_timestamp_us = sample_time;
             }
 
             return (ssize_t)bytes_read;
@@ -943,18 +947,19 @@ ssize_t r2_ears_read(
             r2_log_sensory("audio_read_failed",
                            "R2 Ears encountered a live audio capture error.",
                            pa_strerror(error), ears->event.source_name);
-            /* A failed Pulse/PipeWire read invalidates this stream. Close it
-               now so callers cannot accidentally keep treating it as usable. */
-            r2_ears_close(ears);
+            /* The worker must NOT free the source name or Pulse handle here:
+             * a conversation may be copying source metadata, and the owner
+             * must join the worker before releasing its transport. */
+            atomic_store(&ears->open, 0);
             return -1;
         }
 
-        ears->event.timestamp =
-            r2_ears_timestamp();
+        uint64_t sample_time = r2_ears_timestamp();
         ears->bytes_since_log += buffer_size;
 
         if (ears->last_log_timestamp_us == 0 ||
-            ears->event.timestamp - ears->last_log_timestamp_us >= 5000000ULL) {
+            sample_time < ears->last_log_timestamp_us ||
+            sample_time - ears->last_log_timestamp_us >= 5000000ULL) {
             char details[768];
             snprintf(details, sizeof(details),
                      "bytes_received_since_last_entry=%llu; "
@@ -967,7 +972,7 @@ ssize_t r2_ears_read(
                            "R2 Ears received real PCM audio samples.",
                            details, ears->event.source_name);
             ears->bytes_since_log = 0;
-            ears->last_log_timestamp_us = ears->event.timestamp;
+            ears->last_log_timestamp_us = sample_time;
         }
 
         return (ssize_t)buffer_size;
@@ -1033,7 +1038,7 @@ int r2_ears_is_open(R2Ears *ears)
     if (!ears)
         return 0;
 
-    return ears->open;
+    return atomic_load(&ears->open);
 }
 
 
