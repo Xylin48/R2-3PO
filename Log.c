@@ -889,8 +889,7 @@ int64_t r2_log_event(
         return -1;
 
     if (strlen(event_type) > 128 || strlen(summary) > 8192 ||
-        (details && strlen(details) > R2_LOG_MAX_TEXT) ||
-        (source && strlen(source) > 512)) {
+        (details && strlen(details) > R2_LOG_MAX_TEXT)) {
         errno = E2BIG;
         return -1;
     }
