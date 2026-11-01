@@ -12808,15 +12808,18 @@ finalize_reply:
                             "media_display_was_available", display_event.source_name);
         }
 
-        R2HearingEvent hearing_event;
-        if (ears && r2_ears_is_open(ears) &&
-            r2_ears_get_event(ears, &hearing_event) == 0) {
+        R2HearingEvent hearing_event = {0};
+        pthread_mutex_lock(&ears_capture_lock);
+        int microphone_connected = ears && r2_ears_is_open(ears) &&
+            r2_ears_get_event(ears, &hearing_event) == 0;
+        pthread_mutex_unlock(&ears_capture_lock);
+        if (microphone_connected) {
             char details[1200];
             snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\naudio_source=%s\naudio_origin=%s\n"
+                     "conversation_event_id=%lld\naudio_origin=%s\n"
                      "Ears source was active during this conversation; PCM input is not "
                      "automatically transcribed or semantically interpreted by Ears.",
-                     (long long)turn_event_id, hearing_event.source_name,
+                     (long long)turn_event_id,
                      hearing_event.origin == R2_HEARING_FILE ? "file" :
                      hearing_event.origin == R2_HEARING_WORLD ? "world/desktop" : "unknown");
             int64_t association_id = r2_log_event(
@@ -12826,6 +12829,7 @@ finalize_reply:
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
                             "conversation_occurred_during_audio", hearing_event.source_name);
+            r2_ears_release_event(&hearing_event);
         }
         /* Preserve the desktop playback event independently of microphone
            audio, without claiming either stream was interpreted. */
@@ -12839,9 +12843,9 @@ finalize_reply:
         if (desktop_connected) {
             char details[1200];
             snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\naudio_source=%s\naudio_origin=desktop_playback\n"
+                     "conversation_event_id=%lld\naudio_origin=desktop_playback\n"
                      "An independent desktop PCM source was active, without automatic transcription.",
-                     (long long)turn_event_id, desktop_event.source_name);
+                     (long long)turn_event_id);
             int64_t association_id = r2_log_event(
                 R2_LOG_CONVERSATION, "conversation_during_audio_input",
                 "A conversation occurred while desktop playback audio was active.",
@@ -12849,6 +12853,7 @@ finalize_reply:
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
                             "conversation_occurred_during_audio", desktop_event.source_name);
+            r2_ears_release_event(&desktop_event);
         }
     }
 
