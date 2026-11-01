@@ -238,26 +238,14 @@ static void r2_ears_reset_event(R2Ears *ears)
 }
 
 
-static void r2_ears_set_source_name(
-    R2Ears *ears,
-    const char *name
-)
+static int r2_ears_set_source_name(R2Ears *ears, const char *name)
 {
-    if (!ears)
-        return;
-
-    if (!name)
-    {
-        ears->event.source_name[0] = '\0';
-        return;
-    }
-
-    snprintf(
-        ears->event.source_name,
-        sizeof(ears->event.source_name),
-        "%s",
-        name
-    );
+    if (!ears) return -1;
+    char *copy = strdup(name ? name : "");
+    if (!copy) return -1;
+    free(ears->event.source_name);
+    ears->event.source_name = copy;
+    return 0;
 }
 
 
@@ -684,15 +672,16 @@ void r2_ears_close(R2Ears *ears)
     if (ears->open) {
         char details[768];
         snprintf(details, sizeof(details),
-                 "source=%s; origin=%d; bytes_since_last_journal_entry=%llu",
-                 ears->event.source_name[0] ? ears->event.source_name : "(unknown)",
+                 "origin=%d; bytes_since_last_journal_entry=%llu",
                  (int)ears->event.origin,
                  (unsigned long long)ears->bytes_since_log);
         r2_log_sensory("audio_source_closed",
                        "R2 Ears stopped receiving audio samples.",
-                       details, "Ears.c");
+                       details, ears->event.source_name ? ears->event.source_name : "Ears.c");
     }
 
+    free(ears->event.source_name);
+    ears->event.source_name = NULL;
     ears->file_pid = -1;
     ears->using_file = 0;
     ears->open = 0;
@@ -845,10 +834,11 @@ int r2_ears_open_source(
     ears->event.timestamp =
         r2_ears_timestamp();
 
-    r2_ears_set_source_name(
-        ears,
-        actual_source
-    );
+    if (r2_ears_set_source_name(ears, actual_source) != 0) {
+        free(resolved_source);
+        r2_ears_close(ears);
+        return -1;
+    }
 
     ears->using_file = 0;
     ears->open = 1;
@@ -1034,10 +1024,10 @@ int r2_ears_open_file(
     ears->event.timestamp =
         r2_ears_timestamp();
 
-    r2_ears_set_source_name(
-        ears,
-        path
-    );
+    if (r2_ears_set_source_name(ears, path) != 0) {
+        r2_ears_close(ears);
+        return -1;
+    }
 
     ears->using_file = 1;
     ears->open = 1;
@@ -1221,21 +1211,21 @@ ssize_t r2_ears_read(
  * Event information
  * --------------------------------------------------------- */
 
-int r2_ears_get_event(
-    R2Ears *ears,
-    R2HearingEvent *event
-)
+int r2_ears_get_event(R2Ears *ears, R2HearingEvent *event)
 {
-    if (!ears || !event)
-        return -1;
-
-    memcpy(
-        event,
-        &ears->event,
-        sizeof(R2HearingEvent)
-    );
-
+    if (!ears || !event) return -1;
+    char *source = strdup(ears->event.source_name ? ears->event.source_name : "");
+    if (!source) return -1;
+    *event = ears->event;
+    event->source_name = source;
     return 0;
+}
+
+void r2_ears_release_event(R2HearingEvent *event)
+{
+    if (!event) return;
+    free(event->source_name);
+    event->source_name = NULL;
 }
 
 
