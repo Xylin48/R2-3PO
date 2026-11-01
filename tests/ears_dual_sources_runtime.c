@@ -14,6 +14,7 @@
 
 typedef struct { int desktop; } FakePulse;
 static int open_count = 0, close_count = 0;
+static int fail_mic_read = 0;
 
 /* Use real Ears.c with controlled Pulse device objects: no hardware needed. */
 pa_simple *__wrap_pa_simple_new(const char *server, const char *name,
@@ -36,6 +37,10 @@ int __wrap_pa_simple_read(pa_simple *s, void *data, size_t bytes, int *error)
 {
     FakePulse *p = (FakePulse *)s;
     assert(p && bytes == 1920);
+    if (fail_mic_read && !p->desktop) {
+        if (error) *error = PA_ERR_IO;
+        return -1;
+    }
     memset(data, p->desktop ? 0x5a : 0xa5, bytes);
     if (error) *error = 0;
     return 0;
@@ -108,6 +113,13 @@ int main(void)
     assert(!strcmp(event_desktop.source_name, monitor_name));
     check_pcm(mic, 0xa5);
     check_pcm(desktop, 0x5a);
+    /* A source event describes when this capture opened, not the
+     * last sample time; concurrent snapshots must see stable metadata. */
+    R2HearingEvent mic_after_read = {0};
+    assert(r2_ears_get_event(mic, &mic_after_read) == 0);
+    assert(mic_after_read.timestamp == event_mic.timestamp);
+    assert(!strcmp(mic_after_read.source_name, event_mic.source_name));
+    r2_ears_release_event(&mic_after_read);
     r2_ears_close(mic);
     /* An event snapshot remains owned by its caller after the live source closes. */
     assert(!strcmp(event_mic.source_name, microphone_name));
@@ -117,6 +129,13 @@ int main(void)
     r2_ears_close(desktop);
     assert(r2_ears_is_open(mic) && !r2_ears_is_open(desktop));
     check_pcm(mic, 0xa5);
+    /* A worker read error invalidates the stream without freeing it under
+     * the reader. The lifecycle owner closes it only after the reader exits. */
+    fail_mic_read = 1;
+    unsigned char failure_samples[1920];
+    assert(r2_ears_read(mic, failure_samples, sizeof(failure_samples)) == -1);
+    assert(r2_ears_is_open(mic) == 0);
+    assert(close_count == 2);
     r2_ears_release_event(&event_mic);
     r2_ears_release_event(&event_desktop);
     r2_ears_shutdown(desktop);
