@@ -340,6 +340,12 @@ int r2_vision_close(void);
  * The implementation must call the EXISTING Ears subsystem.
  */
 int r2_ears_start(void);
+/* Watch claims only a newly created stream. Zero means already owned or failed. */
+uint64_t r2_ears_start_for_watch(void);
+uint64_t r2_ears_start_desktop_for_watch(void);
+/* Stop only the precise stream generation started by Watch; safe after replacement. */
+int r2_ears_stop_if_watch_owned(uint64_t token);
+int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */
