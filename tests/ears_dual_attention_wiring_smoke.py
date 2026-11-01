@@ -50,8 +50,16 @@ watch = shell[shell.index("static void *shell_watch_worker(void *unused)"):
               shell.index("static void shell_watch_start(void)")]
 assert "managed_microphone" in watch and "managed_desktop" in watch
 assert "wanted_audio" not in watch
-assert "r2_ears_start_desktop()" in watch and "r2_ears_start()" in watch
-assert "r2_ears_stop_desktop()" in watch and "r2_ears_stop()" in watch
+# Watch must claim only newly opened capture generations and only stop its own.
+assert "r2_ears_start_desktop_for_watch()" in watch
+assert "r2_ears_start_for_watch()" in watch
+assert "r2_ears_stop_desktop_if_watch_owned(managed_desktop)" in watch
+assert "r2_ears_stop_if_watch_owned(managed_microphone)" in watch
+assert "r2_ears_start_desktop()" not in watch and "r2_ears_start()" not in watch
+assert "r2_ears_stop_desktop()" not in watch and "r2_ears_stop()" not in watch
+for api in ("r2_ears_start_for_watch", "r2_ears_start_desktop_for_watch",
+            "r2_ears_stop_if_watch_owned", "r2_ears_stop_desktop_if_watch_owned"):
+    assert api in header and api in core, api
 assert "r2_ears_status_desktop()" in watch and "r2_ears_status()" in watch
 assert "audio_origin=desktop_playback" in core
 assert "No automatic transcription or semantic interpretation." in core
