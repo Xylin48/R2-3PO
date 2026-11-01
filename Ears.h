@@ -120,7 +120,9 @@ typedef struct
      *   "microphone"
      *   "desktop-audio"
      */
-    char source_name[512];
+    /* Caller-owned full source identity returned by r2_ears_get_event().
+     * Release it with r2_ears_release_event() after the snapshot is used. */
+    char *source_name;
 
     R2AudioFormat format;
 
@@ -265,6 +267,9 @@ int r2_ears_get_event(
  *   0  = success
  *  -1  = failure
  */
+/* Releases the source identity allocated by r2_ears_get_event(). */
+void r2_ears_release_event(R2HearingEvent *event);
+
 int r2_ears_get_format(
     R2Ears *ears,
     R2AudioFormat *format
