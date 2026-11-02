@@ -7863,8 +7863,9 @@ static char *r2_process_ears_listen_request(const char *request)
         free(copy);
         return strdup("EARS LISTEN ERROR: use recent|seconds, live|seconds, desktop_recent|seconds, desktop_live|seconds, or desktop_source_recent/live|exact-monitor|seconds (1..15). No capture was started.");
     }
-    if (recent && !(desktop ? atomic_load(&ears_desktop_capture_running)
-                            : atomic_load(&ears_capture_running))) {
+    if (!extra_monitor && recent &&
+        !(desktop ? atomic_load(&ears_desktop_capture_running)
+                  : atomic_load(&ears_capture_running))) {
         free(copy);
         return strdup("EARS LISTEN ERROR: the chosen source has no active continuous audio to inspect.");
     }
@@ -7881,22 +7882,21 @@ static char *r2_process_ears_listen_request(const char *request)
     r2_ears_recent_requested = 0;
     r2_ears_desktop_requested = 0;
     r2_ears_extra_requested = NULL;
-    free(copy);
     if (!transcript || !*transcript) {
         free(transcript);
+        free(copy);
         return strdup("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.");
     }
-    size_t transcript_length = strlen(transcript);
-    if (transcript_length > SIZE_MAX - 96U) {
-        free(transcript);
-        return strdup("EARS LISTEN ERROR: the recognized result was too large to record.");
-    }
-    char *result = malloc(transcript_length + 96U);
-    if (result)
-        snprintf(result, transcript_length + 96U,
-                 "EARS LISTEN RESULT (%s, locally recognized speech from real audio):\n%s",
-                 desktop ? "desktop playback" : "microphone",
-                 transcript);
+    /* Do not cut source identity or transcript to fit a guessed fixed
+     * buffer. Source selection is part of the observed evidence. */
+    const char *source_label = extra_monitor ? extra_monitor :
+                               desktop ? "primary desktop playback" : "microphone";
+    char *result = NULL;
+    if (asprintf(&result,
+                 "EARS LISTEN RESULT (source=%s, locally recognized speech from real audio):\n%s",
+                 source_label, transcript) < 0)
+        result = NULL;
+    free(copy);
     free(transcript);
     return result;
 }
@@ -7918,49 +7918,46 @@ static char *process_tools_with_status(
 
     results[0] = '\0';
 
-#define APPEND(...)                                                   \
-    do {                                                              \
-        char _b[8192];                                                \
-        int _n = snprintf(_b, sizeof(_b), __VA_ARGS__);              \
-        if (_n > 0) {                                                 \
-            /* snprintf reports the required length, which may exceed   \
-               _b. Clamp to stored bytes and make truncation explicit. */\
-            size_t _append_n = (size_t)_n;                            \
-            if (_append_n >= sizeof(_b)) {                            \
-                static const char _truncated[] = "\n[tool output truncated]"; \
-                _append_n = sizeof(_b) - 1 - (sizeof(_truncated) - 1);\
-                memcpy(_b + _append_n, _truncated, sizeof(_truncated) - 1); \
-                _append_n += sizeof(_truncated) - 1;                  \
-            }                                                         \
-            if (len + _append_n + 1 > cap) {                         \
-                size_t _needed = len + _append_n + 1;                  \
-                size_t _new_cap = cap;                                \
-                while (_new_cap < _needed) {                          \
-                    if (_new_cap > SIZE_MAX / 2) {                    \
-                        _new_cap = _needed;                           \
-                        break;                                        \
-                    }                                                 \
-                    _new_cap *= 2;                                    \
-                }                                                     \
-                char *_grown = realloc(results, _new_cap);            \
-                if (!_grown) {                                       \
-                    /* Keep cap unchanged: results still has only cap bytes. */ \
-                    /* A preceding tool may already have changed the world. */ \
-                    static const char _capture_failure[] =             \
-                        "I ran out of memory while recording an action result. " \
-                        "An action may already have completed, so I will not " \
-                        "repeat it automatically. Verify the current state " \
-                        "before retrying the request.";                \
-                    snprintf(results, cap, "%s", _capture_failure);    \
-                    return results;                                   \
-                }                                                     \
-                results = _grown;                                    \
-                cap = _new_cap;                                      \
-            }                                                         \
-            memcpy(results + len, _b, _append_n);                     \
-            len += _append_n;                                         \
-            results[len] = '\0';                                     \
-        }                                                             \
+#define APPEND(...)                                                       \
+    do {                                                                    \
+        char *_part = NULL;                                                 \
+        int _n = asprintf(&_part, __VA_ARGS__);                              \
+        if (_n < 0 || !_part || (size_t)_n > SIZE_MAX - len - 1U) {          \
+            free(_part);                                                    \
+            static const char _failure[] =                                  \
+                "I could not preserve an action result in full. "          \
+                "Some actions may have already completed; inspect the "    \
+                "current state before retrying.";                          \
+            snprintf(results, cap, "%s", _failure);                         \
+            return results;                                                 \
+        }                                                                   \
+        size_t _needed = len + (size_t)_n + 1U;                             \
+        if (_needed > cap) {                                                \
+            size_t _new_cap = cap;                                          \
+            while (_new_cap < _needed) {                                    \
+                if (_new_cap > SIZE_MAX / 2U) {                             \
+                    _new_cap = _needed;                                     \
+                    break;                                                  \
+                }                                                           \
+                _new_cap *= 2U;                                             \
+            }                                                               \
+            char *_grown = realloc(results, _new_cap);                      \
+            if (!_grown) {                                                  \
+                free(_part);                                                \
+                static const char _failure[] =                              \
+                    "I could not preserve an action result in full. "      \
+                    "Some actions may have already completed; inspect "   \
+                    "the current state before retrying.";                  \
+                snprintf(results, cap, "%s", _failure);                     \
+                return results;                                             \
+            }                                                               \
+            results = _grown;                                               \
+            cap = _new_cap;                                                 \
+        }                                                                   \
+        memcpy(results + len, _part, (size_t)_n);                            \
+        len += (size_t)_n;                                                  \
+        results[len] = '\0';                                               \
+        free(_part);                                                        \
     } while (0)
 
     /*
