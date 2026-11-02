@@ -1345,6 +1345,7 @@ static void *shell_watch_worker(void *unused)
     (void)unused;
     int managed_camera = 0;
     int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
+    uint64_t managed_media_token = 0; /* only a Watch-opened generation */
     unsigned long managed_window_id = 0;
     uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
     uint64_t managed_desktop = 0;
@@ -1390,20 +1391,24 @@ static void *shell_watch_worker(void *unused)
         unsigned long wanted_window = wanted_media == 3 ? media_window :
                                       wanted_media == 4 ? playback_window : 0;
         if (managed_media &&
-            (!eyes_permitted || r2_vision_media_status() <= 0 ||
+            (!r2_vision_media_watch_owns(managed_media_token) ||
+             !eyes_permitted || r2_vision_media_status() <= 0 ||
              ((audio_known || window_available) &&
               (wanted_media != managed_media ||
                managed_window_id != wanted_window)))) {
-            (void)r2_vision_media_stop();
+            (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
             managed_media = 0;
+            managed_media_token = 0;
             managed_window_id = 0;
         }
         if (eyes_permitted && !managed_media && wanted_media &&
             !r2_vision_media_status() && r2_vision_available()) {
-            int opened = wanted_media == 2 ? r2_vision_open_vlc() :
-                         r2_vision_media_open_window(wanted_window);
-            if (opened == 0) {
+            uint64_t opened_token = wanted_media == 2 ?
+                r2_vision_media_open_vlc_for_watch() :
+                r2_vision_media_open_window_for_watch(wanted_window);
+            if (opened_token) {
                 managed_media = wanted_media;
+                managed_media_token = opened_token;
                 managed_window_id = wanted_window;
                 r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
                              "R2 can observe an independent real media display.",
@@ -1457,7 +1462,7 @@ static void *shell_watch_worker(void *unused)
     else if (attached_visual)
         (void)r2_vision_watch_stop();
     if (managed_media)
-        (void)r2_vision_media_stop();
+        (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
     if (managed_microphone)
         (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)
