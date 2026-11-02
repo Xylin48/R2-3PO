@@ -43,6 +43,9 @@ assert "r2_process_ears_listen_request(request)" in tool
 assert "r2_process_ears_listen_request(ears_request)" in core
 assert "AUTONOMOUS REFLECTION CONTEXT:" in core
 assert "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:" in core
+assert 'extract_marker(reflection, "[EARS_SOURCES]"' in core
+assert 'RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:' in core
+assert 'action_result = r2_ears_desktop_available_sources();' in core
 assert "reflection_repeated_hearing_request" in core
 
 # Continuous capture liveness must be based on actual PCM worker state, not
