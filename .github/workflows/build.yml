@@ -172,6 +172,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_async_capture_cancel_runtime.c -o /tmp/r2-ears-async-cancel-test -lpulse -lpthread -Wl,--wrap=pa_threaded_mainloop_lock -Wl,--wrap=pa_threaded_mainloop_unlock -Wl,--wrap=pa_threaded_mainloop_wait -Wl,--wrap=pa_threaded_mainloop_signal -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_stream_get_state -Wl,--wrap=pa_stream_readable_size -Wl,--wrap=pa_stream_peek -Wl,--wrap=pa_stream_drop
           /tmp/r2-ears-async-cancel-test
 
+      - name: Cancel stalled FFmpeg file reads and reap the exact decoder child
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_file_cancel_runtime.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c -o /tmp/r2-ears-file-cancel-test -lpulse -lpthread
+          /tmp/r2-ears-file-cancel-test
+
       - name: Exercise independent microphone and desktop PCM capture objects
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c AudioDiscovery.c AudioFile.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread
