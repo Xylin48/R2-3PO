@@ -412,7 +412,12 @@ int r2_ears_open_source(
     }
     else
     {
-        actual_source = source_name;
+        /* A caller may pass ears->event.source_name. That string belongs
+         * to the source we are about to close; make a stable owned copy
+         * BEFORE freeing its event metadata. */
+        resolved_source = strdup(source_name);
+        if (!resolved_source) return -1;
+        actual_source = resolved_source;
     }
 
     if (!actual_source ||
@@ -571,21 +576,26 @@ int r2_ears_open_file(
         return -1;
     }
 
+    /* A reopen can be requested using the name from its own event.
+     * Preserve the complete path before the previous source is closed. */
+    char *stable_path = strdup(path);
+    if (!stable_path) return -1;
     r2_ears_close(ears);
     atomic_store(&ears->cancel_requested, 0);
-    R2AudioFile *decoder = r2_audio_file_open(path, R2_EARS_SAMPLE_RATE,
+    R2AudioFile *decoder = r2_audio_file_open(stable_path, R2_EARS_SAMPLE_RATE,
                                                R2_EARS_CHANNELS);
     if (!decoder)
     {
         fprintf(
             stderr,
             "R2 Ears: could not open audio file: %s\n",
-            path
+            stable_path
         );
         r2_log_sensory("audio_file_open_failed",
                        "R2 Ears could not decode the requested audio file.",
                        "FFmpeg did not provide a readable PCM stream.",
-                       path);
+                       stable_path);
+        free(stable_path);
         return -1;
     }
 
@@ -597,6 +607,7 @@ int r2_ears_open_file(
     if (atomic_load(&ears->cancel_requested)) {
         r2_ears_close(ears);
         errno = ECANCELED;
+        free(stable_path);
         return -1;
     }
 
@@ -621,8 +632,9 @@ int r2_ears_open_file(
     ears->event.timestamp =
         r2_ears_timestamp();
 
-    if (r2_ears_set_source_name(ears, path) != 0) {
+    if (r2_ears_set_source_name(ears, stable_path) != 0) {
         r2_ears_close(ears);
+        free(stable_path);
         return -1;
     }
 
@@ -640,8 +652,9 @@ int r2_ears_open_file(
                  ears->format.bits_per_sample);
         r2_log_sensory("audio_source_opened",
                        "R2 Ears opened an audio file for PCM input.",
-                       details, path);
+                       details, stable_path);
     }
+    free(stable_path);
 
     return 0;
 }
