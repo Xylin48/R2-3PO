@@ -1451,6 +1451,14 @@ static void *shell_watch_worker(void *unused)
             managed_desktop =
                 r2_ears_start_desktop_for_watch(audio.desktop_monitor);
 
+        /* Every other active output gets its own continuously buffered
+         * listener, without replacing the primary or the physical mic.
+         * Failed discovery cannot be treated as evidence of unplugging. */
+        if (!r2_sense_auto_allowed(3))
+            r2_ears_extra_stop_all();
+        else if (audio_known)
+            (void)r2_ears_extra_reconcile(&audio, audio.desktop_monitor);
+
         if (audio_known) r2_audio_discovery_free(&audio);
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
@@ -1468,6 +1476,7 @@ static void *shell_watch_worker(void *unused)
         (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)
         (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
+    r2_ears_extra_stop_all();
     return NULL;
 }
 
