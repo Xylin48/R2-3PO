@@ -4,7 +4,9 @@
  * supply a controlled FFmpeg executable through a private test PATH.
  * No physical microphone or media decoder package is needed.
  */
-#include "Ears.h"
+/* Include Ears only here to test a pointer borrowed from its own event;
+ * production callers continue using the opaque Ears.h interface. */
+#include "../Ears.c"
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -103,6 +105,11 @@ int main(void)
     assert(memcmp(out, "EFGH", 4) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 0);
     assert(!r2_ears_is_open(ears));
+    /* Reopening from the exact event string previously freed it before
+     * passing it to FFmpeg. Recreate while the old event is still owned. */
+    assert(r2_ears_open_file(ears, ears->event.source_name) == 0);
+    assert(r2_ears_read(ears, out, sizeof(out)) == 4);
+    assert(memcmp(out, "ABCD", 4) == 0);
     r2_ears_close(ears);
 
     /* A failed decoder producing zero PCM must report EIO, not clean EOF. */
@@ -144,7 +151,7 @@ int main(void)
     assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
-    assert(source_closes == 3); /* EOF, failed decoder, cancellation all journalled */
+    assert(source_closes == 4); /* EOF, reopened file, failed decoder, cancellation */
     assert(unlink(pid_path) == 0);
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
