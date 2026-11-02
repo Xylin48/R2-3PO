@@ -324,6 +324,12 @@ int r2_vision_media_status(void);
 int r2_vision_media_attention_status(void);
 int r2_vision_media_set_attention(int watching);
 int r2_vision_media_stop(void);
+/* Watch alone may stop the exact media display generation it opened.
+ * Explicit media replacement takes ownership away from Watch. */
+uint64_t r2_vision_media_open_window_for_watch(unsigned long window_id);
+uint64_t r2_vision_media_open_vlc_for_watch(void);
+int r2_vision_media_stop_if_watch_owned(uint64_t token);
+int r2_vision_media_watch_owns(uint64_t token);
 char *r2_vision_media_see(const char *question);
 int r2_vision_open_vlc(void);
 int r2_vision_open_file(const char *path);
