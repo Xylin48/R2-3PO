@@ -195,6 +195,8 @@ int r2_ears_open_microphone(
     R2Ears *ears
 );
 
+int r2_ears_open_microphone_source(R2Ears *ears, const char *source);
+
 
 /*
  * Open a specific system audio source.
