@@ -124,13 +124,15 @@ int main(void)
     assert(scan.done && scan.failed);
 
     /* Invalid PID metadata is unknown, not guessed from a paused producer. */
-    scan.data.desktop_playing = 0;
-    scan.data.playback_pid = -1;
     assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3141xyz") == 0);
-    scan.done = scan.failed = 0;
-    r2_discovery_sink_input(NULL, &playback, 0, &scan);
-    assert(scan.data.desktop_playing && scan.data.playback_pid == -1);
-    assert(scan.data.playback_output_count == 3);
+    R2PulseScan invalid_pid = {0};
+    invalid_pid.data.playback_pid = -1;
+    invalid_pid.data.playback_sink = PA_INVALID_INDEX;
+    r2_discovery_sink_input(NULL, &playback, 0, &invalid_pid);
+    assert(invalid_pid.data.desktop_playing && invalid_pid.data.playback_pid == -1);
+    assert(invalid_pid.data.playback_output_count == 1);
+    r2_audio_discovery_free(&invalid_pid.data);
+    assert(scan.data.playback_output_count == 2);
 
     pa_proplist_free(properties);
     free(scan.default_source);
