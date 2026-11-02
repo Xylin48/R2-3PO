@@ -103,7 +103,7 @@ int main(void)
     assert(!strcmp(event_mic.source_name, microphone_name));
     assert(!r2_ears_is_open(mic) && r2_ears_is_open(desktop));
     check_pcm(desktop, 0x5a);
-    assert(r2_ears_open_microphone(mic) == 0);
+    assert(r2_ears_open_microphone_source(mic, microphone_name) == 0);
     r2_ears_close(desktop);
     assert(r2_ears_is_open(mic) && !r2_ears_is_open(desktop));
     check_pcm(mic, 0xa5);
