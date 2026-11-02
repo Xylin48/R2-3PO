@@ -105,7 +105,7 @@ int main(void)
         assert(strstr(source_list, names[i]));
     free(source_list);
     /* Tool accumulation itself must not cut an 8192+ byte source list. */
-    char *tool_result = process_tools_with_status("[EARS_SOURCES]\\n", NULL);
+    char *tool_result = process_tools_with_status("[EARS_SOURCES]\n", NULL);
     assert(tool_result && strlen(tool_result) > 8192);
     assert(strstr(tool_result, names[11]));
     assert(!strstr(tool_result, "[tool output truncated]"));
