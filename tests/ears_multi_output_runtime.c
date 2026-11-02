@@ -43,6 +43,17 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *buffer, size_t size)
     return (ssize_t)size;
 }
 
+static unsigned char marker_for(const char *monitor)
+{
+    pthread_mutex_lock(&fake_lock);
+    unsigned char result = 0;
+    for (size_t i = 0; i < opened_count; ++i)
+        if (!strcmp(opened[i].source, monitor)) result = opened[i].marker;
+    pthread_mutex_unlock(&fake_lock);
+    assert(result);
+    return result;
+}
+
 static void wait_for_pcm(const char *monitor, unsigned char expected)
 {
     unsigned char samples[1920];
@@ -111,12 +122,18 @@ int main(void)
     assert(!strstr(tool_result, "[tool output truncated]"));
     free(tool_result);
 
+    /* If a manual receiver is listening to another sink, Watch must not
+     * assume the first discovered output is already captured. */
+    assert(r2_ears_extra_reconcile(&audio, "alsa_output.manual_elsewhere.monitor") == 0);
+    assert(r2_ears_extra_source_count() == 12);
+    wait_for_pcm(names[0], marker_for(names[0]));
+
     /* A physical reroute makes the formerly primary monitor eligible,
      * while the new primary is no longer duplicated by the extra list. */
     assert(r2_ears_extra_reconcile(&audio, names[5]) == 0);
     assert(r2_ears_extra_source_count() == 11);
     assert(r2_ears_extra_copy_recent(names[5], 1920, (unsigned char[1920]){0}) < 0);
-    wait_for_pcm(names[0], 28);
+    wait_for_pcm(names[0], marker_for(names[0]));
     assert(r2_ears_extra_reconcile(&audio, names[5]) == 0);
     assert(r2_ears_extra_source_count() == 11);
 
