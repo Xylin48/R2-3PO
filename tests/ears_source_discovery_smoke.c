@@ -1,79 +1,108 @@
+/*
+ * Native PulseAudio/PipeWire introspection regression. Call the actual
+ * production callbacks with synthetic metadata; no hardware server needed.
+ */
 #define _POSIX_C_SOURCE 200809L
-#include "Ears.h"
-#include "Log.h"
-#include <assert.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "../AudioDiscovery.c"
 
-/* Discovery must work without opening any real microphone or speaker. */
-int64_t r2_log_sensory(const char *sense, const char *observation,
-                      const char *details, const char *source)
-{
-    (void)sense; (void)observation; (void)details; (void)source;
-    return 0;
-}
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
 
 int main(void)
 {
-    char root[] = "/tmp/r2-source-discovery-XXXXXX";
-    assert(mkdtemp(root) != NULL);
-    char script[PATH_MAX], augmented_path[PATH_MAX * 2];
-    assert(snprintf(script, sizeof(script), "%s/pactl", root) < (int)sizeof(script));
-    FILE *fp = fopen(script, "w");
-    assert(fp);
-    const char *body =
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"get-default-source\" ]; then\n"
-        "  echo alsa_input.test_mic\n"
-        "elif [ \"$1\" = \"list\" ] && [ \"$2\" = \"short\" ]; then\n"
-        "  echo '0 alsa_output.test.monitor module-null-sink.c'\n"
-        "  if [ \"$R2_TEST_MIC\" = \"1\" ]; then\n"
-        "    echo '1 alsa_input.test_mic module-alsa-card.c'\n"
-        "  fi\n"
-        "elif [ \"$1\" = \"list\" ] && [ \"$2\" = \"sink-inputs\" ]; then\n"
-        "  echo 'Sink Input #21'\n"
-        "  if [ \"$R2_TEST_PLAYING\" = \"1\" ]; then echo '    Corked: no'\n"
-        "  else echo '    Corked: yes'; fi\n"
-        "  echo '    application.process.id = \"3141\"'\n"
-        "  echo 'Sink Input #22'\n"
-        "  echo '    Corked: yes'\n"
-        "  echo '    application.process.id = \"2718\"'\n"
-        "fi\n";
-    assert(fputs(body, fp) >= 0);
-    assert(fclose(fp) == 0);
-    assert(chmod(script, 0700) == 0);
-    const char *old_path = getenv("PATH");
-    assert(snprintf(augmented_path, sizeof(augmented_path), "%s:%s", root,
-                    old_path ? old_path : "/usr/bin") < (int)sizeof(augmented_path));
-    assert(setenv("PATH", augmented_path, 1) == 0);
+    R2PulseScan scan = {0};
+    scan.data.playback_pid = -1;
+    scan.data.playback_sink = PA_INVALID_INDEX;
+    char preferred[1024] = "alsa_input.usb_microphone.";
+    size_t length = strlen(preferred);
+    memset(preferred + length, 'q', 700);
+    preferred[length + 700] = '\0';
 
-    assert(setenv("R2_TEST_MIC", "0", 1) == 0);
-    assert(setenv("R2_TEST_PLAYING", "0", 1) == 0);
-    assert(r2_ears_microphone_available() == 0);
-    assert(r2_ears_desktop_playing() == 0);
-    assert(r2_ears_playback_pid() == -1);
+    pa_server_info server = {0};
+    server.default_source_name = preferred;
+    server.default_sink_name = "alsa_output.default";
+    r2_discovery_server_info(NULL, &server, &scan);
+    assert(scan.done && !scan.failed);
+    assert(!strcmp(scan.default_source, preferred));
+    assert(!strcmp(scan.data.default_sink, "alsa_output.default"));
 
-    assert(setenv("R2_TEST_MIC", "1", 1) == 0);
-    assert(r2_ears_microphone_available() == 1);
-    assert(r2_ears_desktop_playing() == 0);
-    assert(r2_ears_playback_pid() == -1);
+    scan.done = 0;
+    pa_source_info monitor = {0};
+    monitor.name = "alsa_output.default.monitor";
+    monitor.monitor_of_sink = 25;
+    r2_discovery_source_info(NULL, &monitor, 0, &scan);
+    assert(!scan.data.microphone_source && !scan.fallback_microphone);
+    pa_source_info other = {0};
+    other.name = "alsa_input.builtin";
+    other.monitor_of_sink = PA_INVALID_INDEX;
+    r2_discovery_source_info(NULL, &other, 0, &scan);
+    assert(!strcmp(scan.fallback_microphone, "alsa_input.builtin"));
+    pa_source_info selected = {0};
+    selected.name = preferred;
+    selected.monitor_of_sink = PA_INVALID_INDEX;
+    r2_discovery_source_info(NULL, &selected, 0, &scan);
+    r2_discovery_source_info(NULL, NULL, 1, &scan);
+    assert(scan.done && !scan.failed);
+    assert(!strcmp(scan.data.microphone_source, preferred));
+    assert(strlen(scan.data.microphone_source) > 512);
 
-    assert(setenv("R2_TEST_PLAYING", "1", 1) == 0);
-    assert(r2_ears_microphone_available() == 1);
-    assert(r2_ears_desktop_playing() == 1);
-    assert(r2_ears_playback_pid() == 3141);
+    pa_proplist *properties = pa_proplist_new();
+    assert(properties);
+    assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3141") == 0);
+    pa_sink_input_info paused = {0};
+    paused.corked = 1;
+    paused.sink = 11;
+    paused.proplist = properties;
+    scan.done = 0;
+    r2_discovery_sink_input(NULL, &paused, 0, &scan);
+    assert(!scan.data.desktop_playing && scan.data.playback_pid == -1);
 
-    assert(setenv("R2_TEST_MIC", "0", 1) == 0);
-    assert(r2_ears_microphone_available() == 0);
-    assert(r2_ears_desktop_playing() == 1);
-    assert(r2_ears_playback_pid() == 3141);
+    /* An uncorked stream on a nondefault sink must select that stream's
+     * real sink, never append '.monitor' to the global default name. */
+    pa_sink_input_info playback = {0};
+    playback.corked = 0;
+    playback.sink = 88;
+    playback.proplist = properties;
+    r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    r2_discovery_sink_input(NULL, &paused, 0, &scan);
+    r2_discovery_sink_input(NULL, NULL, 1, &scan);
+    assert(scan.done && !scan.failed);
+    assert(scan.data.desktop_playing);
+    assert(scan.data.playback_sink == 88);
+    assert(scan.data.playback_pid == 3141);
 
-    assert(unlink(script) == 0);
-    assert(rmdir(root) == 0);
-    puts("Watch audio source probes distinguish hotplugged microphones and uncorked playback.");
+    char routed_monitor[1200] = "alsa_output.routed.";
+    size_t monitor_prefix = strlen(routed_monitor);
+    memset(routed_monitor + monitor_prefix, 'm', 850);
+    strcpy(routed_monitor + monitor_prefix + 850, ".monitor");
+    scan.done = 0;
+    pa_sink_info output = {0};
+    output.index = 88;
+    output.name = "alsa_output.routed";
+    output.monitor_source_name = routed_monitor;
+    r2_discovery_sink_info(NULL, &output, 0, &scan);
+    r2_discovery_sink_info(NULL, NULL, 1, &scan);
+    assert(scan.done && !scan.failed);
+    assert(!strcmp(scan.data.desktop_monitor, routed_monitor));
+
+    /* An API failure must never be reported as a successful empty list. */
+    scan.done = scan.failed = 0;
+    r2_discovery_source_info(NULL, NULL, -1, &scan);
+    assert(scan.done && scan.failed);
+
+    /* Invalid PID metadata is unknown, not guessed from a paused producer. */
+    scan.data.desktop_playing = 0;
+    scan.data.playback_pid = -1;
+    assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3141xyz") == 0);
+    scan.done = scan.failed = 0;
+    r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    assert(scan.data.desktop_playing && scan.data.playback_pid == -1);
+
+    pa_proplist_free(properties);
+    free(scan.default_source);
+    free(scan.fallback_microphone);
+    r2_audio_discovery_free(&scan.data);
+    puts("Native source discovery chooses physical microphones, routed sink monitor, active PID, and error state.");
     return 0;
 }
