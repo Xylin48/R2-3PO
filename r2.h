@@ -111,6 +111,8 @@ int r2_ollama_vision_request_should_abort(void);
  * by the caller with free().
  */
 char *r2_talk(const char *message);
+/* Same serialized conversation path, with an exact persisted speech-event link. */
+char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id);
 /* Caller frees; returns a bounded recent user/assistant transcript with tool payloads excluded. */
 char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars);
 
@@ -394,6 +396,11 @@ char *r2_ears_listen(unsigned seconds);
 char *r2_ears_listen_cancelable(unsigned seconds,
                                 int (*cancelled)(void *userdata),
                                 void *userdata);
+/* Optional outputs are initialized to NULL/0; caller frees the full captured
+ * source. Its identity is sampled with PCM, never after recognition finishes. */
+char *r2_ears_listen_source_cancelable(unsigned seconds,
+                                       int (*cancelled)(void *), void *userdata,
+                                       char **source_out, int64_t *event_id_out);
 
 
 /* ============================================================

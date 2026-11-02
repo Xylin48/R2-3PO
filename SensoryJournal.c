@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <stdint.h>
 
 static sqlite3 *sj_db;
 static pthread_mutex_t sj_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -301,7 +303,6 @@ static char *sj_query(const char *query, int limit)
     }
     if (query) {
         size_t n = strlen(query);
-        if (n > 1024) n = 1024;
         /* Treat user search text literally: LIKE's %, _, and our escape
            character must not silently broaden the requested search. */
         if (n > ((size_t)-1 - 3) / 2) {
@@ -341,7 +342,6 @@ static char *sj_query(const char *query, int limit)
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
     out[0] = '\0';
     int rc;
-    int intentionally_truncated = 0;
     int serialization_failed = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *utc = sqlite3_column_text(st, 1);
@@ -367,13 +367,17 @@ static char *sj_query(const char *query, int limit)
             serialization_failed = 1;
             break;
         }
-        if (len + (size_t)needed + 1 > 2 * 1024 * 1024) {
-            intentionally_truncated = 1;
+        if (len == SIZE_MAX || (size_t)needed > SIZE_MAX - len - 1) {
+            serialization_failed = 1;
+            errno = EOVERFLOW;
             break;
         }
         if (len + (size_t)needed + 1 > cap) {
             size_t next = cap;
-            while (next < len + (size_t)needed + 1) next *= 2;
+            while (next < len + (size_t)needed + 1) {
+                if (next > SIZE_MAX / 2) { next = len + (size_t)needed + 1; break; }
+                next *= 2;
+            }
             char *grown = realloc(out, next);
             if (!grown) { free(out); out = NULL; break; }
             out = grown; cap = next;
@@ -393,18 +397,13 @@ static char *sj_query(const char *query, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
-    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+    if (serialization_failed || rc != SQLITE_DONE) {
         free(out);
         return NULL;
     }
     if (out && len == 0)
         snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
                                       "The Sensory Journal contains no entries yet.\n");
-    if (out && intentionally_truncated) {
-        const char *note = "[Sensory Journal output truncated at 2 MiB; remaining entries are still stored.]\n";
-        size_t note_len = strlen(note);
-        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
-    }
     return out;
 }
 

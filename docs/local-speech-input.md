@@ -13,9 +13,13 @@ capture alone cannot make spoken words part of a conversation. The explicit
 6. Pass the recognized text to the same `r2_talk()` conversation path used by typed messages.
 
 No audio is uploaded to a remote service, and temporary raw audio/transcript
-files are removed after processing. The sensory event records that a
-transcription occurred; the recognized text is then handled as a normal user
-conversation turn, so it follows the existing chat history and memory path.
+files are removed after processing. A `speech_transcribed` sensory event keeps
+the complete recognized text and the exact source identity captured with the PCM,
+even if the device changes while recognition runs. Shell speech follows the normal
+conversation path and links its turn to that exact event ID. A model-selected
+listening action returns evidence to its current turn or reflection; it does not
+invent a new user message. Life Log and Sensory Journal keep complete selected
+records rather than cutting transcript or conversation text to a fixed buffer.
 
 ## Configure it
 
@@ -64,23 +68,27 @@ instead of pretending it understood audio.
 
 ## Watch coordinator
 
-- `watch` or `watch start` opens continuous raw microphone capture and starts
-  a coordinator that keeps sensory input active. It does not require Whisper.
-- Watch refuses to start while Ears already has an active source, because that
-  source could be a file or desktop monitor rather than the microphone. Stop
-  the existing Ears source first; Watch does not silently replace it.
-- While Watch is active, standalone `ears start`, `ears listen`, and
-  `ears stop` commands are refused so they cannot compete with Watch's source.
-  `ears status` remains available.
-- Watch does not automatically transcribe speech or create chat turns from
-  whatever happens to be audible. R2 must deliberately request a listening
-  action to inspect an audio interval.
-- `watch status` reports the coordinator thread, raw audio input, and visual
-  input states. `watch stop` stops continuous microphone capture and joins the
-  coordinator worker.
-- If Eyes is already open, Watch may join its existing raw-frame capture.
-  Watch never opens a camera or media source by itself and does not start a
-  background image-description loop.
+- `watch` or `watch start` begins source discovery even when no input is currently
+  available. It does not require Whisper. Available permitted microphones,
+  physical cameras and playback monitors can then start their independent raw
+  feeds; the camera remains primary Eyes and media uses a separate display.
+- Multiple active playback sinks keep separate monitor identities and PCM
+  histories. `[EARS_SOURCES]` lists the active primary and additional monitors.
+  `[EARS_LISTEN] desktop_source_recent|exact-monitor|5` or
+  `desktop_source_live|exact-monitor|5` selects a named monitor, including the
+  current primary. The requested interval cannot cross a source generation.
+- Watch can coexist with manually opened sources. Explicit `ears start`,
+  `ears listen`, and `ears stop` remain available; a deliberate sensory close
+  prevents Watch from reopening that input until it is permitted again.
+- Raw availability never automatically transcribes speech, classifies a room
+  sound or forces an attention change. R2 chooses whether to inspect it.
+- `watch status` reports discovery and independent input states. `watch stop`
+  cancels pending Watch-owned opens and joins the coordinator, then releases
+  only captures still owned by that exact Watch generation. Manual replacements
+  are preserved. Shutdown also wakes a blocked direct microphone capture.
+- A failed discovery query preserves existing inputs rather than claiming they
+  disappeared. Confirmed route changes can replace only Watch-owned captures.
+
 
 This provides continuous raw PCM capture plus deliberate speech recognition.
 It is not yet semantic perception of non-speech sounds: Qwen 3.5 9B does not

@@ -691,7 +691,7 @@ static void shell_status(void)
    TALK
    ============================================================ */
 
-static void shell_talk_inner(const char *message)
+static void shell_talk_inner(const char *message, int64_t speech_event_id)
 {
     if (message)
         fprintf(stderr, "[R2 Input Audit] shell_message_chars=%zu\n", strlen(message));
@@ -701,7 +701,8 @@ static void shell_talk_inner(const char *message)
         return;
     }
 
-    char *reply = r2_talk(message);
+    char *reply = speech_event_id > 0
+        ? r2_talk_with_speech_event(message, speech_event_id) : r2_talk(message);
 
     if (!reply || !*reply) {
         fprintf(
@@ -729,11 +730,16 @@ static void shell_talk_inner(const char *message)
 
 static pthread_mutex_t shell_conversation_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void shell_talk(const char *message)
+static void shell_talk_with_speech_event(const char *message, int64_t speech_event_id)
 {
     pthread_mutex_lock(&shell_conversation_lock);
-    shell_talk_inner(message);
+    shell_talk_inner(message, speech_event_id);
     pthread_mutex_unlock(&shell_conversation_lock);
+}
+
+static void shell_talk(const char *message)
+{
+    shell_talk_with_speech_event(message, 0);
 }
 
 /* ============================================================
@@ -1225,7 +1231,10 @@ static void shell_ears(const char *argument)
         }
         printf("[Ears] Listening for %u seconds. Speak after the capture begins...\n", seconds);
         fflush(stdout);
-        char *transcript = r2_ears_listen(seconds);
+        char *captured_source = NULL;
+        int64_t speech_event_id = 0;
+        char *transcript = r2_ears_listen_source_cancelable(
+            seconds, NULL, NULL, &captured_source, &speech_event_id);
         if (!transcript) {
             printf("[Ears] No transcript produced. Check the microphone, whisper-cli, and R2_WHISPER_MODEL.\n");
             return;
@@ -1237,7 +1246,8 @@ static void shell_ears(const char *argument)
          * conversation, persistence, error-reporting, and reply-display path.
          * Do not add a speech-specific conversation or database route here.
          */
-        shell_talk(transcript);
+        shell_talk_with_speech_event(transcript, speech_event_id);
+        free(captured_source);
         free(transcript);
         fflush(stdout);
         return;

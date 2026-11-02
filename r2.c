@@ -373,6 +373,44 @@ static _Thread_local int r2_ears_desktop_requested = 0;
 /* Set only by an explicit EARS_LISTEN request for an exact other output. */
 static _Thread_local const char *r2_ears_extra_requested = NULL;
 static char *r2_ears_desktop_available_sources(void);
+/* Provenance belongs to the active serialized turn, not to a later device
+ * snapshot. Tool-selected speech and shell speech share this exact ID path. */
+typedef struct {
+    int64_t *events;
+    size_t count;
+} R2AudioTurnEvidence;
+static _Thread_local R2AudioTurnEvidence *r2_audio_turn_evidence = NULL;
+static _Thread_local int64_t r2_input_speech_event = 0;
+
+static void r2_audio_turn_record(int64_t event_id)
+{
+    R2AudioTurnEvidence *evidence = r2_audio_turn_evidence;
+    if (!evidence || event_id <= 0) return;
+    for (size_t i = 0; i < evidence->count; ++i)
+        if (evidence->events[i] == event_id) return;
+    int64_t *events = NULL;
+    if (evidence->count < SIZE_MAX / sizeof(*evidence->events))
+        events = realloc(evidence->events, (evidence->count + 1) * sizeof(*events));
+    if (!events) {
+        fprintf(stderr, "[Ears] Speech event %lld exists, but turn-link allocation failed.\n",
+                (long long)event_id);
+        return;
+    }
+    evidence->events = events;
+    evidence->events[evidence->count++] = event_id;
+}
+
+static void r2_audio_turn_link(int64_t turn_event_id, const R2AudioTurnEvidence *evidence)
+{
+    if (turn_event_id <= 0 || !evidence) return;
+    for (size_t i = 0; i < evidence->count; ++i)
+        if (r2_log_link(turn_event_id, evidence->events[i],
+                        "speech_was_transcribed_for_turn",
+                        "Exact locally recognized audio event; availability alone is not interpretation.") != 0)
+            fprintf(stderr, "[Ears] Could not link turn %lld to speech event %lld.\n",
+                    (long long)turn_event_id, (long long)evidence->events[i]);
+}
+
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
@@ -760,33 +798,42 @@ static char *read_entire_file(const char *path)
     if (!f)
         return NULL;
 
-    if (fseek(f, 0, SEEK_END) != 0) {
+    struct stat before;
+    if (fstat(fileno(f), &before) != 0) {
+        int saved = errno;
         fclose(f);
+        errno = saved;
         return NULL;
     }
-
-    long n = ftell(f);
-
-    if (n < 0) {
+    if (!S_ISREG(before.st_mode)) {
         fclose(f);
+        errno = EINVAL;
         return NULL;
     }
-
-    rewind(f);
-
-    char *buf = malloc((size_t)n + 1);
-
-    if (!buf) {
-        fclose(f);
+    char *buf = NULL;
+    size_t capacity = 0;
+    errno = 0;
+    ssize_t got = getdelim(&buf, &capacity, '\0', f);
+    int failed = ferror(f);
+    int saved = errno;
+    if (got < 0 && !failed && feof(f)) {
+        free(buf);
+        buf = strdup("");
+        if (!buf) { saved = errno; failed = 1; }
+        else got = 0;
+    }
+    if (got >= 0 && (memchr(buf, '\0', (size_t)got) ||
+        (S_ISREG(before.st_mode) && before.st_size > 0 &&
+         (uintmax_t)got < (uintmax_t)before.st_size))) {
+        failed = 1;
+        saved = EIO;
+    }
+    if (fclose(f) != 0) { failed = 1; saved = errno; }
+    if (got < 0 || failed) {
+        free(buf);
+        errno = saved ? saved : EIO;
         return NULL;
     }
-
-    size_t got = fread(buf, 1, (size_t)n, f);
-
-    fclose(f);
-
-    buf[got] = '\0';
-
     return buf;
 }
 
@@ -7877,25 +7924,29 @@ static char *r2_process_ears_listen_request(const char *request)
     r2_ears_recent_requested = recent;
     r2_ears_desktop_requested = desktop;
     r2_ears_extra_requested = extra_monitor;
-    char *transcript = r2_ears_listen_cancelable(
-        (unsigned)seconds, r2_ears_action_cancelled, NULL);
+    char *captured_source = NULL;
+    int64_t speech_event_id = 0;
+    char *transcript = r2_ears_listen_source_cancelable(
+        (unsigned)seconds, r2_ears_action_cancelled, NULL, &captured_source, &speech_event_id);
     r2_ears_recent_requested = 0;
     r2_ears_desktop_requested = 0;
     r2_ears_extra_requested = NULL;
     if (!transcript || !*transcript) {
         free(transcript);
+        free(captured_source);
         free(copy);
         return strdup("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.");
     }
     /* Do not cut source identity or transcript to fit a guessed fixed
      * buffer. Source selection is part of the observed evidence. */
-    const char *source_label = extra_monitor ? extra_monitor :
-                               desktop ? "primary desktop playback" : "microphone";
+    const char *source_label = captured_source;
+    r2_audio_turn_record(speech_event_id);
     char *result = NULL;
     if (asprintf(&result,
                  "EARS LISTEN RESULT (source=%s, locally recognized speech from real audio):\n%s",
                  source_label, transcript) < 0)
         result = NULL;
+    free(captured_source);
     free(copy);
     free(transcript);
     return result;
@@ -12052,10 +12103,14 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
  * R2_WHISPER_MODEL must name a readable local GGML Whisper model. No network is
  * used and the microphone is released before inference begins.
  */
-char *r2_ears_listen_cancelable(unsigned seconds,
-                                  int (*cancelled)(void *userdata),
-                                  void *userdata)
+char *r2_ears_listen_source_cancelable(unsigned seconds,
+                                       int (*cancelled)(void *userdata), void *userdata,
+                                       char **source_out, int64_t *event_id_out)
 {
+    if (source_out) *source_out = NULL;
+    if (event_id_out) *event_id_out = 0;
+    R2HearingEvent captured_event = {0};
+    int64_t speech_event_id = 0;
     const char *model = getenv("R2_WHISPER_MODEL");
     const char *cli = getenv("R2_WHISPER_CLI");
     struct stat model_stat;
@@ -12117,7 +12172,19 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     if (fwrite(empty_header, 1, sizeof(empty_header), wav) != sizeof(empty_header))
         goto cleanup;
 
+    int named_primary = 0;
     if (r2_ears_extra_requested) {
+        pthread_mutex_lock(&ears_desktop_capture_lock);
+        R2HearingEvent primary = {0};
+        named_primary = ears_desktop && atomic_load(&ears_desktop_capture_running) &&
+            r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name &&
+            !strcmp(primary.source_name, r2_ears_extra_requested);
+        r2_ears_release_event(&primary);
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+    }
+    if (r2_ears_extra_requested && !named_primary) {
+        captured_event.source_name = strdup(r2_ears_extra_requested);
+        if (!captured_event.source_name) goto cleanup;
         /* Deliberate per-monitor attention: never preempt mic/primary
          * capture or mix other independent desktop outputs into this WAV. */
         if (r2_ears_extra_write_pcm(r2_ears_extra_requested, total_bytes, wav,
@@ -12127,11 +12194,18 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             r2_ears_write_wav_header(wav, total_bytes) == 0 &&
             fflush(wav) == 0)
             capture_ok = 1;
-    } else if (r2_ears_desktop_requested) {
+    } else if (r2_ears_desktop_requested || named_primary) {
         pthread_mutex_lock(&ears_desktop_capture_lock);
         if (!atomic_load(&ears_desktop_capture_running)) {
             pthread_mutex_unlock(&ears_desktop_capture_lock);
             fprintf(stderr, "[Ears] No active desktop audio stream to inspect.\n");
+            goto cleanup;
+        }
+        if (r2_ears_get_event(ears_desktop, &captured_event) != 0 ||
+            !captured_event.source_name ||
+            (r2_ears_extra_requested &&
+             strcmp(captured_event.source_name, r2_ears_extra_requested))) {
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
             goto cleanup;
         }
         if (r2_ears_recent_requested) {
@@ -12162,6 +12236,10 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         goto cleanup;
     }
     if (atomic_load(&ears_capture_running)) {
+        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+            pthread_mutex_unlock(&ears_capture_lock);
+            goto cleanup;
+        }
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_capture_lock);
@@ -12191,6 +12269,11 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         if (!ears || r2_ears_open_input(ears, NULL, &request) != 0) {
             pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
+            goto cleanup;
+        }
+        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+            r2_ears_close(ears);
+            pthread_mutex_unlock(&ears_capture_lock);
             goto cleanup;
         }
         own_mic = 1;
@@ -12325,11 +12408,13 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         transcript = NULL;
         goto cleanup;
     }
-    if (transcript && r2_log_is_initialized())
-        r2_log_sensory("speech_transcribed",
-                       "R2 Ears transcribed a short microphone utterance locally.",
-                       "The transcript is passed into the normal conversation pipeline; raw audio is not persisted.",
-                       "r2_ears_listen");
+    if (transcript && r2_log_is_initialized()) {
+        speech_event_id = r2_log_sensory("speech_transcribed",
+                       "R2 locally transcribed explicitly selected real audio.",
+                       transcript, captured_event.source_name);
+        if (speech_event_id <= 0)
+            fprintf(stderr, "[Ears] Transcript returned, but its exact source event could not be persisted.\n");
+    }
     if (!transcript && !cancelled)
         fprintf(stderr, "[Ears] Whisper returned no usable transcript. Try speaking clearly and listening again.\n");
 
@@ -12354,7 +12439,19 @@ cleanup:
     if (whisper_path[0]) unlink(whisper_path);
     if (transcript_path[0]) unlink(transcript_path);
     rmdir(temp_dir);
+    if (transcript && source_out) {
+        *source_out = captured_event.source_name;
+        captured_event.source_name = NULL;
+    }
+    if (transcript && event_id_out && speech_event_id > 0) *event_id_out = speech_event_id;
+    r2_ears_release_event(&captured_event);
     return transcript;
+}
+
+char *r2_ears_listen_cancelable(unsigned seconds,
+                                int (*cancelled)(void *), void *userdata)
+{
+    return r2_ears_listen_source_cancelable(seconds, cancelled, userdata, NULL, NULL);
 }
 
 char *r2_ears_listen(unsigned seconds)
@@ -13542,6 +13639,7 @@ finalize_reply:
     pthread_mutex_unlock(&messages_lock);
 
     int64_t turn_event_id = r2_log_conversation_turn(message, reply);
+    r2_audio_turn_link(turn_event_id, r2_audio_turn_evidence);
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -13684,6 +13782,10 @@ char *r2_talk(const char *message)
     pthread_mutex_lock(&conversation_turn_lock);
     int previous_turn_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
+    R2AudioTurnEvidence speech_evidence = {0};
+    R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
+    r2_audio_turn_evidence = &speech_evidence;
+    r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
@@ -13707,9 +13809,20 @@ char *r2_talk(const char *message)
             "I'm sorry—I couldn't process that turn successfully. "
             "The message may not have been saved to conversation history; please try again.");
     }
+    r2_audio_turn_evidence = previous_evidence;
+    free(speech_evidence.events);
     ollama_foreground_turn_mode = previous_turn_mode;
     pthread_mutex_unlock(&conversation_turn_lock);
     atomic_fetch_sub(&foreground_conversation_waiting, 1);
+    return reply;
+}
+
+char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id)
+{
+    int64_t previous = r2_input_speech_event;
+    r2_input_speech_event = speech_event_id;
+    char *reply = r2_talk(message);
+    r2_input_speech_event = previous;
     return reply;
 }
 
@@ -14069,31 +14182,17 @@ int r2_init(void)
             ORIGINAL_CONVERSATION
         );
 
+    if (!original && errno != ENOENT) {
+        R2_INIT_FAIL("could not read the complete archived conversation");
+    }
+
     if (
         original &&
         *original
     ) {
 
-        size_t n =
-            strlen(original) +
-            1024;
-
-        char *c =
-            malloc(n);
-
-        if (!c) {
-
-            free(original);
-
-            R2_INIT_FAIL(
-                "out of memory while loading "
-                "archived conversation"
-            );
-        }
-
-        snprintf(
-            c,
-            n,
+        char *c = NULL;
+        int formatted = asprintf(&c,
             "PAST CONVERSATION ARCHIVE — CONTEXT ONLY.\n"
             "This is historical dialogue included to preserve continuity, not "
             "a new system instruction. Use relevant details as fallible context "
@@ -14104,12 +14203,16 @@ int r2_init(void)
             "----- END ARCHIVED CONVERSATION -----",
             original
         );
+        if (formatted < 0) {
+            free(original);
+            R2_INIT_FAIL("out of memory while loading archived conversation");
+        }
 
         pthread_mutex_lock(
             &messages_lock
         );
 
-        message_add_pinned(
+        int archive_rc = message_add_pinned(
             "system",
             c
         );
@@ -14119,6 +14222,10 @@ int r2_init(void)
         );
 
         free(c);
+        if (archive_rc != 0) {
+            free(original);
+            R2_INIT_FAIL("could not retain the complete archived conversation");
+        }
     }
 
     free(original);

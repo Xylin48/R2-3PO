@@ -23,10 +23,10 @@ assert "r2_ears_listen_cancelable(" not in capture
 assert "r2_ears_listen_cancelable(" not in desktop_capture
 assert "r2_ears_write_desktop_recent_audio(" in core
 assert "r2_ears_write_desktop_buffered_audio(" in core
-listen_start = core.index("char *r2_ears_listen_cancelable(unsigned seconds,")
+listen_start = core.index("char *r2_ears_listen_source_cancelable(unsigned seconds,")
 listen_end = core.index("char *r2_ears_listen(unsigned seconds)", listen_start)
 listen = core[listen_start:listen_end]
-assert "if (r2_ears_desktop_requested)" in listen
+assert "if (r2_ears_desktop_requested || named_primary)" in listen
 assert "r2_ears_write_desktop_buffered_audio" in listen
 assert "r2_ears_write_desktop_recent_audio" in listen
 assert "r2_ears_write_buffered_audio" in listen

@@ -22,7 +22,7 @@ assert "do not use them for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in ears_helper
 assert "seconds >= 1UL && seconds <= 15UL" in ears_helper
-assert "r2_ears_listen_cancelable(" in ears_helper and "r2_ears_action_cancelled, NULL" in ears_helper
+assert "r2_ears_listen_source_cancelable(" in ears_helper and "r2_ears_action_cancelled, NULL" in ears_helper
 assert "r2_ears_recent_requested = recent;" in ears_helper
 assert "r2_ears_write_buffered_audio(total_bytes, wav)" in core
 assert "r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata)" in core
