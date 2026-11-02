@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,10 @@ int main(void)
     char script[512];
     assert(snprintf(script, sizeof(script), "%s/ffmpeg", root) <
            (int)sizeof(script));
+    char pid_path[512];
+    assert(snprintf(pid_path, sizeof(pid_path), "%s/child.pid", root) <
+           (int)sizeof(pid_path));
+    assert(setenv("R2_TEST_CHILD_PID_FILE", pid_path, 1) == 0);
     FILE *fp = fopen(script, "w");
     assert(fp);
     /* The input is one literal argv element even when it contains shell
@@ -68,6 +73,7 @@ int main(void)
         "  fi\n"
         "  shift\n"
         "done\n"
+        "printf '%s\\n' \"$$\" > \"$R2_TEST_CHILD_PID_FILE\"\n"
         "if [ \"$R2_TEST_FILE_MODE\" = failed ]; then exit 23; fi\n"
         "if [ \"$R2_TEST_FILE_MODE\" = stalled ]; then\n"
         "  printf 'WXYZ'\n"
@@ -128,9 +134,18 @@ int main(void)
     r2_ears_close(ears);
     assert(clock_gettime(CLOCK_MONOTONIC, &after) == 0);
     assert(reader.result == -1 && reader.error == ECANCELED);
+    /* A direct-child FFmpeg PID was reaped, not left running or zombie. */
+    FILE *pid_file = fopen(pid_path, "r");
+    assert(pid_file);
+    long child_pid = -1;
+    assert(fscanf(pid_file, "%ld", &child_pid) == 1 && child_pid > 1);
+    assert(fclose(pid_file) == 0);
+    errno = 0;
+    assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
     assert(source_closes == 3); /* EOF, failed decoder, cancellation all journalled */
+    assert(unlink(pid_path) == 0);
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
     puts("File decoder preserves exact argv, complete PCM, and promptly cancels stalled FFmpeg reads and reaps child.");
