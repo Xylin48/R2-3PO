@@ -7921,15 +7921,18 @@ static char *process_tools_with_status(
 
 #define APPEND(...)                                                       \
     do {                                                                    \
+        /* Preserve the existing authoritative failure marker: the caller   \
+         * must know that an earlier real-world action might have completed. */\
+        static const char _capture_failure[] =                              \
+            "I ran out of memory while recording an action result. "        \
+            "An action may already have completed, so I will not "          \
+            "repeat it automatically. Verify the current state "            \
+            "before retrying the request.";                                 \
         char *_part = NULL;                                                 \
         int _n = asprintf(&_part, __VA_ARGS__);                              \
         if (_n < 0 || !_part || (size_t)_n > SIZE_MAX - len - 1U) {          \
             free(_part);                                                    \
-            static const char _failure[] =                                  \
-                "I could not preserve an action result in full. "          \
-                "Some actions may have already completed; inspect the "    \
-                "current state before retrying.";                          \
-            snprintf(results, cap, "%s", _failure);                         \
+            snprintf(results, cap, "%s", _capture_failure);                  \
             return results;                                                 \
         }                                                                   \
         size_t _needed = len + (size_t)_n + 1U;                             \
@@ -7945,11 +7948,8 @@ static char *process_tools_with_status(
             char *_grown = realloc(results, _new_cap);                      \
             if (!_grown) {                                                  \
                 free(_part);                                                \
-                static const char _failure[] =                              \
-                    "I could not preserve an action result in full. "      \
-                    "Some actions may have already completed; inspect "   \
-                    "the current state before retrying.";                  \
-                snprintf(results, cap, "%s", _failure);                     \
+                /* Keep cap unchanged: original allocation remains valid. */ \
+                snprintf(results, cap, "%s", _capture_failure);              \
                 return results;                                             \
             }                                                               \
             results = _grown;                                               \
