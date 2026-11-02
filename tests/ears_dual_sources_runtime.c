@@ -68,8 +68,6 @@ static void check_pcm(R2Ears *stream, unsigned char expected)
 
 int main(void)
 {
-    char temp[] = "/tmp/r2-dual-ear-XXXXXX";
-    assert(mkdtemp(temp));
     /* Exercise actual source identities beyond all old 512-byte metadata quotas. */
     char microphone_name[1024] = "alsa_input.test_mic.";
     char sink_name[1024] = "alsa_output.test.";
@@ -78,33 +76,13 @@ int main(void)
     microphone_name[m + 850] = '\0';
     memset(sink_name + n, 's', 850);
     sink_name[n + 850] = '\0';
-    assert(setenv("R2_TEST_MIC_NAME", microphone_name, 1) == 0);
-    assert(setenv("R2_TEST_SINK_NAME", sink_name, 1) == 0);
     char monitor_name[1200];
     assert(snprintf(monitor_name, sizeof(monitor_name), "%s.monitor", sink_name) <
            (int)sizeof(monitor_name));
-    char path[PATH_MAX], environment[PATH_MAX * 2];
-    assert(snprintf(path, sizeof(path), "%s/pactl", temp) < (int)sizeof(path));
-    FILE *fp = fopen(path, "w");
-    assert(fp);
-    assert(fputs(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = \"get-default-source\" ]; then printf '%s\\n' \"$R2_TEST_MIC_NAME\"\n"
-        "elif [ \"$1\" = \"get-default-sink\" ]; then printf '%s\\n' \"$R2_TEST_SINK_NAME\"\n"
-        "elif [ \"$1\" = \"list\" ]; then\n"
-        "  printf '1\\t%s\\tx\\n' \"$R2_TEST_MIC_NAME\"\n"
-        "  printf '2\\t%s.monitor\\tx\\n' \"$R2_TEST_SINK_NAME\"\n"
-        "fi\n", fp) >= 0);
-    assert(fclose(fp) == 0 && chmod(path, 0700) == 0);
-    const char *old_path = getenv("PATH");
-    assert(snprintf(environment, sizeof(environment), "%s:%s", temp,
-                    old_path ? old_path : "/usr/bin") < (int)sizeof(environment));
-    assert(setenv("PATH", environment, 1) == 0);
-
     R2Ears *mic = NULL, *desktop = NULL;
     assert(r2_ears_init(&mic) == 0 && r2_ears_init(&desktop) == 0);
-    assert(r2_ears_open_microphone(mic) == 0);
-    assert(r2_ears_open_desktop(desktop) == 0);
+    assert(r2_ears_open_microphone_source(mic, microphone_name) == 0);
+    assert(r2_ears_open_desktop_source(desktop, monitor_name) == 0);
     assert(r2_ears_is_open(mic) && r2_ears_is_open(desktop));
     R2HearingEvent event_mic = {0}, event_desktop = {0};
     assert(r2_ears_get_event(mic, &event_mic) == 0);
@@ -141,7 +119,6 @@ int main(void)
     r2_ears_shutdown(desktop);
     r2_ears_shutdown(mic);
     assert(open_count == close_count && open_count == 3);
-    assert(unlink(path) == 0 && rmdir(temp) == 0);
     puts("Independent microphone and desktop PCM sources, metadata and lifecycles passed.");
     return 0;
 }
