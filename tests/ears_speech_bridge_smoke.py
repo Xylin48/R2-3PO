@@ -91,7 +91,7 @@ assert "r2_ears_read(" in ears and "ssize_t r2_ears_read(" in ears_header
 read_start = ears.index("ssize_t r2_ears_read(")
 read_end = ears.index("int r2_ears_get_event(", read_start)
 read_impl = ears[read_start:read_end]
-live_error_start = read_impl.index("if (pa_simple_read(")
+live_error_start = read_impl.index("if (r2_audio_capture_read(")
 live_error_end = read_impl.index("uint64_t sample_time =", live_error_start)
 live_error = read_impl[live_error_start:live_error_end]
 assert "atomic_store(&ears->open, 0);" in live_error, (
@@ -101,7 +101,7 @@ assert "r2_ears_close(ears);" not in live_error, (
     "the worker must not free a source or Pulse handle before its lifecycle owner joins it"
 )
 assert "pthread_join(ears_capture_thread, NULL)" in core
-assert "r2_ears_close(ears);" in core[core.index("static int r2_ears_stop_impl("):], (
+assert "r2_ears_cancel(ears);" in core[core.index("static int r2_ears_stop_impl("):], (
     "the lifecycle owner must release the stream after joining the reader"
 )
 assert "if (feof(ears->file_stream))" in read_impl
