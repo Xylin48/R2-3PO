@@ -223,6 +223,14 @@ int r2_ears_open_desktop(
 
 /* Open the exact monitor from a single native discovery snapshot. */
 int r2_ears_open_desktop_source(R2Ears *ears, const char *monitor);
+/* Owner also calls r2_ears_cancel while connecting. This predicate closes
+ * the pre-open/reset race; it must be thread-safe and must not block. */
+int r2_ears_open_source_cancelable(R2Ears *ears, const char *source,
+                                    int (*cancelled)(void *), void *userdata);
+int r2_ears_open_desktop_cancelable(R2Ears *ears,
+                                    int (*cancelled)(void *), void *userdata);
+int r2_ears_open_desktop_source_cancelable(R2Ears *ears, const char *monitor,
+                                          int (*cancelled)(void *), void *userdata);
 
 
 /*

@@ -382,9 +382,10 @@ void r2_ears_shutdown(R2Ears *ears)
  * Open generic Pulse/PipeWire source
  * --------------------------------------------------------- */
 
-int r2_ears_open_source(
+int r2_ears_open_source_cancelable(
     R2Ears *ears,
-    const char *source_name
+    const char *source_name,
+    int (*cancelled)(void *), void *userdata
 )
 {
     pa_sample_spec spec;
@@ -404,8 +405,12 @@ int r2_ears_open_source(
     if (!source_name ||
         source_name[0] == '\0')
     {
-        resolved_source =
-            r2_ears_find_microphone();
+        R2AudioDiscovery sources;
+        if (r2_audio_discover_cancelable(&sources, cancelled, userdata) != 0)
+            return -1;
+        resolved_source = sources.microphone_source;
+        sources.microphone_source = NULL;
+        r2_audio_discovery_free(&sources);
 
         actual_source =
             resolved_source;
@@ -449,7 +454,10 @@ int r2_ears_open_source(
      * even while the server is connecting, not just after the first sample. */
     pthread_mutex_lock(&ears->transport_lock);
     ears->pulse_stream = capture;
-    if (atomic_load(&ears->cancel_requested))
+    /* Check the owner's persistent stop predicate after resetting this
+     * reusable receiver. A stop before open must not be erased by reset. */
+    if (atomic_load(&ears->cancel_requested) ||
+        (cancelled && cancelled(userdata)))
         r2_audio_capture_cancel(capture);
     pthread_mutex_unlock(&ears->transport_lock);
 
@@ -516,6 +524,10 @@ int r2_ears_open_source(
     return 0;
 }
 
+int r2_ears_open_source(R2Ears *ears, const char *source_name)
+{
+    return r2_ears_open_source_cancelable(ears, source_name, NULL, NULL);
+}
 
 /* ---------------------------------------------------------
  * Open default microphone / recording source
@@ -546,6 +558,25 @@ int r2_ears_open_desktop_source(R2Ears *ears, const char *monitor)
 {
     if (!ears || !monitor || !*monitor) return -1;
     return r2_ears_open_source(ears, monitor);
+}
+
+int r2_ears_open_desktop_source_cancelable(R2Ears *ears, const char *monitor,
+                                          int (*cancelled)(void *), void *userdata)
+{
+    if (!ears || !monitor || !*monitor) { errno = EINVAL; return -1; }
+    return r2_ears_open_source_cancelable(ears, monitor, cancelled, userdata);
+}
+
+int r2_ears_open_desktop_cancelable(R2Ears *ears,
+                                    int (*cancelled)(void *), void *userdata)
+{
+    if (!ears) { errno = EINVAL; return -1; }
+    R2AudioDiscovery sources;
+    if (r2_audio_discover_cancelable(&sources, cancelled, userdata) != 0) return -1;
+    int rc = sources.desktop_monitor ? r2_ears_open_source_cancelable(
+        ears, sources.desktop_monitor, cancelled, userdata) : -1;
+    r2_audio_discovery_free(&sources);
+    return rc;
 }
 
 int r2_ears_open_desktop(R2Ears *ears)

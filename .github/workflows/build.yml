@@ -164,7 +164,7 @@ jobs:
 
       - name: Exercise source discovery with synthetic microphone and desktop playback
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread -lpthread -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_mainloop_iterate
           /tmp/r2-ears-source-discovery-smoke
 
       - name: Wake a truly blocked asynchronous Pulse read on stop
@@ -184,12 +184,27 @@ jobs:
 
       - name: Capture every simultaneous desktop output independently and preserve PCM identities
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_multi_output_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-multi-output -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_multi_output_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-multi-output -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_ears_read
           /tmp/r2-ears-multi-output
+
+      - name: Cancel supplementary output handshakes before joining Watch
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_discover_cancelable
+          /tmp/r2-ears-extra-connect-cancel
+
+      - name: Cancel a real libpulse handshake stalled on a silent local server
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_connect_cancel_runtime.c AudioCapture.c -o /tmp/r2-ears-connect-cancel -lpulse -lpthread
+          /tmp/r2-ears-connect-cancel
+
+      - name: Preserve source-specific raw primary history generations and journal identities
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_primary_history_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-primary-history -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_log_sensory
+          /tmp/r2-ears-primary-history
 
       - name: Check live Watch ownership tokens against external capture takeover
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_ears_open_desktop_cancelable
           /tmp/r2-ears-watch-ownership
 
       - name: Require source-specific raw hearing, deliberate attention, and shutdown

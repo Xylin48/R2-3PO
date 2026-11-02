@@ -16,7 +16,7 @@ end = core.index("int r2_ears_start(void)", start)
 bridge = core[start:end]
 
 assert "r2_ears_read(ears, pcm, wanted)" in bridge
-assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in bridge
+assert "r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata)" in bridge
 capture_start = core.index("static void *r2_ears_capture_worker(void *unused)")
 capture_end = core.index("static int r2_ears_write_recent_audio(", capture_start)
 capture_worker = core[capture_start:capture_end]

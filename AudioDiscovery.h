@@ -30,6 +30,9 @@ typedef struct {
 } R2AudioDiscovery;
 
 int r2_audio_discover(R2AudioDiscovery *result);
+/* Predicate is polled during the nonblocking native query; no device opens. */
+int r2_audio_discover_cancelable(R2AudioDiscovery *result,
+                                  int (*cancelled)(void *), void *userdata);
 void r2_audio_discovery_free(R2AudioDiscovery *result);
 
 #endif

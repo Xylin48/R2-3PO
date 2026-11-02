@@ -360,13 +360,12 @@ static int init_attempt_active = 0;
 /* curl_global_cleanup is valid only after a successful global initialization. */
 static int curl_global_initialized = 0;
 static int startup_memory_loaded = 0;
-static int watch_running = 0;
+static atomic_int watch_running = ATOMIC_VAR_INIT(0);
 static int diary_initialized = 0;
 /* These flags are consumed by the tool dispatcher before the capture implementation. */
 static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
-/* Send stop intent before waiting for a one-shot microphone read's mutex.
- * Cooperative cancellation is bounded by the next successful PCM read;
- * a stuck pa_simple_read still requires an asynchronously cancelable backend. */
+/* Send stop intent before waiting for a one-shot microphone lifecycle
+ * mutex; the asynchronous transport can also wake an already blocked read. */
 static atomic_uint ears_stop_requesters = ATOMIC_VAR_INIT(0);
 static atomic_int ears_desktop_capture_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int r2_ears_recent_requested = 0;
@@ -11141,6 +11140,7 @@ static pthread_mutex_t ears_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t ears_recent_length = 0;
 static size_t ears_recent_write_position = 0;
 static uint64_t ears_recent_total_bytes = 0;
+static uint64_t ears_recent_generation = 1;
 static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
 /* The desktop sink monitor never shares the microphone's stream or history. */
@@ -11153,6 +11153,81 @@ static unsigned char ears_desktop_recent_audio[R2_EARS_RECENT_CAPACITY];
 static size_t ears_desktop_recent_length = 0;
 static size_t ears_desktop_recent_write_position = 0;
 static uint64_t ears_desktop_recent_total_bytes = 0;
+static uint64_t ears_desktop_recent_generation = 1;
+/* Pending opens have a separate lifetime lock so stop never waits behind
+ * the lifecycle mutex before notifying a connecting transport. */
+static pthread_mutex_t ears_open_pointer_lock = PTHREAD_MUTEX_INITIALIZER;
+static R2Ears *ears_pending_open[2] = {NULL, NULL};
+static int ears_pending_watch[2] = {0, 0};
+static atomic_uint_fast64_t ears_open_epoch[2] = {ATOMIC_VAR_INIT(1), ATOMIC_VAR_INIT(1)};
+static atomic_uint_fast64_t ears_watch_stop_epoch = ATOMIC_VAR_INIT(1);
+static atomic_uint ears_desktop_stop_requesters = ATOMIC_VAR_INIT(0);
+typedef struct {
+    int desktop, watch;
+    uint_fast64_t epoch, watch_epoch;
+    int (*cancelled)(void *);
+    void *userdata;
+} R2EarsOpenRequest;
+
+static int r2_ears_open_cancelled(void *userdata)
+{
+    R2EarsOpenRequest *request = userdata;
+    return shutting_down ||
+        atomic_load(request->desktop ? &ears_desktop_stop_requesters : &ears_stop_requesters) ||
+        atomic_load(&ears_open_epoch[request->desktop]) != request->epoch ||
+        (request->watch && (atomic_load(&ears_watch_stop_epoch) != request->watch_epoch ||
+                           !r2_sense_auto_allowed(request->desktop ? 3 : 2))) ||
+        (request->cancelled && request->cancelled(request->userdata));
+}
+
+static R2EarsOpenRequest r2_ears_open_request(int desktop, int watch,
+                                             int (*cancelled)(void *), void *userdata)
+{
+    return (R2EarsOpenRequest){desktop, watch,
+        atomic_load(&ears_open_epoch[desktop]), atomic_load(&ears_watch_stop_epoch),
+        cancelled, userdata};
+}
+
+static void r2_ears_cancel_pending_source(int desktop)
+{
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    atomic_fetch_add(&ears_open_epoch[desktop], 1);
+    if (ears_pending_open[desktop]) r2_ears_cancel(ears_pending_open[desktop]);
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+}
+
+static void r2_ears_cancel_pending_inputs(int watch_only)
+{
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    if (watch_only) atomic_fetch_add(&ears_watch_stop_epoch, 1);
+    for (int i = 0; i < 2; ++i) {
+        if (!watch_only) atomic_fetch_add(&ears_open_epoch[i], 1);
+        if (ears_pending_open[i] && (!watch_only || ears_pending_watch[i]))
+            r2_ears_cancel(ears_pending_open[i]);
+    }
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+}
+
+/* Caller owns the corresponding lifecycle mutex until this returns. */
+static int r2_ears_open_input(R2Ears *receiver, const char *source,
+                              R2EarsOpenRequest *request)
+{
+    if (!receiver || r2_ears_open_cancelled(request)) { errno = ECANCELED; return -1; }
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    ears_pending_open[request->desktop] = receiver;
+    ears_pending_watch[request->desktop] = request->watch;
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+    int rc = request->desktop && !source
+        ? r2_ears_open_desktop_cancelable(receiver, r2_ears_open_cancelled, request)
+        : r2_ears_open_source_cancelable(receiver, source, r2_ears_open_cancelled, request);
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    ears_pending_open[request->desktop] = NULL;
+    int stopped = r2_ears_open_cancelled(request);
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+    if (stopped) { r2_ears_close(receiver); errno = ECANCELED; return -1; }
+    return rc;
+}
+
 static pthread_t ears_desktop_capture_thread;
 static int ears_desktop_capture_thread_started = 0;
 
@@ -11207,6 +11282,11 @@ static void r2_ears_notice_pcm_change(const unsigned char *pcm, size_t size,
 static void *r2_ears_capture_worker(void *unused)
 {
     (void)unused;
+    R2HearingEvent source = {0};
+    if (r2_ears_get_event(ears, &source) != 0) {
+        atomic_store(&ears_capture_running, 0);
+        return NULL;
+    }
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
     unsigned prior_audio_level = 0;
     int have_prior_audio = 0;
@@ -11218,12 +11298,12 @@ static void *r2_ears_capture_worker(void *unused)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous microphone stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
-                               "Ears");
+                               source.source_name);
             break;
         }
         r2_ears_notice_pcm_change(pcm, (size_t)got,
                                    &prior_audio_level, &have_prior_audio,
-                                   &last_audio_notice, "microphone");
+                                   &last_audio_notice, source.source_name);
         pthread_mutex_lock(&ears_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_recent_write_position;
@@ -11243,6 +11323,7 @@ static void *r2_ears_capture_worker(void *unused)
         ears_recent_total_bytes += count;
         pthread_mutex_unlock(&ears_recent_lock);
     }
+    r2_ears_release_event(&source);
     atomic_store(&ears_capture_running, 0);
     return NULL;
 }
@@ -11251,6 +11332,11 @@ static void *r2_ears_capture_worker(void *unused)
 static void *r2_ears_desktop_capture_worker(void *unused)
 {
     (void)unused;
+    R2HearingEvent source = {0};
+    if (r2_ears_get_event(ears_desktop, &source) != 0) {
+        atomic_store(&ears_desktop_capture_running, 0);
+        return NULL;
+    }
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
     unsigned prior_audio_level = 0;
     int have_prior_audio = 0;
@@ -11262,12 +11348,12 @@ static void *r2_ears_desktop_capture_worker(void *unused)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous desktop playback stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
-                               "Ears desktop");
+                               source.source_name);
             break;
         }
         r2_ears_notice_pcm_change(pcm, (size_t)got,
                                    &prior_audio_level, &have_prior_audio,
-                                   &last_audio_notice, "desktop_playback");
+                                   &last_audio_notice, source.source_name);
         pthread_mutex_lock(&ears_desktop_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_desktop_recent_write_position;
@@ -11287,6 +11373,7 @@ static void *r2_ears_desktop_capture_worker(void *unused)
         ears_desktop_recent_total_bytes += count;
         pthread_mutex_unlock(&ears_desktop_recent_lock);
     }
+    r2_ears_release_event(&source);
     atomic_store(&ears_desktop_capture_running, 0);
     return NULL;
 }
@@ -11320,6 +11407,35 @@ typedef struct R2ExtraDesktop {
 static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ExtraDesktop *extra_desktop_head = NULL;
 static atomic_uint_fast64_t extra_desktop_generation = ATOMIC_VAR_INIT(1);
+/* This lock never waits on the reconciliation lock. It protects only the
+ * pending receiver's lifetime so stop can reach an in-progress connect. */
+static pthread_mutex_t extra_desktop_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static R2Ears *extra_desktop_pending = NULL;
+static atomic_uint_fast64_t extra_desktop_stop_epoch = ATOMIC_VAR_INIT(1);
+static atomic_uint extra_desktop_stoppers = ATOMIC_VAR_INIT(0);
+
+void r2_ears_extra_cancel_pending(void)
+{
+    pthread_mutex_lock(&extra_desktop_pending_lock);
+    atomic_fetch_add(&extra_desktop_stop_epoch, 1);
+    if (extra_desktop_pending) r2_ears_cancel(extra_desktop_pending);
+    pthread_mutex_unlock(&extra_desktop_pending_lock);
+}
+
+typedef struct {
+    uint_fast64_t epoch;
+    int (*cancelled)(void *);
+    void *userdata;
+} R2ExtraDesktopOpen;
+
+static int r2_extra_desktop_open_cancelled(void *userdata)
+{
+    const R2ExtraDesktopOpen *request = userdata;
+    return shutting_down || atomic_load(&extra_desktop_stoppers) ||
+        atomic_load(&extra_desktop_stop_epoch) != request->epoch ||
+        (request->cancelled && request->cancelled(request->userdata)) ||
+        !r2_sense_auto_allowed(3);
+}
 
 static void *r2_extra_desktop_worker(void *arg)
 {
@@ -11390,6 +11506,8 @@ static int r2_extra_desktop_wanted(const R2AudioDiscovery *audio,
 
 void r2_ears_extra_stop_all(void)
 {
+    atomic_fetch_add(&extra_desktop_stoppers, 1);
+    r2_ears_extra_cancel_pending();
     pthread_mutex_lock(&extra_desktop_lock);
     while (extra_desktop_head) {
         R2ExtraDesktop *old = extra_desktop_head;
@@ -11397,14 +11515,26 @@ void r2_ears_extra_stop_all(void)
         r2_extra_desktop_destroy(old);
     }
     pthread_mutex_unlock(&extra_desktop_lock);
+    atomic_fetch_sub(&extra_desktop_stoppers, 1);
 }
 
 /* A discovery failure leaves all existing captures intact. A successful
  * snapshot is authoritative only for output availability, not attention. */
-int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
+int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char *primary,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (!audio) { errno = EINVAL; return -1; }
+    R2ExtraDesktopOpen request = {
+        atomic_load(&extra_desktop_stop_epoch), cancelled, userdata
+    };
     pthread_mutex_lock(&extra_desktop_lock);
+    if (shutting_down || atomic_load(&extra_desktop_stoppers) ||
+        atomic_load(&extra_desktop_stop_epoch) != request.epoch ||
+        (cancelled && cancelled(userdata))) {
+        pthread_mutex_unlock(&extra_desktop_lock);
+        errno = ECANCELED;
+        return -1;
+    }
     R2ExtraDesktop **slot = &extra_desktop_head;
     while (*slot) {
         R2ExtraDesktop *entry = *slot;
@@ -11419,6 +11549,11 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
     int result = 0;
     if (r2_sense_auto_allowed(3)) {
         for (size_t i = 0; i < audio->playback_output_count; ++i) {
+            if (r2_extra_desktop_open_cancelled(&request)) {
+                result = -1;
+                errno = ECANCELED;
+                break;
+            }
             const char *monitor = audio->playback_outputs[i].monitor;
             if (!r2_extra_desktop_wanted(audio, primary, monitor))
                 continue;
@@ -11446,9 +11581,20 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
             /* Nothing is published to readers until the stream opens and
              * the worker exists. If the server refuses the monitor, leave
              * its identity available for retry at the next poll. */
-            if (r2_ears_open_desktop_source(entry->receiver, entry->monitor) != 0) {
+            pthread_mutex_lock(&extra_desktop_pending_lock);
+            extra_desktop_pending = entry->receiver;
+            pthread_mutex_unlock(&extra_desktop_pending_lock);
+            int opened = r2_ears_open_desktop_source_cancelable(
+                entry->receiver, entry->monitor,
+                r2_extra_desktop_open_cancelled, &request);
+            pthread_mutex_lock(&extra_desktop_pending_lock);
+            extra_desktop_pending = NULL;
+            int cancelled_open = r2_extra_desktop_open_cancelled(&request);
+            pthread_mutex_unlock(&extra_desktop_pending_lock);
+            if (opened != 0 || cancelled_open) {
                 r2_extra_desktop_destroy(entry);
                 result = -1;
+                if (cancelled_open) { errno = ECANCELED; break; }
                 continue;
             }
             atomic_store(&entry->running, 1);
@@ -11468,6 +11614,11 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
     }
     pthread_mutex_unlock(&extra_desktop_lock);
     return result;
+}
+
+int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
+{
+    return r2_ears_extra_reconcile_cancelable(audio, primary, NULL, NULL);
 }
 
 size_t r2_ears_extra_source_count(void)
@@ -11629,7 +11780,7 @@ static int r2_ears_extra_write_pcm(const char *monitor, uint32_t bytes,
 
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11655,9 +11806,10 @@ static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
 
 /* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11667,6 +11819,12 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_tota
             return -1;
         }
         pthread_mutex_lock(&ears_recent_lock);
+        if (ears_recent_generation != generation) {
+            pthread_mutex_unlock(&ears_recent_lock);
+            free(snapshot);
+            errno = ECANCELED;
+            return -1;
+        }
         uint64_t captured_since_request = ears_recent_total_bytes >= start_total
             ? ears_recent_total_bytes - start_total : 0;
         if (captured_since_request >= bytes_needed &&
@@ -11707,7 +11865,7 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_tota
 /* Desktop samples are independently available to R2's chosen attention. */
 static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11733,9 +11891,10 @@ static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav
 
 /* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11745,6 +11904,12 @@ static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t st
             return -1;
         }
         pthread_mutex_lock(&ears_desktop_recent_lock);
+        if (ears_desktop_recent_generation != generation) {
+            pthread_mutex_unlock(&ears_desktop_recent_lock);
+            free(snapshot);
+            errno = ECANCELED;
+            return -1;
+        }
         uint64_t captured_since_request = ears_desktop_recent_total_bytes >= start_total
             ? ears_desktop_recent_total_bytes - start_total : 0;
         if (captured_since_request >= bytes_needed &&
@@ -11905,8 +12070,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     const uint32_t bytes_per_second = 48000U * 2U * 2U;
     uint32_t total_bytes;
     int capture_ok = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(0, 0, cancelled, userdata);
 
-    if ((cancelled && cancelled(userdata)) ||
+    if (r2_ears_open_cancelled(&request) ||
         atomic_load(&ears_stop_requesters) != 0) return NULL;
     if (seconds < 1U || seconds > 15U) {
         fprintf(stderr, "[Ears] Listen duration must be between 1 and 15 seconds.\n");
@@ -11988,10 +12154,11 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         } else {
             pthread_mutex_lock(&ears_desktop_recent_lock);
             uint64_t start_desktop_total = ears_desktop_recent_total_bytes;
+            uint64_t generation = ears_desktop_recent_generation;
             pthread_mutex_unlock(&ears_desktop_recent_lock);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
             pthread_mutex_unlock(&ears_capture_lock);
-            if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, wav,
+            if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, generation, wav,
                                                    cancelled, userdata) == 0 &&
                 !shutting_down && !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
@@ -12010,9 +12177,10 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         } else {
             pthread_mutex_lock(&ears_recent_lock);
             uint64_t start_total = ears_recent_total_bytes;
+            uint64_t generation = ears_recent_generation;
             pthread_mutex_unlock(&ears_recent_lock);
             pthread_mutex_unlock(&ears_capture_lock);
-            if (r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata) == 0 &&
+            if (r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata) == 0 &&
                 !shutting_down && !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
                 fflush(wav) == 0)
@@ -12024,12 +12192,19 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No continuously buffered audio is available to inspect.\n");
             goto cleanup;
         }
-        if (!ears || r2_ears_open_microphone(ears) != 0) {
+        if (!ears || r2_ears_open_input(ears, NULL, &request) != 0) {
             pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
             goto cleanup;
         }
         own_mic = 1;
+        /* Keep direct capture cancellable through the whole blocking read,
+         * not merely its connection handshake. Shutdown signals this stable
+         * receiver before joining any worker that requested the utterance. */
+        pthread_mutex_lock(&ears_open_pointer_lock);
+        ears_pending_open[0] = ears;
+        ears_pending_watch[0] = 0;
+        pthread_mutex_unlock(&ears_open_pointer_lock);
         uint32_t captured_bytes = 0;
         while (captured_bytes < total_bytes && !shutting_down &&
                atomic_load(&ears_stop_requesters) == 0 &&
@@ -12048,6 +12223,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             captured_bytes += (uint32_t)got;
         }
         if (own_mic) {
+            pthread_mutex_lock(&ears_open_pointer_lock);
+            ears_pending_open[0] = NULL;
+            pthread_mutex_unlock(&ears_open_pointer_lock);
             r2_ears_close(ears);
             own_mic = 0;
         }
@@ -12132,16 +12310,13 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     {
         FILE *text_fp = fopen(transcript_path, "rb");
         if (!text_fp) goto cleanup;
-        transcript = malloc(16385U);
-        if (!transcript) { fclose(text_fp); goto cleanup; }
-        size_t n = fread(transcript, 1, 16384U, text_fp);
+        size_t capacity = 0;
+        ssize_t n = getdelim(&transcript, &capacity, '\0', text_fp);
         int read_error = ferror(text_fp);
-        int extra = fgetc(text_fp);
-        fclose(text_fp);
-        if (read_error || extra != EOF || memchr(transcript, '\0', n) != NULL) {
+        if (fclose(text_fp) != 0) read_error = 1;
+        if (n < 0 || read_error || memchr(transcript, '\0', (size_t)n) != NULL) {
             free(transcript); transcript = NULL; goto cleanup;
         }
-        transcript[n] = '\0';
         char *start = transcript;
         while (*start && isspace((unsigned char)*start)) ++start;
         char *end = start + strlen(start);
@@ -12193,9 +12368,11 @@ char *r2_ears_listen(unsigned seconds)
 
 /* Microphone retains the existing Ears bridge and its history, including
  * direct speech capture. It never takes over the separate desktop monitor. */
-static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source)
+static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source,
+                                int (*cancelled)(void *), void *userdata)
 {
     if (watch_token_out) *watch_token_out = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(0, watch_token_out != NULL, cancelled, userdata);
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
         /* An explicit start takes over an existing Watch-owned stream. */
@@ -12208,13 +12385,13 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? (microphone_source ? r2_ears_open_microphone_source(ears, microphone_source)
-                                       : r2_ears_open_microphone(ears)) : -1;
+    int rc = r2_ears_open_input(ears, microphone_source, &request);
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
         ears_recent_write_position = 0;
         ears_recent_total_bytes = 0;
+        ++ears_recent_generation;
         pthread_mutex_unlock(&ears_recent_lock);
         atomic_store(&ears_capture_running, 1);
         if (pthread_create(&ears_capture_thread, NULL,
@@ -12241,21 +12418,31 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
 
 int r2_ears_start(void)
 {
-    return r2_ears_start_input(NULL, NULL);
+    return r2_ears_start_input(NULL, NULL, NULL, NULL);
 }
 
 uint64_t r2_ears_start_for_watch(const char *source)
 {
     if (!source || !*source) return 0;
     uint64_t token = 0;
-    return r2_ears_start_input(&token, source) == 0 ? token : 0;
+    return r2_ears_start_input(&token, source, NULL, NULL) == 0 ? token : 0;
+}
+
+uint64_t r2_ears_start_for_watch_cancelable(const char *source,
+                                            int (*cancelled)(void *), void *userdata)
+{
+    if (!source || !*source) return 0;
+    uint64_t token = 0;
+    return r2_ears_start_input(&token, source, cancelled, userdata) == 0 ? token : 0;
 }
 
 /* Playback monitor has its own Pulse stream, worker and rolling history.
  * It can run alongside the microphone and shuts down independently. */
-static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *monitor)
+static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *monitor,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (watch_token_out) *watch_token_out = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(1, watch_token_out != NULL, cancelled, userdata);
     pthread_mutex_lock(&ears_desktop_capture_lock);
     if (atomic_load(&ears_desktop_capture_running) &&
         ears_desktop_capture_thread_started) {
@@ -12275,13 +12462,13 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
         return -1;
     }
     pthread_mutex_unlock(&ears_desktop_pointer_lock);
-    int rc = monitor ? r2_ears_open_desktop_source(ears_desktop, monitor)
-                     : r2_ears_open_desktop(ears_desktop);
+    int rc = r2_ears_open_input(ears_desktop, monitor, &request);
     if (rc == 0) {
         pthread_mutex_lock(&ears_desktop_recent_lock);
         ears_desktop_recent_length = 0;
         ears_desktop_recent_write_position = 0;
         ears_desktop_recent_total_bytes = 0;
+        ++ears_desktop_recent_generation;
         pthread_mutex_unlock(&ears_desktop_recent_lock);
         atomic_store(&ears_desktop_capture_running, 1);
         if (pthread_create(&ears_desktop_capture_thread, NULL,
@@ -12308,19 +12495,29 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
 
 int r2_ears_start_desktop(void)
 {
-    return r2_ears_start_desktop_impl(NULL, NULL);
+    return r2_ears_start_desktop_impl(NULL, NULL, NULL, NULL);
 }
 
 uint64_t r2_ears_start_desktop_for_watch(const char *monitor)
 {
     if (!monitor || !*monitor) return 0;
     uint64_t token = 0;
-    return r2_ears_start_desktop_impl(&token, monitor) == 0 ? token : 0;
+    return r2_ears_start_desktop_impl(&token, monitor, NULL, NULL) == 0 ? token : 0;
+}
+
+uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
+                                                    int (*cancelled)(void *), void *userdata)
+{
+    if (!monitor || !*monitor) return 0;
+    uint64_t token = 0;
+    return r2_ears_start_desktop_impl(&token, monitor, cancelled, userdata) == 0 ? token : 0;
 }
 
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
     if (!watch_only) {
+        atomic_fetch_add(&ears_desktop_stop_requesters, 1);
+        r2_ears_cancel_pending_source(1);
         /* An explicit desktop-close choice covers every output, not just
          * the historical default monitor. Independent mic stays open. */
         r2_ears_extra_stop_all();
@@ -12348,8 +12545,10 @@ static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
     ears_desktop_recent_length = 0;
     ears_desktop_recent_write_position = 0;
     ears_desktop_recent_total_bytes = 0;
+    ++ears_desktop_recent_generation;
     pthread_mutex_unlock(&ears_desktop_recent_lock);
     pthread_mutex_unlock(&ears_desktop_capture_lock);
+    if (!watch_only) atomic_fetch_sub(&ears_desktop_stop_requesters, 1);
     return 0;
 }
 
@@ -12431,6 +12630,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
      * A Watch cleanup cannot cancel another caller's one-shot capture. */
     if (!watch_only) {
         atomic_fetch_add(&ears_stop_requesters, 1);
+        r2_ears_cancel_pending_source(0);
         r2_ears_cancel(ears); /* wake a direct listen BEFORE waiting for its mutex */
     }
     pthread_mutex_lock(&ears_capture_lock);
@@ -12450,6 +12650,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
     ears_recent_length = 0;
     ears_recent_write_position = 0;
     ears_recent_total_bytes = 0;
+    ++ears_recent_generation;
     pthread_mutex_unlock(&ears_recent_lock);
     pthread_mutex_unlock(&ears_capture_lock);
     if (!watch_only) atomic_fetch_sub(&ears_stop_requesters, 1);
@@ -12495,6 +12696,8 @@ int r2_watch_start(void)
 int r2_watch_stop(void)
 {
     watch_running = 0;
+    r2_ears_extra_cancel_pending();
+    r2_ears_cancel_pending_inputs(1);
     r2_log_event(R2_LOG_SENSORY, "watch_stopped",
                  "R2 Watch mode was stopped.", NULL, "r2_watch_stop");
     return 0;
@@ -12514,6 +12717,8 @@ void r2_request_shutdown(void)
     shutting_down = 1;
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
+    r2_ears_extra_cancel_pending();
+    r2_ears_cancel_pending_inputs(0);
 }
 
 int r2_request_restart(void)
@@ -14130,6 +14335,8 @@ void r2_shutdown(void)
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
 
+    r2_ears_cancel_pending_inputs(0);
+    r2_ears_extra_cancel_pending();
     atomic_store(&diary_running, 0);
     watch_running = 0;
     r2_vision_watch_stop();

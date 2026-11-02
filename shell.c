@@ -1353,7 +1353,12 @@ static void *shell_watch_worker(void *unused)
 
     while (!shell_watch_cancelled(NULL)) {
         R2AudioDiscovery audio;
-        int audio_known = r2_audio_discover(&audio) == 0;
+        int audio_known = r2_audio_discover_cancelable(
+            &audio, shell_watch_cancelled, NULL) == 0;
+        if (shell_watch_cancelled(NULL)) {
+            if (audio_known) r2_audio_discovery_free(&audio);
+            break;
+        }
         /* On a server query error, existing capture is not evidence of
          * unplugging. Use status only to preserve established attention. */
         int desktop_playing = audio_known ? audio.desktop_playing :
@@ -1433,7 +1438,8 @@ static void *shell_watch_worker(void *unused)
         if (!managed_microphone && r2_sense_auto_allowed(2) &&
             microphone_available && r2_ears_status() <= 0)
             managed_microphone =
-                r2_ears_start_for_watch(audio.microphone_source);
+                r2_ears_start_for_watch_cancelable(audio.microphone_source,
+                                                    shell_watch_cancelled, NULL);
 
         int monitor_changed = audio_known && desktop_playing &&
             audio.desktop_monitor &&
@@ -1449,7 +1455,8 @@ static void *shell_watch_worker(void *unused)
             audio_known && desktop_playing && audio.desktop_monitor &&
             r2_ears_status_desktop() <= 0)
             managed_desktop =
-                r2_ears_start_desktop_for_watch(audio.desktop_monitor);
+                r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor,
+                                                            shell_watch_cancelled, NULL);
 
         /* Every other active output gets its own continuously buffered
          * listener, without replacing the primary or the physical mic.
@@ -1461,7 +1468,8 @@ static void *shell_watch_worker(void *unused)
              * differ from the first detected output after manual takeover.
              * If there is no active primary receiver, capture every sink. */
             char *primary_source = r2_ears_current_desktop_source();
-            (void)r2_ears_extra_reconcile(&audio, primary_source);
+            (void)r2_ears_extra_reconcile_cancelable(&audio, primary_source,
+                                                   shell_watch_cancelled, NULL);
             free(primary_source);
         }
 
