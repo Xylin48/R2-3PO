@@ -68,6 +68,7 @@ int main(void)
         "  fi\n"
         "  shift\n"
         "done\n"
+        "if [ \"$R2_TEST_FILE_MODE\" = failed ]; then exit 23; fi\n"
         "if [ \"$R2_TEST_FILE_MODE\" = stalled ]; then\n"
         "  printf 'WXYZ'\n"
         "  exec sleep 60\n"
@@ -98,6 +99,13 @@ int main(void)
     assert(!r2_ears_is_open(ears));
     r2_ears_close(ears);
 
+    /* A failed decoder producing zero PCM must report EIO, not clean EOF. */
+    assert(setenv("R2_TEST_FILE_MODE", "failed", 1) == 0);
+    assert(r2_ears_open_file(ears, unusual_filename) == 0);
+    assert(r2_ears_read(ears, out, sizeof(out)) == -1);
+    assert(errno == EIO);
+    r2_ears_close(ears);
+
     assert(setenv("R2_TEST_FILE_MODE", "stalled", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
@@ -122,7 +130,7 @@ int main(void)
     assert(reader.result == -1 && reader.error == ECANCELED);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
-    assert(source_closes == 2); /* EOF and cancelled source both journalled */
+    assert(source_closes == 3); /* EOF, failed decoder, cancellation all journalled */
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
     puts("File decoder preserves exact argv, complete PCM, and promptly cancels stalled FFmpeg reads and reaps child.");
