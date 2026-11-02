@@ -12149,6 +12149,9 @@ uint64_t r2_ears_start_desktop_for_watch(const char *monitor)
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
     if (!watch_only) {
+        /* An explicit desktop-close choice covers every output, not just
+         * the historical default monitor. Independent mic stays open. */
+        r2_ears_extra_stop_all();
         /* A setup call can be waiting on Pulse's context/stream callbacks
          * while still holding the capture mutex. Cancel through the stable
          * pointer without first blocking behind that mutex. */
