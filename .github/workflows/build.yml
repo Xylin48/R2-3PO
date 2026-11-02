@@ -174,7 +174,7 @@ jobs:
 
       - name: Exercise independent microphone and desktop PCM capture objects
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c AudioDiscovery.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c AudioDiscovery.c AudioFile.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread
           /tmp/r2-ears-dual-sources-test
 
       - name: Check live Watch ownership tokens against external capture takeover
