@@ -2,6 +2,7 @@
 #include "AudioCapture.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
