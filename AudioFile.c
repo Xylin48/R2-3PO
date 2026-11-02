@@ -152,7 +152,7 @@ static int r2_file_check_eof(R2AudioFile *file)
 
 ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
 {
-    if (!file || !buffer || !bytes || bytes > SSIZE_MAX) {
+    if (!file || !buffer || !bytes || bytes > SSIZE_MAX || (bytes % 4U) != 0U) {
         errno = EINVAL;
         return -1;
     }
@@ -164,7 +164,7 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
         }
         /* Do not return a partial stereo 16-bit frame. The caller's ring
          * history relies on complete four-byte frames. */
-        if (copied > 0 && (copied % 4U == 0 || copied == bytes))
+        if (copied > 0 && copied % 4U == 0)
             return (ssize_t)copied;
         struct pollfd pfd[2] = {
             {.fd = file->cancel_fd, .events = POLLIN},
