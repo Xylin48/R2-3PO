@@ -4,6 +4,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 ears = (root / "Ears.c").read_text()
 ears_h = (root / "Ears.h").read_text()
+audio = (root / "AudioDiscovery.c").read_text()
 eyes = (root / "Eyes.c").read_text()
 eyes_h = (root / "Eyes.h").read_text()
 core = (root / "r2.c").read_text()
@@ -15,12 +16,13 @@ for symbol, source, hdr in (
     ("r2_vision_window_for_pid", core, core_h),
 ):
     assert symbol in source and symbol in hdr
-probe = ears[ears.index("long r2_ears_playback_pid(void)"):
-             ears.index("/* ---------------------------------------------------------\n * File process handling")]
-assert 'pactl list sink-inputs' in probe
-assert 'application.process.id' in probe
-assert 'Corked: no' in probe
-assert 'strtol(key, &end, 10)' in probe
+probe = audio[audio.index("static void r2_discovery_sink_input("):
+              audio.index("static void r2_discovery_sink_info(", audio.index("static void r2_discovery_sink_input("))]
+assert "PA_PROP_APPLICATION_PROCESS_ID" in probe
+assert "info->corked" in probe
+assert "info->sink" in probe
+assert "r2_discovery_pid(pid)" in probe
+assert "r2_audio_discover(&sources)" in ears
 vision = eyes[eyes.index("unsigned long r2_eyes_window_for_pid(long pid)"):
               eyes.index("static FILE *r2_eyes_start_vlc(")]
 assert 'xdotool search --onlyvisible --pid' in vision
@@ -28,7 +30,8 @@ assert 'r2_eyes_probe_vlc_dimensions(candidate' in vision
 assert 'r2_eyes_start_vlc(' not in vision
 worker = shell[shell.index("static void *shell_watch_worker(void *unused)"):
                shell.index("static void shell_watch_start(void)")]
-assert "r2_ears_playback_pid()" in worker
+assert "audio.playback_pid" in worker
+assert "r2_audio_discover(&audio)" in worker
 assert "r2_vision_window_for_pid(playback_pid)" in worker
 assert "wanted_media == 3 ? media_window" in worker
 assert "r2_vision_media_open_window(wanted_window)" in worker
