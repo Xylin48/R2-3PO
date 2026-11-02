@@ -1343,7 +1343,7 @@ static int shell_watch_cancelled(void *unused)
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int managed_camera = 0;
+    uint64_t managed_camera = 0; /* exact Watch-owned camera generation */
     int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
     uint64_t managed_media_token = 0; /* only a Watch-opened generation */
     unsigned long managed_window_id = 0;
@@ -1371,13 +1371,14 @@ static void *shell_watch_worker(void *unused)
            Neither a playing media window nor its disappearance changes eyesight. */
         int eyes_permitted = r2_sense_auto_allowed(1);
         if (managed_camera &&
-            (!eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
-            (void)r2_eyes_release_source();
+            (!r2_eyes_watch_owns(managed_camera) ||
+             !eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
+            (void)r2_eyes_release_if_watch_owned(managed_camera);
             managed_camera = 0;
         }
         if (eyes_permitted && !managed_camera && camera_available &&
-            r2_eyes_status() <= 0 && r2_eyes_start() == 0)
-            managed_camera = 1;
+            r2_eyes_status() <= 0)
+            managed_camera = r2_eyes_start_for_watch();
 
         if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
             !r2_vision_watch_active() && r2_vision_available() &&
@@ -1458,7 +1459,7 @@ static void *shell_watch_worker(void *unused)
     }
 
     if (managed_camera)
-        (void)r2_eyes_release_source();
+        (void)r2_eyes_release_if_watch_owned(managed_camera);
     else if (attached_visual)
         (void)r2_vision_watch_stop();
     if (managed_media)
