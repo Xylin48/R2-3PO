@@ -111,6 +111,45 @@ error:
     }
 }
 
+/* On pipe EOF, distinguish a decoder that exited successfully from one
+ * which failed to decode the file. Its output pipe can close just before
+ * exit(2), so allow a short cancellable grace period for the exit status.
+ * A process that deliberately continues after closing stdout is left to
+ * the lifecycle owner to terminate rather than blocking the reader. */
+static int r2_file_check_eof(R2AudioFile *file)
+{
+    if (file->child <= 0) return 0;
+    uint64_t start = r2_file_now_ms();
+    for (;;) {
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(file->child, &status, WNOHANG); }
+        while (result < 0 && errno == EINTR);
+        if (result == file->child) {
+            file->child = -1; /* reaped; owner must never signal this PID */
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                errno = EIO;
+                return -1;
+            }
+            return 0;
+        }
+        if (result < 0) {
+            if (errno == ECHILD) { file->child = -1; return 0; }
+            return -1;
+        }
+        if (atomic_load(&file->cancelled)) {
+            errno = ECANCELED;
+            return -1;
+        }
+        uint64_t now = r2_file_now_ms();
+        if (start == UINT64_MAX || now == UINT64_MAX ||
+            now < start || now - start >= 150U)
+            return 0; /* EOF certain, child exit status not yet known */
+        struct timespec pause = {0, 5000000L};
+        while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
+    }
+}
+
 ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
 {
     if (!file || !buffer || !bytes || bytes > SSIZE_MAX) {
@@ -156,6 +195,7 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
         }
         if (got == 0) {
             if (copied % 4U != 0) { errno = EPROTO; return -1; }
+            if (copied == 0 && r2_file_check_eof(file) < 0) return -1;
             return (ssize_t)copied;
         }
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
