@@ -14,6 +14,9 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+/* White-box only for the borrowed, current event.source_name alias test.
+ * Production uses the opaque Ears interface unchanged. */
+#include "../Ears.c"
 
 /* Transport injected below: Ears is real, Pulse server is synthetic. */
 typedef struct {
@@ -103,6 +106,14 @@ int main(void)
     assert(r2_ears_get_event(desktop, &event_desktop) == 0);
     assert(!strcmp(event_mic.source_name, microphone_name));
     assert(!strcmp(event_desktop.source_name, monitor_name));
+    /* The caller is allowed to reopen with a pointer into the current event.
+     * The old implementation freed it during close before opening the source. */
+    assert(r2_ears_open_source(mic, mic->event.source_name) == 0);
+    assert(r2_ears_is_open(mic));
+    R2HearingEvent reopened = {0};
+    assert(r2_ears_get_event(mic, &reopened) == 0);
+    assert(!strcmp(reopened.source_name, microphone_name));
+    r2_ears_release_event(&reopened);
     check_pcm(mic, 0xa5);
     check_pcm(desktop, 0x5a);
     /* A source event describes when this capture opened, not the
@@ -127,12 +138,12 @@ int main(void)
     unsigned char failure_samples[1920];
     assert(r2_ears_read(mic, failure_samples, sizeof(failure_samples)) == -1);
     assert(r2_ears_is_open(mic) == 0);
-    assert(close_count == 2);
+    assert(close_count == 3);
     r2_ears_release_event(&event_mic);
     r2_ears_release_event(&event_desktop);
     r2_ears_shutdown(desktop);
     r2_ears_shutdown(mic);
-    assert(open_count == close_count && open_count == 3);
+    assert(open_count == close_count && open_count == 4);
     puts("Independent microphone and desktop PCM sources, metadata and lifecycles passed.");
     return 0;
 }
