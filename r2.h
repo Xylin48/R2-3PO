@@ -342,11 +342,13 @@ int r2_vision_close(void);
  */
 int r2_ears_start(void);
 /* Watch claims only a newly created stream. Zero means already owned or failed. */
-uint64_t r2_ears_start_for_watch(void);
-uint64_t r2_ears_start_desktop_for_watch(void);
+uint64_t r2_ears_start_for_watch(const char *source);
+uint64_t r2_ears_start_desktop_for_watch(const char *monitor);
 /* Stop only the precise stream generation started by Watch; safe after replacement. */
 int r2_ears_stop_if_watch_owned(uint64_t token);
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
+/* Read the active monitor identity under the desktop stream lifecycle lock. */
+int r2_ears_status_desktop_source(const char *monitor);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */
