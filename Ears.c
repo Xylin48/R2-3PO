@@ -29,6 +29,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "Ears.h"
+#include "AudioDiscovery.h"
 #include "Log.h"
 
 #include <errno.h>
@@ -271,149 +272,43 @@ static pa_sample_spec r2_ears_sample_spec(void)
 
 
 /*
- * Get the system's default Pulse/PipeWire sink.
- *
- * Example:
- *
- *     alsa_output.pci-0000_00_1f.3.analog-stereo
- *
- * The corresponding monitor source is:
- *
- *     alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
- *
- * This is what allows R2 to hear what the desktop itself
- * is playing.
+ * Native read-only PulseAudio/PipeWire enumeration is shared with Watch.
+ * Query errors are distinct from a valid snapshot with zero microphones.
  */
-static char *r2_ears_read_command_line(const char *command)
-{
-    FILE *pipe = popen(command, "r");
-    if (!pipe) return NULL;
-    char *line = NULL;
-    size_t capacity = 0;
-    ssize_t length = getline(&line, &capacity, pipe);
-    int status = pclose(pipe);
-    if (length < 0 || status != 0) { free(line); return NULL; }
-    line[strcspn(line, "\r\n")] = '\0';
-    if (!*line) { free(line); return NULL; }
-    return line;
-}
-
-static char *r2_ears_get_default_sink(void)
-{
-    return r2_ears_read_command_line("pactl get-default-sink 2>/dev/null");
-}
-
-static char *r2_ears_get_default_source(void)
-{
-    return r2_ears_read_command_line("pactl get-default-source 2>/dev/null");
-}
-
-
-/* Let pa_simple_new determine actual source availability without substring grep. */
-
-/* Availability discovery is separate from sound capture. Both USB and built-in
- * microphone names come from the active Pulse/PipeWire server, not an app list.
- * A monitor is desktop playback, not a physical microphone. */
-static int r2_ears_is_monitor(const char *name)
-{
-    if (!name) return 1;
-    size_t n = strlen(name);
-    return n >= 8 && strcmp(name + n - 8, ".monitor") == 0;
-}
-
 static char *r2_ears_find_microphone(void)
 {
-    char *default_name = r2_ears_get_default_source();
-    FILE *pipe = popen("pactl list short sources 2>/dev/null", "r");
-    if (!pipe) { free(default_name); return NULL; }
-    char *line = NULL, *fallback = NULL, *preferred = NULL;
-    size_t capacity = 0;
-    while (getline(&line, &capacity, pipe) >= 0) {
-        char *cursor = line;
-        while (*cursor >= '0' && *cursor <= '9') ++cursor;
-        if (cursor == line || (*cursor != ' ' && *cursor != '\t')) continue;
-        while (*cursor == ' ' || *cursor == '\t') ++cursor;
-        char *end = cursor + strcspn(cursor, " \t\r\n");
-        if (end == cursor) continue;
-        *end = '\0';
-        if (r2_ears_is_monitor(cursor)) continue;
-        if (!fallback) fallback = strdup(cursor);
-        if (default_name && strcmp(cursor, default_name) == 0) {
-            preferred = strdup(cursor);
-            break;
-        }
-    }
-    free(line);
-    int status = pclose(pipe);
-    free(default_name);
-    if (status != 0) { free(preferred); free(fallback); return NULL; }
-    if (preferred) { free(fallback); return preferred; }
-    return fallback;
+    R2AudioDiscovery sources;
+    if (r2_audio_discover(&sources) != 0) return NULL;
+    char *selected = sources.microphone_source;
+    sources.microphone_source = NULL;
+    r2_audio_discovery_free(&sources);
+    return selected;
 }
 
 int r2_ears_microphone_available(void)
 {
-    char *name = r2_ears_find_microphone();
-    int available = name != NULL;
-    free(name);
+    char *selected = r2_ears_find_microphone();
+    int available = selected != NULL;
+    free(selected);
     return available;
 }
 
-/* A live, uncorked playback stream is an audio source regardless of whether
- * it belongs to a browser, movie player, audio player or game. Paused/corked
- * streams do not keep the continuous desktop listener alive. */
 int r2_ears_desktop_playing(void)
 {
-    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
-    if (!pipe) return 0;
-    char line[2048];
-    int playing = 0, have_input = 0;
-    while (fgets(line, sizeof(line), pipe)) {
-        if (strstr(line, "Sink Input #")) have_input = 1;
-        if (have_input && strstr(line, "Corked: no"))
-            playing = 1;
-    }
-    if (pclose(pipe) != 0) return 0;
+    R2AudioDiscovery sources;
+    if (r2_audio_discover(&sources) != 0) return 0;
+    int playing = sources.desktop_playing;
+    r2_audio_discovery_free(&sources);
     return playing;
 }
 
-/* Resolve the real process responsible for an uncorked output stream.
- * It is evidence of desktop playback, not evidence that a video exists.
- * The optional Eyes bridge can look for a visible window owned by this PID. */
 long r2_ears_playback_pid(void)
 {
-    FILE *pipe = popen("pactl list sink-inputs 2>/dev/null", "r");
-    if (!pipe) return -1;
-    char line[2048];
-    long current_pid = -1, selected = -1;
-    int active = 0, seen_input = 0;
-    while (fgets(line, sizeof(line), pipe)) {
-        if (strstr(line, "Sink Input #")) {
-            if (seen_input && active && current_pid > 1 && selected < 0)
-                selected = current_pid;
-            seen_input = 1;
-            active = 0;
-            current_pid = -1;
-        } else if (seen_input && strstr(line, "Corked: ")) {
-            active = strstr(line, "Corked: no") != NULL;
-        } else if (seen_input) {
-            char *key = strstr(line, "application.process.id = ");
-            if (key) {
-                key += strlen("application.process.id = ");
-                if (*key == '"') ++key;
-                char *end = NULL;
-                errno = 0;
-                long value = strtol(key, &end, 10);
-                if (!errno && end != key && value > 1 && value <= INT_MAX &&
-                    (*end == '"' || *end == '\n' || *end == '\0'))
-                    current_pid = value;
-            }
-        }
-    }
-    if (seen_input && active && current_pid > 1 && selected < 0)
-        selected = current_pid;
-    if (pclose(pipe) != 0) return -1;
-    return selected;
+    R2AudioDiscovery sources;
+    if (r2_audio_discover(&sources) != 0) return -1;
+    long pid = sources.playback_pid;
+    r2_audio_discovery_free(&sources);
+    return pid;
 }
 
 /* ---------------------------------------------------------
@@ -576,7 +471,7 @@ int r2_ears_open_source(
         source_name[0] == '\0')
     {
         resolved_source =
-            r2_ears_get_default_source();
+            r2_ears_find_microphone();
 
         actual_source =
             resolved_source;
@@ -721,21 +616,21 @@ int r2_ears_open_microphone(R2Ears *ears)
  * Open desktop/system audio
  * --------------------------------------------------------- */
 
+int r2_ears_open_desktop_source(R2Ears *ears, const char *monitor)
+{
+    if (!ears || !monitor || !*monitor) return -1;
+    return r2_ears_open_source(ears, monitor);
+}
+
 int r2_ears_open_desktop(R2Ears *ears)
 {
     if (!ears) return -1;
-    char *sink = r2_ears_get_default_sink();
-    if (!sink) {
-        fprintf(stderr, "R2 Ears: could not determine the default desktop sink.\n");
-        return -1;
-    }
-    char *monitor = NULL;
-    int length = asprintf(&monitor, "%s.monitor", sink);
-    free(sink);
-    if (length < 0 || !monitor) return -1;
-    int result = r2_ears_open_source(ears, monitor);
-    free(monitor);
-    return result;
+    R2AudioDiscovery sources;
+    if (r2_audio_discover(&sources) != 0) return -1;
+    int rc = sources.desktop_monitor
+        ? r2_ears_open_desktop_source(ears, sources.desktop_monitor) : -1;
+    r2_audio_discovery_free(&sources);
+    return rc;
 }
 
 
