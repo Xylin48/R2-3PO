@@ -84,6 +84,33 @@ int main(void)
     for (size_t i = 1; i < 12; ++i)
         wait_for_pcm(names[i], (unsigned char)(i + 16));
 
+    /* Explicitly chosen source preserves its own samples in both recent
+     * and newly gathered future audio; no mixing with other outputs. */
+    for (int recent = 0; recent <= 1; ++recent) {
+        FILE *wav = tmpfile();
+        assert(wav);
+        assert(r2_ears_extra_write_pcm(names[3], 1920, wav, recent,
+                                       NULL, NULL) == 0);
+        rewind(wav);
+        unsigned char raw[1920];
+        assert(fread(raw, 1, sizeof(raw), wav) == sizeof(raw));
+        for (size_t k = 0; k < sizeof(raw); ++k)
+            assert(raw[k] == 19); /* index3 starts as opened slot2 */
+        fclose(wav);
+    }
+    char *source_list = r2_ears_desktop_available_sources();
+    assert(source_list);
+    assert(strlen(source_list) > 8192);
+    for (size_t i = 1; i < 12; ++i)
+        assert(strstr(source_list, names[i]));
+    free(source_list);
+    /* Tool accumulation itself must not cut an 8192+ byte source list. */
+    char *tool_result = process_tools_with_status("[EARS_SOURCES]\\n", NULL);
+    assert(tool_result && strlen(tool_result) > 8192);
+    assert(strstr(tool_result, names[11]));
+    assert(!strstr(tool_result, "[tool output truncated]"));
+    free(tool_result);
+
     /* A physical reroute makes the formerly primary monitor eligible,
      * while the new primary is no longer duplicated by the extra list. */
     assert(r2_ears_extra_reconcile(&audio, names[5]) == 0);
