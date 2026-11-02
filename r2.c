@@ -10987,6 +10987,9 @@ static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
 /* The desktop sink monitor never shares the microphone's stream or history. */
 static pthread_mutex_t ears_desktop_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Protected publication permits desktop stop to cancel an ongoing async
+ * connect BEFORE it can acquire the separate capture lifecycle mutex. */
+static pthread_mutex_t ears_desktop_pointer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t ears_desktop_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char ears_desktop_recent_audio[R2_EARS_RECENT_CAPACITY];
 static size_t ears_desktop_recent_length = 0;
@@ -11758,10 +11761,13 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
         pthread_join(ears_desktop_capture_thread, NULL);
         ears_desktop_capture_thread_started = 0;
     }
+    pthread_mutex_lock(&ears_desktop_pointer_lock);
     if (!ears_desktop && r2_ears_init(&ears_desktop) != 0) {
+        pthread_mutex_unlock(&ears_desktop_pointer_lock);
         pthread_mutex_unlock(&ears_desktop_capture_lock);
         return -1;
     }
+    pthread_mutex_unlock(&ears_desktop_pointer_lock);
     int rc = monitor ? r2_ears_open_desktop_source(ears_desktop, monitor)
                      : r2_ears_open_desktop(ears_desktop);
     if (rc == 0) {
@@ -11807,6 +11813,14 @@ uint64_t r2_ears_start_desktop_for_watch(const char *monitor)
 
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
+    if (!watch_only) {
+        /* A setup call can be waiting on Pulse's context/stream callbacks
+         * while still holding the capture mutex. Cancel through the stable
+         * pointer without first blocking behind that mutex. */
+        pthread_mutex_lock(&ears_desktop_pointer_lock);
+        if (ears_desktop) r2_ears_cancel(ears_desktop);
+        pthread_mutex_unlock(&ears_desktop_pointer_lock);
+    }
     pthread_mutex_lock(&ears_desktop_capture_lock);
     if (watch_only && (!watch_token || ears_desktop_watch_token != watch_token)) {
         pthread_mutex_unlock(&ears_desktop_capture_lock);
@@ -13633,10 +13647,12 @@ void r2_shutdown(void)
 
     /* Both independent audio workers stop before persistent stores close. */
     (void)r2_ears_stop_desktop();
+    pthread_mutex_lock(&ears_desktop_pointer_lock);
     if (ears_desktop) {
         r2_ears_shutdown(ears_desktop);
         ears_desktop = NULL;
     }
+    pthread_mutex_unlock(&ears_desktop_pointer_lock);
     if (ears) {
         (void)r2_ears_stop();
         r2_ears_shutdown(ears);
