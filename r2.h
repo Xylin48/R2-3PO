@@ -348,6 +348,8 @@ uint64_t r2_ears_start_desktop_for_watch(const char *monitor);
 int r2_ears_stop_if_watch_owned(uint64_t token);
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
 /* Read the active monitor identity under the desktop stream lifecycle lock. */
+/* Does the active microphone capture still use this exact source? */
+int r2_ears_status_microphone_source(const char *expected_source);
 int r2_ears_status_desktop_source(const char *monitor);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
