@@ -30,12 +30,14 @@
 
 #include "Ears.h"
 #include "AudioDiscovery.h"
+#include "AudioCapture.h"
 #include "Log.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,7 +47,7 @@
 #include <unistd.h>
 
 #include <pulse/error.h>
-#include <pulse/simple.h>
+#include <pulse/sample.h>
 
 
 /* ---------------------------------------------------------
@@ -110,7 +112,11 @@ struct R2Ears
      * PipeWire normally exposes its PulseAudio compatibility
      * layer through libpulse, so this works for both systems.
      */
-    pa_simple *pulse_stream;
+    R2AudioCapture *pulse_stream;
+    /* Serializes publication, cancellation and release of the transport.
+     * The transport's own Pulse mainloop mutex never blocks on PCM delivery. */
+    pthread_mutex_t transport_lock;
+    atomic_int cancel_requested;
 
     /*
      * FFmpeg process for file/media decoding.
@@ -364,6 +370,11 @@ int r2_ears_init(R2Ears **ears)
         R2_EARS_BITS_PER_SAMPLE;
 
     atomic_init(&new_ears->open, 0);
+    atomic_init(&new_ears->cancel_requested, 0);
+    if (pthread_mutex_init(&new_ears->transport_lock, NULL) != 0) {
+        free(new_ears);
+        return -1;
+    }
     new_ears->pulse_stream = NULL;
     new_ears->file_stream = NULL;
     new_ears->file_pid = -1;
@@ -386,14 +397,13 @@ void r2_ears_close(R2Ears *ears)
     if (!ears)
         return;
 
-    if (ears->pulse_stream)
-    {
-        pa_simple_free(
-            ears->pulse_stream
-        );
-
+    pthread_mutex_lock(&ears->transport_lock);
+    if (ears->pulse_stream) {
+        /* Only the lifecycle owner may close, after its reader has exited. */
+        r2_audio_capture_free(ears->pulse_stream);
         ears->pulse_stream = NULL;
     }
+    pthread_mutex_unlock(&ears->transport_lock);
 
     if (ears->file_stream)
     {
@@ -427,6 +437,19 @@ void r2_ears_close(R2Ears *ears)
 }
 
 
+/* Interrupt both an asynchronous connect and a read waiting for PCM.
+ * Safe before taking R2's capture lifecycle mutex, so a one-shot listen
+ * cannot hide this cancellation behind that mutex. */
+void r2_ears_cancel(R2Ears *ears)
+{
+    if (!ears) return;
+    atomic_store(&ears->cancel_requested, 1);
+    pthread_mutex_lock(&ears->transport_lock);
+    if (ears->pulse_stream)
+        r2_audio_capture_cancel(ears->pulse_stream);
+    pthread_mutex_unlock(&ears->transport_lock);
+}
+
 /* ---------------------------------------------------------
  * Shutdown
  * --------------------------------------------------------- */
@@ -437,7 +460,7 @@ void r2_ears_shutdown(R2Ears *ears)
         return;
 
     r2_ears_close(ears);
-
+    pthread_mutex_destroy(&ears->transport_lock);
     free(ears);
 }
 
@@ -497,54 +520,35 @@ int r2_ears_open_source(
         return -1;
     }
 
+    atomic_store(&ears->cancel_requested, 0);
     r2_ears_close(ears);
 
-    spec =
-        r2_ears_sample_spec();
+    spec = r2_ears_sample_spec();
+    R2AudioCapture *capture = r2_audio_capture_new();
+    if (!capture) {
+        free(resolved_source);
+        return -1;
+    }
+    /* Publish before attempting the connection: stop requests can now cancel
+     * even while the server is connecting, not just after the first sample. */
+    pthread_mutex_lock(&ears->transport_lock);
+    ears->pulse_stream = capture;
+    if (atomic_load(&ears->cancel_requested))
+        r2_audio_capture_cancel(capture);
+    pthread_mutex_unlock(&ears->transport_lock);
 
-    memset(
-        &buffer_attr,
-        0,
-        sizeof(buffer_attr)
-    );
-
-    /*
-     * Pulse/PipeWire can choose the actual internal buffer
-     * layout, while fragsize gives R2 roughly 10 ms reads.
-     */
-    buffer_attr.maxlength =
-        (uint32_t)-1;
-
-    buffer_attr.fragsize =
-        (uint32_t)R2_EARS_FRAME_BYTES;
-
-    ears->pulse_stream =
-        pa_simple_new(
-            NULL,
-            "R2-3PO",
-            PA_STREAM_RECORD,
-            actual_source,
-            "R2 Hearing",
-            &spec,
-            NULL,
-            &buffer_attr,
-            &error
-        );
-
-    if (!ears->pulse_stream)
-    {
-        fprintf(
-            stderr,
-            "R2 Ears: could not open audio source '%s': %s\n",
-            actual_source,
-            pa_strerror(error)
-        );
-
+    if (r2_audio_capture_connect(capture, actual_source, &spec,
+                                 R2_EARS_FRAME_BYTES) != 0 ||
+        atomic_load(&ears->cancel_requested)) {
+        int failed_errno = errno ? errno : ECANCELED;
         r2_log_sensory("audio_source_open_failed",
                        "R2 Ears could not open the live audio source.",
-                       pa_strerror(error), actual_source);
+                       failed_errno == ECANCELED ? "Audio connection was cancelled."
+                                                 : "PulseAudio/PipeWire connection failed.",
+                       actual_source);
+        r2_ears_close(ears);
         free(resolved_source);
-
+        errno = failed_errno;
         return -1;
     }
 
@@ -831,27 +835,17 @@ ssize_t r2_ears_read(
 
     if (ears->pulse_stream)
     {
-        int error = 0;
-
-        if (pa_simple_read(
-                ears->pulse_stream,
-                buffer,
-                buffer_size,
-                &error
-            ) < 0)
-        {
-            fprintf(
-                stderr,
-                "R2 Ears: audio read failed: %s\n",
-                pa_strerror(error)
-            );
-            r2_log_sensory("audio_read_failed",
-                           "R2 Ears encountered a live audio capture error.",
-                           pa_strerror(error), ears->event.source_name);
-            /* The worker must NOT free the source name or Pulse handle here:
-             * a conversation may be copying source metadata, and the owner
-             * must join the worker before releasing its transport. */
+        if (r2_audio_capture_read(ears->pulse_stream, buffer, buffer_size) < 0) {
+            int read_errno = errno;
+            if (read_errno != ECANCELED) {
+                r2_log_sensory("audio_read_failed",
+                               "R2 Ears encountered a live audio capture error.",
+                               "Asynchronous PulseAudio recording failed.",
+                               ears->event.source_name);
+            }
+            /* The reader never releases this handle. Stop joins before close. */
             atomic_store(&ears->open, 0);
+            errno = read_errno;
             return -1;
         }
 
