@@ -50,9 +50,12 @@ assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
 assert "(void)r2_eyes_release_source();" not in worker
 assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_vision_watch_start()" in worker
-assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker\nassert "r2_vision_media_open_vlc_for_watch()" in worker\nassert "r2_vision_media_watch_owns(managed_media_token)" in worker
+assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_open_vlc_for_watch()" in worker
+assert "r2_vision_media_watch_owns(managed_media_token)" in worker
 assert "managed_window_id != wanted_window" in worker
-assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker\nassert "(void)r2_vision_media_stop();" not in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
+assert "(void)r2_vision_media_stop();" not in worker
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
 assert "R2_WHISPER_MODEL" not in start_body and "R2_WHISPER_CLI" not in start_body
