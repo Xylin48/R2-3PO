@@ -9288,7 +9288,7 @@ static void *autonomous_thinking(void *arg)
             "\n"
             "Write naturally in first person as R2.\n"
             "\n"
-            "If no tool action is needed, return only the private diary reflection. If you choose to perform a sensory action, return one [EARS_LISTEN], [MEDIA_FOCUS], [MEDIA_SEE] or [SENSE] marker on its own line, so the system can execute it and supply the result for the final reflection.";
+            "If no tool action is needed, return only the private diary reflection. If you choose to perform a sensory action, return one [EARS_SOURCES], [EARS_LISTEN], [MEDIA_FOCUS], [MEDIA_SEE] or [SENSE] marker on its own line, so the system can execute it and supply the result for the final reflection.";
 
         Message m = { "user", ctx, 0, 0 };
         int previous_background_mode = ollama_background_mode;
@@ -9302,11 +9302,12 @@ static void *autonomous_thinking(void *arg)
            media attention or listening tools as the conversation brain. Raw
            variation alone never forces a visual description or transcription. */
         if (reflection) {
-            size_t sense_pos = 0, focus_pos = 0, media_pos = 0, ears_pos = 0;
+            size_t sense_pos = 0, focus_pos = 0, media_pos = 0, ears_pos = 0, sources_pos = 0;
             char *sense_request = extract_marker(reflection, "[SENSE]", "\n", &sense_pos);
             char *focus_request = extract_marker(reflection, "[MEDIA_FOCUS]", "\n", &focus_pos);
             char *media_request = extract_marker(reflection, "[MEDIA_SEE]", "\n", &media_pos);
             char *ears_request = extract_marker(reflection, "[EARS_LISTEN]", "\n", &ears_pos);
+            char *sources_request = extract_marker(reflection, "[EARS_SOURCES]", "\n", &sources_pos);
             const char *heading = NULL;
             char *action_result = NULL;
             if (sense_request) {
@@ -9321,11 +9322,15 @@ static void *autonomous_thinking(void *arg)
             } else if (ears_request) {
                 heading = "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:";
                 action_result = r2_process_ears_listen_request(ears_request);
+            } else if (sources_request) {
+                heading = "RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:";
+                action_result = r2_ears_desktop_available_sources();
             }
             free(sense_request);
             free(focus_request);
             free(media_request);
             free(ears_request);
+            free(sources_request);
             if (heading) {
                 char *followup = NULL;
                 if (action_result &&
@@ -9348,6 +9353,7 @@ static void *autonomous_thinking(void *arg)
                     free(followup);
                     if (reflection &&
                         (strstr(reflection, "[EARS_LISTEN]") ||
+                         strstr(reflection, "[EARS_SOURCES]") ||
                          strstr(reflection, "[MEDIA_FOCUS]") ||
                          strstr(reflection, "[MEDIA_SEE]") ||
                          strstr(reflection, "[SENSE]"))) {
