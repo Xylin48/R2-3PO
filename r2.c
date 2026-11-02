@@ -7921,17 +7921,15 @@ static char *process_tools_with_status(
 
 #define APPEND(...)                                                       \
     do {                                                                    \
-        /* Preserve the existing authoritative failure marker: the caller   \
-         * must know that an earlier real-world action might have completed. */\
-        static const char _capture_failure[] =                              \
-            "I ran out of memory while recording an action result. "        \
-            "An action may already have completed, so I will not "          \
-            "repeat it automatically. Verify the current state "            \
-            "before retrying the request.";                                 \
         char *_part = NULL;                                                 \
         int _n = asprintf(&_part, __VA_ARGS__);                              \
         if (_n < 0 || !_part || (size_t)_n > SIZE_MAX - len - 1U) {          \
             free(_part);                                                    \
+            static const char _capture_failure[] =                          \
+                "I ran out of memory while recording an action result. "    \
+                "An action may already have completed, so I will not "      \
+                "repeat it automatically. Verify the current state "        \
+                "before retrying the request.";                             \
             snprintf(results, cap, "%s", _capture_failure);                  \
             return results;                                                 \
         }                                                                   \
@@ -7948,7 +7946,13 @@ static char *process_tools_with_status(
             char *_grown = realloc(results, _new_cap);                      \
             if (!_grown) {                                                  \
                 free(_part);                                                \
-                /* Keep cap unchanged: original allocation remains valid. */ \
+                /* Keep the original cap: previously committed actions may  \
+                 * have succeeded, and the error must remain a valid reply. */ \
+                static const char _capture_failure[] =                      \
+                    "I ran out of memory while recording an action result. " \
+                    "An action may already have completed, so I will not "  \
+                    "repeat it automatically. Verify the current state "    \
+                    "before retrying the request.";                         \
                 snprintf(results, cap, "%s", _capture_failure);              \
                 return results;                                             \
             }                                                               \
