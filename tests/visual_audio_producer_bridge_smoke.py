@@ -34,11 +34,11 @@ assert "audio.playback_pid" in worker
 assert "r2_audio_discover(&audio)" in worker
 assert "r2_vision_window_for_pid(playback_pid)" in worker
 assert "wanted_media == 3 ? media_window" in worker
-assert "r2_vision_media_open_window(wanted_window)" in worker
+assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
 assert "managed_window_id != wanted_window" in worker
 assert "r2_vision_watch_active()" in worker
-assert "r2_eyes_release_source()" in worker
-assert "r2_vision_media_stop()" in worker
+assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
 assert "r2_visual_analyze_frame(" not in worker
 assert "r2_ears_listen_cancelable(" not in worker
 print("Application-independent X11 visual-source discovery and raw frame handoff passed.")
