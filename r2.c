@@ -5617,7 +5617,7 @@ static int r2_recent_message_is_tool_payload(const char *content)
     static const char *const markers[] = {
         /* World, sensory, device, diary, and task actions. */
         "[WORLD]", "[IMAGINE]", "[IMAGINE_FEEDBACK]", "[SENSORY_JOURNAL]",
-        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]",
+        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]", "[EARS_SOURCES]",
         "[ALTERNATE_CREATE]", "[ALTERNATE_DISCARD]", "[ALTERNATE_RETAIN]",
         "[ALTERNATE_COMPARE]", "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]",
         "[GAMEBOY]", "[TV]", "[DIARY]", "[READ_DIARY]", "[TASK]", "[FRIDGE]",
@@ -7830,6 +7830,7 @@ static char *r2_process_ears_listen_request(const char *request)
     int valid = 1;
     int recent = 0;
     int desktop = 0;
+    const char *extra_monitor = NULL;
     char *mode_separator = strchr(seconds_text, '|');
     if (mode_separator) {
         *mode_separator = '\0';
@@ -7838,6 +7839,20 @@ static char *r2_process_ears_listen_request(const char *request)
         if (!strcasecmp(mode, "recent")) recent = 1;
         else if (!strcasecmp(mode, "desktop_recent")) { recent = 1; desktop = 1; }
         else if (!strcasecmp(mode, "desktop_live")) desktop = 1;
+        else if (!strcasecmp(mode, "desktop_source_recent") ||
+                 !strcasecmp(mode, "desktop_source_live")) {
+            /* Split at the LAST pipe: source IDs may contain internal pipes,
+             * and the entire exact source ID is preserved without truncation. */
+            char *last = strrchr(seconds_text, '|');
+            if (!last || last == seconds_text) valid = 0;
+            else {
+                *last = '\0';
+                extra_monitor = seconds_text;
+                seconds_text = trim(last + 1);
+                recent = !strcasecmp(mode, "desktop_source_recent");
+                desktop = 1;
+            }
+        }
         else if (strcasecmp(mode, "live")) valid = 0;
     }
     errno = 0;
@@ -7846,7 +7861,7 @@ static char *r2_process_ears_listen_request(const char *request)
             seconds >= 1UL && seconds <= 15UL;
     if (!valid) {
         free(copy);
-        return strdup("EARS LISTEN ERROR: use recent|1..15, live|1..15, desktop_recent|1..15 or desktop_live|1..15. No capture was started.");
+        return strdup("EARS LISTEN ERROR: use recent|seconds, live|seconds, desktop_recent|seconds, desktop_live|seconds, or desktop_source_recent/live|exact-monitor|seconds (1..15). No capture was started.");
     }
     if (recent && !(desktop ? atomic_load(&ears_desktop_capture_running)
                             : atomic_load(&ears_capture_running))) {
@@ -7860,10 +7875,12 @@ static char *r2_process_ears_listen_request(const char *request)
 
     r2_ears_recent_requested = recent;
     r2_ears_desktop_requested = desktop;
+    r2_ears_extra_requested = extra_monitor;
     char *transcript = r2_ears_listen_cancelable(
         (unsigned)seconds, r2_ears_action_cancelled, NULL);
     r2_ears_recent_requested = 0;
     r2_ears_desktop_requested = 0;
+    r2_ears_extra_requested = NULL;
     free(copy);
     if (!transcript || !*transcript) {
         free(transcript);
@@ -8689,6 +8706,22 @@ static char *process_tools_with_status(
         if (!request) break;
         char *result = r2_process_media_see_request(trim(request));
         if (result) { APPEND("%s\n", result); free(result); }
+        free(request);
+    }
+
+    /* Source discovery is itself a deliberate read-only action and does
+       not choose a particular movie, microphone or playback output. */
+    size_t ears_sources_pos = 0;
+    while (1) {
+        char *request = extract_marker(reply, "[EARS_SOURCES]", "\n", &ears_sources_pos);
+        if (!request) break;
+        char *list = r2_ears_desktop_available_sources();
+        if (list) {
+            APPEND("EARS SOURCE DISCOVERY RESULT (available, not necessarily attended):\n%s\n", list);
+            free(list);
+        } else {
+            APPEND("EARS SOURCE DISCOVERY ERROR: could not allocate complete source list.\n");
+        }
         free(request);
     }
 
@@ -11472,6 +11505,47 @@ int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output)
     pthread_mutex_unlock(&extra_desktop_lock);
     errno = ENOENT;
     return -1;
+}
+
+/* A deliberate query of actually available monitor identities. Capture
+ * is independent; listing a source does not mean R2 chose to attend to it.
+ * An open_memstream grows with the actual names (no 512-byte or 20K cut). */
+static char *r2_ears_desktop_available_sources(void)
+{
+    char *report = NULL;
+    size_t report_size = 0;
+    FILE *stream = open_memstream(&report, &report_size);
+    if (!stream) return NULL;
+    R2HearingEvent primary = {0};
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    int have_primary = ears_desktop &&
+        atomic_load(&ears_desktop_capture_running) &&
+        r2_ears_get_event(ears_desktop, &primary) == 0;
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    if (fprintf(stream, "PRIMARY DESKTOP AUDIO SOURCE: %s\n",
+                have_primary && primary.source_name ? primary.source_name :
+                "(not active)") < 0) goto fail;
+    r2_ears_release_event(&primary);
+    pthread_mutex_lock(&extra_desktop_lock);
+    size_t active = 0;
+    for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next) {
+        if (!atomic_load(&p->running)) continue;
+        if (fprintf(stream, "INDEPENDENT DESKTOP SOURCE: %s\n", p->monitor) < 0) {
+            pthread_mutex_unlock(&extra_desktop_lock);
+            goto fail;
+        }
+        ++active;
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    if (!active && fprintf(stream, "(no additional playback sinks active)\n") < 0)
+        goto fail;
+    if (fclose(stream) != 0) { free(report); return NULL; }
+    return report;
+fail:
+    r2_ears_release_event(&primary);
+    fclose(stream);
+    free(report);
+    return NULL;
 }
 
 /* Caller-selected independent output audio. This function deliberately
