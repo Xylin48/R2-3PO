@@ -1,5 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "Ears.h"
+#include "AudioCapture.h"
+#include <pulse/sample.h>
+#include <errno.h>
 #include "Log.h"
 #include <pulse/simple.h>
 #include <pulse/error.h>
@@ -12,45 +15,56 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct { int desktop; } FakePulse;
+/* Transport injected below: Ears is real, Pulse server is synthetic. */
+typedef struct {
+    int desktop;
+    int cancelled;
+} FakeCapture;
 static int open_count = 0, close_count = 0;
 static int fail_mic_read = 0;
 
-/* Use real Ears.c with controlled Pulse device objects: no hardware needed. */
-pa_simple *__wrap_pa_simple_new(const char *server, const char *name,
-    pa_stream_direction_t dir, const char *dev, const char *stream_name,
-    const pa_sample_spec *ss, const pa_channel_map *map,
-    const pa_buffer_attr *attr, int *error)
+R2AudioCapture *r2_audio_capture_new(void)
 {
-    (void)server; (void)name; (void)stream_name; (void)map; (void)attr;
-    assert(dir == PA_STREAM_RECORD);
-    assert(ss->rate == 48000 && ss->channels == 2);
-    assert(dev && (strstr(dev, "test_mic") || strstr(dev, "monitor")));
-    FakePulse *p = calloc(1, sizeof(*p));
-    assert(p);
-    p->desktop = strstr(dev, "monitor") != NULL;
-    if (error) *error = 0;
-    ++open_count;
-    return (pa_simple *)p;
+    FakeCapture *c = calloc(1, sizeof(*c));
+    assert(c);
+    return (R2AudioCapture *)c;
 }
-int __wrap_pa_simple_read(pa_simple *s, void *data, size_t bytes, int *error)
+
+int r2_audio_capture_connect(R2AudioCapture *handle, const char *device,
+                             const pa_sample_spec *ss, size_t bytes)
 {
-    FakePulse *p = (FakePulse *)s;
-    assert(p && bytes == 1920);
-    if (fail_mic_read && !p->desktop) {
-        if (error) *error = PA_ERR_IO;
-        return -1;
-    }
-    memset(data, p->desktop ? 0x5a : 0xa5, bytes);
-    if (error) *error = 0;
+    FakeCapture *c = (FakeCapture *)handle;
+    assert(c && device && (strstr(device, "test_mic") || strstr(device, "monitor")));
+    assert(ss && ss->rate == 48000 && ss->channels == 2 &&
+           ss->format == PA_SAMPLE_S16LE);
+    assert(bytes == 1920);
+    c->desktop = strstr(device, "monitor") != NULL;
+    ++open_count;
     return 0;
 }
-void __wrap_pa_simple_free(pa_simple *s)
+
+ssize_t r2_audio_capture_read(R2AudioCapture *handle, void *data, size_t bytes)
 {
-    assert(s);
-    ++close_count;
-    free(s);
+    FakeCapture *c = (FakeCapture *)handle;
+    assert(c && bytes == 1920);
+    if (c->cancelled) { errno = ECANCELED; return -1; }
+    if (fail_mic_read && !c->desktop) { errno = EIO; return -1; }
+    memset(data, c->desktop ? 0x5a : 0xa5, bytes);
+    return (ssize_t)bytes;
 }
+
+void r2_audio_capture_cancel(R2AudioCapture *handle)
+{
+    if (handle) ((FakeCapture *)handle)->cancelled = 1;
+}
+
+void r2_audio_capture_free(R2AudioCapture *handle)
+{
+    assert(handle);
+    ++close_count;
+    free(handle);
+}
+
 int64_t r2_log_sensory(const char *type, const char *text,
                        const char *details, const char *source)
 {
