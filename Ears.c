@@ -322,7 +322,11 @@ void r2_ears_close(R2Ears *ears)
     }
     pthread_mutex_unlock(&ears->transport_lock);
 
-    if (ears->open) {
+    /* A reader can mark the source inactive at EOF/failure, but only the
+     * lifecycle owner closes it. Preserve the final close journal event
+     * regardless of the availability flag; a source name means a session
+     * was actually opened. */
+    if (ears->event.source_name) {
         char details[768];
         snprintf(details, sizeof(details),
                  "origin=%d; bytes_since_last_journal_entry=%llu",
