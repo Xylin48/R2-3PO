@@ -290,6 +290,10 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt, int 
  * never needs to know how Eyes internally works.
  */
 int r2_eyes_start(void);
+/* Watch receives a token only for its own newly opened camera session. */
+uint64_t r2_eyes_start_for_watch(void);
+int r2_eyes_release_if_watch_owned(uint64_t token);
+int r2_eyes_watch_owns(uint64_t token);
 int r2_eyes_stop(void);
 /* Watch-only release; disappearance is not a chosen sensory shutdown. */
 int r2_eyes_release_source(void);
