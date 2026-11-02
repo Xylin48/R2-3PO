@@ -219,6 +219,9 @@ int r2_ears_open_desktop(
     R2Ears *ears
 );
 
+/* Open the exact monitor from a single native discovery snapshot. */
+int r2_ears_open_desktop_source(R2Ears *ears, const char *monitor);
+
 
 /*
  * Stop the current hearing source.
