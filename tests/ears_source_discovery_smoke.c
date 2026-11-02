@@ -65,18 +65,26 @@ int main(void)
     playback.sink = 88;
     playback.proplist = properties;
     r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    /* Same sink, separate producer: one monitor capture, not duplicates. */
+    r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    pa_sink_input_info secondary = {.sink = 99, .proplist = properties};
+    r2_discovery_sink_input(NULL, &secondary, 0, &scan);
     r2_discovery_sink_input(NULL, &paused, 0, &scan);
     r2_discovery_sink_input(NULL, NULL, 1, &scan);
     assert(scan.done && !scan.failed);
     assert(scan.data.desktop_playing);
     assert(scan.data.playback_sink == 88);
     assert(scan.data.playback_pid == 3141);
+    assert(scan.data.playback_output_count == 2);
+    assert(scan.data.playback_outputs[0].sink_index == 88);
+    assert(scan.data.playback_outputs[1].sink_index == 99);
 
     char routed_monitor[1200] = "alsa_output.routed.";
     size_t monitor_prefix = strlen(routed_monitor);
     memset(routed_monitor + monitor_prefix, 'm', 850);
     strcpy(routed_monitor + monitor_prefix + 850, ".monitor");
     scan.done = 0;
+    scan.resolving_output_slot = 0;
     pa_sink_info output = {0};
     output.index = 88;
     output.name = "alsa_output.routed";
@@ -85,6 +93,30 @@ int main(void)
     r2_discovery_sink_info(NULL, NULL, 1, &scan);
     assert(scan.done && !scan.failed);
     assert(!strcmp(scan.data.desktop_monitor, routed_monitor));
+    assert(!strcmp(scan.data.playback_outputs[0].monitor, routed_monitor));
+
+    /* The second sink must retain its own untruncated monitor identity. */
+    char other_monitor[1200] = "alsa_output.secondary.";
+    size_t other_prefix = strlen(other_monitor);
+    memset(other_monitor + other_prefix, 'n', 900);
+    strcpy(other_monitor + other_prefix + 900, ".monitor");
+    output.index = 99;
+    output.monitor_source_name = other_monitor;
+    scan.resolving_output_slot = 1;
+    scan.done = scan.failed = 0;
+    r2_discovery_sink_info(NULL, &output, 0, &scan);
+    r2_discovery_sink_info(NULL, NULL, 1, &scan);
+    assert(scan.done && !scan.failed);
+    assert(!strcmp(scan.data.playback_outputs[1].monitor, other_monitor));
+    assert(strcmp(scan.data.playback_outputs[1].monitor,
+                  scan.data.playback_outputs[0].monitor));
+    assert(!strcmp(scan.data.desktop_monitor, routed_monitor));
+
+    /* A stale sink index must fail discovery rather than silently misroute. */
+    scan.done = scan.failed = 0;
+    output.index = 100;
+    r2_discovery_sink_info(NULL, &output, 0, &scan);
+    assert(scan.failed);
 
     /* An API failure must never be reported as a successful empty list. */
     scan.done = scan.failed = 0;
@@ -98,11 +130,12 @@ int main(void)
     scan.done = scan.failed = 0;
     r2_discovery_sink_input(NULL, &playback, 0, &scan);
     assert(scan.data.desktop_playing && scan.data.playback_pid == -1);
+    assert(scan.data.playback_output_count == 3);
 
     pa_proplist_free(properties);
     free(scan.default_source);
     free(scan.fallback_microphone);
     r2_audio_discovery_free(&scan.data);
-    puts("Native source discovery chooses physical microphones, routed sink monitor, active PID, and error state.");
+    puts("Native discovery keeps untruncated microphones and every distinct routed playback sink, with failure propagation.");
     return 0;
 }
