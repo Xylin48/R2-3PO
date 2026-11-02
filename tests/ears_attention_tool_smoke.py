@@ -18,7 +18,7 @@ worker = watch[worker_start:worker_end]
 
 for source in ("recent", "live", "desktop_recent", "desktop_live"):
     assert f"[EARS_LISTEN] {source}|seconds" in prompt, source
-assert "do not use it for hypothetical situations" in prompt.lower()
+assert "do not use them for hypothetical situations" in prompt.lower()
 assert 'extract_marker(reply, "[EARS_LISTEN]", "\\n", &ears_listen_pos)' in tool
 assert "strtoul(seconds_text, &end, 10)" in ears_helper
 assert "seconds >= 1UL && seconds <= 15UL" in ears_helper
@@ -29,6 +29,13 @@ assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, use
 assert "!desktop && r2_ears_status() > 0 && !atomic_load(&ears_capture_running)" in ears_helper
 assert "r2_ears_desktop_requested = desktop;" in ears_helper
 assert "r2_ears_desktop_requested = 0;" in ears_helper
+assert 'desktop_source_recent' in ears_helper and 'desktop_source_live' in ears_helper
+assert 'r2_ears_extra_requested = extra_monitor;' in ears_helper
+assert 'r2_ears_extra_requested = NULL;' in ears_helper
+assert 'r2_ears_extra_write_pcm(' in core
+assert '[EARS_SOURCES]' in prompt
+assert 'r2_ears_desktop_available_sources()' in core
+assert 'extract_marker(reply, "[EARS_SOURCES]"' in core
 assert "r2_ears_status_desktop()" in core
 assert "That source was left untouched" in ears_helper
 assert "Do not infer what was said." in ears_helper
@@ -36,6 +43,9 @@ assert "r2_process_ears_listen_request(request)" in tool
 assert "r2_process_ears_listen_request(ears_request)" in core
 assert "AUTONOMOUS REFLECTION CONTEXT:" in core
 assert "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:" in core
+assert 'extract_marker(reflection, "[EARS_SOURCES]"' in core
+assert 'RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:' in core
+assert 'action_result = r2_ears_desktop_available_sources();' in core
 assert "reflection_repeated_hearing_request" in core
 
 # Continuous capture liveness must be based on actual PCM worker state, not

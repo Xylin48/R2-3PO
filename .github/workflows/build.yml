@@ -158,19 +158,39 @@ jobs:
 
       - name: Verify Whisper WAV conversion and exact clip duration
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_whisper_wav_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-whisper-wav-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_whisper_wav_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-whisper-wav-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-ears-whisper-wav-test
 
 
       - name: Exercise source discovery with synthetic microphone and desktop playback
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c Ears.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
           /tmp/r2-ears-source-discovery-smoke
+
+      - name: Wake a truly blocked asynchronous Pulse read on stop
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_async_capture_cancel_runtime.c -o /tmp/r2-ears-async-cancel-test -lpulse -lpthread -Wl,--wrap=pa_threaded_mainloop_lock -Wl,--wrap=pa_threaded_mainloop_unlock -Wl,--wrap=pa_threaded_mainloop_wait -Wl,--wrap=pa_threaded_mainloop_signal -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_stream_get_state -Wl,--wrap=pa_stream_readable_size -Wl,--wrap=pa_stream_peek -Wl,--wrap=pa_stream_drop
+          /tmp/r2-ears-async-cancel-test
+
+      - name: Cancel stalled FFmpeg file reads and reap the exact decoder child
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_file_cancel_runtime.c AudioDiscovery.c AudioCapture.c AudioFile.c -o /tmp/r2-ears-file-cancel-test -lpulse -lpthread
+          /tmp/r2-ears-file-cancel-test
 
       - name: Exercise independent microphone and desktop PCM capture objects
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c Ears.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread -Wl,--wrap=pa_simple_new -Wl,--wrap=pa_simple_read -Wl,--wrap=pa_simple_free
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_dual_sources_runtime.c AudioDiscovery.c AudioFile.c -o /tmp/r2-ears-dual-sources-test -lpulse-simple -lpulse -lpthread
           /tmp/r2-ears-dual-sources-test
+
+      - name: Capture every simultaneous desktop output independently and preserve PCM identities
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_multi_output_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-multi-output -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read
+          /tmp/r2-ears-multi-output
+
+      - name: Check live Watch ownership tokens against external capture takeover
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event
+          /tmp/r2-ears-watch-ownership
 
       - name: Require source-specific raw hearing, deliberate attention, and shutdown
         run: python3 tests/ears_dual_attention_wiring_smoke.py
@@ -183,6 +203,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c Eyes.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
           /tmp/r2-eyes-window-discovery-test
 
+      - name: Protect camera and media from stale Watch ownership and manual takeover races
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/watch_visual_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-watch-visual-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_visual_is_initialized -Wl,--wrap=r2_eyes_is_open
+          /tmp/r2-watch-visual-ownership
+
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py
 
@@ -194,7 +219,7 @@ jobs:
 
       - name: Verify camera-first media image order in a real JSON payload
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/media_focus_payload_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-media-focus-payload-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/media_focus_payload_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-media-focus-payload-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-media-focus-payload-test
 
       - name: Exercise independent raw camera and auxiliary media frames
@@ -227,7 +252,7 @@ jobs:
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/recent_context_budget_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-recent-context-runtime-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/recent_context_budget_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-recent-context-runtime-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-recent-context-runtime-test
 
       - name: Check multi-turn recovery and conversation serialization
@@ -307,7 +332,7 @@ jobs:
           rm -rf "$ROOT" /tmp/r2-task-shutdown-smoke-test
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/r2_task_shutdown_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-task-shutdown-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/r2_task_shutdown_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-task-shutdown-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-task-shutdown-smoke-test
 
       - name: Exercise the production reply-misclassification guard
@@ -316,7 +341,7 @@ jobs:
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-reply-misclassification-smoke-test
 
       - name: Guard against silent conversation failures
@@ -336,7 +361,7 @@ jobs:
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/memory_schema_migration_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-memory-schema-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/memory_schema_migration_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-memory-schema-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-memory-schema-smoke-test
 
       - name: Exercise persistent-memory top-k ranking behavior
@@ -345,7 +370,7 @@ jobs:
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/memory_ranking_behavior_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-memory-ranking-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/memory_ranking_behavior_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-memory-ranking-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-memory-ranking-smoke-test
 
       - name: Check R2 shell Game Boy control-plane routing
@@ -388,14 +413,14 @@ jobs:
           rm -rf "$ROOT" /tmp/r2-wallet-smoke-r2.o /tmp/r2-wallet-smoke-test
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS -Dmain=r2_program_main -c r2.c -o /tmp/r2-wallet-smoke-r2.o
-          cc $FLAGS -DR2_MONEY_TEST_FAILURE_INJECTION tests/money_wallet_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-wallet-smoke-r2.o -o /tmp/r2-wallet-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS -DR2_MONEY_TEST_FAILURE_INJECTION tests/money_wallet_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-wallet-smoke-r2.o -o /tmp/r2-wallet-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-wallet-smoke-test
 
       - name: Exercise shared Ollama request-gate serialization
         run: |
           ROOT=/tmp/r2-wallet-smoke
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/ollama_gate_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-wallet-smoke-r2.o -o /tmp/r2-ollama-gate-smoke -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/ollama_gate_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-wallet-smoke-r2.o -o /tmp/r2-ollama-gate-smoke -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-ollama-gate-smoke
 
       - name: Exercise Alternate-Self Lab persistence
@@ -477,7 +502,7 @@ jobs:
           rm -rf "$ROOT" /tmp/r2-needs-smoke-r2.o /tmp/r2-needs-smoke-test
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_INVENTORY_TEST_FAILURE_INJECTION -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS -Dmain=r2_program_main -c r2.c -o /tmp/r2-needs-smoke-r2.o
-          cc $FLAGS tests/reality_needs_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-needs-smoke-r2.o -o /tmp/r2-needs-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/reality_needs_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-needs-smoke-r2.o -o /tmp/r2-needs-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-needs-smoke-test
 
       - name: Check fridge context against real inventory semantics
@@ -539,7 +564,7 @@ jobs:
           mkdir -p "$ROOT"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS -DR2_TEST_STARTUP_FAILURE_INJECTION -Dmain=r2_program_main -c r2.c -o /tmp/r2-startup-unwind-r2.o
-          cc $FLAGS tests/startup_failure_unwind_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-startup-unwind-r2.o -o /tmp/r2-startup-unwind-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/startup_failure_unwind_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-startup-unwind-r2.o -o /tmp/r2-startup-unwind-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-startup-unwind-test hands
           rm -rf "$ROOT"
           /tmp/r2-startup-unwind-test diary

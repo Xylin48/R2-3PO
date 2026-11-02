@@ -120,7 +120,9 @@ typedef struct
      *   "microphone"
      *   "desktop-audio"
      */
-    char source_name[512];
+    /* Caller-owned full source identity returned by r2_ears_get_event().
+     * Release it with r2_ears_release_event() after the snapshot is used. */
+    char *source_name;
 
     R2AudioFormat format;
 
@@ -193,6 +195,8 @@ int r2_ears_open_microphone(
     R2Ears *ears
 );
 
+int r2_ears_open_microphone_source(R2Ears *ears, const char *source);
+
 
 /*
  * Open a specific system audio source.
@@ -217,6 +221,9 @@ int r2_ears_open_desktop(
     R2Ears *ears
 );
 
+/* Open the exact monitor from a single native discovery snapshot. */
+int r2_ears_open_desktop_source(R2Ears *ears, const char *monitor);
+
 
 /*
  * Stop the current hearing source.
@@ -224,6 +231,9 @@ int r2_ears_open_desktop(
 void r2_ears_close(
     R2Ears *ears
 );
+
+/* Wake a pending PulseAudio connect or PCM read without closing the stream. */
+void r2_ears_cancel(R2Ears *ears);
 
 
 /* ---------------------------------------------------------
@@ -265,6 +275,9 @@ int r2_ears_get_event(
  *   0  = success
  *  -1  = failure
  */
+/* Releases the source identity allocated by r2_ears_get_event(). */
+void r2_ears_release_event(R2HearingEvent *event);
+
 int r2_ears_get_format(
     R2Ears *ears,
     R2AudioFormat *format

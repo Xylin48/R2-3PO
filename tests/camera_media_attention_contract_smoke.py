@@ -38,12 +38,12 @@ assert "r2_eyes_capture(media_eyes)" not in current_frame
 
 worker = shell[shell.index("static void *shell_watch_worker("):
                shell.index("static void shell_watch_start(void)")]
-assert "int managed_camera = 0;" in worker
+assert "uint64_t managed_camera = 0;" in worker
 assert "int managed_media = 0;" in worker
-assert "r2_eyes_start() == 0" in worker
-assert "r2_vision_media_open_window(wanted_window)" in worker
-assert "r2_vision_media_stop()" in worker
-assert "r2_eyes_release_source()" in worker
+assert "r2_eyes_start_for_watch()" in worker
+assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
+assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
 assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen closure"
 for channel in ("1", "2", "3"):
     assert f"r2_sense_auto_allowed({channel})" in worker

@@ -20,7 +20,7 @@ shell = (ROOT / "shell.c").read_text(encoding="utf-8")
 
 required_sources = (
     "r2.c", "shell.c", "r2_diary.c", "Log.c", "Reality.c", "Addiction.c",
-    "Reward.c", "AlternateSelf.c", "Visual.c", "Ears.c", "Eyes.c",
+    "Reward.c", "AlternateSelf.c", "Visual.c", "Ears.c", "AudioDiscovery.c", "AudioCapture.c", "AudioFile.c", "Eyes.c",
     "R2Sounds.c", "R2Reply.c",
 )
 

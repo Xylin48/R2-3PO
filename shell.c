@@ -50,6 +50,7 @@
 #include "shell.h"
 #include "r2.h"
 #include "Ears.h"
+#include "AudioDiscovery.h"
 #include "r2_input.h"
 #include "Log.h"
 #include "Reality.h"
@@ -1342,35 +1343,42 @@ static int shell_watch_cancelled(void *unused)
 static void *shell_watch_worker(void *unused)
 {
     (void)unused;
-    int managed_camera = 0;
+    uint64_t managed_camera = 0; /* exact Watch-owned camera generation */
     int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
+    uint64_t managed_media_token = 0; /* only a Watch-opened generation */
     unsigned long managed_window_id = 0;
-    int managed_microphone = 0;
-    int managed_desktop = 0;
+    uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
+    uint64_t managed_desktop = 0;
     int attached_visual = 0;
 
     while (!shell_watch_cancelled(NULL)) {
-        int desktop_playing = r2_ears_desktop_playing();
-        int microphone_available = r2_ears_microphone_available();
+        R2AudioDiscovery audio;
+        int audio_known = r2_audio_discover(&audio) == 0;
+        /* On a server query error, existing capture is not evidence of
+         * unplugging. Use status only to preserve established attention. */
+        int desktop_playing = audio_known ? audio.desktop_playing :
+            r2_ears_status_desktop() > 0;
+        int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
         int vlc_available = r2_vision_vlc_available() && desktop_playing;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
-        long playback_pid = desktop_playing ? r2_ears_playback_pid() : -1;
+        long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
         unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
 
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
         int eyes_permitted = r2_sense_auto_allowed(1);
         if (managed_camera &&
-            (!eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
-            (void)r2_eyes_release_source();
+            (!r2_eyes_watch_owns(managed_camera) ||
+             !eyes_permitted || !camera_available || r2_eyes_status() <= 0)) {
+            (void)r2_eyes_release_if_watch_owned(managed_camera);
             managed_camera = 0;
         }
         if (eyes_permitted && !managed_camera && camera_available &&
-            r2_eyes_status() <= 0 && r2_eyes_start() == 0)
-            managed_camera = 1;
+            r2_eyes_status() <= 0)
+            managed_camera = r2_eyes_start_for_watch();
 
         if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
             !r2_vision_watch_active() && r2_vision_available() &&
@@ -1384,19 +1392,24 @@ static void *shell_watch_worker(void *unused)
         unsigned long wanted_window = wanted_media == 3 ? media_window :
                                       wanted_media == 4 ? playback_window : 0;
         if (managed_media &&
-            (!eyes_permitted || wanted_media != managed_media ||
-             managed_window_id != wanted_window ||
-             r2_vision_media_status() <= 0)) {
-            (void)r2_vision_media_stop();
+            (!r2_vision_media_watch_owns(managed_media_token) ||
+             !eyes_permitted || r2_vision_media_status() <= 0 ||
+             ((audio_known || window_available) &&
+              (wanted_media != managed_media ||
+               managed_window_id != wanted_window)))) {
+            (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
             managed_media = 0;
+            managed_media_token = 0;
             managed_window_id = 0;
         }
         if (eyes_permitted && !managed_media && wanted_media &&
             !r2_vision_media_status() && r2_vision_available()) {
-            int opened = wanted_media == 2 ? r2_vision_open_vlc() :
-                         r2_vision_media_open_window(wanted_window);
-            if (opened == 0) {
+            uint64_t opened_token = wanted_media == 2 ?
+                r2_vision_media_open_vlc_for_watch() :
+                r2_vision_media_open_window_for_watch(wanted_window);
+            if (opened_token) {
                 managed_media = wanted_media;
+                managed_media_token = opened_token;
                 managed_window_id = wanted_window;
                 r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
                              "R2 can observe an independent real media display.",
@@ -1408,27 +1421,51 @@ static void *shell_watch_worker(void *unused)
 
         /* Both audio sources operate independently; the decision to close one
            must not be overridden by mere availability of that source. */
+        int microphone_changed = audio_known && microphone_available &&
+            !r2_ears_status_microphone_source(audio.microphone_source);
         if (managed_microphone &&
-            (!r2_sense_auto_allowed(2) || !microphone_available ||
+            (!r2_sense_auto_allowed(2) ||
+             (audio_known && (!microphone_available || microphone_changed)) ||
              r2_ears_status() <= 0)) {
-            (void)r2_ears_stop();
+            (void)r2_ears_stop_if_watch_owned(managed_microphone);
             managed_microphone = 0;
         }
         if (!managed_microphone && r2_sense_auto_allowed(2) &&
-            microphone_available && r2_ears_status() <= 0 &&
-            r2_ears_start() == 0)
-            managed_microphone = 1;
+            microphone_available && r2_ears_status() <= 0)
+            managed_microphone =
+                r2_ears_start_for_watch(audio.microphone_source);
 
+        int monitor_changed = audio_known && desktop_playing &&
+            audio.desktop_monitor &&
+            !r2_ears_status_desktop_source(audio.desktop_monitor);
         if (managed_desktop &&
-            (!r2_sense_auto_allowed(3) || !desktop_playing ||
+            (!r2_sense_auto_allowed(3) ||
+             (audio_known && (!desktop_playing || monitor_changed)) ||
              r2_ears_status_desktop() <= 0)) {
-            (void)r2_ears_stop_desktop();
+            (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
             managed_desktop = 0;
         }
         if (!managed_desktop && r2_sense_auto_allowed(3) &&
-            desktop_playing && r2_ears_status_desktop() <= 0 &&
-            r2_ears_start_desktop() == 0)
-            managed_desktop = 1;
+            audio_known && desktop_playing && audio.desktop_monitor &&
+            r2_ears_status_desktop() <= 0)
+            managed_desktop =
+                r2_ears_start_desktop_for_watch(audio.desktop_monitor);
+
+        /* Every other active output gets its own continuously buffered
+         * listener, without replacing the primary or the physical mic.
+         * Failed discovery cannot be treated as evidence of unplugging. */
+        if (!r2_sense_auto_allowed(3))
+            r2_ears_extra_stop_all();
+        else if (audio_known) {
+            /* Exclude the receiver's ACTUAL selected monitor, which may
+             * differ from the first detected output after manual takeover.
+             * If there is no active primary receiver, capture every sink. */
+            char *primary_source = r2_ears_current_desktop_source();
+            (void)r2_ears_extra_reconcile(&audio, primary_source);
+            free(primary_source);
+        }
+
+        if (audio_known) r2_audio_discovery_free(&audio);
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
@@ -1436,15 +1473,16 @@ static void *shell_watch_worker(void *unused)
     }
 
     if (managed_camera)
-        (void)r2_eyes_release_source();
+        (void)r2_eyes_release_if_watch_owned(managed_camera);
     else if (attached_visual)
         (void)r2_vision_watch_stop();
     if (managed_media)
-        (void)r2_vision_media_stop();
+        (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
     if (managed_microphone)
-        (void)r2_ears_stop();
+        (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)
-        (void)r2_ears_stop_desktop();
+        (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
+    r2_ears_extra_stop_all();
     return NULL;
 }
 

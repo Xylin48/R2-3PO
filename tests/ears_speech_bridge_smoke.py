@@ -91,16 +91,25 @@ assert "r2_ears_read(" in ears and "ssize_t r2_ears_read(" in ears_header
 read_start = ears.index("ssize_t r2_ears_read(")
 read_end = ears.index("int r2_ears_get_event(", read_start)
 read_impl = ears[read_start:read_end]
-live_error_start = read_impl.index("if (pa_simple_read(")
-live_error_end = read_impl.index("ears->event.timestamp =", live_error_start)
+live_error_start = read_impl.index("if (r2_audio_capture_read(")
+live_error_end = read_impl.index("uint64_t sample_time =", live_error_start)
 live_error = read_impl[live_error_start:live_error_end]
-assert "r2_ears_close(ears);" in live_error, (
-    "a failed live microphone read must close its dead stream"
+assert "atomic_store(&ears->open, 0);" in live_error, (
+    "a failed live microphone read must promptly invalidate its state"
 )
-assert "if (feof(ears->file_stream))" in read_impl
-assert "r2_ears_close(ears);" in read_impl[
-    read_impl.index("if (feof(ears->file_stream))"):
-    read_impl.index("if (ferror(ears->file_stream))")
-], "decoded audio EOF must close the finished stream"
+assert "r2_ears_close(ears);" not in live_error, (
+    "the worker must not free a source or Pulse handle before its lifecycle owner joins it"
+)
+assert "pthread_join(ears_capture_thread, NULL)" in core
+assert "r2_ears_cancel(ears);" in core[core.index("static int r2_ears_stop_impl("):], (
+    "the lifecycle owner must release the stream after joining the reader"
+)
+# File decoder EOF must mark the event inactive without freeing a transport
+# while another thread still holds a read reference. The owner closes it.
+assert "r2_audio_file_read(ears->file_stream, buffer," in read_impl
+assert "atomic_store(&ears->open, 0);" in read_impl
+assert "r2_audio_file_close(ears->file_stream);" in ears
+assert "r2_audio_file_cancel(ears->file_stream);" in ears
+assert "r2_ears_close(ears);" not in read_impl
 assert "Qwen 3.5 9B accepts text and images, not raw microphone PCM" in ears_header
 print("Local microphone capture, Whisper transcription, and normal chat handoff smoke checks passed.")

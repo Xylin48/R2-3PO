@@ -2,6 +2,8 @@
 #define R2_H
 
 #include <stddef.h>
+#include <stdint.h>
+#include "AudioDiscovery.h"
 
 /*
  * ============================================================
@@ -289,6 +291,10 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt, int 
  * never needs to know how Eyes internally works.
  */
 int r2_eyes_start(void);
+/* Watch receives a token only for its own newly opened camera session. */
+uint64_t r2_eyes_start_for_watch(void);
+int r2_eyes_release_if_watch_owned(uint64_t token);
+int r2_eyes_watch_owns(uint64_t token);
 int r2_eyes_stop(void);
 /* Watch-only release; disappearance is not a chosen sensory shutdown. */
 int r2_eyes_release_source(void);
@@ -323,6 +329,12 @@ int r2_vision_media_status(void);
 int r2_vision_media_attention_status(void);
 int r2_vision_media_set_attention(int watching);
 int r2_vision_media_stop(void);
+/* Watch alone may stop the exact media display generation it opened.
+ * Explicit media replacement takes ownership away from Watch. */
+uint64_t r2_vision_media_open_window_for_watch(unsigned long window_id);
+uint64_t r2_vision_media_open_vlc_for_watch(void);
+int r2_vision_media_stop_if_watch_owned(uint64_t token);
+int r2_vision_media_watch_owns(uint64_t token);
 char *r2_vision_media_see(const char *question);
 int r2_vision_open_vlc(void);
 int r2_vision_open_file(const char *path);
@@ -340,11 +352,29 @@ int r2_vision_close(void);
  * The implementation must call the EXISTING Ears subsystem.
  */
 int r2_ears_start(void);
+/* Watch claims only a newly created stream. Zero means already owned or failed. */
+uint64_t r2_ears_start_for_watch(const char *source);
+uint64_t r2_ears_start_desktop_for_watch(const char *monitor);
+/* Stop only the precise stream generation started by Watch; safe after replacement. */
+int r2_ears_stop_if_watch_owned(uint64_t token);
+int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
+/* Read the active monitor identity under the desktop stream lifecycle lock. */
+/* Does the active microphone capture still use this exact source? */
+int r2_ears_status_microphone_source(const char *expected_source);
+int r2_ears_status_desktop_source(const char *monitor);
+/* Caller frees the full selected source name, or receives NULL if inactive. */
+char *r2_ears_current_desktop_source(void);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */
 int r2_ears_stop_desktop(void);
 int r2_ears_status_desktop(void);
+/* Independent simultaneous desktop output captures. Watch owns these
+ * supplemental sources; the ordinary desktop Ears API remains primary. */
+int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary);
+void r2_ears_extra_stop_all(void);
+size_t r2_ears_extra_source_count(void);
+int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output);
 int r2_ears_stop(void);
 int r2_ears_status(void);
 /* Capture a short utterance and return a malloc-owned local ASR transcript.
