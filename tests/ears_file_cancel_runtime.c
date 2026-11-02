@@ -99,6 +99,11 @@ int main(void)
     assert(setenv("R2_TEST_FILE_MODE", "complete", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
     char out[4];
+    /* Invalid sub-frame requests must fail before consuming any decoder
+     * bytes. Ears history and timestamps only accept complete S16LE frames. */
+    errno = 0;
+    assert(r2_audio_file_read(ears->file_stream, out, 3) == -1);
+    assert(errno == EINVAL);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
     assert(memcmp(out, "ABCD", 4) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
