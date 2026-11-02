@@ -11977,9 +11977,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fflush(wav) == 0)
             capture_ok = 1;
     }
+    } /* ordinary microphone / primary desktop capture */
     if (fclose(wav) != 0) capture_ok = 0;
     wav = NULL;
-    } /* ordinary microphone / primary desktop capture */
 
     if (!capture_ok) goto cleanup;
 
