@@ -138,6 +138,10 @@ static R2Ears *ears = NULL;
 /* Desktop and microphone are independent live hearing organs. */
 static R2Ears *ears_desktop = NULL;
 static pthread_mutex_t visual_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Camera Watch token is separate from the media display's generation.
+ * Explicit camera operations always supersede Watch's stale claim. */
+static pthread_mutex_t eyes_source_owner_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t eyes_watch_token = 0;
 /* Keep this process from flooding the local text model with concurrent requests. */
 static pthread_mutex_t ollama_request_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Foreground conversations can interrupt background Ollama bookkeeping. */
@@ -10928,6 +10932,9 @@ int r2_vision_open_file(const char *path)
 
 int r2_vision_close(void)
 {
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    eyes_watch_token = 0;
+    pthread_mutex_unlock(&eyes_source_owner_lock);
     r2_sense_set_auto_allowed(1, 0);
     (void)r2_vision_media_set_attention(0);
     (void)r2_vision_media_stop();
@@ -10942,9 +10949,21 @@ int r2_vision_close(void)
     return 0;
 }
 
-int r2_eyes_start(void)
+/* Only a newly opened camera can be claimed by Watch. Manual starts
+ * revoke the Watch token, including when camera capture was already active. */
+static int r2_eyes_start_impl(uint64_t *watch_token_out)
 {
-    r2_sense_set_auto_allowed(1, 1);
+    if (watch_token_out) *watch_token_out = 0;
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    if (watch_token_out &&
+        (!r2_sense_auto_allowed(1) || r2_eyes_status() > 0)) {
+        pthread_mutex_unlock(&eyes_source_owner_lock);
+        return -1;
+    }
+    if (!watch_token_out) {
+        eyes_watch_token = 0;
+        r2_sense_set_auto_allowed(1, 1);
+    }
     pthread_mutex_lock(&visual_capture_lock);
     int rc = eyes ? r2_eyes_open_camera(eyes) : -1;
     pthread_mutex_unlock(&visual_capture_lock);
@@ -10954,6 +10973,11 @@ int r2_eyes_start(void)
         pthread_mutex_unlock(&visual_capture_lock);
         rc = -1;
     }
+    if (rc == 0 && watch_token_out) {
+        eyes_watch_token = (uint64_t)atomic_fetch_add(&visual_watch_next_token, 1);
+        *watch_token_out = eyes_watch_token;
+    }
+    pthread_mutex_unlock(&eyes_source_owner_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "eyes_started" : "eyes_start_failed",
                  rc == 0 ? "R2 Eyes camera and continuous raw-frame input are active."
                          : "R2 Eyes could not start camera input and continuous capture.",
@@ -10961,8 +10985,20 @@ int r2_eyes_start(void)
     return rc;
 }
 
-/* Hardware disappearance/Watch teardown does not express R2's intent. */
-int r2_eyes_release_source(void)
+int r2_eyes_start(void)
+{
+    return r2_eyes_start_impl(NULL);
+}
+
+uint64_t r2_eyes_start_for_watch(void)
+{
+    uint64_t token = 0;
+    return r2_eyes_start_impl(&token) == 0 ? token : 0;
+}
+
+/* Calling release_source explicitly revokes Watch. A Watch cleanup may only
+ * release the precise camera generation it opened, not a manual replacement. */
+static int r2_eyes_release_source_locked(void)
 {
     if (!eyes) return -1;
     (void)r2_vision_watch_stop();
@@ -10970,6 +11006,35 @@ int r2_eyes_release_source(void)
     r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
     return 0;
+}
+
+int r2_eyes_release_source(void)
+{
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    eyes_watch_token = 0;
+    int rc = r2_eyes_release_source_locked();
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    return rc;
+}
+
+int r2_eyes_release_if_watch_owned(uint64_t token)
+{
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    int rc = 0;
+    if (token && eyes_watch_token == token) {
+        eyes_watch_token = 0;
+        rc = r2_eyes_release_source_locked();
+    }
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    return rc;
+}
+
+int r2_eyes_watch_owns(uint64_t token)
+{
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    int owns = token && eyes_watch_token == token;
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    return owns;
 }
 
 int r2_eyes_stop(void)
