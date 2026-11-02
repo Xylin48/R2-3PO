@@ -15,6 +15,24 @@
 static atomic_int mic_closes = ATOMIC_VAR_INIT(0);
 static atomic_int desktop_closes = ATOMIC_VAR_INIT(0);
 static atomic_int synthetic_reads = ATOMIC_VAR_INIT(0);
+static char current_microphone[256] = {0}, current_desktop[256] = {0};
+static void remember_source(char *destination, size_t capacity, const char *source)
+{
+    assert(source && strlen(source) < capacity);
+    strcpy(destination, source);
+}
+int __wrap_r2_ears_get_event(R2Ears *receiver, R2HearingEvent *event)
+{
+    assert(event);
+    const char *source = receiver == ears ? current_microphone :
+                         receiver == ears_desktop ? current_desktop : NULL;
+    assert(source);
+    memset(event, 0, sizeof(*event));
+    event->source_name = strdup(source);
+    assert(event->source_name);
+    return 0;
+}
+
 
 static void *direct_listen_worker(void *unused)
 {
@@ -31,24 +49,28 @@ static double duration_seconds(struct timespec before, struct timespec after)
 int __wrap_r2_ears_open_microphone(R2Ears *receiver)
 {
     assert(receiver == ears);
+    remember_source(current_microphone, sizeof(current_microphone), "alsa_input.default");
     return 0;
 }
 
 int __wrap_r2_ears_open_desktop(R2Ears *receiver)
 {
     assert(receiver == ears_desktop);
+    remember_source(current_desktop, sizeof(current_desktop), "alsa_output.default.monitor");
     return 0;
 }
 
 int __wrap_r2_ears_open_microphone_source(R2Ears *receiver, const char *source)
 {
     assert(receiver == ears && source && *source);
+    remember_source(current_microphone, sizeof(current_microphone), source);
     return 0;
 }
 
 int __wrap_r2_ears_open_desktop_source(R2Ears *receiver, const char *source)
 {
     assert(receiver == ears_desktop && source && *source);
+    remember_source(current_desktop, sizeof(current_desktop), source);
     return 0;
 }
 
@@ -79,6 +101,8 @@ int main(void)
 
     uint64_t mic_first = r2_ears_start_for_watch("alsa_input.test_mic");
     assert(mic_first != 0 && r2_ears_status() == 1);
+    assert(r2_ears_status_microphone_source("alsa_input.test_mic") == 1);
+    assert(r2_ears_status_microphone_source("alsa_input.other") == 0);
     assert(r2_ears_start_for_watch("alsa_input.test_mic") == 0); /* attached, not a new owner */
     assert(r2_ears_stop_if_watch_owned(0) == 0);
     assert(atomic_load(&mic_closes) == 0 && r2_ears_status() == 1);
@@ -90,12 +114,22 @@ int main(void)
     assert(r2_ears_stop() == 0);
     assert(atomic_load(&mic_closes) == 1 && r2_ears_status() == 0);
 
+    /* A real default-microphone reroute changes the exact active name.
+     * The old Watch token can stop only its own capture, then a replacement
+     * receives a fresh generation. */
+    uint64_t mic_routed = r2_ears_start_for_watch("alsa_input.other");
+    assert(mic_routed != 0 && r2_ears_status_microphone_source("alsa_input.other"));
+    assert(!r2_ears_status_microphone_source("alsa_input.test_mic"));
+    assert(r2_ears_stop_if_watch_owned(mic_routed) == 0);
+    assert(atomic_load(&mic_closes) == 2);
+    assert(!r2_ears_status_microphone_source("alsa_input.other"));
+
     uint64_t mic_second = r2_ears_start_for_watch("alsa_input.test_mic");
     assert(mic_second != 0 && mic_second != mic_first);
     assert(r2_ears_stop_if_watch_owned(mic_first) == 0);
-    assert(atomic_load(&mic_closes) == 1 && r2_ears_status() == 1);
+    assert(atomic_load(&mic_closes) == 2 && r2_ears_status() == 1);
     assert(r2_ears_stop_if_watch_owned(mic_second) == 0);
-    assert(atomic_load(&mic_closes) == 2 && r2_ears_status() == 0);
+    assert(atomic_load(&mic_closes) == 3 && r2_ears_status() == 0);
 
     uint64_t desktop_first = r2_ears_start_desktop_for_watch("alsa_output.test.monitor");
     assert(desktop_first != 0 && r2_ears_status_desktop() == 1);
