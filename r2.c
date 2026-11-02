@@ -11683,7 +11683,7 @@ char *r2_ears_listen(unsigned seconds)
 
 /* Microphone retains the existing Ears bridge and its history, including
  * direct speech capture. It never takes over the separate desktop monitor. */
-static int r2_ears_start_input(uint64_t *watch_token_out)
+static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source)
 {
     if (watch_token_out) *watch_token_out = 0;
     pthread_mutex_lock(&ears_capture_lock);
@@ -11698,7 +11698,8 @@ static int r2_ears_start_input(uint64_t *watch_token_out)
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? r2_ears_open_microphone(ears) : -1;
+    int rc = ears ? (microphone_source ? r2_ears_open_microphone_source(ears, microphone_source)
+                                       : r2_ears_open_microphone(ears)) : -1;
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
@@ -11730,18 +11731,19 @@ static int r2_ears_start_input(uint64_t *watch_token_out)
 
 int r2_ears_start(void)
 {
-    return r2_ears_start_input(NULL);
+    return r2_ears_start_input(NULL, NULL);
 }
 
-uint64_t r2_ears_start_for_watch(void)
+uint64_t r2_ears_start_for_watch(const char *source)
 {
+    if (!source || !*source) return 0;
     uint64_t token = 0;
-    return r2_ears_start_input(&token) == 0 ? token : 0;
+    return r2_ears_start_input(&token, source) == 0 ? token : 0;
 }
 
 /* Playback monitor has its own Pulse stream, worker and rolling history.
  * It can run alongside the microphone and shuts down independently. */
-static int r2_ears_start_desktop_impl(uint64_t *watch_token_out)
+static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *monitor)
 {
     if (watch_token_out) *watch_token_out = 0;
     pthread_mutex_lock(&ears_desktop_capture_lock);
@@ -11760,7 +11762,8 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out)
         pthread_mutex_unlock(&ears_desktop_capture_lock);
         return -1;
     }
-    int rc = r2_ears_open_desktop(ears_desktop);
+    int rc = monitor ? r2_ears_open_desktop_source(ears_desktop, monitor)
+                     : r2_ears_open_desktop(ears_desktop);
     if (rc == 0) {
         pthread_mutex_lock(&ears_desktop_recent_lock);
         ears_desktop_recent_length = 0;
@@ -11792,13 +11795,14 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out)
 
 int r2_ears_start_desktop(void)
 {
-    return r2_ears_start_desktop_impl(NULL);
+    return r2_ears_start_desktop_impl(NULL, NULL);
 }
 
-uint64_t r2_ears_start_desktop_for_watch(void)
+uint64_t r2_ears_start_desktop_for_watch(const char *monitor)
 {
+    if (!monitor || !*monitor) return 0;
     uint64_t token = 0;
-    return r2_ears_start_desktop_impl(&token) == 0 ? token : 0;
+    return r2_ears_start_desktop_impl(&token, monitor) == 0 ? token : 0;
 }
 
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
@@ -11841,6 +11845,21 @@ int r2_ears_status_desktop(void)
                  atomic_load(&ears_desktop_capture_running) ? 1 : 0;
     pthread_mutex_unlock(&ears_desktop_capture_lock);
     return active;
+}
+
+int r2_ears_status_desktop_source(const char *expected_monitor)
+{
+    if (!expected_monitor || !*expected_monitor) return 0;
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    R2HearingEvent event = {0};
+    int matches = ears_desktop &&
+        ears_desktop_capture_thread_started &&
+        atomic_load(&ears_desktop_capture_running) &&
+        r2_ears_get_event(ears_desktop, &event) == 0 &&
+        event.source_name && !strcmp(event.source_name, expected_monitor);
+    r2_ears_release_event(&event);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    return matches;
 }
 
 static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
