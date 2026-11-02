@@ -31,6 +31,7 @@
 #include "Ears.h"
 #include "AudioDiscovery.h"
 #include "AudioCapture.h"
+#include "AudioFile.h"
 #include "Log.h"
 
 #include <errno.h>
@@ -123,9 +124,7 @@ struct R2Ears
      *
      * FFmpeg outputs canonical raw PCM through this pipe.
      */
-    FILE *file_stream;
-
-    pid_t file_pid;
+    R2AudioFile *file_stream;
 
     /*
      * Whether the current source is a file.
@@ -156,71 +155,6 @@ static uint64_t r2_ears_timestamp(void)
 
     return ((uint64_t)ts.tv_sec * 1000000ULL) +
            ((uint64_t)ts.tv_nsec / 1000ULL);
-}
-
-
-/*
- * Safely quote a string for use as one shell argument.
- *
- * This matters for:
- *
- *     /home/x/My Music/song.mp3
- *     /home/x/Movie's Audio/movie.mkv
- *
- * and also prevents a filename from becoming shell syntax.
- */
-static char *r2_ears_shell_quote(const char *input)
-{
-    size_t length;
-    size_t max_size;
-    char *output;
-    char *p;
-
-    if (!input)
-        return NULL;
-
-    length = strlen(input);
-
-    /*
-     * Worst case:
-     *
-     * every character is a single quote and therefore becomes
-     *
-     *     '\''
-     *
-     * plus surrounding quotes.
-     */
-    if (length > (SIZE_MAX - 3) / 4)
-        return NULL;
-
-    max_size = (length * 4) + 3;
-
-    output = malloc(max_size);
-
-    if (!output)
-        return NULL;
-
-    p = output;
-
-    *p++ = '\'';
-
-    for (size_t i = 0; i < length; ++i)
-    {
-        if (input[i] == '\'')
-        {
-            memcpy(p, "'\\''", 4);
-            p += 4;
-        }
-        else
-        {
-            *p++ = input[i];
-        }
-    }
-
-    *p++ = '\'';
-    *p = '\0';
-
-    return output;
 }
 
 
@@ -318,30 +252,6 @@ long r2_ears_playback_pid(void)
 }
 
 /* ---------------------------------------------------------
- * File process handling
- * --------------------------------------------------------- */
-
-static int r2_ears_start_ffmpeg(R2Ears *ears, const char *path)
-{
-    if (!ears || !path || !*path) return -1;
-    char *quoted_path = r2_ears_shell_quote(path);
-    if (!quoted_path) return -1;
-    char *command = NULL;
-    int written = asprintf(&command,
-        "ffmpeg -nostdin -hide_banner -loglevel error "
-        "-i %s -vn -f s16le -ar %u -ac %u -acodec pcm_s16le pipe:1",
-        quoted_path, R2_EARS_SAMPLE_RATE, R2_EARS_CHANNELS);
-    free(quoted_path);
-    if (written < 0 || !command) return -1;
-    ears->file_stream = popen(command, "r");
-    free(command);
-    if (!ears->file_stream) return -1;
-    ears->file_pid = -1;
-    return 0;
-}
-
-
-/* ---------------------------------------------------------
  * Initialization
  * --------------------------------------------------------- */
 
@@ -377,7 +287,6 @@ int r2_ears_init(R2Ears **ears)
     }
     new_ears->pulse_stream = NULL;
     new_ears->file_stream = NULL;
-    new_ears->file_pid = -1;
     new_ears->using_file = 0;
 
     r2_ears_reset_event(new_ears);
@@ -405,14 +314,13 @@ void r2_ears_close(R2Ears *ears)
     }
     pthread_mutex_unlock(&ears->transport_lock);
 
-    if (ears->file_stream)
-    {
-        pclose(
-            ears->file_stream
-        );
-
+    pthread_mutex_lock(&ears->transport_lock);
+    if (ears->file_stream) {
+        /* The owner only closes after its reader has completed. */
+        r2_audio_file_close(ears->file_stream);
         ears->file_stream = NULL;
     }
+    pthread_mutex_unlock(&ears->transport_lock);
 
     if (ears->open) {
         char details[768];
@@ -427,7 +335,6 @@ void r2_ears_close(R2Ears *ears)
 
     free(ears->event.source_name);
     ears->event.source_name = NULL;
-    ears->file_pid = -1;
     ears->using_file = 0;
     ears->open = 0;
     ears->bytes_since_log = 0;
@@ -447,6 +354,8 @@ void r2_ears_cancel(R2Ears *ears)
     pthread_mutex_lock(&ears->transport_lock);
     if (ears->pulse_stream)
         r2_audio_capture_cancel(ears->pulse_stream);
+    if (ears->file_stream)
+        r2_audio_file_cancel(ears->file_stream);
     pthread_mutex_unlock(&ears->transport_lock);
 }
 
@@ -659,11 +568,10 @@ int r2_ears_open_file(
     }
 
     r2_ears_close(ears);
-
-    if (r2_ears_start_ffmpeg(
-            ears,
-            path
-        ) != 0)
+    atomic_store(&ears->cancel_requested, 0);
+    R2AudioFile *decoder = r2_audio_file_open(path, R2_EARS_SAMPLE_RATE,
+                                               R2_EARS_CHANNELS);
+    if (!decoder)
     {
         fprintf(
             stderr,
@@ -677,14 +585,20 @@ int r2_ears_open_file(
         return -1;
     }
 
-    ears->format.sample_rate =
-        R2_EARS_SAMPLE_RATE;
+    pthread_mutex_lock(&ears->transport_lock);
+    ears->file_stream = decoder;
+    if (atomic_load(&ears->cancel_requested))
+        r2_audio_file_cancel(decoder);
+    pthread_mutex_unlock(&ears->transport_lock);
+    if (atomic_load(&ears->cancel_requested)) {
+        r2_ears_close(ears);
+        errno = ECANCELED;
+        return -1;
+    }
 
-    ears->format.channels =
-        R2_EARS_CHANNELS;
-
-    ears->format.bits_per_sample =
-        R2_EARS_BITS_PER_SAMPLE;
+    ears->format.sample_rate = R2_EARS_SAMPLE_RATE;
+    ears->format.channels = R2_EARS_CHANNELS;
+    ears->format.bits_per_sample = R2_EARS_BITS_PER_SAMPLE;
 
     /*
      * R2 knows that this audio originated as a file.
@@ -760,30 +674,12 @@ ssize_t r2_ears_read(
 
     if (ears->using_file)
     {
-        size_t bytes_read;
-
-        if (!ears->file_stream)
-        {
-            errno = EBADF;
-            return -1;
-        }
-
-        bytes_read =
-            fread(
-                buffer,
-                1,
-                buffer_size,
-                ears->file_stream
-            );
-
-        if (bytes_read > 0)
-        {
-            /* Keep the hearing event timestamp fixed at source open;
-             * another thread may snapshot the stable source metadata.
-             * Sample timing is private to this reader. */
+        if (!ears->file_stream) { errno = EBADF; return -1; }
+        ssize_t bytes_read = r2_audio_file_read(ears->file_stream, buffer,
+                                                 buffer_size);
+        if (bytes_read > 0) {
             uint64_t sample_time = r2_ears_timestamp();
-            ears->bytes_since_log += bytes_read;
-
+            ears->bytes_since_log += (uint64_t)bytes_read;
             if (ears->last_log_timestamp_us == 0 ||
                 sample_time < ears->last_log_timestamp_us ||
                 sample_time - ears->last_log_timestamp_us >= 5000000ULL) {
@@ -801,29 +697,19 @@ ssize_t r2_ears_read(
                 ears->bytes_since_log = 0;
                 ears->last_log_timestamp_us = sample_time;
             }
-
-            return (ssize_t)bytes_read;
+            return bytes_read;
         }
-
-        if (feof(ears->file_stream))
-        {
-            r2_ears_close(ears);
-
-            return 0;
-        }
-
-        if (ferror(ears->file_stream))
-        {
+        int read_error = errno;
+        if (bytes_read < 0 && read_error != ECANCELED)
             r2_log_sensory("audio_read_failed",
                            "R2 Ears encountered an error reading audio-file samples.",
-                           "The decoded PCM stream reported a read error.",
+                           "The decoded PCM stream ended with an error.",
                            ears->event.source_name);
-            r2_ears_close(ears);
-
-            return -1;
-        }
-
-        return 0;
+        /* Do not free the decoder here: the lifecycle owner must first
+         * establish that the reader has exited, then close and reap FFmpeg. */
+        atomic_store(&ears->open, 0);
+        if (bytes_read < 0) errno = read_error;
+        return bytes_read;
     }
 
 
