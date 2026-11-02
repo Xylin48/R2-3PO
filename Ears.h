@@ -232,6 +232,9 @@ void r2_ears_close(
     R2Ears *ears
 );
 
+/* Wake a pending PulseAudio connect or PCM read without closing the stream. */
+void r2_ears_cancel(R2Ears *ears);
+
 
 /* ---------------------------------------------------------
  * Hearing
