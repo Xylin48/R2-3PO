@@ -1415,9 +1415,11 @@ static void *shell_watch_worker(void *unused)
 
         /* Both audio sources operate independently; the decision to close one
            must not be overridden by mere availability of that source. */
+        int microphone_changed = audio_known && microphone_available &&
+            !r2_ears_status_microphone_source(audio.microphone_source);
         if (managed_microphone &&
             (!r2_sense_auto_allowed(2) ||
-             (audio_known && !microphone_available) ||
+             (audio_known && (!microphone_available || microphone_changed)) ||
              r2_ears_status() <= 0)) {
             (void)r2_ears_stop_if_watch_owned(managed_microphone);
             managed_microphone = 0;
