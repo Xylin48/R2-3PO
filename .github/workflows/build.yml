@@ -174,7 +174,7 @@ jobs:
 
       - name: Cancel stalled FFmpeg file reads and reap the exact decoder child
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_file_cancel_runtime.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c -o /tmp/r2-ears-file-cancel-test -lpulse -lpthread
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_file_cancel_runtime.c AudioDiscovery.c AudioCapture.c AudioFile.c -o /tmp/r2-ears-file-cancel-test -lpulse -lpthread
           /tmp/r2-ears-file-cancel-test
 
       - name: Exercise independent microphone and desktop PCM capture objects
