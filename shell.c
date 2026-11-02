@@ -1456,8 +1456,14 @@ static void *shell_watch_worker(void *unused)
          * Failed discovery cannot be treated as evidence of unplugging. */
         if (!r2_sense_auto_allowed(3))
             r2_ears_extra_stop_all();
-        else if (audio_known)
-            (void)r2_ears_extra_reconcile(&audio, audio.desktop_monitor);
+        else if (audio_known) {
+            /* Exclude the receiver's ACTUAL selected monitor, which may
+             * differ from the first detected output after manual takeover.
+             * If there is no active primary receiver, capture every sink. */
+            char *primary_source = r2_ears_current_desktop_source();
+            (void)r2_ears_extra_reconcile(&audio, primary_source);
+            free(primary_source);
+        }
 
         if (audio_known) r2_audio_discovery_free(&audio);
 
