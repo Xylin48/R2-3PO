@@ -11877,6 +11877,24 @@ int r2_ears_status_desktop_source(const char *expected_monitor)
     return matches;
 }
 
+/* Exact microphone source identity permits Watch to follow an actual
+ * default-input reroute without mistaking an unavailable query for a change.
+ * Use the same capture mutex that protects the event's owned string. */
+int r2_ears_status_microphone_source(const char *expected_source)
+{
+    if (!expected_source || !*expected_source) return 0;
+    pthread_mutex_lock(&ears_capture_lock);
+    R2HearingEvent event = {0};
+    int matches = ears &&
+        ears_capture_thread_started &&
+        atomic_load(&ears_capture_running) &&
+        r2_ears_get_event(ears, &event) == 0 &&
+        event.source_name && !strcmp(event.source_name, expected_source);
+    r2_ears_release_event(&event);
+    pthread_mutex_unlock(&ears_capture_lock);
+    return matches;
+}
+
 static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
 {
     if (!ears) return -1;
