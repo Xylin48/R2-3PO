@@ -362,6 +362,8 @@ int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
 /* Does the active microphone capture still use this exact source? */
 int r2_ears_status_microphone_source(const char *expected_source);
 int r2_ears_status_desktop_source(const char *monitor);
+/* Caller frees the full selected source name, or receives NULL if inactive. */
+char *r2_ears_current_desktop_source(void);
 /* Capture the default sink monitor instead of the microphone. */
 int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */
