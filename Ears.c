@@ -475,8 +475,6 @@ int r2_ears_open_source(
 )
 {
     pa_sample_spec spec;
-    pa_buffer_attr buffer_attr;
-    int error = 0;
     char *resolved_source = NULL;
     const char *actual_source;
 
