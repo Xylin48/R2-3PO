@@ -16,10 +16,12 @@
 #include <time.h>
 #include <unistd.h>
 
+static int source_closes = 0;
 int64_t r2_log_sensory(const char *type, const char *text,
                       const char *details, const char *source)
 {
-    (void)type; (void)text; (void)details; (void)source;
+    (void)text; (void)details; (void)source;
+    if (type && strcmp(type, "audio_source_closed") == 0) ++source_closes;
     return 1;
 }
 
@@ -120,6 +122,7 @@ int main(void)
     assert(reader.result == -1 && reader.error == ECANCELED);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
+    assert(source_closes == 2); /* EOF and cancelled source both journalled */
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
     puts("File decoder preserves exact argv, complete PCM, and promptly cancels stalled FFmpeg reads and reaps child.");
