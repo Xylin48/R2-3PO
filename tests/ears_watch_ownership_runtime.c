@@ -40,6 +40,17 @@ static void *direct_listen_worker(void *unused)
     return r2_ears_listen_cancelable(15U, NULL, NULL);
 }
 
+static atomic_int desktop_listen_done = ATOMIC_VAR_INIT(0);
+static void *desktop_listen_worker(void *unused)
+{
+    (void)unused;
+    r2_ears_desktop_requested = 1;
+    r2_ears_recent_requested = 1;
+    char *result = r2_ears_listen_cancelable(1U, NULL, NULL);
+    atomic_store(&desktop_listen_done, 1);
+    return result;
+}
+
 static double duration_seconds(struct timespec before, struct timespec after)
 {
     return (double)(after.tv_sec - before.tv_sec) +
@@ -218,6 +229,29 @@ int main(void)
     char *complete = r2_ears_listen_cancelable(1U, NULL, NULL);
     assert(complete && !strcmp(complete, expected));
     free(complete);
+    /* Desktop attention must neither wait for the independent microphone's
+     * lifecycle mutex nor inherit its explicit-stop cancellation state. */
+    pthread_mutex_lock(&ears_desktop_recent_lock);
+    memset(ears_desktop_recent_audio, 0, 192000);
+    ears_desktop_recent_length = 192000;
+    ears_desktop_recent_write_position = 192000;
+    pthread_mutex_unlock(&ears_desktop_recent_lock);
+    atomic_store(&ears_desktop_capture_running, 1);
+    pthread_mutex_lock(&ears_capture_lock);
+    atomic_fetch_add(&ears_stop_requesters, 1);
+    assert(pthread_create(&listener, NULL, desktop_listen_worker, NULL) == 0);
+    for (int i = 0; i < 2000 && !atomic_load(&desktop_listen_done); ++i) {
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    assert(atomic_load(&desktop_listen_done));
+    atomic_fetch_sub(&ears_stop_requesters, 1);
+    pthread_mutex_unlock(&ears_capture_lock);
+    void *desktop_transcript = NULL;
+    assert(pthread_join(listener, &desktop_transcript) == 0);
+    assert(desktop_transcript && !strcmp(desktop_transcript, expected));
+    free(desktop_transcript);
+    atomic_store(&ears_desktop_capture_running, 0);
     assert(unlink(text_path) == 0 && unlink(cli_path) == 0);
     assert(unlink(model_path) == 0);
 

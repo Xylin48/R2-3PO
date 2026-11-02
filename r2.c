@@ -12070,10 +12070,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     const uint32_t bytes_per_second = 48000U * 2U * 2U;
     uint32_t total_bytes;
     int capture_ok = 0;
-    R2EarsOpenRequest request = r2_ears_open_request(0, 0, cancelled, userdata);
+    R2EarsOpenRequest request = r2_ears_open_request(r2_ears_desktop_requested, 0, cancelled, userdata);
 
-    if (r2_ears_open_cancelled(&request) ||
-        atomic_load(&ears_stop_requesters) != 0) return NULL;
+    if (r2_ears_open_cancelled(&request)) return NULL;
     if (seconds < 1U || seconds > 15U) {
         fprintf(stderr, "[Ears] Listen duration must be between 1 and 15 seconds.\n");
         return NULL;
@@ -12128,24 +12127,16 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             r2_ears_write_wav_header(wav, total_bytes) == 0 &&
             fflush(wav) == 0)
             capture_ok = 1;
-    } else {
-    pthread_mutex_lock(&ears_capture_lock);
-    if (atomic_load(&ears_stop_requesters) != 0) {
-        pthread_mutex_unlock(&ears_capture_lock);
-        goto cleanup;
-    }
-    if (r2_ears_desktop_requested) {
+    } else if (r2_ears_desktop_requested) {
         pthread_mutex_lock(&ears_desktop_capture_lock);
         if (!atomic_load(&ears_desktop_capture_running)) {
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] No active desktop audio stream to inspect.\n");
             goto cleanup;
         }
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_desktop_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
             if (audio_rc == 0 && !shutting_down &&
                 !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
@@ -12157,7 +12148,6 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             uint64_t generation = ears_desktop_recent_generation;
             pthread_mutex_unlock(&ears_desktop_recent_lock);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
             if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, generation, wav,
                                                    cancelled, userdata) == 0 &&
                 !shutting_down && !(cancelled && cancelled(userdata)) &&
@@ -12165,7 +12155,13 @@ char *r2_ears_listen_cancelable(unsigned seconds,
                 fflush(wav) == 0)
                 capture_ok = 1;
         }
-    } else if (atomic_load(&ears_capture_running)) {
+    } else {
+    pthread_mutex_lock(&ears_capture_lock);
+    if (r2_ears_open_cancelled(&request)) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        goto cleanup;
+    }
+    if (atomic_load(&ears_capture_running)) {
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_capture_lock);
@@ -12237,7 +12233,7 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fflush(wav) == 0)
             capture_ok = 1;
     }
-    } /* ordinary microphone / primary desktop capture */
+    } /* ordinary microphone capture */
     if (fclose(wav) != 0) capture_ok = 0;
     wav = NULL;
 
