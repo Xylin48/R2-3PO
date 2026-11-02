@@ -119,6 +119,10 @@ static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
+/* Watch owns a particular media receiver generation, not "the media slot".
+ * Protected by media_lifecycle_lock, which already serializes replacement. */
+static atomic_uint_fast64_t visual_watch_next_token = ATOMIC_VAR_INIT(1);
+static uint64_t media_watch_token = 0;
 static int media_capture_thread_started = 0;
 static unsigned char *media_latest_data = NULL;
 static size_t media_latest_capacity = 0;
@@ -10363,6 +10367,7 @@ static int r2_vision_media_stop_locked(void)
 int r2_vision_media_stop(void)
 {
     pthread_mutex_lock(&media_lifecycle_lock);
+    media_watch_token = 0; /* explicit stop invalidates stale Watch claim */
     int rc = r2_vision_media_stop_locked();
     pthread_mutex_unlock(&media_lifecycle_lock);
     return rc;
@@ -10374,8 +10379,10 @@ int r2_vision_media_status(void)
 }
 
 /* kind=window, vlc or file; only a separate receiver is changed. */
-static int r2_vision_media_open(int kind, unsigned long window, const char *path)
+static int r2_vision_media_open(int kind, unsigned long window,
+                                const char *path, uint64_t *watch_token_out)
 {
+    if (watch_token_out) *watch_token_out = 0;
     if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
         !atomic_load(&eyes_auto_allowed)) return -1;
     pthread_mutex_lock(&media_lifecycle_lock);
@@ -10384,6 +10391,7 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
         return -1;
     }
     (void)r2_vision_media_stop_locked();
+    media_watch_token = 0; /* a new source supersedes the old token */
     pthread_mutex_lock(&media_capture_lock);
     if (!media_eyes && r2_eyes_init(&media_eyes) != 0) {
         pthread_mutex_unlock(&media_capture_lock);
@@ -10410,6 +10418,10 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
         return -1;
     }
     media_capture_thread_started = 1;
+    if (watch_token_out) {
+        media_watch_token = (uint64_t)atomic_fetch_add(&visual_watch_next_token, 1);
+        *watch_token_out = media_watch_token;
+    }
     pthread_mutex_unlock(&media_lifecycle_lock);
     r2_log_sensory("media_display_connected",
                   "An independent video display is available to R2's visual attention.",
@@ -10420,7 +10432,40 @@ static int r2_vision_media_open(int kind, unsigned long window, const char *path
 }
 int r2_vision_media_open_window(unsigned long window)
 {
-    return window ? r2_vision_media_open(1, window, NULL) : -1;
+    return window ? r2_vision_media_open(1, window, NULL, NULL) : -1;
+}
+
+uint64_t r2_vision_media_open_window_for_watch(unsigned long window)
+{
+    if (!window) return 0;
+    uint64_t token = 0;
+    return r2_vision_media_open(1, window, NULL, &token) == 0 ? token : 0;
+}
+
+uint64_t r2_vision_media_open_vlc_for_watch(void)
+{
+    uint64_t token = 0;
+    return r2_vision_media_open(2, 0, NULL, &token) == 0 ? token : 0;
+}
+
+int r2_vision_media_stop_if_watch_owned(uint64_t token)
+{
+    pthread_mutex_lock(&media_lifecycle_lock);
+    int rc = 0;
+    if (token && media_watch_token == token) {
+        media_watch_token = 0;
+        rc = r2_vision_media_stop_locked();
+    }
+    pthread_mutex_unlock(&media_lifecycle_lock);
+    return rc;
+}
+
+int r2_vision_media_watch_owns(uint64_t token)
+{
+    pthread_mutex_lock(&media_lifecycle_lock);
+    int owns = token && media_watch_token == token;
+    pthread_mutex_unlock(&media_lifecycle_lock);
+    return owns;
 }
 
 char *r2_vision_media_see(const char *question)
@@ -10873,12 +10918,12 @@ int r2_vision_open_window(unsigned long window_id)
 
 int r2_vision_open_vlc(void)
 {
-    return r2_vision_media_open(2, 0, NULL);
+    return r2_vision_media_open(2, 0, NULL, NULL);
 }
 
 int r2_vision_open_file(const char *path)
 {
-    return path && *path ? r2_vision_media_open(3, 0, path) : -1;
+    return path && *path ? r2_vision_media_open(3, 0, path, NULL) : -1;
 }
 
 int r2_vision_close(void)
