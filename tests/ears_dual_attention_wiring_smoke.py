@@ -56,6 +56,7 @@ assert "r2_ears_start_for_watch(audio.microphone_source)" in watch
 assert "r2_ears_stop_desktop_if_watch_owned(managed_desktop)" in watch
 assert "r2_ears_stop_if_watch_owned(managed_microphone)" in watch
 assert "r2_ears_start_desktop()" not in watch and "r2_ears_start()" not in watch
+assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in watch
 assert "r2_ears_stop_desktop()" not in watch and "r2_ears_stop()" not in watch
 for api in ("r2_ears_start_for_watch", "r2_ears_start_desktop_for_watch",
             "r2_ears_stop_if_watch_owned", "r2_ears_stop_desktop_if_watch_owned"):
