@@ -94,6 +94,7 @@
 #include "r2_diary.h"
 #include "Eyes.h"
 #include "Ears.h"
+#include "AudioDiscovery.h"
 #include "Log.h"
 #include "Reality.h"
 #include "AlternateSelf.h"
@@ -11245,6 +11246,226 @@ static void *r2_ears_desktop_capture_worker(void *unused)
     }
     atomic_store(&ears_desktop_capture_running, 0);
     return NULL;
+}
+
+/*
+ * Supplemental desktop outputs. A Pulse sink monitor carries a mix of apps
+ * on ONE output; distinct sinks remain independently identifiable real PCM.
+ * The historical desktop listener is retained for compatibility; this list
+ * contains only the other active output monitors. No fixed device-count
+ * quota or shortened source-name allocation is imposed.
+ *
+ * Watch alone reconciles these captures. The lock serializes reconciliation,
+ * snapshots and teardown; each worker only touches its own history lock, and
+ * never acquires extra_desktop_lock, so cancellation + join are safe.
+ */
+typedef struct R2ExtraDesktop {
+    char *monitor;
+    R2Ears *receiver;
+    pthread_t thread;
+    int thread_started;
+    atomic_int running;
+    pthread_mutex_t history_lock;
+    unsigned char *recent;
+    size_t length;
+    size_t position;
+    uint64_t total_bytes;
+    struct R2ExtraDesktop *next;
+} R2ExtraDesktop;
+
+static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
+static R2ExtraDesktop *extra_desktop_head = NULL;
+
+static void *r2_extra_desktop_worker(void *arg)
+{
+    R2ExtraDesktop *entry = arg;
+    unsigned char pcm[1920];
+    unsigned previous = 0;
+    int have_previous = 0;
+    uint64_t last_notice = 0;
+    while (!shutting_down && atomic_load(&entry->running)) {
+        ssize_t got = r2_ears_read(entry->receiver, pcm, sizeof(pcm));
+        if (got <= 0 || ((size_t)got % 4U) != 0U) {
+            if (!shutting_down && atomic_load(&entry->running))
+                r2_log_sensory("audio_capture_ended",
+                              "An independent desktop playback output stopped supplying valid PCM.",
+                              "Its own monitor will be retried on the next valid discovery snapshot.",
+                              entry->monitor);
+            break;
+        }
+        r2_ears_notice_pcm_change(pcm, (size_t)got, &previous, &have_previous,
+                                   &last_notice, entry->monitor);
+        pthread_mutex_lock(&entry->history_lock);
+        size_t count = (size_t)got;
+        size_t first = R2_EARS_RECENT_CAPACITY - entry->position;
+        if (first > count) first = count;
+        memcpy(entry->recent + entry->position, pcm, first);
+        if (count > first)
+            memcpy(entry->recent, pcm + first, count - first);
+        entry->position = (entry->position + count) % R2_EARS_RECENT_CAPACITY;
+        if (count >= R2_EARS_RECENT_CAPACITY)
+            entry->length = R2_EARS_RECENT_CAPACITY;
+        else if (entry->length + count >= R2_EARS_RECENT_CAPACITY)
+            entry->length = R2_EARS_RECENT_CAPACITY;
+        else
+            entry->length += count;
+        entry->total_bytes += count;
+        pthread_mutex_unlock(&entry->history_lock);
+    }
+    atomic_store(&entry->running, 0);
+    return NULL;
+}
+
+/* Caller owns extra_desktop_lock and must not remove an entry while another
+ * caller is copying its rolling history. */
+static void r2_extra_desktop_destroy(R2ExtraDesktop *entry)
+{
+    if (!entry) return;
+    atomic_store(&entry->running, 0);
+    if (entry->receiver) r2_ears_cancel(entry->receiver);
+    if (entry->thread_started) pthread_join(entry->thread, NULL);
+    if (entry->receiver) r2_ears_shutdown(entry->receiver);
+    pthread_mutex_destroy(&entry->history_lock);
+    free(entry->recent);
+    free(entry->monitor);
+    free(entry);
+}
+
+static int r2_extra_desktop_wanted(const R2AudioDiscovery *audio,
+                                  const char *primary, const char *monitor)
+{
+    if (!audio || !monitor || !*monitor || (primary && !strcmp(primary, monitor)))
+        return 0;
+    for (size_t i = 0; i < audio->playback_output_count; ++i)
+        if (audio->playback_outputs[i].monitor &&
+            !strcmp(audio->playback_outputs[i].monitor, monitor))
+            return 1;
+    return 0;
+}
+
+void r2_ears_extra_stop_all(void)
+{
+    pthread_mutex_lock(&extra_desktop_lock);
+    while (extra_desktop_head) {
+        R2ExtraDesktop *old = extra_desktop_head;
+        extra_desktop_head = old->next;
+        r2_extra_desktop_destroy(old);
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+}
+
+/* A discovery failure leaves all existing captures intact. A successful
+ * snapshot is authoritative only for output availability, not attention. */
+int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
+{
+    if (!audio) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&extra_desktop_lock);
+    R2ExtraDesktop **slot = &extra_desktop_head;
+    while (*slot) {
+        R2ExtraDesktop *entry = *slot;
+        if (!r2_sense_auto_allowed(3) ||
+            !atomic_load(&entry->running) ||
+            !r2_extra_desktop_wanted(audio, primary, entry->monitor)) {
+            *slot = entry->next;
+            r2_extra_desktop_destroy(entry);
+        } else
+            slot = &entry->next;
+    }
+    int result = 0;
+    if (r2_sense_auto_allowed(3)) {
+        for (size_t i = 0; i < audio->playback_output_count; ++i) {
+            const char *monitor = audio->playback_outputs[i].monitor;
+            if (!r2_extra_desktop_wanted(audio, primary, monitor))
+                continue;
+            int exists = 0;
+            for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next)
+                if (!strcmp(p->monitor, monitor)) { exists = 1; break; }
+            if (exists) continue;
+            R2ExtraDesktop *entry = calloc(1, sizeof(*entry));
+            if (!entry) { result = -1; continue; }
+            if (pthread_mutex_init(&entry->history_lock, NULL) != 0) {
+                free(entry);
+                result = -1;
+                continue;
+            }
+            entry->monitor = strdup(monitor);
+            entry->recent = malloc(R2_EARS_RECENT_CAPACITY);
+            if (!entry->monitor || !entry->recent ||
+                r2_ears_init(&entry->receiver) != 0) {
+                r2_extra_desktop_destroy(entry);
+                result = -1;
+                continue;
+            }
+            /* Nothing is published to readers until the stream opens and
+             * the worker exists. If the server refuses the monitor, leave
+             * its identity available for retry at the next poll. */
+            if (r2_ears_open_desktop_source(entry->receiver, entry->monitor) != 0) {
+                r2_extra_desktop_destroy(entry);
+                result = -1;
+                continue;
+            }
+            atomic_store(&entry->running, 1);
+            if (pthread_create(&entry->thread, NULL, r2_extra_desktop_worker, entry) != 0) {
+                r2_extra_desktop_destroy(entry);
+                result = -1;
+                continue;
+            }
+            entry->thread_started = 1;
+            entry->next = extra_desktop_head;
+            extra_desktop_head = entry;
+            r2_log_sensory("audio_source_opened",
+                           "An additional desktop output is supplying independent raw PCM.",
+                           "This does not automatically transcribe audio or change R2's attention.",
+                           entry->monitor);
+        }
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    return result;
+}
+
+size_t r2_ears_extra_source_count(void)
+{
+    pthread_mutex_lock(&extra_desktop_lock);
+    size_t count = 0;
+    for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next)
+        if (atomic_load(&p->running)) ++count;
+    pthread_mutex_unlock(&extra_desktop_lock);
+    return count;
+}
+
+/* Explicit per-monitor PCM snapshot: no mixing and no implicit inference.
+ * The caller selects the exact full source identity and owns the output
+ * buffer. A missing/inactive/insufficiently buffered source fails cleanly.
+ */
+int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output)
+{
+    if (!monitor || !*monitor || !output || !bytes ||
+        bytes % 4U || bytes > R2_EARS_RECENT_CAPACITY) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&extra_desktop_lock);
+    for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
+        if (strcmp(entry->monitor, monitor)) continue;
+        pthread_mutex_lock(&entry->history_lock);
+        int ok = atomic_load(&entry->running) && entry->length >= bytes;
+        if (ok) {
+            size_t start = (entry->position + R2_EARS_RECENT_CAPACITY - bytes) %
+                           R2_EARS_RECENT_CAPACITY;
+            size_t first = R2_EARS_RECENT_CAPACITY - start;
+            if (first > bytes) first = bytes;
+            memcpy(output, entry->recent + start, first);
+            if (bytes > first)
+                memcpy((unsigned char *)output + first, entry->recent, bytes - first);
+        }
+        pthread_mutex_unlock(&entry->history_lock);
+        pthread_mutex_unlock(&extra_desktop_lock);
+        if (!ok) errno = EAGAIN;
+        return ok ? 0 : -1;
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    errno = ENOENT;
+    return -1;
 }
 
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
