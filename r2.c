@@ -10390,7 +10390,11 @@ static int r2_vision_media_open(int kind, unsigned long window,
     if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
         !atomic_load(&eyes_auto_allowed)) return -1;
     pthread_mutex_lock(&media_lifecycle_lock);
-    if (shutting_down || !atomic_load(&eyes_auto_allowed)) {
+    if (shutting_down || !atomic_load(&eyes_auto_allowed) ||
+        (watch_token_out &&
+         (atomic_load(&media_capture_running) || media_capture_thread_started))) {
+        /* A manual/other caller may have opened a display between Watch's
+         * status check and this lock. Watch must not replace that source. */
         pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
     }
