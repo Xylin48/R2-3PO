@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "AudioDiscovery.h"
 
 /*
  * ============================================================
@@ -366,6 +367,12 @@ int r2_ears_start_desktop(void);
 /* Independent desktop playback receiver; never replaces microphone capture. */
 int r2_ears_stop_desktop(void);
 int r2_ears_status_desktop(void);
+/* Independent simultaneous desktop output captures. Watch owns these
+ * supplemental sources; the ordinary desktop Ears API remains primary. */
+int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary);
+void r2_ears_extra_stop_all(void);
+size_t r2_ears_extra_source_count(void);
+int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output);
 int r2_ears_stop(void);
 int r2_ears_status(void);
 /* Capture a short utterance and return a malloc-owned local ASR transcript.
