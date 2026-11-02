@@ -106,14 +106,6 @@ int main(void)
     assert(r2_ears_get_event(desktop, &event_desktop) == 0);
     assert(!strcmp(event_mic.source_name, microphone_name));
     assert(!strcmp(event_desktop.source_name, monitor_name));
-    /* The caller is allowed to reopen with a pointer into the current event.
-     * The old implementation freed it during close before opening the source. */
-    assert(r2_ears_open_source(mic, mic->event.source_name) == 0);
-    assert(r2_ears_is_open(mic));
-    R2HearingEvent reopened = {0};
-    assert(r2_ears_get_event(mic, &reopened) == 0);
-    assert(!strcmp(reopened.source_name, microphone_name));
-    r2_ears_release_event(&reopened);
     check_pcm(mic, 0xa5);
     check_pcm(desktop, 0x5a);
     /* A source event describes when this capture opened, not the
@@ -123,6 +115,14 @@ int main(void)
     assert(mic_after_read.timestamp == event_mic.timestamp);
     assert(!strcmp(mic_after_read.source_name, event_mic.source_name));
     r2_ears_release_event(&mic_after_read);
+    /* The caller is allowed to reopen with a pointer into the current event.
+     * The old implementation freed it during close before opening the source. */
+    assert(r2_ears_open_source(mic, mic->event.source_name) == 0);
+    assert(r2_ears_is_open(mic));
+    R2HearingEvent reopened = {0};
+    assert(r2_ears_get_event(mic, &reopened) == 0);
+    assert(!strcmp(reopened.source_name, microphone_name));
+    r2_ears_release_event(&reopened);
     r2_ears_close(mic);
     /* An event snapshot remains owned by its caller after the live source closes. */
     assert(!strcmp(event_mic.source_name, microphone_name));
