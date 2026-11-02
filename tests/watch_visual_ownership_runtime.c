@@ -13,6 +13,13 @@ int __wrap_r2_visual_is_initialized(void)
     return 1;
 }
 
+/* Simulate an already opened physical camera, without needing a device. */
+int __wrap_r2_eyes_is_open(R2Eyes *receiver)
+{
+    assert((uintptr_t)receiver == 1);
+    return 1;
+}
+
 int main(void)
 {
     /* A stale Watch cleanup may not stop a replacement media session. */
@@ -48,6 +55,10 @@ int main(void)
     /* Camera cleanup has the same exact-generation contract.
      * The synthetic test has no camera; it checks that stale cleanup
      * never calls release and that an explicit release revokes ownership. */
+    eyes = (R2Eyes *)(uintptr_t)1;
+    assert(r2_eyes_start_for_watch() == 0);
+    assert(eyes_watch_token == 0); /* no takeover of an existing camera */
+    eyes = NULL;
     eyes_watch_token = 105;
     assert(r2_eyes_watch_owns(105));
     assert(!r2_eyes_watch_owns(104));
