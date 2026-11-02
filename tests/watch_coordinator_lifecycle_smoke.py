@@ -43,7 +43,11 @@ assert "r2_ears_status_desktop_source(audio.desktop_monitor)" in worker
 assert "audio_known && (!desktop_playing || monitor_changed)" in worker
 assert "r2_audio_discovery_free(&audio)" in worker
 assert "wanted_audio" not in worker, "desktop playback must never displace microphone hearing"
-assert "if (managed_camera)" in worker and "r2_eyes_release_source()" in worker
+assert "if (managed_camera)" in worker
+assert "r2_eyes_start_for_watch()" in worker
+assert "r2_eyes_watch_owns(managed_camera)" in worker
+assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
+assert "(void)r2_eyes_release_source();" not in worker
 assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_vision_watch_start()" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker\nassert "r2_vision_media_open_vlc_for_watch()" in worker\nassert "r2_vision_media_watch_owns(managed_media_token)" in worker
