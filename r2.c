@@ -12362,6 +12362,25 @@ int r2_ears_status_desktop(void)
     return active;
 }
 
+/* The primary listener may have been deliberately opened on a monitor
+ * other than the first active playback sink. Return its exact owned name
+ * so Watch never leaves that first sink silently uncaptured. */
+char *r2_ears_current_desktop_source(void)
+{
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    R2HearingEvent event = {0};
+    int valid = ears_desktop && ears_desktop_capture_thread_started &&
+        atomic_load(&ears_desktop_capture_running) &&
+        r2_ears_get_event(ears_desktop, &event) == 0;
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    if (!valid) {
+        r2_ears_release_event(&event);
+        return NULL;
+    }
+    /* Event source is a caller-owned snapshot. Return that allocation as-is. */
+    return event.source_name;
+}
+
 int r2_ears_status_desktop_source(const char *expected_monitor)
 {
     if (!expected_monitor || !*expected_monitor) return 0;
