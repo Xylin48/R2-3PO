@@ -601,12 +601,18 @@ int r2_ears_open_source(
  * Open default microphone / recording source
  * --------------------------------------------------------- */
 
+int r2_ears_open_microphone_source(R2Ears *ears, const char *source)
+{
+    if (!ears || !source || !*source) return -1;
+    return r2_ears_open_source(ears, source);
+}
+
 int r2_ears_open_microphone(R2Ears *ears)
 {
     if (!ears) return -1;
     char *source = r2_ears_find_microphone();
     if (!source) return -1;
-    int result = r2_ears_open_source(ears, source);
+    int result = r2_ears_open_microphone_source(ears, source);
     free(source);
     return result;
 }
