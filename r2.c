@@ -371,6 +371,8 @@ static atomic_uint ears_stop_requesters = ATOMIC_VAR_INIT(0);
 static atomic_int ears_desktop_capture_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int r2_ears_recent_requested = 0;
 static _Thread_local int r2_ears_desktop_requested = 0;
+/* Set only by an explicit EARS_LISTEN request for an exact other output. */
+static _Thread_local const char *r2_ears_extra_requested = NULL;
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
@@ -11270,11 +11272,13 @@ typedef struct R2ExtraDesktop {
     size_t length;
     size_t position;
     uint64_t total_bytes;
+    uint64_t generation; /* never splice PCM from a replaced source */
     struct R2ExtraDesktop *next;
 } R2ExtraDesktop;
 
 static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ExtraDesktop *extra_desktop_head = NULL;
+static atomic_uint_fast64_t extra_desktop_generation = ATOMIC_VAR_INIT(1);
 
 static void *r2_extra_desktop_worker(void *arg)
 {
@@ -11388,6 +11392,8 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
                 result = -1;
                 continue;
             }
+            atomic_init(&entry->running, 0);
+            entry->generation = atomic_fetch_add(&extra_desktop_generation, 1);
             entry->monitor = strdup(monitor);
             entry->recent = malloc(R2_EARS_RECENT_CAPACITY);
             if (!entry->monitor || !entry->recent ||
@@ -11466,6 +11472,77 @@ int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output)
     pthread_mutex_unlock(&extra_desktop_lock);
     errno = ENOENT;
     return -1;
+}
+
+/* Caller-selected independent output audio. This function deliberately
+ * does not infer whether the audio is speech or what caused a sound.
+ * The exact source generation must survive the entire requested interval.
+ */
+static int r2_ears_extra_write_pcm(const char *monitor, uint32_t bytes,
+                                   FILE *wav, int recent,
+                                   int (*cancelled)(void *), void *userdata)
+{
+    if (!monitor || !*monitor || !wav || !bytes ||
+        bytes > R2_EARS_RECENT_CAPACITY || bytes % 4U) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned char *snapshot = malloc(bytes);
+    if (!snapshot) return -1;
+    uint64_t generation = 0, start_total = 0;
+    int copied = 0, seen_source = 0;
+    for (;;) {
+        if (shutting_down || (cancelled && cancelled(userdata))) {
+            errno = ECANCELED;
+            break;
+        }
+        pthread_mutex_lock(&extra_desktop_lock);
+        R2ExtraDesktop *entry = extra_desktop_head;
+        for (; entry && strcmp(entry->monitor, monitor); entry = entry->next) {}
+        if (!entry || !atomic_load(&entry->running) ||
+            (generation && generation != entry->generation)) {
+            pthread_mutex_unlock(&extra_desktop_lock);
+            errno = seen_source ? ECANCELED : ENOENT;
+            break;
+        }
+        seen_source = 1;
+        pthread_mutex_lock(&entry->history_lock);
+        if (!generation) {
+            generation = entry->generation;
+            start_total = entry->total_bytes;
+        }
+        uint64_t since_start = entry->total_bytes >= start_total
+            ? entry->total_bytes - start_total : UINT64_MAX;
+        int ready = recent ? entry->length >= bytes
+                           : since_start >= bytes && since_start <= R2_EARS_RECENT_CAPACITY;
+        if (ready) {
+            size_t start = recent ?
+                (entry->position + R2_EARS_RECENT_CAPACITY - bytes) %
+                    R2_EARS_RECENT_CAPACITY
+                : (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
+            size_t first = R2_EARS_RECENT_CAPACITY - start;
+            if (first > bytes) first = bytes;
+            memcpy(snapshot, entry->recent + start, first);
+            if (bytes > first)
+                memcpy(snapshot + first, entry->recent, bytes - first);
+            copied = 1;
+        }
+        int overrun = !recent && since_start > R2_EARS_RECENT_CAPACITY;
+        pthread_mutex_unlock(&entry->history_lock);
+        pthread_mutex_unlock(&extra_desktop_lock);
+        if (copied) break;
+        if (recent || overrun) {
+            errno = recent ? EAGAIN : EOVERFLOW;
+            break;
+        }
+        struct timespec pause = {0, 100000000L};
+        while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
+            if (shutting_down || (cancelled && cancelled(userdata))) break;
+    }
+    int rc = copied && (!cancelled || !cancelled(userdata)) &&
+        !shutting_down && fwrite(snapshot, 1, bytes, wav) == bytes ? 0 : -1;
+    free(snapshot);
+    return rc;
 }
 
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
@@ -11793,6 +11870,17 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     if (fwrite(empty_header, 1, sizeof(empty_header), wav) != sizeof(empty_header))
         goto cleanup;
 
+    if (r2_ears_extra_requested) {
+        /* Deliberate per-monitor attention: never preempt mic/primary
+         * capture or mix other independent desktop outputs into this WAV. */
+        if (r2_ears_extra_write_pcm(r2_ears_extra_requested, total_bytes, wav,
+                                    r2_ears_recent_requested,
+                                    cancelled, userdata) == 0 &&
+            !shutting_down && !(cancelled && cancelled(userdata)) &&
+            r2_ears_write_wav_header(wav, total_bytes) == 0 &&
+            fflush(wav) == 0)
+            capture_ok = 1;
+    } else {
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_stop_requesters) != 0) {
         pthread_mutex_unlock(&ears_capture_lock);
@@ -11891,6 +11979,8 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     }
     if (fclose(wav) != 0) capture_ok = 0;
     wav = NULL;
+    } /* ordinary microphone / primary desktop capture */
+
     if (!capture_ok) goto cleanup;
 
     /* Only the private completed clip is normalized for whisper.cpp.
