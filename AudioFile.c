@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <spawn.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -16,6 +17,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char **environ;
 
 struct R2AudioFile {
     int pcm_fd;             /* nonblocking read end, owned by this object */
@@ -29,7 +32,9 @@ static void r2_file_close_fd(int *fd)
     if (*fd < 0) return;
     int old = *fd;
     *fd = -1;
-    while (close(old) < 0 && errno == EINTR) {}
+    /* On Linux close(EINTR) still releases this fd. Retrying could close a
+     * descriptor opened by a different thread after this call. */
+    (void)close(old);
 }
 
 static uint64_t r2_file_now_ms(void)
@@ -53,30 +58,41 @@ R2AudioFile *r2_audio_file_open(const char *path, uint32_t sample_rate,
     atomic_init(&file->cancelled, 0);
 
     int pipes[2] = {-1, -1};
-    if (pipe2(pipes, O_CLOEXEC | O_NONBLOCK) < 0) goto error;
+    /* Only the reader should be nonblocking: applying O_NONBLOCK to the
+     * pipe writer makes FFmpeg fail with EAGAIN under normal backpressure. */
+    if (pipe2(pipes, O_CLOEXEC) < 0) goto error;
+    int flags = fcntl(pipes[0], F_GETFL);
+    if (flags < 0 || fcntl(pipes[0], F_SETFL, flags | O_NONBLOCK) < 0)
+        goto error;
     file->cancel_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (file->cancel_fd < 0) goto error;
 
     char rate[32], channel_count[32];
     snprintf(rate, sizeof(rate), "%u", sample_rate);
     snprintf(channel_count, sizeof(channel_count), "%u", channels);
-    pid_t child = fork();
-    if (child < 0) goto error;
-    if (child == 0) {
-        /* The child never inherits the reader or cancellation channel.
-         * No shell interpolation: the entire filename is one argv entry. */
-        close(pipes[0]);
-        close(file->cancel_fd);
-        if (dup2(pipes[1], STDOUT_FILENO) < 0) _exit(127);
-        close(pipes[1]);
+    posix_spawn_file_actions_t actions;
+    int spawn_rc = posix_spawn_file_actions_init(&actions);
+    if (spawn_rc != 0) { errno = spawn_rc; goto error; }
+    spawn_rc = posix_spawn_file_actions_addclose(&actions, pipes[0]);
+    if (spawn_rc == 0)
+        spawn_rc = posix_spawn_file_actions_addclose(&actions, file->cancel_fd);
+    if (spawn_rc == 0)
+        spawn_rc = posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+    if (spawn_rc == 0 && pipes[1] != STDOUT_FILENO)
+        spawn_rc = posix_spawn_file_actions_addclose(&actions, pipes[1]);
+    pid_t child = -1;
+    if (spawn_rc == 0) {
         char *const argv[] = {
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-i", (char *)path, "-vn", "-f", "s16le", "-ar", rate,
             "-ac", channel_count, "-acodec", "pcm_s16le", "pipe:1", NULL
         };
-        execvp(argv[0], argv);
-        _exit(127);
+        /* Safe from a multithreaded program; FFmpeg receives a single
+         * filename argument, without a shell or inherited cancel pipe. */
+        spawn_rc = posix_spawnp(&child, argv[0], &actions, NULL, argv, environ);
     }
+    (void)posix_spawn_file_actions_destroy(&actions);
+    if (spawn_rc != 0) { errno = spawn_rc; goto error; }
     file->child = child;
     file->pcm_fd = pipes[0];
     pipes[0] = -1;
