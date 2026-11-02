@@ -11813,6 +11813,7 @@ static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
         return 0;
     }
     ears_desktop_watch_token = 0;
+    if (ears_desktop) r2_ears_cancel(ears_desktop);
     atomic_store(&ears_desktop_capture_running, 0);
     if (ears_desktop_capture_thread_started) {
         pthread_join(ears_desktop_capture_thread, NULL);
@@ -11867,13 +11868,17 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
     if (!ears) return -1;
     /* Only explicit unconditional stops should interrupt direct listening.
      * A Watch cleanup cannot cancel another caller's one-shot capture. */
-    if (!watch_only) atomic_fetch_add(&ears_stop_requesters, 1);
+    if (!watch_only) {
+        atomic_fetch_add(&ears_stop_requesters, 1);
+        r2_ears_cancel(ears); /* wake a direct listen BEFORE waiting for its mutex */
+    }
     pthread_mutex_lock(&ears_capture_lock);
     if (watch_only && (!watch_token || ears_microphone_watch_token != watch_token)) {
         pthread_mutex_unlock(&ears_capture_lock);
         return 0;
     }
     ears_microphone_watch_token = 0;
+    r2_ears_cancel(ears); /* release Watch-owned reader before join */
     atomic_store(&ears_capture_running, 0);
     if (ears_capture_thread_started) {
         pthread_join(ears_capture_thread, NULL);
