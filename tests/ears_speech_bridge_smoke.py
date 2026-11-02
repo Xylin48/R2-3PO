@@ -104,10 +104,12 @@ assert "pthread_join(ears_capture_thread, NULL)" in core
 assert "r2_ears_cancel(ears);" in core[core.index("static int r2_ears_stop_impl("):], (
     "the lifecycle owner must release the stream after joining the reader"
 )
-assert "if (feof(ears->file_stream))" in read_impl
-assert "r2_ears_close(ears);" in read_impl[
-    read_impl.index("if (feof(ears->file_stream))"):
-    read_impl.index("if (ferror(ears->file_stream))")
-], "decoded audio EOF must close the finished stream"
+# File decoder EOF must mark the event inactive without freeing a transport
+# while another thread still holds a read reference. The owner closes it.
+assert "r2_audio_file_read(ears->file_stream, buffer," in read_impl
+assert "atomic_store(&ears->open, 0);" in read_impl
+assert "r2_audio_file_close(ears->file_stream);" in ears
+assert "r2_audio_file_cancel(ears->file_stream);" in ears
+assert "r2_ears_close(ears);" not in read_impl
 assert "Qwen 3.5 9B accepts text and images, not raw microphone PCM" in ears_header
 print("Local microphone capture, Whisper transcription, and normal chat handoff smoke checks passed.")
