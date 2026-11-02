@@ -26,18 +26,22 @@ assert "r2_ears_start()" not in start_body
 assert "r2_ears_stop()" not in start_body
 assert "shell_watch_start();" in shell[shell.index("int r2_shell_run(void)"):]
 assert "while (!shell_watch_cancelled(NULL))" in worker
-assert "r2_ears_microphone_available()" in worker
-assert "r2_ears_desktop_playing()" in worker
+assert "r2_audio_discover(&audio)" in worker
+assert "audio_known && audio.microphone_source" in worker
+assert "audio_known ? audio.desktop_playing" in worker
 assert "r2_vision_camera_available()" in worker
 assert "r2_vision_vlc_available()" in worker
 assert "r2_vision_window_available(media_window)" in worker
-assert "r2_ears_start_desktop_for_watch()" in worker
-assert "r2_ears_start_for_watch()" in worker
+assert "r2_ears_start_desktop_for_watch(audio.desktop_monitor)" in worker
+assert "r2_ears_start_for_watch(audio.microphone_source)" in worker
 assert "if (managed_microphone)" in worker and "r2_ears_stop_if_watch_owned(managed_microphone)" in worker
 assert "if (managed_desktop)" in worker and "r2_ears_stop_desktop_if_watch_owned(managed_desktop)" in worker
 assert "r2_ears_stop()" not in worker and "r2_ears_stop_desktop()" not in worker
 assert "r2_ears_start()" not in worker and "r2_ears_start_desktop()" not in worker
 assert "r2_ears_status_desktop()" in worker
+assert "r2_ears_status_desktop_source(audio.desktop_monitor)" in worker
+assert "audio_known && (!desktop_playing || monitor_changed)" in worker
+assert "r2_audio_discovery_free(&audio)" in worker
 assert "wanted_audio" not in worker, "desktop playback must never displace microphone hearing"
 assert "if (managed_camera)" in worker and "r2_eyes_release_source()" in worker
 assert "r2_sense_auto_allowed(1)" in worker
