@@ -32,6 +32,7 @@ typedef struct {
     char *default_source;
     char *fallback_microphone;
     R2AudioDiscovery data;
+    size_t resolving_output_slot; /* SIZE_MAX for default-only monitor */
 } R2PulseScan;
 
 static uint64_t r2_discovery_now_ms(void)
@@ -53,6 +54,9 @@ void r2_audio_discovery_free(R2AudioDiscovery *result)
     free(result->microphone_source);
     free(result->desktop_monitor);
     free(result->default_sink);
+    for (size_t i = 0; i < result->playback_output_count; ++i)
+        free(result->playback_outputs[i].monitor);
+    free(result->playback_outputs);
     memset(result, 0, sizeof(*result));
     result->playback_pid = -1;
     result->playback_sink = PA_INVALID_INDEX;
@@ -108,6 +112,9 @@ static long r2_discovery_pid(const char *source)
         ? value : -1;
 }
 
+/* Snapshot every distinct output sink with live, uncorked playback.
+ * Multiple applications on the same sink share its monitor; different
+ * sinks never collapse into one audio stream. */
 static void r2_discovery_sink_input(pa_context *ctx,
                                      const pa_sink_input_info *info,
                                      int eol, void *userdata)
@@ -121,14 +128,33 @@ static void r2_discovery_sink_input(pa_context *ctx,
     }
     if (!info || info->corked || info->sink == PA_INVALID_INDEX)
         return;
-    /* Deterministic first active stream: do not report a PID from a
-     * different (possibly paused) stream or guess from an app name. */
-    if (scan->data.desktop_playing) return;
-    scan->data.desktop_playing = 1;
-    scan->data.playback_sink = info->sink;
+    for (size_t i = 0; i < scan->data.playback_output_count; ++i)
+        if (scan->data.playback_outputs[i].sink_index == info->sink)
+            return;
+    if (scan->data.playback_output_count == SIZE_MAX ||
+        scan->data.playback_output_count >= SIZE_MAX / sizeof(R2AudioPlaybackOutput)) {
+        scan->failed = 1;
+        return;
+    }
+    size_t next = scan->data.playback_output_count + 1;
+    R2AudioPlaybackOutput *grown = realloc(
+        scan->data.playback_outputs, next * sizeof(*grown));
+    if (!grown) { scan->failed = 1; return; }
+    scan->data.playback_outputs = grown;
     const char *pid = info->proplist ?
         pa_proplist_gets(info->proplist, PA_PROP_APPLICATION_PROCESS_ID) : NULL;
-    scan->data.playback_pid = r2_discovery_pid(pid);
+    R2AudioPlaybackOutput *output = &grown[scan->data.playback_output_count];
+    *output = (R2AudioPlaybackOutput){
+        .monitor = NULL,
+        .sink_index = info->sink,
+        .playback_pid = r2_discovery_pid(pid)
+    };
+    scan->data.playback_output_count = next;
+    if (!scan->data.desktop_playing) {
+        scan->data.desktop_playing = 1;
+        scan->data.playback_sink = info->sink;
+        scan->data.playback_pid = output->playback_pid;
+    }
 }
 
 static void r2_discovery_sink_info(pa_context *ctx, const pa_sink_info *info,
@@ -145,7 +171,23 @@ static void r2_discovery_sink_info(pa_context *ctx, const pa_sink_info *info,
         scan->failed = 1;
         return;
     }
-    if (!scan->data.desktop_monitor) {
+    if (scan->resolving_output_slot != SIZE_MAX) {
+        if (scan->resolving_output_slot >= scan->data.playback_output_count ||
+            scan->data.playback_outputs[scan->resolving_output_slot].sink_index != info->index) {
+            scan->failed = 1; /* route changed during introspection */
+            return;
+        }
+        R2AudioPlaybackOutput *output =
+            &scan->data.playback_outputs[scan->resolving_output_slot];
+        if (!output->monitor) {
+            output->monitor = strdup(info->monitor_source_name);
+            if (!output->monitor) scan->failed = 1;
+        }
+    }
+    if (!scan->data.desktop_monitor && scan->resolving_output_slot == 0) {
+        scan->data.desktop_monitor = strdup(info->monitor_source_name);
+        if (!scan->data.desktop_monitor) scan->failed = 1;
+    } else if (!scan->data.desktop_monitor && scan->resolving_output_slot == SIZE_MAX) {
         scan->data.desktop_monitor = strdup(info->monitor_source_name);
         if (!scan->data.desktop_monitor) scan->failed = 1;
     }
@@ -195,6 +237,7 @@ int r2_audio_discover(R2AudioDiscovery *result)
     R2PulseScan scan = {0};
     scan.data.playback_pid = -1;
     scan.data.playback_sink = PA_INVALID_INDEX;
+    scan.resolving_output_slot = SIZE_MAX;
     uint64_t started = r2_discovery_now_ms();
     if (started == UINT64_MAX || started > UINT64_MAX - R2_DISCOVERY_DEADLINE_MS)
         return -1;
@@ -234,17 +277,27 @@ int r2_audio_discover(R2AudioDiscovery *result)
     scan.done = scan.failed = 0;
     if (r2_discovery_run(&scan, pa_context_get_sink_input_info_list(
             scan.context, r2_discovery_sink_input, &scan)) < 0) goto fail;
-    /* The active stream's actual sink takes precedence over the desktop
-     * default; a manually started listener can still open the default sink
-     * when nothing is playing. */
-    if (scan.data.desktop_playing || scan.data.default_sink) {
+    /* Resolve every distinct active sink's actual monitor. Keep the
+     * first-selected monitor as the legacy desktop listener for existing
+     * explicit attention commands, without hiding other simultaneously
+     * audible outputs. No hard device-count cap is imposed. */
+    for (size_t i = 0; i < scan.data.playback_output_count; ++i) {
         scan.done = scan.failed = 0;
-        pa_operation *op = scan.data.desktop_playing ?
-            pa_context_get_sink_info_by_index(scan.context, scan.data.playback_sink,
-                                               r2_discovery_sink_info, &scan) :
-            pa_context_get_sink_info_by_name(scan.context, scan.data.default_sink,
-                                              r2_discovery_sink_info, &scan);
+        scan.resolving_output_slot = i;
+        pa_operation *op = pa_context_get_sink_info_by_index(
+            scan.context, scan.data.playback_outputs[i].sink_index,
+            r2_discovery_sink_info, &scan);
         if (r2_discovery_run(&scan, op) < 0 ||
+            !scan.data.playback_outputs[i].monitor) goto fail;
+    }
+    /* A manually requested desktop listener can still open the default
+     * monitor when no app currently plays to an output sink. */
+    if (!scan.data.desktop_playing && scan.data.default_sink) {
+        scan.done = scan.failed = 0;
+        scan.resolving_output_slot = SIZE_MAX;
+        if (r2_discovery_run(&scan,
+            pa_context_get_sink_info_by_name(scan.context, scan.data.default_sink,
+                                              r2_discovery_sink_info, &scan)) < 0 ||
             !scan.data.desktop_monitor) goto fail;
     }
 
