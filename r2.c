@@ -5338,18 +5338,11 @@ static char *r2_retry_direct_answer(Message *messages_copy,
     return retry;
 }
 
-/*
- * Give ordinary turns a substantial bounded evidence budget: normal conversation
- * still searches persistent memory, Life Log, diary, and visual experiences, while
- * explicit recall receives a larger ceiling. The Ollama payload builder applies
- * a second hardware-aware cap so these retrieval budgets do not override RAM headroom.
- */
+/* Search counts select the records made available for this turn. Complete
+ * selected contents are preserved; only the real configured inference window
+ * determines whether the final request can proceed. */
 #define R2_TURN_MEMORY_LIMIT 10
-#define R2_TURN_MEMORY_CHARS 6000
-#define R2_TURN_HISTORY_CHARS 6000
 #define R2_TURN_HISTORY_SEARCHES 12
-#define R2_RECALL_MEMORY_CHARS 18000
-#define R2_RECALL_HISTORY_CHARS 14000
 #define R2_RECALL_HISTORY_SEARCHES 16
 
 /*
@@ -5420,23 +5413,6 @@ static int r2_query_explicitly_requests_recall(const char *query)
     return 0;
 }
 
-/* Clip only at a record boundary when possible, so a memory is not half-sent. */
-static void r2_bound_context_records(char *context, size_t max_chars)
-{
-    if (!context || max_chars == 0)
-        return;
-    size_t length = strlen(context);
-    if (length <= max_chars)
-        return;
-
-    size_t cut = max_chars;
-    while (cut > 0 && context[cut] != '\n')
-        --cut;
-    if (cut == 0)
-        cut = r2_utf8_safe_prefix_length(context, max_chars);
-    context[cut] = '\0';
-}
-
 /*
  * Ask the same local model to interpret the current message for retrieval,
  * not to answer it. These associative cues are used only to search R2's
@@ -5448,102 +5424,44 @@ typedef char *(*R2AssociationSearchFn)(const char *, int);
 
 /* Search other existing experience stores with the same model-generated cues.
    This is read-only retrieval: it does not rewrite or promote stored records. */
-static char *r2_collect_associated_records(
-    char keywords[MAX_MEMORY_KEYWORDS][64],
-    size_t keyword_count,
-    R2AssociationSearchFn search_fn,
-    size_t max_chars)
+static int r2_append_association_section(char **context, const char *heading, const char *records)
 {
-    if (!search_fn || max_chars == 0)
-        return xstrdup("");
-
-    char *out = calloc(max_chars + 1, 1);
-    if (!out)
-        return NULL;
-
-    size_t used = 0;
-    int searches = 0;
-    for (size_t i = 0; i < keyword_count && searches < 6 && used < max_chars; ++i) {
-        if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i]))
-            continue;
-
-        char *found = search_fn(keywords[i], 2);
-        ++searches;
-        if (!found || !*found) {
-            free(found);
-            continue;
-        }
-
-        if (strstr(found, "No Life Log events matched") ||
-            strstr(found, "The Life Log contains no events") ||
-            strstr(found, "No visual experiences matched")) {
-            free(found);
-            continue;
-        }
-
-        /* Avoid repeating the same entry when several cues hit it. */
-        if (used && strstr(out, found)) {
-            free(found);
-            continue;
-        }
-
-        size_t n = strlen(found);
-        if (n > max_chars - used)
-            n = max_chars - used;
-        while (n > 0 && found[n - 1] != '\n')
-            --n;
-        if (n == 0)
-            n = r2_utf8_safe_prefix_length(found, max_chars - used);
-        if (n == 0) {
-            free(found);
-            break;
-        }
-
-        if (used)
-            out[used++] = '\n';
-        if (n > max_chars - used)
-            n = r2_utf8_safe_prefix_length(found, max_chars - used);
-        if (n == 0) {
-            free(found);
-            break;
-        }
-        memcpy(out + used, found, n);
-        used += n;
-        out[used] = '\0';
-        free(found);
-    }
-
-    if (used == 0) {
-        free(out);
-        return xstrdup("");
-    }
-    return out;
+    if (!context || !*context || !heading || !records) { errno = EINVAL; return -1; }
+    if (!*records) return 0;
+    size_t old_n = strlen(*context), heading_n = strlen(heading), records_n = strlen(records);
+    if (old_n > SIZE_MAX - 4 || heading_n > SIZE_MAX - 4 - old_n ||
+        records_n > SIZE_MAX - 4 - old_n - heading_n) { errno = EOVERFLOW; return -1; }
+    size_t total = old_n + heading_n + records_n + 4;
+    char *joined = malloc(total);
+    if (!joined) return -1;
+    snprintf(joined, total, "%s%s%s%s\n", *context, old_n ? "\n\n" : "", heading, records);
+    free(*context); *context = joined;
+    return 0;
 }
 
-static void r2_append_association_section(
-    char **context,
-    const char *heading,
-    const char *records)
+/* Each requested search returns complete records. Search/row counts bound
+ * selection; no character cap or substring-based deduplication may cut evidence.
+ * NULL is a failed read, while an empty successful result remains valid. */
+static char *r2_collect_associated_records(
+    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, R2AssociationSearchFn search_fn)
 {
-    if (!context || !*context || !heading || !records || !*records)
-        return;
-
-    size_t old_n = strlen(*context);
-    size_t heading_n = strlen(heading);
-    size_t records_n = strlen(records);
-    if (old_n > SIZE_MAX - heading_n - records_n - 8)
-        return;
-
-    size_t total = old_n + heading_n + records_n + 8;
-    char *joined = malloc(total);
-    if (!joined)
-        return;
-
-    snprintf(joined, total, "%s%s%s%s%s",
-             *context, old_n ? "\n\n" : "",
-             heading, records, "\n");
-    free(*context);
-    *context = joined;
+    if (!search_fn) { errno = EINVAL; return NULL; }
+    char *out = xstrdup("");
+    if (!out) return NULL;
+    int searches = 0;
+    for (size_t i = 0; i < keyword_count && searches < 6; ++i) {
+        if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i])) continue;
+        char *found = search_fn(keywords[i], 2);
+        ++searches;
+        if (!found) { free(out); return NULL; }
+        /* Match only the complete API sentinel, never words quoted in data. */
+        int empty = !*found || !strcmp(found, "(No visual experiences found.)\n");
+        if (!empty && r2_append_association_section(&out, "", found) != 0) {
+            free(found); free(out); return NULL;
+        }
+        free(found);
+    }
+    return out;
 }
 
 static pthread_mutex_t r2_associative_query_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -5895,7 +5813,7 @@ static char *chat_with_relevant_memories(
 {
     /*
        Preserve the user's original message as an actual user turn.
-       Historical memory and Life Log evidence is bounded and kept with the
+       Historical memory and Life Log evidence is kept with the
        leading system context, before dialogue begins. Live Reality is refreshed
        separately, and live visual evidence is never cached here. The permanent
        conversation is never modified by retrieval.
@@ -5904,8 +5822,6 @@ static char *chat_with_relevant_memories(
     int explicit_recall = r2_query_explicitly_requests_recall(query);
     int memory_limit = explicit_recall ? MAX_RELEVANT_MEMORIES
                                        : R2_TURN_MEMORY_LIMIT;
-    size_t memory_char_limit = explicit_recall ? R2_RECALL_MEMORY_CHARS
-                                               : R2_TURN_MEMORY_CHARS;
     int history_search_limit = explicit_recall ? R2_RECALL_HISTORY_SEARCHES
                                                : R2_TURN_HISTORY_SEARCHES;
 
@@ -5930,7 +5846,6 @@ static char *chat_with_relevant_memories(
     } else {
         fprintf(stderr, "[R2 Context] Reused persistent-memory retrieval from RAM cache.\n");
     }
-    r2_bound_context_records(memory_context, memory_char_limit);
 
     /*
        Conversation continuity: the Life Log retains complete historical
@@ -5980,22 +5895,22 @@ static char *chat_with_relevant_memories(
         extract_memory_keywords(associative_query, associated_keywords);
 
     char *diary_matches = r2_collect_associated_records(
-        associated_keywords, associated_count, r2_diary_search, 1400);
-    if (diary_matches && *diary_matches)
-        r2_append_association_section(
-            &memory_context,
-            "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n",
-            diary_matches);
+        associated_keywords, associated_count, r2_diary_search);
+    if (!diary_matches || r2_append_association_section(&memory_context,
+            "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n", diary_matches) != 0) {
+        free(diary_matches); free(associative_query); free(memory_context);
+        r2_history_release(&life_history); return NULL;
+    }
     free(diary_matches);
 
     if (r2_visual_is_initialized()) {
         char *visual_matches = r2_collect_associated_records(
-            associated_keywords, associated_count, r2_visual_search, 1400);
-        if (visual_matches && *visual_matches)
-            r2_append_association_section(
-                &memory_context,
-                "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n",
-                visual_matches);
+            associated_keywords, associated_count, r2_visual_search);
+        if (!visual_matches || r2_append_association_section(&memory_context,
+                "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n", visual_matches) != 0) {
+            free(visual_matches); free(associative_query); free(memory_context);
+            r2_history_release(&life_history); return NULL;
+        }
         free(visual_matches);
     }
 
@@ -6018,17 +5933,9 @@ static char *chat_with_relevant_memories(
     if (r2_visual_is_initialized() &&
         (visual_requested || (eyes && r2_eyes_is_open(eyes)))) {
         char *prior_visual = r2_visual_recent(3);
-        if (prior_visual && *prior_visual) {
-            size_t old_n = strlen(memory_context);
-            size_t visual_n = strlen(prior_visual);
-            char *joined = malloc(old_n + visual_n + 160);
-            if (joined) {
-                snprintf(joined, old_n + visual_n + 160,
-                         "%s%sPRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n%s\n",
-                         memory_context, old_n ? "\n\n" : "", prior_visual);
-                free(memory_context);
-                memory_context = joined;
-            }
+        if (!prior_visual || r2_append_association_section(&memory_context,
+                "PRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n", prior_visual) != 0) {
+            free(prior_visual); free(memory_context); r2_history_release(&life_history); return NULL;
         }
         free(prior_visual);
     }
@@ -6052,33 +5959,15 @@ static char *chat_with_relevant_memories(
             const char unavailable[] =
                 "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request. "
                 "Do not claim to see the current scene from historical memories.";
-            size_t old_n = strlen(memory_context);
-            size_t note_n = sizeof(unavailable) - 1U;
-            char *joined = malloc(old_n + note_n + 4U);
-            if (joined) {
-                snprintf(joined, old_n + note_n + 4U, "%s%s%s",
-                         memory_context, old_n ? "\n\n" : "", unavailable);
-                free(memory_context);
-                memory_context = joined;
+            if (r2_append_association_section(&memory_context, "", unavailable) != 0) {
+                free(memory_context); r2_history_release(&life_history); return NULL;
             }
         }
     }
 
-    /*
-     * Per-section limits do not bound the final sum after diary, historical
-     * vision, and live visual evidence are appended. Cap the complete evidence
-     * block immediately before it is inserted into the prompt. The actual user
-     * message is stored separately and is never modified by this evidence cap.
-     */
-    size_t final_context_limit = explicit_recall ? 28000U : 16000U;
-    size_t assembled_context_chars = strlen(memory_context);
-    if (assembled_context_chars > final_context_limit) {
-        fprintf(stderr,
-                "[R2 Context] Assembled evidence exceeded the %zu-character budget (%zu); trimming before prompt construction.\n",
-                final_context_limit, assembled_context_chars);
-        r2_bound_context_records(memory_context, final_context_limit);
-    }
-
+    /* Selected records from every store stay complete; the final inference
+       allocator handles the actual configured model window. The actual user
+       message is stored separately and is never modified by retrieval. */
     if (life_history.length) {
         const char heading[] =
             "\n\nRELATED LIFE LOG HISTORY (prior conversations, media, and sensory events; "
@@ -13233,18 +13122,13 @@ static char *build_learning_context(void)
 {
     char *reward = r2_reward_context();
     char *addiction = r2_addiction_report();
-    size_t cap = 2400;
-    char *context = malloc(cap);
-    if (context) {
-        snprintf(context, cap,
+    char *context = NULL;
+    if (reward && addiction && asprintf(&context,
             "PERSISTENT LEARNING CONTEXT\n"
-            "REWARD/REINFORCEMENT SUMMARY:\n%.900s\n\n"
-            "REPEATED-INTEREST SUMMARY:\n%.900s\n",
-            reward ? reward : "(reinforcement context unavailable)",
-            addiction ? addiction : "(repeated-interest history unavailable)");
-    }
-    free(reward);
-    free(addiction);
+            "REWARD/REINFORCEMENT SUMMARY:\n%s\n\n"
+            "REPEATED-INTEREST SUMMARY:\n%s\n", reward, addiction) < 0)
+        context = NULL;
+    free(reward); free(addiction);
     return context;
 }
 

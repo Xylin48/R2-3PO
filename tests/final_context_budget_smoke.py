@@ -18,25 +18,18 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(1)
     print(f"PASS: {message}")
 
-cap = body.find("size_t final_context_limit = explicit_recall ? 28000U : 16000U;")
-visual_history = body.find("PRIOR VISUAL EXPERIENCES")
-copy_messages = body.find("size_t base_count")
-require(cap >= 0, "final assembled context has a recall/focused size cap")
-require(visual_history >= 0 and cap > visual_history,
-        "cap is applied after historical visual context is appended; live images are serialized separately")
+require("r2_bound_context_records" not in body and "final_context_limit" not in body,
+        "selected evidence is not clipped by intermediate character caps")
+require("r2_append_association_section(&memory_context" in body,
+        "diary and visual sections use checked complete allocations")
 require('json_object_object_add(message, "images", images)' in core
         and "r2_vision_current_frame_base64()" in core,
-        "current raw visual input is attached separately from bounded text retrieval")
-require(copy_messages >= 0 and cap < copy_messages,
-        "retrieval evidence is bounded before conversation history is copied into the prompt")
-require("r2_bound_context_records(memory_context, final_context_limit);" in body,
-        "legacy excerpt cap remains separate from complete Life Log records")
-
-require(body.find("if (life_history.length)") > cap,
-        "complete structured Life Log evidence is appended after the legacy excerpt cap")
+        "current raw visual input is serialized separately from historical evidence")
+require(body.find("if (life_history.length)") < body.find("size_t base_count"),
+        "complete Life Log evidence is assembled before prompt construction")
 require("r2_preserve_inference_units(msgs, count" in core
         and "Complete instructions, selected recall and current turn require" in core,
-        "final inference allocation preserves complete selected messages or reports insufficient configured capacity")
+        "final inference preserves complete selected messages or rejects insufficient configured capacity")
 
 budget_start = core.find("static R2SystemContextBudget r2_compute_system_context_budget(")
 budget_end = core.find("\n}\n", budget_start)
@@ -55,7 +48,7 @@ require("capability_context=%d" in core and "audit_capability_context = 1" in co
         "prompt audit reports whether capability instructions survived serialization")
 require("size_t category_remaining = reality_reserve > reality_used" in core
         and "reality_used += length;" in core,
-        "live Reality cannot consume more than its allocated prompt share")
+        "provisional allocation still measures live Reality separately")
 require("The actual user" in body and "message is stored separately" in body,
-        "retrieval cap explicitly preserves the user's actual message")
+        "retrieval preserves the user's actual message separately")
 print("Final retrieved-context budget regression passed.")
