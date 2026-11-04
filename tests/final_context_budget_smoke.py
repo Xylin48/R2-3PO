@@ -30,7 +30,13 @@ require('json_object_object_add(message, "images", images)' in core
 require(copy_messages >= 0 and cap < copy_messages,
         "retrieval evidence is bounded before conversation history is copied into the prompt")
 require("r2_bound_context_records(memory_context, final_context_limit);" in body,
-        "oversized retrieved evidence is clipped at a record boundary")
+        "legacy excerpt cap remains separate from complete Life Log records")
+
+require(body.find("if (life_history.length)") > cap,
+        "complete structured Life Log evidence is appended after the legacy excerpt cap")
+require("r2_preserve_inference_units(msgs, count" in core
+        and "Complete instructions, selected recall and current turn require" in core,
+        "final inference allocation preserves complete selected messages or reports insufficient configured capacity")
 
 budget_start = core.find("static R2SystemContextBudget r2_compute_system_context_budget(")
 budget_end = core.find("\n}\n", budget_start)

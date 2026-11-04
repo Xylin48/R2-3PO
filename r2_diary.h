@@ -2,6 +2,7 @@
 #define R2_DIARY_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * ============================================================
@@ -67,6 +68,8 @@ int r2_diary_reconnect_history(int limit);
 int r2_diary_write(
     const char *entry
 );
+/* Stable ID of the actual inserted row, protected by the diary write lock. */
+int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out);
 
 char *r2_diary_recent(
     int count

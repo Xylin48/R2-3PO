@@ -1078,7 +1078,7 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
 }
 
 static int r2_diary_write_unlocked(
-    const char *entry
+    const char *entry, int64_t *entry_id_out
 )
 {
     char timestamp[64];
@@ -1139,6 +1139,7 @@ static int r2_diary_write_unlocked(
     diary_entry_id = diary_insert_entry_row(entry, timestamp);
     if (diary_entry_id <= 0)
         return -1;
+    if (entry_id_out) *entry_id_out = diary_entry_id;
 
     /* Evaluate the explicitly configured identity-correction rule after
        the authoritative row exists. Reward metadata never copies diary prose. */
@@ -1226,12 +1227,18 @@ static int r2_diary_write_unlocked(
     return 0;
 }
 
-int r2_diary_write(const char *entry)
+int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 {
+    if (entry_id_out) *entry_id_out = 0;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
+}
+
+int r2_diary_write(const char *entry)
+{
+    return r2_diary_write_with_id(entry, NULL);
 }
 
 
