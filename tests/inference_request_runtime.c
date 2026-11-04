@@ -1,0 +1,232 @@
+/* Execute the real serializer, CURL setup and response handler without a server. */
+#define main r2_program_main
+#include "../r2.c"
+#undef main
+#include <assert.h>
+#include <stdarg.h>
+
+static const char *posted;
+static curl_off_t posted_size;
+static size_t (*write_response)(void *, size_t, size_t, void *);
+static void *write_data;
+static int perform_count, cleanup_count;
+static CURLoption failed_option;
+static int fail_predict_update;
+static char *response_body;
+static struct json_object *captured;
+
+int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
+int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
+{
+    struct json_object *existing = NULL;
+    if (fail_predict_update && !strcmp(key, "num_predict") &&
+        json_object_object_get_ex(object, key, &existing)) return -1;
+    return __real_json_object_object_add(object, key, value);
+}
+CURLcode __wrap_curl_easy_setopt(CURL *curl, CURLoption option, ...)
+{
+    (void)curl;
+    if (option == failed_option) return CURLE_OUT_OF_MEMORY;
+    va_list ap; va_start(ap, option);
+    switch (option) {
+    case CURLOPT_POSTFIELDS: posted = va_arg(ap, const char *); break;
+    case CURLOPT_POSTFIELDSIZE_LARGE: posted_size = va_arg(ap, curl_off_t); break;
+    case CURLOPT_WRITEFUNCTION:
+        write_response = va_arg(ap, size_t (*)(void *, size_t, size_t, void *)); break;
+    case CURLOPT_WRITEDATA: write_data = va_arg(ap, void *); break;
+    default: break;
+    }
+    va_end(ap);
+    return CURLE_OK;
+}
+CURLcode __wrap_curl_easy_perform(CURL *curl)
+{
+    (void)curl; ++perform_count;
+    assert(posted && posted_size == (curl_off_t)strlen(posted));
+    assert(write_response && write_data && response_body);
+    captured = json_tokener_parse(posted); assert(captured);
+    size_t n = strlen(response_body), split = n / 3;
+    assert(write_response(response_body, 1, split, write_data) == split);
+    assert(write_response(response_body + split, 1, n - split, write_data) == n - split);
+    return CURLE_OK;
+}
+CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
+{
+    (void)curl; assert(info == CURLINFO_RESPONSE_CODE);
+    va_list ap; va_start(ap, info); *va_arg(ap, long *) = 200; va_end(ap);
+    return CURLE_OK;
+}
+void __real_curl_easy_cleanup(CURL *);
+void __wrap_curl_easy_cleanup(CURL *curl)
+{
+    ++cleanup_count; __real_curl_easy_cleanup(curl);
+}
+static char *text(size_t n, char fill, const char *prefix)
+{
+    size_t p = strlen(prefix); assert(n >= p);
+    char *out = malloc(n + 1); assert(out);
+    memcpy(out, prefix, p); memset(out + p, fill, n - p); out[n] = '\0';
+    return out;
+}
+static void set_response(const char *answer, const char *reason, int done)
+{
+    if (captured) json_object_put(captured);
+    captured = NULL; posted = NULL; posted_size = 0; write_data = NULL; write_response = NULL;
+    free(response_body); response_body = NULL;
+    struct json_object *r = json_object_new_object(), *m = json_object_new_object();
+    assert(r && m);
+    json_object_object_add(m, "role", json_object_new_string("assistant"));
+    json_object_object_add(m, "content", json_object_new_string(answer));
+    json_object_object_add(m, "thinking", json_object_new_string("PRIVATE-THINKING-NEVER-ARCHIVE"));
+    json_object_object_add(r, "message", m);
+    json_object_object_add(r, "done", json_object_new_boolean(done));
+    if (reason) json_object_object_add(r, "done_reason", json_object_new_string(reason));
+    response_body = strdup(json_object_to_json_string_ext(r, JSON_C_TO_STRING_PLAIN));
+    assert(response_body); json_object_put(r);
+}
+static void check_request(Message *messages, size_t count, const char *override,
+                          int ctx, int requested, int expect_reallocation)
+{
+    char setting[24]; snprintf(setting, sizeof(setting), "%d", ctx);
+    assert(setenv("R2_OLLAMA_NUM_CTX", setting, 1) == 0);
+    const char *query = NULL;
+    size_t required = override ? strlen(override) : 0;
+    for (size_t i = 0; i < count; ++i) {
+        required += strlen(messages[i].content);
+        if (!strcmp(messages[i].role, "user") && !messages[i].internal_tool_result) query = messages[i].content;
+    }
+    ollama_authoritative_user_query = query;
+    set_response("ACTUAL COMPLETE ANSWER", "stop", 1);
+    int before = perform_count;
+    char *answer = ollama_chat_with_limit(messages, count, override, requested, 60);
+    assert(answer && !strcmp(answer, "ACTUAL COMPLETE ANSWER") && perform_count == before + 1);
+    free(answer);
+    struct json_object *options = NULL, *value = NULL, *array = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_ctx", &value) && json_object_get_int(value) == ctx);
+    assert(json_object_object_get_ex(options, "num_predict", &value));
+    int predict = json_object_get_int(value);
+    assert(predict >= 64 && predict <= requested);
+    assert(!expect_reallocation || predict < requested);
+    assert(required <= (size_t)(ctx - predict - 512) * 32U / 10U);
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    assert(json_object_array_length(array) == count + (override != NULL));
+    size_t matches = 0;
+    for (size_t i = 0; i < json_object_array_length(array); ++i) {
+        struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
+        assert(json_object_object_get_ex(entry, "content", &content));
+        assert(json_object_object_get_ex(entry, "role", &role));
+        const char *actual = json_object_get_string(content), *actual_role = json_object_get_string(role);
+        int found = override && !strcmp(actual_role, "system") && !strcmp(actual, override);
+        for (size_t j = 0; j < count; ++j)
+            if (!strcmp(actual_role, messages[j].role) && !strcmp(actual, messages[j].content)) found = 1;
+        assert(found); ++matches;
+    }
+    assert(matches == count + (override != NULL));
+    for (size_t j = 0; j < count; ++j) {
+        size_t occurrences = 0;
+        for (size_t i = 0; i < json_object_array_length(array); ++i) {
+            struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
+            assert(json_object_object_get_ex(entry, "content", &content));
+            assert(json_object_object_get_ex(entry, "role", &role));
+            if (!strcmp(json_object_get_string(role), messages[j].role) &&
+                !strcmp(json_object_get_string(content), messages[j].content)) ++occurrences;
+        }
+        assert(occurrences == 1);
+    }
+    ollama_authoritative_user_query = NULL;
+}
+static void check_boundaries(void)
+{
+    const int contexts[] = {2048, 4096, 8192, 12288, 16384};
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        int ctx = contexts[i], original = ctx / 2, predict = original;
+        size_t current = (size_t)(ctx - predict - 512) * 32U / 10U;
+        assert(r2_fit_complete_input(current, ctx, &predict) == 0 && predict == original);
+        assert(r2_fit_complete_input(current + 1, ctx, &predict) == 0 && predict < original);
+        size_t maximum = (size_t)(ctx - 512 - 64) * 32U / 10U;
+        predict = original;
+        assert(r2_fit_complete_input(maximum, ctx, &predict) == 0 && predict == 64);
+        predict = original;
+        assert(r2_fit_complete_input(maximum + 1, ctx, &predict) == -1 && errno == E2BIG && predict == original);
+        assert(r2_fit_complete_input(SIZE_MAX, ctx, &predict) == -1 && predict == original);
+    }
+}
+int main(void)
+{
+    assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
+    assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
+    assert(r2_log_init() == 0);
+    check_boundaries();
+    char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
+    char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
+    char *query = text(1000, 'u', "ACTUAL CURRENT USER: ");
+    char *result = text(500, 't', "[R2_INTERNAL_TOOL_RESULT]\n");
+    char *override = text(700, 'o', "COMPLETE OVERRIDE: ");
+    Message turn[] = {{"system", identity, 0, 0}, {"system", retrieval, 0, 0},
+        {"user", query, 0, 0}, {"assistant", "[R2_INTERNAL_TOOL_REQUEST]\nprocessed", 0, 0}, {"user", result, 0, 1}};
+    ollama_audit_stage = "conversation-answer";
+    check_request(turn, 5, override, 4096, 2048, 1);
+    ollama_audit_stage = "unspecified";
+    char *large_contract = text(25000, 'c', "HELPER CONTRACT: ");
+    Message helper[] = {{"system", large_contract, 0, 0}, {"user", "helper task", 0, 0}};
+    check_request(helper, 2, override, 16384, 8192, 1);
+    char *large_user = text(18000, 'q', "LONG COMPLETE USER: ");
+    Message user_turn = {"user", large_user, 0, 0};
+    check_request(&user_turn, 1, override, 8192, 4096, 1);
+    Message small = {"user", "small turn", 0, 0};
+    check_request(&small, 1, large_contract, 16384, 8192, 1);
+    check_request(&small, 1, "small contract", 4096, 2048, 0);
+
+    char *oversized = text(60000, 'x', "CURRENT TURN RETRIEVED CONTEXT\n");
+    Message impossible[] = {{"system", oversized, 0, 0}, {"user", "actual user", 0, 0}};
+    set_response("should never run", "stop", 1);
+    int before = perform_count;
+    assert(!ollama_chat_with_limit(impossible, 2, NULL, 2048, 60) && perform_count == before);
+    assert(strlen(impossible[0].content) == 60000);
+    assert(!strncmp(impossible[0].content, "CURRENT TURN RETRIEVED CONTEXT\n", strlen("CURRENT TURN RETRIEVED CONTEXT\n")));
+    /* Failed JSON replacement cannot send the original oversized output quota. */
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    fail_predict_update = 1;
+    before = perform_count;
+    assert(!ollama_chat_with_limit(turn, 5, override, 2048, 60) && perform_count == before);
+    fail_predict_update = 0;
+    for (int i = 0; i < 2; ++i) {
+        set_response("not sent", "stop", 1);
+        failed_option = i ? CURLOPT_WRITEFUNCTION : CURLOPT_POSTFIELDS;
+        before = perform_count;
+        assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60) && perform_count == before);
+    }
+    failed_option = 0;
+    char *partial = text(70000, 'p', "[RUN] this is incomplete output; never execute\n");
+    set_response(partial, "length", 1);
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    char *stored = r2_log_search("ollama_output_limit_reached", 10);
+    assert(stored && strstr(stored, partial) && !strstr(stored, "PRIVATE-THINKING-NEVER-ARCHIVE")); free(stored);
+    set_response("partial but not done", "stop", 0);
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    set_response("placeholder", "stop", 1);
+    struct json_object *nul_response = json_tokener_parse(response_body), *nul_message = NULL;
+    assert(nul_response && json_object_object_get_ex(nul_response, "message", &nul_message));
+    static const char nul_text[] = "BEFORE\0AFTER";
+    json_object_object_add(nul_message, "content", json_object_new_string_len(nul_text, sizeof(nul_text) - 1));
+    free(response_body); response_body = strdup(json_object_to_json_string_ext(nul_response, JSON_C_TO_STRING_PLAIN));
+    assert(response_body); json_object_put(nul_response);
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    stored = r2_log_search("ollama_invalid_final_text", 10);
+    assert(stored && strstr(stored, "BEFORE\\u0000AFTER") && !strstr(stored, "PRIVATE-THINKING-NEVER-ARCHIVE")); free(stored);
+    set_response("legacy complete response", NULL, 1);
+    char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
+    assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
+    assert(cleanup_count == perform_count + 2);
+    r2_log_shutdown(); assert(r2_log_init() == 0);
+    stored = r2_log_search("ollama_output_limit_reached", 10);
+    assert(stored && strstr(stored, partial)); free(stored);
+    r2_log_shutdown();
+    free(identity); free(retrieval); free(query); free(result); free(override);
+    free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);
+    if (captured) json_object_put(captured);
+    curl_global_cleanup();
+    puts("Actual request retains complete evidence within unchanged contexts; setup failures do not send and length-limited output is archived as incomplete.");
+    return 0;
+}

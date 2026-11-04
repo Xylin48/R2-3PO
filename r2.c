@@ -3596,6 +3596,26 @@ static int r2_inference_unit_required(const Message *message, size_t index, size
         strncmp(content, "PERSISTENT LEARNING CONTEXT", strlen("PERSISTENT LEARNING CONTEXT")));
 }
 
+/* Reassign unused generation capacity to complete required input without
+ * increasing the configured model context or changing any input bytes. */
+static int r2_fit_complete_input(size_t required_bytes, int num_ctx, int *num_predict)
+{
+    if (!num_predict || num_ctx <= 576 || *num_predict < 1 ||
+        *num_predict > num_ctx - 512) { errno = EINVAL; return -1; }
+    size_t current = (size_t)(num_ctx - *num_predict - 512) * 32U / 10U;
+    if (required_bytes <= current) return 0;
+    /* The existing byte/token estimate is an allocation heuristic, not a
+       tokenizer guarantee. Preserve the existing 512-token safety margin
+       and at least the established 64-token generation floor. */
+    size_t maximum = (size_t)(num_ctx - 512 - 64) * 32U / 10U;
+    if (required_bytes > maximum) { errno = E2BIG; return -1; }
+    size_t input_tokens = (required_bytes * 10U + 31U) / 32U;
+    int fitted = num_ctx - 512 - (int)input_tokens;
+    if (fitted < 64) { errno = E2BIG; return -1; }
+    *num_predict = fitted;
+    return 0;
+}
+
 /* Final allocation is in whole messages. Provisional category budgets may
  * suggest optional context, but cannot shorten instructions or selected recall. */
 static int r2_preserve_inference_units(const Message *msgs, size_t count,
@@ -4101,9 +4121,28 @@ static char *ollama_chat_with_limit(
     size_t complete_override_length = system_override ? strlen(system_override) : 0;
     size_t actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
     size_t required_context_chars = 0;
-    if (r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
+    int preservation_rc = r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
                                     complete_override_length, actual_input_budget,
-                                    &required_context_chars) != 0) {
+                                    &required_context_chars);
+    if (preservation_rc != 0 && errno == E2BIG) {
+        int previous_predict = num_predict;
+        if (r2_fit_complete_input(required_context_chars, num_ctx, &num_predict) == 0) {
+            struct json_object *request_options = NULL;
+            if (!json_object_object_get_ex(root, "options", &request_options) ||
+                ollama_json_object_add_checked(request_options, "num_predict",
+                                               json_object_new_int(num_predict)) != 0) {
+                free(include); free(limits); json_object_put(arr); json_object_put(root);
+                return NULL;
+            }
+            actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+            preservation_rc = r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
+                                    complete_override_length, actual_input_budget, &required_context_chars);
+            fprintf(stderr, "[R2 Ollama] Complete input retained by reallocating generation reserve: "
+                            "%d -> %d tokens; context remains %d.\n",
+                    previous_predict, num_predict, num_ctx);
+        }
+    }
+    if (preservation_rc != 0) {
         fprintf(stderr,
                 "[R2 Ollama] Complete instructions, selected recall and current turn require %zu bytes; "
                 "configured input allocation is %zu. No partial evidence was sent.\n",
@@ -4338,20 +4377,34 @@ static char *ollama_chat_with_limit(
     }
     char curl_error[CURL_ERROR_SIZE] = {0};
 
-    curl_easy_setopt(curl, CURLOPT_URL, ollama_url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(payload));
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds > 0 ? timeout_seconds : 180L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ollama_progress);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    /* Never perform a partially configured request: a failed write callback
+       could otherwise route raw model output to libcurl's default stdout. */
+#define R2_OLLAMA_SETOPT(option, value) \
+    do { \
+        CURLcode setup_rc = curl_easy_setopt(curl, (option), (value)); \
+        if (setup_rc != CURLE_OK) { \
+            fprintf(stderr, "[R2 Ollama] Request option %d failed: %s.\n", \
+                    (int)(option), curl_easy_strerror(setup_rc)); \
+            curl_slist_free_all(headers); curl_easy_cleanup(curl); \
+            json_object_put(root); free(b.data); return NULL; \
+        } \
+    } while (0)
+    R2_OLLAMA_SETOPT(CURLOPT_URL, ollama_url);
+    R2_OLLAMA_SETOPT(CURLOPT_HTTPHEADER, headers);
+    R2_OLLAMA_SETOPT(CURLOPT_POST, 1L);
+    R2_OLLAMA_SETOPT(CURLOPT_POSTFIELDS, payload);
+    R2_OLLAMA_SETOPT(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(payload));
+    R2_OLLAMA_SETOPT(CURLOPT_WRITEFUNCTION, curl_write);
+    R2_OLLAMA_SETOPT(CURLOPT_WRITEDATA, &b);
+    R2_OLLAMA_SETOPT(CURLOPT_ERRORBUFFER, curl_error);
+    R2_OLLAMA_SETOPT(CURLOPT_CONNECTTIMEOUT, 10L);
+    R2_OLLAMA_SETOPT(CURLOPT_TIMEOUT, timeout_seconds > 0 ? timeout_seconds : 180L);
+    R2_OLLAMA_SETOPT(CURLOPT_NOSIGNAL, 1L);
+    R2_OLLAMA_SETOPT(CURLOPT_NOPROGRESS, 0L);
+    R2_OLLAMA_SETOPT(CURLOPT_XFERINFOFUNCTION, ollama_progress);
+    R2_OLLAMA_SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
+
+#undef R2_OLLAMA_SETOPT
 
     if (ollama_background_mode) {
         /* Never queue background reflection/bookkeeping ahead of a live turn. */
@@ -4477,7 +4530,15 @@ static char *ollama_chat_with_limit(
             content && json_object_is_type(content, json_type_string)) {
             const char *text = json_object_get_string(content);
             if (text) {
-                content_chars = strlen(text);
+                content_chars = (size_t)json_object_get_string_len(content);
+                if (strlen(text) != content_chars) {
+                    fprintf(stderr, "[R2 Ollama] Rejected embedded NUL in final-channel text; no prefix was accepted.\n");
+                    if (r2_log_is_initialized() && r2_log_event(R2_LOG_ERROR, "ollama_invalid_final_text",
+                            "Model final-channel text contains an embedded NUL; escaped evidence retained, not a reply or executed action.",
+                            json_object_to_json_string_ext(content, JSON_C_TO_STRING_PLAIN), MODEL) <= 0)
+                        fprintf(stderr, "[R2 Ollama] Could not archive escaped invalid final-channel evidence.\n");
+                    json_object_put(resp); return NULL;
+                }
                 if (*text) result = xstrdup(text);
             }
         }
@@ -4545,6 +4606,19 @@ static char *ollama_chat_with_limit(
         free(result);
         json_object_put(resp);
         return NULL;
+    }
+
+    /* done=true ends the HTTP exchange, but an explicit generation-limit
+       stop is not a complete reply or a safe executable action request. */
+    if (!strcmp(done_reason, "length")) {
+        fprintf(stderr, "[R2 Ollama] Generation limit reached; incomplete final-channel output "
+                        "was rejected (bytes=%zu, stage=%s).\n", content_chars,
+                ollama_audit_stage ? ollama_audit_stage : "unspecified");
+        if (r2_log_is_initialized() && r2_log_event(R2_LOG_ERROR, "ollama_output_limit_reached",
+                "Incomplete model output reached its generation limit; not a completed reply or executed action.",
+                result ? result : "No final-channel text was returned; private reasoning was not archived.", MODEL) <= 0)
+            fprintf(stderr, "[R2 Ollama] Could not archive the incomplete final-channel output.\n");
+        free(result); json_object_put(resp); return NULL;
     }
 
     if (!result) {
