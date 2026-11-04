@@ -71,3 +71,13 @@ output as incomplete evidence rather than a finished reply. See audits 036–038
 their exact verification checkpoint for completed scope and remaining acceptance.
 Staged oversized-evidence ingestion, broader manual review and physical/overnight
 acceptance remain open; this work must not be mistaken for their completion.
+
+## Subsequent Visual boundary workload
+
+Audits 039–042 trace Visual request setup, complete outer/nested response
+validation, owned JPEG file and encoder-child cleanup, and visual-library
+generation changes. The ledger checkpoint records exact commits and verification.
+These fixes do not certify the whole file or real hardware. Separate overlay
+publication ownership, stable-ID association deduplication, staged oversized
+evidence, broader manual inspection and physical/overnight acceptance remain
+continuation work.

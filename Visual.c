@@ -23,6 +23,8 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <ctype.h>
+#include <signal.h>
 
 #define R2_VISION_DEFAULT_MODEL R2_OLLAMA_MODEL
 #define R2_VISION_MAX_IMAGE_BYTES (20U * 1024U * 1024U)
@@ -31,6 +33,7 @@
 static sqlite3 *visual_db = NULL;
 static pthread_mutex_t visual_lock = PTHREAD_MUTEX_INITIALIZER;
 static int visual_initialized = 0;
+static uint64_t visual_generation = 0;
 static char visual_directory[PATH_MAX];
 static char visual_model[256];
 
@@ -63,7 +66,9 @@ static int visual_json_array_add_checked(json_object *array, json_object *value)
     return 0;
 }
 
+#ifndef R2_VWEBCAM_DIR
 #define R2_VWEBCAM_DIR "/tmp/r2-vwebcam-r2"
+#endif
 
 static int visual_vwebcam_prepare_dir(void)
 {
@@ -128,9 +133,11 @@ static void publish_focus_region_impl(json_object *focus)
     (void)json_object_object_get_ex(focus, "label", &lv);
     const char *raw_label = lv && json_object_is_type(lv, json_type_string)
         ? json_object_get_string(lv) : "Selected region";
-    char label[129];
-    snprintf(label, sizeof(label), "%s", raw_label && *raw_label
-        ? raw_label : "Selected region");
+    const char *label = raw_label && *raw_label ? raw_label : "Selected region";
+    if (lv && json_object_is_type(lv, json_type_string) &&
+        strlen(raw_label) != (size_t)json_object_get_string_len(lv)) {
+        (void)unlink(path); return;
+    }
 
     json_object *root = json_object_new_object();
     if (!root) {
@@ -175,46 +182,72 @@ static void publish_focus_region(json_object *focus)
     pthread_mutex_unlock(&focus_publish_lock);
 }
 
+/* Parse the entire supplied representation, never a valid-looking prefix. */
+static json_object *visual_parse_complete_json(const char *text, size_t length)
+{
+    if (!text || length > INT_MAX || memchr(text, '\0', length)) return NULL;
+    struct json_tokener *tok = json_tokener_new();
+    if (!tok) return NULL;
+    json_tokener_set_flags(tok, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    json_object *root = json_tokener_parse_ex(tok, text, (int)length);
+    size_t end = json_tokener_get_parse_end(tok);
+    while (end < length && isspace((unsigned char)text[end])) ++end;
+    if (json_tokener_get_error(tok) != json_tokener_success || end != length) {
+        if (root) json_object_put(root);
+        root = NULL;
+    }
+    json_tokener_free(tok);
+    return root;
+}
+
 /* Return the natural-language description for R2 while publishing the
    optional focus region separately for the display-only V-Webcam overlay. */
 static char *extract_visual_description(char *text)
 {
-    if (!text)
-        return NULL;
-    while (*text == ' ' || *text == '\n' || *text == '\r' || *text == '\t')
-        ++text;
+    if (!text) return NULL;
+    while (isspace((unsigned char)*text)) ++text;
+    size_t length = strlen(text);
     if (!strncmp(text, "```", 3)) {
         char *nl = strchr(text, '\n');
-        if (nl) {
-            text = nl + 1;
-            char *end = strstr(text, "```");
-            if (end)
-                *end = '\0';
-        }
+        size_t end = length;
+        while (end && isspace((unsigned char)text[end - 1])) --end;
+        if (!nl || end < 6 || memcmp(text + end - 3, "```", 3) ||
+            (size_t)(nl + 1 - text) > end - 3) goto invalid;
+        length = end - 3 - (size_t)(nl + 1 - text);
+        text = nl + 1;
     }
-    json_object *root = json_tokener_parse(text);
-    if (!root || !json_object_is_type(root, json_type_object)) {
-        if (root)
-            json_object_put(root);
+    while (length && isspace((unsigned char)*text)) { ++text; --length; }
+    if (!length) goto invalid;
+    /* Retain complete legacy plain-prose observations. A structured response
+       must validate; malformed/missing descriptions cannot become prose. */
+    if (*text != '{' && *text != '[') {
+        char *out = strndup(text, length);
         publish_focus_region(NULL);
-        return strdup(text);
+        return out;
+    }
+    json_object *root = visual_parse_complete_json(text, length);
+    if (!root || !json_object_is_type(root, json_type_object)) {
+        if (root) json_object_put(root);
+        goto invalid;
     }
     json_object *description = NULL, *focus = NULL;
     char *out = NULL;
     if (json_object_object_get_ex(root, "description", &description) &&
         json_object_is_type(description, json_type_string)) {
         const char *value = json_object_get_string(description);
-        if (value && *value)
+        const char *nonspace = value;
+        while (nonspace && isspace((unsigned char)*nonspace)) ++nonspace;
+        if (nonspace && *nonspace && strlen(value) == (size_t)json_object_get_string_len(description))
             out = strdup(value);
     }
-    if (json_object_object_get_ex(root, "focus", &focus))
-        publish_focus_region(focus);
-    else
-        publish_focus_region(NULL);
+    if (!out) { json_object_put(root); goto invalid; }
+    if (json_object_object_get_ex(root, "focus", &focus)) publish_focus_region(focus);
+    else publish_focus_region(NULL);
     json_object_put(root);
-    if (!out)
-        out = strdup(text);
     return out;
+invalid:
+    publish_focus_region(NULL);
+    return NULL;
 }
 
 struct response_buffer {
@@ -228,7 +261,7 @@ static size_t response_write(char *ptr, size_t size, size_t nmemb, void *userdat
     struct response_buffer *b = userdata;
     if (!b || (size && nmemb > SIZE_MAX / size)) return 0;
     size_t amount = size * nmemb;
-    if (amount > R2_VISION_MAX_RESPONSE - b->length) return 0;
+    if (b->length > R2_VISION_MAX_RESPONSE || amount > R2_VISION_MAX_RESPONSE - b->length) return 0;
     size_t needed = b->length + amount + 1;
     if (needed > b->capacity) {
         size_t cap = b->capacity ? b->capacity : 4096;
@@ -276,24 +309,34 @@ static unsigned char *read_file(const char *path, size_t *length)
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
-        (uint64_t)st.st_size > R2_VISION_MAX_IMAGE_BYTES) {
-        close(fd);
-        return NULL;
-    }
-    size_t cap = (size_t)st.st_size;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > R2_VISION_MAX_IMAGE_BYTES) { close(fd); return NULL; }
+    size_t initial = (size_t)st.st_size, cap = initial, done = 0;
     unsigned char *data = malloc(cap);
     if (!data) { close(fd); return NULL; }
-    size_t done = 0;
-    while (done < cap) {
-        ssize_t n = read(fd, data + done, cap - done);
+    unsigned char chunk[8192];
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) { free(data); close(fd); return NULL; }
-        done += (size_t)n;
+        if (n < 0) goto failed;
+        if (!n) break;
+        size_t add = (size_t)n;
+        if (add > R2_VISION_MAX_IMAGE_BYTES - done) { errno = EFBIG; goto failed; }
+        if (done + add > cap) {
+            size_t next = cap > R2_VISION_MAX_IMAGE_BYTES / 2 ? R2_VISION_MAX_IMAGE_BYTES : cap * 2;
+            if (next < done + add) next = done + add;
+            unsigned char *grown = realloc(data, next);
+            if (!grown) goto failed;
+            data = grown; cap = next;
+        }
+        memcpy(data + done, chunk, add); done += add;
     }
-    close(fd);
-    *length = cap;
+    if (done < initial) { errno = EIO; goto failed; }
+    if (close(fd) != 0) { free(data); return NULL; }
+    *length = done;
     return data;
+failed:
+    close(fd); free(data); return NULL;
 }
 
 static char *base64_encode(const unsigned char *data, size_t length)
@@ -318,6 +361,35 @@ static char *base64_encode(const unsigned char *data, size_t length)
     }
     out[outlen] = '\0';
     return out;
+}
+
+/* Encoding is a child we own. Poll so source shutdown/foreground work can
+ * cancel it, and bound a stuck encoder independently of model inference. */
+static int visual_wait_encoder(pid_t pid)
+{
+    struct timespec start, now;
+    int status = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) goto terminate;
+    for (;;) {
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+        if (rc < 0 && errno != EINTR) return -1;
+        if (r2_ollama_vision_request_should_abort()) { errno = ECANCELED; goto terminate; }
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) goto terminate;
+        time_t elapsed = now.tv_sec - start.tv_sec;
+        if (elapsed > 30 || (elapsed == 30 && now.tv_nsec >= start.tv_nsec)) {
+            errno = ETIMEDOUT; goto terminate;
+        }
+        struct timespec pause = {0, 25000000};
+        (void)nanosleep(&pause, NULL);
+    }
+terminate:
+    ;
+    int saved_errno = errno;
+    (void)kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    errno = saved_errno;
+    return -1;
 }
 
 static unsigned char *encode_jpeg(const R2VisionFrame *frame, size_t *jpeg_length)
@@ -356,7 +428,7 @@ static unsigned char *encode_jpeg(const R2VisionFrame *frame, size_t *jpeg_lengt
              write_all(ppm_fd, header, (size_t)header_len) == 0 &&
              write_all(ppm_fd, frame->data, frame->size) == 0;
     if (close(ppm_fd) != 0) ok = 0;
-    if (!ok) { unlink(ppm_template); return NULL; }
+    if (!ok) { unlink(ppm_template); unlink(jpg_template); return NULL; }
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -368,15 +440,9 @@ static unsigned char *encode_jpeg(const R2VisionFrame *frame, size_t *jpeg_lengt
         _exit(127);
     }
 
-    int status = -1;
-    if (pid > 0) {
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    }
+    int encoded = pid > 0 ? visual_wait_encoder(pid) : -1;
     unlink(ppm_template);
-    if (pid < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        unlink(jpg_template);
-        return NULL;
-    }
+    if (encoded != 0) { unlink(jpg_template); return NULL; }
 
     unsigned char *jpeg = read_file(jpg_template, jpeg_length);
     unlink(jpg_template);
@@ -530,85 +596,99 @@ payload_ready:
     struct response_buffer response = {0};
     struct curl_slist *headers = NULL;
     char *answer = NULL;
-    if (curl) {
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_URL, ollama_url);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(payload));
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, response_write);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, vision_progress);
-        if (!r2_ollama_vision_request_begin()) {
-            r2_log_sensory("vision_request_deferred",
-                           "R2 deferred visual inference because the shared Ollama model is busy or a foreground turn is waiting.",
-                           "The captured frame remains unreported rather than blocking ordinary conversation.",
-                           model);
-            curl_slist_free_all(headers);
-            curl_easy_cleanup(curl);
-            free(response.data);
-            json_object_put(root);
-            return NULL;
-        }
-        CURLcode cc = curl_easy_perform(curl);
-        int yielded_to_foreground =
-            cc == CURLE_ABORTED_BY_CALLBACK &&
-            r2_ollama_vision_request_should_abort();
-        r2_ollama_vision_request_end();
-        long http_status = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
-        if (cc == CURLE_OK && http_status >= 200 && http_status < 300 &&
-            response.data) {
-            json_object *parsed = json_tokener_parse(response.data);
-            json_object *message = NULL, *content = NULL;
-            json_object *role = NULL, *done = NULL;
-            int complete_assistant_turn =
-                parsed &&
-                json_object_object_get_ex(parsed, "done", &done) && done &&
-                json_object_is_type(done, json_type_boolean) &&
-                json_object_get_boolean(done) &&
-                json_object_object_get_ex(parsed, "message", &message) && message &&
-                json_object_is_type(message, json_type_object) &&
-                json_object_object_get_ex(message, "role", &role) && role &&
-                json_object_is_type(role, json_type_string) &&
-                strcmp(json_object_get_string(role), "assistant") == 0;
-            if (complete_assistant_turn &&
-                json_object_object_get_ex(message, "content", &content) &&
-                content && json_object_is_type(content, json_type_string)) {
-                const char *text = json_object_get_string(content);
-                if (text && *text) answer = strdup(text);
-            } else if (parsed) {
-                r2_log_sensory("vision_invalid_completion_contract",
-                               "R2 rejected an incomplete or invalid vision-model response.",
-                               "The response must contain message.role=assistant and boolean done=true.",
-                               model);
-            }
-            if (parsed) json_object_put(parsed);
-        } else if (yielded_to_foreground) {
-            r2_log_sensory("vision_request_yielded",
-                           "R2's visual inference yielded to an ordinary conversation request.",
-                           "The incomplete visual result was discarded and will not be used as an answer.",
-                           model);
-        } else {
-            char failure[1200];
-            snprintf(failure, sizeof(failure),
-                     "curl=%s; HTTP=%ld; response_bytes=%zu; model=%s",
-                     curl_easy_strerror(cc), http_status, response.length, model);
-            r2_log_sensory("vision_model_request_failed",
-                           "R2's vision model request failed.",
-                           response.data ? response.data : failure,
-                           model);
-        }
-        curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
+    int gate_active = 0;
+    if (!curl) {
+        r2_log_sensory("vision_request_setup_failed", "Vision HTTP handle could not be allocated; no request sent.", NULL, model);
+        goto request_cleanup;
     }
-    free(response.data);
-    json_object_put(root);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (!headers) {
+        r2_log_sensory("vision_request_setup_failed", "Vision HTTP headers could not be allocated; no request sent.", NULL, model);
+        goto request_cleanup;
+    }
+#define R2_VISION_SETOPT(option, value) \
+    do { \
+        CURLcode setup_rc = curl_easy_setopt(curl, (option), (value)); \
+        if (setup_rc != CURLE_OK) { \
+            char failure[160]; \
+            snprintf(failure, sizeof(failure), "option=%d; curl=%s; no request sent", \
+                     (int)(option), curl_easy_strerror(setup_rc)); \
+            r2_log_sensory("vision_request_setup_failed", "R2 could not configure visual inference.", failure, model); \
+            goto request_cleanup; \
+        } \
+    } while (0)
+    R2_VISION_SETOPT(CURLOPT_URL, ollama_url);
+    R2_VISION_SETOPT(CURLOPT_HTTPHEADER, headers);
+    R2_VISION_SETOPT(CURLOPT_POST, 1L);
+    R2_VISION_SETOPT(CURLOPT_POSTFIELDS, payload);
+    R2_VISION_SETOPT(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(payload));
+    R2_VISION_SETOPT(CURLOPT_WRITEFUNCTION, response_write);
+    R2_VISION_SETOPT(CURLOPT_WRITEDATA, &response);
+    R2_VISION_SETOPT(CURLOPT_CONNECTTIMEOUT, 5L);
+    R2_VISION_SETOPT(CURLOPT_TIMEOUT, 180L);
+    R2_VISION_SETOPT(CURLOPT_NOSIGNAL, 1L);
+    R2_VISION_SETOPT(CURLOPT_NOPROGRESS, 0L);
+    R2_VISION_SETOPT(CURLOPT_XFERINFOFUNCTION, vision_progress);
+#undef R2_VISION_SETOPT
+    if (!r2_ollama_vision_request_begin()) {
+        r2_log_sensory("vision_request_deferred",
+                       "R2 deferred visual inference because the shared Ollama model is busy or a foreground turn is waiting.",
+                       "The captured frame remains unreported rather than blocking ordinary conversation.", model);
+        goto request_cleanup;
+    }
+    gate_active = 1;
+    CURLcode cc = curl_easy_perform(curl);
+    int yielded_to_foreground = cc == CURLE_ABORTED_BY_CALLBACK && r2_ollama_vision_request_should_abort();
+    r2_ollama_vision_request_end(); gate_active = 0;
+    long http_status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
+    if (cc == CURLE_OK && http_status >= 200 && http_status < 300 && response.data) {
+        json_object *parsed = visual_parse_complete_json(response.data, response.length);
+        json_object *message = NULL, *content = NULL, *role = NULL, *done = NULL, *reason = NULL;
+        int complete_assistant_turn = parsed && json_object_is_type(parsed, json_type_object) &&
+            json_object_object_get_ex(parsed, "done", &done) && done &&
+            json_object_is_type(done, json_type_boolean) && json_object_get_boolean(done) &&
+            json_object_object_get_ex(parsed, "message", &message) && message &&
+            json_object_is_type(message, json_type_object) &&
+            json_object_object_get_ex(message, "role", &role) && role &&
+            json_object_is_type(role, json_type_string) && json_object_get_string_len(role) == 9 &&
+            strcmp(json_object_get_string(role), "assistant") == 0;
+        int has_reason = parsed && json_object_object_get_ex(parsed, "done_reason", &reason);
+        if (has_reason && (!json_object_is_type(reason, json_type_string) ||
+            strlen(json_object_get_string(reason)) != (size_t)json_object_get_string_len(reason)))
+            complete_assistant_turn = 0;
+        if (complete_assistant_turn && json_object_object_get_ex(message, "content", &content) &&
+            content && json_object_is_type(content, json_type_string)) {
+            const char *text = json_object_get_string(content);
+            if (text && strlen(text) != (size_t)json_object_get_string_len(content)) {
+                r2_log_sensory("vision_invalid_final_text", "Vision final text contained NUL; escaped evidence retained, not an observation.",
+                               json_object_to_json_string_ext(content, JSON_C_TO_STRING_PLAIN), model);
+            } else if (has_reason && !strcmp(json_object_get_string(reason), "length")) {
+                r2_log_sensory("vision_output_limit_reached", "Vision generation stopped at its limit; partial evidence is not a visual observation.",
+                               text && *text ? text : "No final-channel text was returned; private reasoning was not archived.", model);
+            } else if (text && *text) answer = strdup(text);
+        } else {
+            r2_log_sensory("vision_invalid_completion_contract",
+                           "R2 rejected an incomplete or invalid vision-model response.",
+                           "Expected complete JSON, message.role=assistant, string content and boolean done=true.", model);
+        }
+        if (parsed) json_object_put(parsed);
+    } else if (yielded_to_foreground) {
+        r2_log_sensory("vision_request_yielded", "R2's visual inference yielded to an ordinary conversation request.",
+                       "The incomplete visual result will not be used as an observation.", model);
+    } else {
+        char failure[1200];
+        snprintf(failure, sizeof(failure), "curl=%s; HTTP=%ld; response_bytes=%zu; model=%s",
+                 curl_easy_strerror(cc), http_status, response.length, model);
+        /* Raw failed responses can contain private reasoning: retain failure
+           metadata here, not an unvalidated response body. */
+        r2_log_sensory("vision_model_request_failed", "R2's vision model request failed.", failure, model);
+    }
+request_cleanup:
+    if (gate_active) r2_ollama_vision_request_end();
+    curl_slist_free_all(headers);
+    if (curl) curl_easy_cleanup(curl);
+    free(response.data); json_object_put(root);
     return answer;
 }
 
@@ -786,6 +866,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         return -1;
     pthread_mutex_lock(&visual_lock);
     if (visual_initialized) { pthread_mutex_unlock(&visual_lock); return 0; }
+    if (visual_generation == UINT64_MAX) { pthread_mutex_unlock(&visual_lock); errno = EOVERFLOW; return -1; }
     snprintf(visual_directory, sizeof(visual_directory), "%s", library_directory);
     const char *configured = getenv("R2_VISION_MODEL");
     if (configured && *configured &&
@@ -837,6 +918,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
+    ++visual_generation;
     visual_initialized = 1;
     pthread_mutex_unlock(&visual_lock);
     r2_log_sensory("visual_library_initialized",
@@ -851,6 +933,7 @@ void r2_visual_shutdown(void)
     if (visual_db) sqlite3_close(visual_db);
     visual_db = NULL;
     visual_initialized = 0;
+    if (visual_generation != UINT64_MAX) ++visual_generation;
     pthread_mutex_unlock(&visual_lock);
 }
 
@@ -905,11 +988,13 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
 
     char model_snapshot[sizeof(visual_model)];
     char directory_snapshot[sizeof(visual_directory)];
+    uint64_t generation_snapshot;
     pthread_mutex_lock(&visual_lock);
     if (!visual_initialized || !visual_db) {
         pthread_mutex_unlock(&visual_lock);
         return NULL;
     }
+    generation_snapshot = visual_generation;
     snprintf(model_snapshot, sizeof(model_snapshot), "%s", visual_model);
     snprintf(directory_snapshot, sizeof(directory_snapshot), "%s", visual_directory);
     pthread_mutex_unlock(&visual_lock);
@@ -931,7 +1016,16 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
         free(jpeg);
         return NULL;
     }
+    pthread_mutex_lock(&visual_lock);
+    int same_library = visual_initialized && visual_db && visual_generation == generation_snapshot;
+    pthread_mutex_unlock(&visual_lock);
+    if (!same_library) {
+        r2_log_sensory("visual_library_session_changed", "Visual library changed during analysis; no result was indexed into its replacement.", NULL, source);
+        free(jpeg); free(model_text); return NULL;
+    }
     char *description = extract_visual_description(model_text);
+    if (!description)
+        r2_log_sensory("vision_invalid_description", "R2 rejected malformed visual description data.", model_text, source);
     free(model_text);
     if (!description) { free(jpeg); return NULL; }
 
@@ -1005,7 +1099,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
         "R2's vision model interpreted a real captured frame.",
         description, source ? source : "Eyes");
     pthread_mutex_lock(&visual_lock);
-    if (!visual_initialized || !visual_db) {
+    if (!visual_initialized || !visual_db || visual_generation != generation_snapshot) {
         pthread_mutex_unlock(&visual_lock);
         unlink(image_path);
         r2_log_sensory("visual_experience_store_failed",
