@@ -44,18 +44,19 @@ static void check_allocator(const char *record)
         {"assistant", optional, 0, 0},
         {"user", "ACTUAL USER QUERY", 0, 0},
         {"assistant", "[R2_INTERNAL_TOOL_REQUEST]\ncompleted", 0, 0},
-        {"user", "[R2_INTERNAL_TOOL_RESULT]\nCOMPLETE ACTION EVIDENCE", 0, 1}
+        {"user", "[R2_INTERNAL_TOOL_RESULT]\nCOMPLETE ACTION EVIDENCE", 0, 1},
+        {"system", "HELPER CONTRACT without a conversation heading: preserve every instruction.", 0, 0}
     };
-    unsigned char include[] = {1, 1, 1, 1, 1, 1};
-    size_t lengths[] = {10, 100, 500, 2, 5, 7};
+    unsigned char include[] = {1, 1, 1, 1, 1, 1, 1};
+    size_t lengths[] = {10, 100, 500, 2, 5, 7, 1};
     size_t required = 0;
-    assert(r2_preserve_inference_units(messages, 6, include, lengths, 3,
+    assert(r2_preserve_inference_units(messages, 7, include, lengths, 3,
                                        200, 40000, &required) == 0);
     assert(required > 20000 && !include[2] && lengths[2] == 0);
     struct json_object *array = json_object_new_array();
     assert(array);
     size_t out_index = 0;
-    for (size_t i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < 7; ++i) {
         if (!include[i]) continue;
         assert(lengths[i] == strlen(messages[i].content));
         assert(ollama_json_append_message(array, messages[i].role, messages[i].content,
@@ -66,13 +67,20 @@ static void check_allocator(const char *record)
     }
     json_object_put(array);
     /* A genuinely insufficient configured window must not send a prefix. */
-    unsigned char old_include[6]; size_t old_lengths[6];
+    unsigned char old_include[7]; size_t old_lengths[7];
     memcpy(old_include, include, sizeof(include)); memcpy(old_lengths, lengths, sizeof(lengths));
-    assert(r2_preserve_inference_units(messages, 6, include, lengths, 3,
+    assert(r2_preserve_inference_units(messages, 7, include, lengths, 3,
                                        200, 1000, &required) == -1 && errno == E2BIG);
     assert(!memcmp(include, old_include, sizeof(include)));
     assert(!memcmp(lengths, old_lengths, sizeof(lengths)));
     assert(strstr(retrieval, "PAYLOAD-END"));
+    /* A helper's otherwise unrecognized system contract is required even
+       when the user text alone would fit the window. */
+    Message helper[] = {{"system", optional, 0, 0}, {"user", "helper task", 0, 0}};
+    unsigned char helper_include[] = {1, 1}; size_t helper_lengths[] = {10, 11};
+    assert(r2_preserve_inference_units(helper, 2, helper_include, helper_lengths,
+                                       1, 0, 1000, &required) == -1 && errno == E2BIG);
+    assert(required > 60000 && helper_include[0] && helper_lengths[0] == 10);
     free(optional); free(retrieval);
 }
 

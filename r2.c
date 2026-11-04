@@ -3583,6 +3583,19 @@ static int ollama_response_contract_valid(const char *role, int done)
     return role && strcmp(role, "assistant") == 0 && done == 1;
 }
 
+/* Helper callers also supply system instructions without the conversation's
+ * section headings. Only explicitly identified historical/learning snapshots
+ * may be optional; an unknown system contract must not disappear. */
+static int r2_inference_unit_required(const Message *message, size_t index, size_t current_user)
+{
+    if (!message->role || strcmp(message->role, "system"))
+        return current_user != SIZE_MAX && index >= current_user;
+    const char *content = message->content ? message->content : "";
+    int priority = r2_inference_system_priority(content, ollama_authoritative_user_query);
+    return priority <= 4 || (priority == 6 &&
+        strncmp(content, "PERSISTENT LEARNING CONTEXT", strlen("PERSISTENT LEARNING CONTEXT")));
+}
+
 /* Final allocation is in whole messages. Provisional category budgets may
  * suggest optional context, but cannot shorten instructions or selected recall. */
 static int r2_preserve_inference_units(const Message *msgs, size_t count,
@@ -3592,10 +3605,7 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
 {
     size_t required = override_length;
     for (size_t i = 0; i < count; ++i) {
-        int mandatory = (current_user != SIZE_MAX && i >= current_user &&
-                         (!msgs[i].role || strcmp(msgs[i].role, "system"))) ||
-            (msgs[i].role && !strcmp(msgs[i].role, "system") &&
-             r2_inference_system_priority(msgs[i].content, ollama_authoritative_user_query) <= 4);
+        int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
         if (!mandatory) continue;
         size_t n = strlen(msgs[i].content ? msgs[i].content : "");
         if (n > SIZE_MAX - required) { errno = EOVERFLOW; return -1; }
@@ -3605,10 +3615,7 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     if (required > input_budget) { errno = E2BIG; return -1; }
     size_t used = required;
     for (size_t i = 0; i < count; ++i) {
-        int mandatory = (current_user != SIZE_MAX && i >= current_user &&
-                         (!msgs[i].role || strcmp(msgs[i].role, "system"))) ||
-            (msgs[i].role && !strcmp(msgs[i].role, "system") &&
-             r2_inference_system_priority(msgs[i].content, ollama_authoritative_user_query) <= 4);
+        int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
         size_t n = strlen(msgs[i].content ? msgs[i].content : "");
         if (mandatory) { include[i] = 1; limits[i] = n; }
         else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
