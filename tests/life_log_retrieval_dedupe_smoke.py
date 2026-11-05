@@ -8,10 +8,14 @@ header = (ROOT / "Log.h").read_text()
 start = core.index("static int r2_history_append_unique_records(")
 end = core.index("static char *chat_with_relevant_memories(", start)
 helper = core[start:end]
+dedupe_start = core.index("static int r2_history_append_unique_row(")
+dedupe_end = core.index("static char *r2_collect_associated_records(", dedupe_start)
+dedupe = core[dedupe_start:dedupe_end]
 builder_end = core.index("/* ============================================================\n   STRING HELPERS", end)
 builder = core[end:builder_end]
 assert "R2LogRecordSpan" in header and "r2_log_search_records" in header
-assert "record.event_id" in helper and "history->ids[j] == record.event_id" in helper
+assert "r2_history_append_unique_row(history, record.event_id," in helper
+assert "history->ids[i] == id" in dedupe
 assert "record.offset" in helper and "record.length" in helper
 assert "max_chars" not in helper and "found[i] == '\\n'" not in helper
 assert "r2_log_search_records(keywords[k], 3, &found)" in builder
