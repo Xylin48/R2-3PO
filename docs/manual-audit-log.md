@@ -681,3 +681,8 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Keep an owned focus reference until storage succeeds. Under the Visual library lock, publish only from the current generation and only when the request is newer than the last committed overlay decision. A successful result without a focus clears the overlay. Failed inference, archive creation and inserts preserve the last committed overlay. Shutdown clears it under the same lock. Use a unique temporary file and atomic rename for publication.
 - The production-path fixture starts a second analysis during the first request's archive write, verifies the newer focus after both complete, then forces an archive collision, incomplete inference and SQLite insert rejection. It checks that the overlay survives those failures and clears on shutdown. The Visual runtime and three related source checks passed locally. Full CI follows publication.
 - Scope is ownership among Visual analyses and library generations. The independent Eyes camera-source lifecycle and end-to-end display/source matching remain to be traced. Stable-ID recall deduplication and oversized-context processing also remain open.
+
+### Verification checkpoint for R2-AUD-2026-11-05-043
+
+- Full GitHub workflow passed at code commit `d751237fd1ba289585b8ec7713f7200329203751`. [Run 41998822889](https://github.com/Xylin48/R2-3PO/actions/runs/41998822889)
+- The runtime exercises overlapping calls through the actual Visual analysis entry point with synthetic HTTP and encoder boundaries, real archive files and SQLite. The archive collision, failed model response, rejected insert and shutdown checks passed. Camera-source display matching still needs its own audit.
