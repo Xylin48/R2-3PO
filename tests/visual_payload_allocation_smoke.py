@@ -25,7 +25,7 @@ for helper, next_marker in (
     require("!= 0" in block, "JSON insertion return code is checked")
 
 start = source.find("static void publish_focus_region_impl(")
-end = source.find("\nstatic void publish_focus_region(json_object *focus)", start)
+end = source.find("\nstatic void publish_committed_focus(", start)
 require(start >= 0 and end > start, "focus metadata implementation exists")
 focus = source[start:end]
 for key in ('"x"', '"y"', '"width"', '"height"', '"label"'):

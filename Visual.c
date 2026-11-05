@@ -83,10 +83,9 @@ static int visual_vwebcam_prepare_dir(void)
     return 0;
 }
 
-/* Focus publication uses a shared temporary path. Serialize writers so
-   overlapping vision requests cannot truncate, rename, or unlink each
-   other's pending focus update. */
-static pthread_mutex_t focus_publish_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Both sequence numbers and overlay publication are protected by visual_lock. */
+static uint64_t visual_request_sequence;
+static uint64_t visual_focus_sequence;
 
 static void publish_focus_region_impl(json_object *focus)
 {
@@ -95,7 +94,7 @@ static void publish_focus_region_impl(json_object *focus)
     if (!display || !*display)
         return;
     int pn = snprintf(path, sizeof(path), "%s/focus.json", R2_VWEBCAM_DIR);
-    int tn = snprintf(tmp, sizeof(tmp), "%s/focus.tmp", R2_VWEBCAM_DIR);
+    int tn = snprintf(tmp, sizeof(tmp), "%s/focus-XXXXXX", R2_VWEBCAM_DIR);
     if (pn < 0 || (size_t)pn >= sizeof(path) ||
         tn < 0 || (size_t)tn >= sizeof(tmp))
         return;
@@ -140,46 +139,44 @@ static void publish_focus_region_impl(json_object *focus)
     }
 
     json_object *root = json_object_new_object();
-    if (!root) {
-        (void)unlink(path);
+    if (!root)
         return;
-    }
     if (visual_json_object_add_checked(root, "x", json_object_new_double(x)) != 0 ||
         visual_json_object_add_checked(root, "y", json_object_new_double(y)) != 0 ||
         visual_json_object_add_checked(root, "width", json_object_new_double(w)) != 0 ||
         visual_json_object_add_checked(root, "height", json_object_new_double(h)) != 0 ||
         visual_json_object_add_checked(root, "label", json_object_new_string(label)) != 0) {
         json_object_put(root);
-        (void)unlink(tmp);
-        (void)unlink(path);
         return;
     }
     const char *encoded = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
-    FILE *fp = encoded ? fopen(tmp, "w") : NULL;
+    int fd = encoded ? mkstemp(tmp) : -1;
+    if (fd < 0) {
+        json_object_put(root);
+        return;
+    }
+    FILE *fp = fdopen(fd, "w");
     int failed = !fp;
     if (fp) {
         if (fputs(encoded, fp) < 0 || fputc('\n', fp) == EOF)
             failed = 1;
         if (fclose(fp) != 0)
             failed = 1;
+    } else {
+        close(fd);
     }
     json_object_put(root);
-    if (!failed) {
-        (void)chmod(tmp, 0600);
-        if (rename(tmp, path) != 0)
-            failed = 1;
-    }
-    if (failed) {
+    if (failed || rename(tmp, path) != 0)
         (void)unlink(tmp);
-        (void)unlink(path);
-    }
 }
 
-static void publish_focus_region(json_object *focus)
+/* Called under visual_lock after the current library accepts the row. */
+static void publish_committed_focus(uint64_t request_sequence, json_object *focus)
 {
-    pthread_mutex_lock(&focus_publish_lock);
+    if (request_sequence <= visual_focus_sequence)
+        return;
+    visual_focus_sequence = request_sequence;
     publish_focus_region_impl(focus);
-    pthread_mutex_unlock(&focus_publish_lock);
 }
 
 /* Parse the entire supplied representation, never a valid-looking prefix. */
@@ -200,10 +197,10 @@ static json_object *visual_parse_complete_json(const char *text, size_t length)
     return root;
 }
 
-/* Return the natural-language description for R2 while publishing the
-   optional focus region separately for the display-only V-Webcam overlay. */
-static char *extract_visual_description(char *text)
+/* Return the description and an owned reference to its optional focus. */
+static char *extract_visual_description(char *text, json_object **focus_out)
 {
+    *focus_out = NULL;
     if (!text) return NULL;
     while (isspace((unsigned char)*text)) ++text;
     size_t length = strlen(text);
@@ -222,7 +219,6 @@ static char *extract_visual_description(char *text)
        must validate; malformed/missing descriptions cannot become prose. */
     if (*text != '{' && *text != '[') {
         char *out = strndup(text, length);
-        publish_focus_region(NULL);
         return out;
     }
     json_object *root = visual_parse_complete_json(text, length);
@@ -241,12 +237,11 @@ static char *extract_visual_description(char *text)
             out = strdup(value);
     }
     if (!out) { json_object_put(root); goto invalid; }
-    if (json_object_object_get_ex(root, "focus", &focus)) publish_focus_region(focus);
-    else publish_focus_region(NULL);
+    if (json_object_object_get_ex(root, "focus", &focus))
+        *focus_out = json_object_get(focus);
     json_object_put(root);
     return out;
 invalid:
-    publish_focus_region(NULL);
     return NULL;
 }
 
@@ -933,6 +928,7 @@ void r2_visual_shutdown(void)
     if (visual_db) sqlite3_close(visual_db);
     visual_db = NULL;
     visual_initialized = 0;
+    publish_focus_region_impl(NULL);
     if (visual_generation != UINT64_MAX) ++visual_generation;
     pthread_mutex_unlock(&visual_lock);
 }
@@ -988,13 +984,14 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
 
     char model_snapshot[sizeof(visual_model)];
     char directory_snapshot[sizeof(visual_directory)];
-    uint64_t generation_snapshot;
+    uint64_t generation_snapshot, request_sequence;
     pthread_mutex_lock(&visual_lock);
-    if (!visual_initialized || !visual_db) {
+    if (!visual_initialized || !visual_db || visual_request_sequence == UINT64_MAX) {
         pthread_mutex_unlock(&visual_lock);
         return NULL;
     }
     generation_snapshot = visual_generation;
+    request_sequence = ++visual_request_sequence;
     snprintf(model_snapshot, sizeof(model_snapshot), "%s", visual_model);
     snprintf(directory_snapshot, sizeof(directory_snapshot), "%s", visual_directory);
     pthread_mutex_unlock(&visual_lock);
@@ -1012,7 +1009,6 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     char *model_text = call_vision_model(base64, question, model_snapshot);
     free(base64);
     if (!model_text) {
-        publish_focus_region(NULL);
         free(jpeg);
         return NULL;
     }
@@ -1023,7 +1019,8 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
         r2_log_sensory("visual_library_session_changed", "Visual library changed during analysis; no result was indexed into its replacement.", NULL, source);
         free(jpeg); free(model_text); return NULL;
     }
-    char *description = extract_visual_description(model_text);
+    json_object *focus = NULL;
+    char *description = extract_visual_description(model_text, &focus);
     if (!description)
         r2_log_sensory("vision_invalid_description", "R2 rejected malformed visual description data.", model_text, source);
     free(model_text);
@@ -1045,6 +1042,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                        "R2 analyzed a frame but its archive path was too long.",
                        directory_snapshot, source ? source : "Eyes");
         free(jpeg);
+        json_object_put(focus);
         free(description);
         errno = ENAMETOOLONG;
         return NULL;
@@ -1062,6 +1060,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                        "R2 analyzed an image but could not create its JPEG archive.",
                        strerror(saved_errno), image_path);
         free(jpeg);
+        json_object_put(focus);
         free(description);
         return NULL; /* Never unlink a path that this call did not create. */
     }
@@ -1073,6 +1072,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                        "R2 analyzed an image but could not write its JPEG archive.",
                        strerror(saved_errno), image_path);
         free(jpeg);
+        json_object_put(focus);
         free(description);
         return NULL;
     }
@@ -1083,6 +1083,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                        "R2 analyzed an image but could not close its JPEG archive cleanly.",
                        strerror(saved_errno), image_path);
         free(jpeg);
+        json_object_put(focus);
         free(description);
         return NULL;
     }
@@ -1106,6 +1107,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                        "R2 analyzed a frame, but the visual library shut down before it could be indexed.",
                        "The JPEG archive was removed because no matching database record could be written.",
                        image_path);
+        json_object_put(focus);
         free(description);
         return NULL;
     }
@@ -1118,15 +1120,19 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     char db_error[512] = "unknown SQLite error";
     if (rc != SQLITE_DONE)
         snprintf(db_error, sizeof(db_error), "%s", sqlite3_errmsg(visual_db));
+    if (rc == SQLITE_DONE)
+        publish_committed_focus(request_sequence, focus);
     pthread_mutex_unlock(&visual_lock);
     if (rc != SQLITE_DONE) {
         unlink(image_path);
         r2_log_sensory("visual_experience_store_failed",
                        "R2 analyzed a frame but failed to save the library record.",
                        db_error, image_path);
+        json_object_put(focus);
         free(description);
         return NULL;
     }
+    json_object_put(focus);
     return description;
 }
 

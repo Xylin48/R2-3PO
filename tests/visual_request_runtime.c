@@ -21,6 +21,9 @@ static size_t (*write_response)(char *, size_t, size_t, void *);
 static void *write_data;
 static char *body;
 static json_object *request_copy;
+static const R2VisionFrame *overlapping_frame;
+static const char *overlapping_response;
+static void response(const char *text, const char *reason);
 
 int __real_mkstemps(char *, int);
 int __wrap_mkstemps(char *path, int suffix)
@@ -34,6 +37,14 @@ ssize_t __real_write(int, const void *, size_t);
 ssize_t __wrap_write(int fd, const void *p, size_t n)
 {
     if (fail_write && fd == ppm_fd) { errno = EIO; return -1; }
+    if (overlapping_frame && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
+        const R2VisionFrame *newer = overlapping_frame;
+        overlapping_frame = NULL;
+        response(overlapping_response, "stop");
+        char *result = r2_visual_analyze_frame(newer, "camera fixture", "newer focus");
+        assert(result && !strcmp(result, "valid"));
+        free(result);
+    }
     return __real_write(fd, p, n);
 }
 int __real_close(int);
@@ -160,7 +171,7 @@ static sqlite3_int64 scalar(sqlite3 *db, const char *sql)
 }
 static void verify_event_link(const char *source, const char *description)
 {
-    sqlite3_int64 id = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences ORDER BY id DESC LIMIT 1");
+    sqlite3_int64 id = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences WHERE description LIKE '%VISUAL-COMPLETE-END'");
     assert(id > 0);
     sqlite3 *connection = NULL; sqlite3_stmt *st = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
@@ -256,20 +267,45 @@ int main(void)
     transport_code = CURLE_OK; cancel_request=0;
 
     char fenced[] = "```json\n \n{\"description\":\"text with ``` inside\",\"focus\":null}\n```\n";
-    actual=extract_visual_description(fenced); assert(actual && !strcmp(actual,"text with ``` inside")); free(actual);
-    char prose[]="Complete legacy prose observation. \n\t"; actual=extract_visual_description(prose); assert(actual && !strcmp(actual,prose)); free(actual);
+    json_object *extracted_focus = NULL;
+    actual=extract_visual_description(fenced, &extracted_focus); assert(actual && !strcmp(actual,"text with ``` inside")); free(actual);
+    char prose[]="Complete legacy prose observation. \n\t"; actual=extract_visual_description(prose, &extracted_focus); assert(actual && !strcmp(actual,prose)); free(actual);
     assert(setenv("DISPLAY", ":fixture",1)==0);
     char label[4001]; memset(label,'L',4000); label[4000]='\0'; memcpy(label+3986,"FULL-LABEL-END",14);
     observation=json_tokener_parse("{\"description\":\"valid\",\"focus\":{\"x\":0.1,\"y\":0.2,\"width\":0.3,\"height\":0.4}}"); assert(observation);
     json_object *focus=NULL; assert(json_object_object_get_ex(observation,"focus",&focus)); json_object_object_add(focus,"label",json_object_new_string(label));
-    char *focus_text=strdup(json_object_to_json_string_ext(observation,JSON_C_TO_STRING_PLAIN)); assert(focus_text); actual=extract_visual_description(focus_text); assert(actual && !strcmp(actual,"valid")); free(actual); free(focus_text); json_object_put(observation);
+    frame.frame_number++;
+    R2VisionFrame newer_frame = frame;
+    newer_frame.frame_number++;
+    overlapping_frame = &newer_frame;
+    overlapping_response = json_object_to_json_string_ext(observation, JSON_C_TO_STRING_PLAIN);
+    response("{\"description\":\"older result\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "camera fixture", "older focus");
+    assert(!overlapping_frame);
+    assert(actual && !strcmp(actual, "older result"));
+    free(actual);
+    json_object_put(observation);
+
+    /* Reuse the archived frame name to force O_EXCL failure after analysis. */
+    response("{\"description\":\"archive conflict\",\"focus\":null}", "stop");
+    assert(!r2_visual_analyze_frame(&frame, "camera fixture", "archive conflict"));
+    frame.frame_number = newer_frame.frame_number;
+    response("failed request", "length");
+    rejected_frame(&frame);
+    assert(sqlite3_exec(visual_db, "CREATE TEMP TRIGGER deny_overlay_insert BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END", NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"rejected insert\",\"focus\":null}", "stop");
+    rejected_frame(&frame);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_overlay_insert", NULL, NULL, NULL) == SQLITE_OK);
+
     bytes=read_file(R2_VWEBCAM_DIR "/focus.json",&encoded); assert(bytes); observation=visual_parse_complete_json((char *)bytes,encoded); free(bytes); assert(observation && json_object_object_get_ex(observation,"label",&focus) && !strcmp(json_object_get_string(focus),label)); json_object_put(observation);
-    assert(unsetenv("DISPLAY")==0);
+
 
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
-    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==1);
+    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==3);
+    assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);
+    assert(unsetenv("DISPLAY")==0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init()==0 && r2_log_init()==0 && r2_sj_init()==0 && r2_visual_init(database,library)==0);
     history=r2_visual_search("VISUAL-COMPLETE-END",10); assert(history && strstr(history,description) && strstr(history,source)); free(history);
