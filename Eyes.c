@@ -1001,7 +1001,10 @@ void r2_eyes_close(R2Eyes *eyes)
         return;
 
     uint64_t session = eyes->preview_session;
-    if (session && atomic_compare_exchange_strong(&active_preview_session, &session, 0))
+    int clear_preview = session
+        ? atomic_compare_exchange_strong(&active_preview_session, &session, 0)
+        : !eyes->auxiliary_display && !r2_eyes_preview_session();
+    if (clear_preview)
         r2_vwebcam_write_status(eyes, 0);
     eyes->preview_session = 0;
 
