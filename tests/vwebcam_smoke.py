@@ -69,7 +69,21 @@ def verify_session_matching() -> None:
         viewer.refresh()
         assert viewer.raw_photo is None and viewer.display_focus is None
 
+        frame.write_bytes(b"P6\n" + pixels)
+        focus.write_text(json.dumps(region))
+        viewer.refresh()
+        assert viewer.raw_photo == b"P6\n" + pixels
+        assert viewer.display_focus is None
+
+        status.write_text("1\nSame name\n1\n1\n1\n124\n0\n")
+        viewer.refresh()
+        assert viewer.raw_photo is None and viewer.display_focus is None
+
         status.write_text("1\nSame name\n1\n1\n1\n124\n20\n")
+        viewer.refresh()
+        assert viewer.raw_photo is None and viewer.display_focus is None
+        frame.write_bytes(b"P6\n# r2-preview 20\n" + pixels)
+        focus.write_text(json.dumps(dict(region, preview_session=20)))
         viewer.refresh()
         assert viewer.raw_photo and viewer.display_focus == region
         frame.unlink()

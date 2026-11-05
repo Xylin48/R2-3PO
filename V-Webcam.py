@@ -39,7 +39,7 @@ class VWebcam:
         self.show_focus = True
         self.photo: tk.PhotoImage | None = None
         self.raw_photo: tk.PhotoImage | None = None
-        self.last_frame_stamp: tuple[int, int, int, int] | None = None
+        self.last_frame_stamp: tuple[int | None, int, int, int] | None = None
         self.image_width = 0
         self.image_height = 0
         self.display_status = self.status()
@@ -108,8 +108,11 @@ class VWebcam:
 
     def status(self) -> dict[str, object]:
         try:
-            rows = STATUS_PATH.read_text(encoding="utf-8", errors="replace").split("\n")
-            rows += [""] * max(0, 7 - len(rows))
+            status = STATUS_PATH.read_text(encoding="utf-8", errors="replace")
+            rows = status.removesuffix("\n").split("\n")
+            if len(rows) < 6:
+                raise ValueError("incomplete preview status")
+            session = int(rows[6] or 0) if len(rows) > 6 else None
             return {
                 "active": rows[0].strip() == "1",
                 "source": rows[1].strip() or "Unknown",
@@ -117,7 +120,7 @@ class VWebcam:
                 "height": int(rows[3] or 0),
                 "frames": int(rows[4] or 0),
                 "timestamp": int(rows[5] or 0),
-                "preview_session": int(rows[6] or 0),
+                "preview_session": session,
             }
         except (OSError, ValueError):
             return {
@@ -162,18 +165,28 @@ class VWebcam:
         )
         self.draw_focus()
 
-    def load_frame(self, preview_session: int) -> bool:
+    def load_frame(self, preview_session: int | None) -> bool:
         # Read the session header and pixels through the same descriptor.
         # Eyes replaces this file atomically while capture continues.
-        expected = f"# r2-preview {preview_session}\n".encode("ascii")
         try:
             with FRAME_PATH.open("rb") as frame:
-                if frame.read(3) != b"P6\n" or frame.readline(128) != expected:
+                magic = frame.read(3)
+                if magic != b"P6\n":
                     return False
+                header = frame.readline(128)
+                if preview_session is None:
+                    # The original writer put dimensions directly after the magic.
+                    if header.startswith(b"#") or not header.endswith(b"\n"):
+                        return False
+                else:
+                    expected = f"# r2-preview {preview_session}\n".encode("ascii")
+                    if header != expected:
+                        return False
+                    header = b""
                 info = os.fstat(frame.fileno())
                 stamp = (preview_session, info.st_dev, info.st_ino, info.st_mtime_ns)
                 if stamp != self.last_frame_stamp:
-                    self.raw_photo = tk.PhotoImage(data=b"P6\n" + frame.read(), format="PPM")
+                    self.raw_photo = tk.PhotoImage(data=magic + header + frame.read(), format="PPM")
                     self.last_frame_stamp = stamp
                 return True
         except (OSError, tk.TclError):
@@ -185,11 +198,14 @@ class VWebcam:
             return
         self.display_status = self.status()
         self.display_focus = None
-        session = int(self.display_status["preview_session"])
+        session = self.display_status["preview_session"]
         previous_stamp = self.last_frame_stamp
+        valid_session = session is None or int(session) > 0
         if (self.display_status["active"] and self.display_status["frames"]
-                and session > 0 and self.load_frame(session)):
-            self.display_focus = self.focus(session)
+                and valid_session and self.load_frame(session)):
+            # Legacy pixels are usable, but the old overlay has no source identity.
+            if session is not None:
+                self.display_focus = self.focus(session)
             if self.last_frame_stamp != previous_stamp:
                 self.fit_image()
             else:
