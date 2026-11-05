@@ -84,6 +84,7 @@ typedef struct
     R2VideoFormat format;
     uint64_t timestamp;
     uint64_t frame_number;
+    uint64_t preview_session; /* Zero for sources outside the Eyes preview. */
 } R2VisionFrame;
 
 /* Vision event */
@@ -105,6 +106,7 @@ int r2_eyes_init(R2Eyes **eyes);
 void r2_eyes_shutdown(R2Eyes *eyes);
 /* Auxiliary media streams cannot overwrite the primary Eyes viewer. */
 void r2_eyes_set_auxiliary(R2Eyes *eyes, int auxiliary);
+uint64_t r2_eyes_preview_session(void);
 
 /* Probe physical camera readiness without starting continuous capture. */
 int r2_eyes_camera_available(void);

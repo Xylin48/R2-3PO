@@ -12,7 +12,15 @@ static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, r
 static int cancel_request, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
+static uint64_t fixture_preview_session = 1;
+static int switch_preview_during_request;
 static CURLoption failed_option;
+
+uint64_t __wrap_r2_eyes_preview_session(void)
+{
+    return fixture_preview_session;
+}
+
 static CURLcode transport_code = CURLE_OK;
 static long http_status = 200;
 static const char *posted;
@@ -139,6 +147,10 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     assert(write_response && write_data && body);
     if (request_copy) json_object_put(request_copy);
     request_copy = visual_parse_complete_json(posted, strlen(posted)); assert(request_copy);
+    if (switch_preview_during_request) {
+        switch_preview_during_request = 0;
+        ++fixture_preview_session;
+    }
     if (restart_library) {
         restart_library = 0;
         r2_visual_shutdown(); assert(r2_visual_init(next_db, next_library) == 0);
@@ -202,7 +214,7 @@ int main(void)
     snprintf(next_db, sizeof(next_db), "%s/next.db", R2_HOME); snprintf(next_library, sizeof(next_library), "%s/next-library", R2_HOME);
     assert(r2_visual_init(database, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
-    R2VisionFrame frame = {.data=rgb, .size=sizeof(rgb), .format={1,1,3,24,R2_PIXEL_RGB24}, .timestamp=1234, .frame_number=1};
+    R2VisionFrame frame = {.data=rgb, .size=sizeof(rgb), .format={1,1,3,24,R2_PIXEL_RGB24}, .timestamp=1234, .frame_number=1, .preview_session=fixture_preview_session};
     size_t encoded = 0;
     fail_write = 1; assert(!encode_jpeg(&frame, &encoded)); fail_write = 0; temporary_files_gone();
     fail_close = 1; assert(!encode_jpeg(&frame, &encoded)); fail_close = 0; temporary_files_gone();
@@ -297,13 +309,37 @@ int main(void)
     rejected_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_overlay_insert", NULL, NULL, NULL) == SQLITE_OK);
 
-    bytes=read_file(R2_VWEBCAM_DIR "/focus.json",&encoded); assert(bytes); observation=visual_parse_complete_json((char *)bytes,encoded); free(bytes); assert(observation && json_object_object_get_ex(observation,"label",&focus) && !strcmp(json_object_get_string(focus),label)); json_object_put(observation);
+    uint64_t focus_sequence = visual_focus_sequence;
+    switch_preview_during_request = 1;
+    frame.frame_number++;
+    response("{\"description\":\"old camera observation\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "camera fixture", "source changed during inference");
+    assert(actual && !strcmp(actual, "old camera observation"));
+    free(actual);
+    assert(!switch_preview_during_request && visual_focus_sequence == focus_sequence);
 
+    frame.preview_session = 0;
+    frame.frame_number++;
+    response("{\"description\":\"auxiliary media observation\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "media fixture", "independent observation");
+    assert(actual && !strcmp(actual, "auxiliary media observation"));
+    free(actual);
+    assert(visual_focus_sequence == focus_sequence);
+
+    bytes = read_file(R2_VWEBCAM_DIR "/focus.json", &encoded);
+    assert(bytes);
+    observation = visual_parse_complete_json((char *)bytes, encoded);
+    free(bytes);
+    assert(observation && json_object_object_get_ex(observation, "label", &focus));
+    assert(!strcmp(json_object_get_string(focus), label));
+    assert(json_object_object_get_ex(observation, "preview_session", &focus));
+    assert(json_object_get_uint64(focus) == fixture_preview_session - 1);
+    json_object_put(observation);
 
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
-    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==3);
+    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==5);
     assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);
     assert(unsetenv("DISPLAY")==0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();

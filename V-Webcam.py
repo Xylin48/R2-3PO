@@ -39,11 +39,11 @@ class VWebcam:
         self.show_focus = True
         self.photo: tk.PhotoImage | None = None
         self.raw_photo: tk.PhotoImage | None = None
-        self.last_frame_mtime: int | None = None
+        self.last_frame_stamp: tuple[int, int, int, int] | None = None
         self.image_width = 0
         self.image_height = 0
         self.display_status = self.status()
-        self.display_focus = self.focus()
+        self.display_focus = None
 
         top = tk.Frame(root, bg=PANEL, padx=12, pady=9)
         top.pack(fill="x")
@@ -108,8 +108,8 @@ class VWebcam:
 
     def status(self) -> dict[str, object]:
         try:
-            rows = STATUS_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-            rows += [""] * max(0, 6 - len(rows))
+            rows = STATUS_PATH.read_text(encoding="utf-8", errors="replace").split("\n")
+            rows += [""] * max(0, 7 - len(rows))
             return {
                 "active": rows[0].strip() == "1",
                 "source": rows[1].strip() or "Unknown",
@@ -117,16 +117,21 @@ class VWebcam:
                 "height": int(rows[3] or 0),
                 "frames": int(rows[4] or 0),
                 "timestamp": int(rows[5] or 0),
+                "preview_session": int(rows[6] or 0),
             }
         except (OSError, ValueError):
             return {
                 "active": False, "source": "No source",
                 "width": 0, "height": 0, "frames": 0, "timestamp": 0,
+                "preview_session": 0,
             }
 
-    def focus(self) -> dict[str, object] | None:
+    def focus(self, preview_session: int) -> dict[str, object] | None:
         try:
             value = json.loads(FOCUS_PATH.read_text(encoding="utf-8"))
+            session = value.get("preview_session") if isinstance(value, dict) else None
+            if type(session) is not int or session != preview_session:
+                return None
             coords = [float(value[key]) for key in ("x", "y", "width", "height")]
             if not all(math.isfinite(n) and 0 <= n <= 1 for n in coords):
                 return None
@@ -137,9 +142,9 @@ class VWebcam:
             label = str(value.get("label", "Selected region")).replace("\n", " ").strip()
             return {
                 "x": coords[0], "y": coords[1], "width": coords[2],
-                "height": coords[3], "label": label[:128] or "Selected region",
+                "height": coords[3], "label": label or "Selected region",
             }
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
             return None
 
     def toggle_pause(self) -> None:
@@ -157,32 +162,47 @@ class VWebcam:
         )
         self.draw_focus()
 
+    def load_frame(self, preview_session: int) -> bool:
+        # Read the session header and pixels through the same descriptor.
+        # Eyes replaces this file atomically while capture continues.
+        expected = f"# r2-preview {preview_session}\n".encode("ascii")
+        try:
+            with FRAME_PATH.open("rb") as frame:
+                if frame.read(3) != b"P6\n" or frame.readline(128) != expected:
+                    return False
+                info = os.fstat(frame.fileno())
+                stamp = (preview_session, info.st_dev, info.st_ino, info.st_mtime_ns)
+                if stamp != self.last_frame_stamp:
+                    self.raw_photo = tk.PhotoImage(data=b"P6\n" + frame.read(), format="PPM")
+                    self.last_frame_stamp = stamp
+                return True
+        except (OSError, tk.TclError):
+            return False
+
     def refresh(self) -> None:
         # Pause freezes the frame and its focus metadata together.
         if self.paused:
             return
         self.display_status = self.status()
-        self.display_focus = self.focus()
-        if not self.display_status["active"] or not self.display_status["frames"]:
-            # A new source starts at frame zero. Never keep showing a frame
-            # from the previous source/session while the next capture warms up.
-            self.raw_photo = None
-            self.photo = None
-            self.last_frame_mtime = None
-            self.image_width = 0
-            self.image_height = 0
-            self.canvas.itemconfigure(self.image_item, image="")
-            self.canvas.coords(self.image_item, 0, 0)
-            self.draw_focus()
-            return
-        try:
-            stamp = FRAME_PATH.stat().st_mtime_ns
-            if stamp != self.last_frame_mtime:
-                self.raw_photo = tk.PhotoImage(file=str(FRAME_PATH))
-                self.last_frame_mtime = stamp
+        self.display_focus = None
+        session = int(self.display_status["preview_session"])
+        previous_stamp = self.last_frame_stamp
+        if (self.display_status["active"] and self.display_status["frames"]
+                and session > 0 and self.load_frame(session)):
+            self.display_focus = self.focus(session)
+            if self.last_frame_stamp != previous_stamp:
                 self.fit_image()
-        except (OSError, tk.TclError):
-            pass
+            else:
+                self.draw_focus()
+            return
+
+        self.raw_photo = None
+        self.photo = None
+        self.last_frame_stamp = None
+        self.image_width = 0
+        self.image_height = 0
+        self.canvas.itemconfigure(self.image_item, image="")
+        self.canvas.coords(self.image_item, 0, 0)
         self.draw_focus()
 
     def fit_image(self) -> None:

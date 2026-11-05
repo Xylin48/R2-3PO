@@ -87,7 +87,7 @@ static int visual_vwebcam_prepare_dir(void)
 static uint64_t visual_request_sequence;
 static uint64_t visual_focus_sequence;
 
-static void publish_focus_region_impl(json_object *focus)
+static void publish_focus_region_impl(json_object *focus, uint64_t preview_session)
 {
     char path[PATH_MAX], tmp[PATH_MAX];
     const char *display = getenv("DISPLAY");
@@ -145,7 +145,8 @@ static void publish_focus_region_impl(json_object *focus)
         visual_json_object_add_checked(root, "y", json_object_new_double(y)) != 0 ||
         visual_json_object_add_checked(root, "width", json_object_new_double(w)) != 0 ||
         visual_json_object_add_checked(root, "height", json_object_new_double(h)) != 0 ||
-        visual_json_object_add_checked(root, "label", json_object_new_string(label)) != 0) {
+        visual_json_object_add_checked(root, "label", json_object_new_string(label)) != 0 ||
+        visual_json_object_add_checked(root, "preview_session", json_object_new_uint64(preview_session)) != 0) {
         json_object_put(root);
         return;
     }
@@ -171,12 +172,14 @@ static void publish_focus_region_impl(json_object *focus)
 }
 
 /* Called under visual_lock after the current library accepts the row. */
-static void publish_committed_focus(uint64_t request_sequence, json_object *focus)
+static void publish_committed_focus(uint64_t request_sequence, uint64_t preview_session,
+                                    json_object *focus)
 {
-    if (request_sequence <= visual_focus_sequence)
+    if (request_sequence <= visual_focus_sequence || !preview_session ||
+        preview_session != r2_eyes_preview_session())
         return;
     visual_focus_sequence = request_sequence;
-    publish_focus_region_impl(focus);
+    publish_focus_region_impl(focus, preview_session);
 }
 
 /* Parse the entire supplied representation, never a valid-looking prefix. */
@@ -928,7 +931,7 @@ void r2_visual_shutdown(void)
     if (visual_db) sqlite3_close(visual_db);
     visual_db = NULL;
     visual_initialized = 0;
-    publish_focus_region_impl(NULL);
+    publish_focus_region_impl(NULL, 0);
     if (visual_generation != UINT64_MAX) ++visual_generation;
     pthread_mutex_unlock(&visual_lock);
 }
@@ -1121,7 +1124,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     if (rc != SQLITE_DONE)
         snprintf(db_error, sizeof(db_error), "%s", sqlite3_errmsg(visual_db));
     if (rc == SQLITE_DONE)
-        publish_committed_focus(request_sequence, focus);
+        publish_committed_focus(request_sequence, frame->preview_session, focus);
     pthread_mutex_unlock(&visual_lock);
     if (rc != SQLITE_DONE) {
         unlink(image_path);
