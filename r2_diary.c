@@ -560,11 +560,11 @@ static int diary_entries_migrate_schema(void)
         char sql[512];
         int n = snprintf(sql, sizeof(sql),
                          "UPDATE diary_entries SET created_at=%s "
-                         "WHERE created_at IS NULL OR created_at='';", legacy);
+                         "WHERE (created_at IS NULL OR created_at='') "
+                         "AND %s IS NOT NULL AND %s<>'';", legacy, legacy, legacy);
         if (n < 0 || (size_t)n >= sizeof(sql) ||
             sqlite3_exec(r2_diary_db, sql, NULL, NULL, NULL) != SQLITE_OK)
             return SQLITE_ERROR;
-        break;
     }
     if (sqlite3_exec(r2_diary_db,
             "UPDATE diary_entries SET created_at=CURRENT_TIMESTAMP "

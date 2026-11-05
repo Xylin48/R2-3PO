@@ -724,8 +724,9 @@ static int visual_backfill(const char *target, const char *source)
     if (!visual_column_exists(source)) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
-        "UPDATE r2_visual_experiences SET %s=%s WHERE %s IS NULL OR %s='';",
-        target, source, target, target);
+        "UPDATE r2_visual_experiences SET %s=%s WHERE (%s IS NULL OR %s='') "
+        "AND %s IS NOT NULL AND %s<>'';",
+        target, source, target, target, source, source);
     if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_TOOBIG;
     return sqlite3_exec(visual_db, sql, NULL, NULL, NULL);
 }

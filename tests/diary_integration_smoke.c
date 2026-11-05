@@ -253,9 +253,10 @@ static void seed_legacy_diary_entries(void)
         "CREATE TABLE diary_entries ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "entry TEXT NOT NULL,"
-        "timestamp TEXT NOT NULL);"
-        "INSERT INTO diary_entries(entry,timestamp) "
-        "VALUES('legacy schema migration fixture','2001-02-03 04:05:06');",
+        "timestamp TEXT, created TEXT);"
+        "INSERT INTO diary_entries(entry,timestamp,created) VALUES"
+        "('legacy schema migration fixture','2001-02-03 04:05:06','2000-01-01 00:00:00'),"
+        "('legacy alternate date',NULL,'2002-03-04 05:06:07');",
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 }
@@ -305,8 +306,16 @@ static void verify_legacy_diary_migration(void)
     assert(entry && strcmp((const char *)entry, "legacy schema migration fixture") == 0);
     assert(created && strcmp((const char *)created, "2001-02-03 04:05:06") == 0);
     sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT created_at,timestamp,created FROM diary_entries WHERE entry='legacy alternate date'",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), "2002-03-04 05:06:07") == 0);
+    assert(sqlite3_column_type(st, 1) == SQLITE_NULL);
+    assert(strcmp((const char *)sqlite3_column_text(st, 2), "2002-03-04 05:06:07") == 0);
+    sqlite3_finalize(st);
     assert(sqlite3_exec(db,
-        "DELETE FROM diary_entries WHERE entry='legacy schema migration fixture'",
+        "DELETE FROM diary_entries WHERE entry IN ('legacy schema migration fixture','legacy alternate date')",
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 }

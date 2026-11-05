@@ -47,15 +47,16 @@ int main(void)
     assert(sqlite3_exec(visual_db,
         "CREATE TABLE r2_visual_experiences ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "created_at TEXT NOT NULL,"
+        "created_at TEXT,"
         "timestamp TEXT NOT NULL,"
-        "file_path TEXT NOT NULL,"
+        "file_path TEXT,"
         "path TEXT NOT NULL,"
         "source TEXT NOT NULL,"
         "description TEXT NOT NULL);"
         "INSERT INTO r2_visual_experiences(created_at,timestamp,file_path,path,source,description) "
         "VALUES('2020-01-02T03:04:05Z','2020-01-02T03:04:05Z',"
-        "'/legacy/old.jpg','/legacy/old.jpg','legacy-camera','old frame');",
+        "'/legacy/old.jpg','/legacy/old.jpg','legacy-camera','old frame'),"
+        "(NULL,'2020-02-03T04:05:06Z','','/legacy/alternate.jpg','another camera','alternate aliases');",
         NULL, NULL, NULL) == SQLITE_OK);
 
     assert(visual_migrate_schema() == SQLITE_OK);
@@ -65,6 +66,10 @@ int main(void)
     assert(legacy_rows == 1);
     char *legacy = r2_visual_search("old frame", 2);
     assert(legacy && strstr(legacy, "image=/legacy/old.jpg\nold frame\n\n"));
+    free(legacy);
+    legacy = r2_visual_search("alternate aliases", 2);
+    assert(legacy && strstr(legacy, "[2020-02-03T04:05:06Z] source=another camera "
+                                  "model=unknown image=/legacy/alternate.jpg"));
     free(legacy);
 
     sqlite3_stmt *st = NULL;
