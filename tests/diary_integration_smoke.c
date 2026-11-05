@@ -281,6 +281,16 @@ static void *write_concurrent_diary_entries(void *opaque)
     return NULL;
 }
 
+static int visit_legacy_diary(void *context, int64_t id, const char *row, size_t length)
+{
+    int *count = context;
+    assert(id == 1);
+    assert(length == strlen(row));
+    assert(strcmp(row, "[2001-02-03 04:05:06]\nlegacy schema migration fixture\n\n") == 0);
+    ++*count;
+    return 0;
+}
+
 static void verify_legacy_diary_migration(void)
 {
     sqlite3 *db = NULL;
@@ -308,6 +318,10 @@ int main(void)
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     seed_legacy_diary_entries();
     assert(r2_diary_init() == 0);
+    int legacy_rows = 0;
+    assert(r2_diary_visit_search("legacy schema migration fixture", 2,
+                                 visit_legacy_diary, &legacy_rows) == 0);
+    assert(legacy_rows == 1);
     verify_legacy_diary_migration();
     /* Simulate a ledger created before reward-to-Life-Log columns existed. */
     assert(create_legacy_reward_db() == 0);

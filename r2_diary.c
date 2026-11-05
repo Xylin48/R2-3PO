@@ -1267,18 +1267,16 @@ static int diary_append_record(char **out, size_t *length, const char *record)
     return 0;
 }
 
-static char *diary_query(const char *query, int limit)
+static int diary_query(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
-    if (!r2_diary_db) return NULL;
+    if (!r2_diary_db) return -1;
     sqlite3_stmt *statement = NULL;
-    char *out = strdup("");
     char *pattern = NULL;
-    size_t length = 0;
     int rc;
-    if (!out) return NULL;
     const char *sql = query
-        ? "SELECT entry,created_at FROM diary_entries WHERE entry LIKE ? ORDER BY id DESC LIMIT ?;"
-        : "SELECT entry,created_at FROM diary_entries ORDER BY id DESC LIMIT ?;";
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ? ORDER BY id DESC LIMIT ?;"
+        : "SELECT entry,created_at,id FROM diary_entries ORDER BY id DESC LIMIT ?;";
     rc = sqlite3_prepare_v2(r2_diary_db, sql, -1, &statement, NULL);
     if (rc != SQLITE_OK) goto failed;
     if (query) {
@@ -1305,33 +1303,65 @@ static char *diary_query(const char *query, int limit)
                 (text && strlen(text) != (size_t)sqlite3_column_bytes(statement, i))) goto failed;
         }
         char *row = NULL;
-        if (asprintf(&row, "[%s]\n%s\n\n", created ? created : "", entry ? entry : "") < 0)
-            goto failed;
-        int append_rc = diary_append_record(&out, &length, row);
+        int n = asprintf(&row, "[%s]\n%s\n\n", created ? created : "", entry ? entry : "");
+        if (n < 0) goto failed;
+        int append_rc = visit(context, sqlite3_column_int64(statement, 2), row, (size_t)n);
         free(row);
         if (append_rc != 0) goto failed;
     }
     if (rc != SQLITE_DONE) goto failed;
     sqlite3_finalize(statement);
-    return out;
+    return 0;
 failed:
     sqlite3_finalize(statement);
-    free(pattern); free(out);
-    return NULL;
+    free(pattern);
+    return -1;
+}
+
+struct diary_query_text {
+    char *data;
+    size_t length;
+};
+
+static int diary_collect_row(void *context, int64_t id, const char *row, size_t length)
+{
+    (void)id;
+    (void)length;
+    struct diary_query_text *text = context;
+    return diary_append_record(&text->data, &text->length, row);
+}
+
+static char *diary_query_string(const char *query, int limit)
+{
+    struct diary_query_text text = {.data = strdup("")};
+    if (!text.data) return NULL;
+    if (diary_query(query, limit, diary_collect_row, &text) != 0) {
+        free(text.data);
+        return NULL;
+    }
+    return text.data;
+}
+
+int r2_diary_visit_search(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    if (!query || !*query || !visit) return -1;
+    if (limit <= 0 || limit > 20) limit = 20;
+    return diary_query(query, limit, visit, context);
 }
 
 char *r2_diary_recent(int limit)
 {
     if (limit <= 0) limit = R2_DEFAULT_DIARY_LIMIT;
     if (limit > 20) limit = 20;
-    return diary_query(NULL, limit);
+    return diary_query_string(NULL, limit);
 }
 
 char *r2_diary_search(const char *search_term, int limit)
 {
     if (!search_term || !*search_term) return NULL;
     if (limit <= 0 || limit > 20) limit = 20;
-    return diary_query(search_term, limit);
+    return diary_query_string(search_term, limit);
 }
 
 

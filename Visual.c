@@ -1139,17 +1139,23 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     return description;
 }
 
-static char *visual_query(const char *sql, const char *query, int limit)
+static int visual_query(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
     if (limit < 1) limit = 1;
     if (limit > 100) limit = 100;
 
-    struct response_buffer b = {0};
+    const char *sql = query
+        ? "SELECT created_utc,source,model,description,image_path,id "
+          "FROM r2_visual_experiences WHERE instr(lower(description),lower(?1))>0 "
+          "OR instr(lower(source),lower(?1))>0 ORDER BY id DESC LIMIT ?2"
+        : "SELECT created_utc,source,model,description,image_path,id "
+          "FROM r2_visual_experiences ORDER BY id DESC LIMIT ?";
     int failed = 0;
     pthread_mutex_lock(&visual_lock);
     if (!visual_initialized || !visual_db) {
         pthread_mutex_unlock(&visual_lock);
-        return NULL;
+        return -1;
     }
 
     sqlite3_stmt *st = NULL;
@@ -1157,17 +1163,12 @@ static char *visual_query(const char *sql, const char *query, int limit)
     if (rc != SQLITE_OK) {
         sqlite3_finalize(st);
         pthread_mutex_unlock(&visual_lock);
-        return NULL;
+        return -1;
     }
 
     if (query) {
         rc = sqlite3_bind_text(st, 1, query, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK && strstr(sql, "lower(source)") != NULL) {
-            rc = sqlite3_bind_text(st, 2, query, -1, SQLITE_TRANSIENT);
-            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 3, limit);
-        } else if (rc == SQLITE_OK) {
-            rc = sqlite3_bind_int(st, 2, limit);
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, limit);
     } else {
         rc = sqlite3_bind_int(st, 1, limit);
     }
@@ -1175,7 +1176,7 @@ static char *visual_query(const char *sql, const char *query, int limit)
     if (rc != SQLITE_OK) {
         sqlite3_finalize(st);
         pthread_mutex_unlock(&visual_lock);
-        return NULL;
+        return -1;
     }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
@@ -1199,23 +1200,9 @@ static char *visual_query(const char *sql, const char *query, int limit)
             model ? (const char *)model : "?", path ? (const char *)path : "?",
             desc ? (const char *)desc : "(no description)");
         if (n < 0) { failed = 1; break; }
-        size_t add = (size_t)n;
-        if (add > SIZE_MAX - b.length - 1) {
-            free(line);
-            failed = 1;
-            break;
-        }
-        char *next = realloc(b.data, b.length + add + 1);
-        if (!next) {
-            free(line);
-            failed = 1;
-            break;
-        }
-        b.data = next;
-        memcpy(b.data + b.length, line, add);
+        int append_rc = visit(context, sqlite3_column_int64(st, 5), line, (size_t)n);
         free(line);
-        b.length += add;
-        b.data[b.length] = '\0';
+        if (append_rc != 0) { failed = 1; break; }
     }
 
     if (rc != SQLITE_DONE)
@@ -1223,29 +1210,40 @@ static char *visual_query(const char *sql, const char *query, int limit)
     sqlite3_finalize(st);
     pthread_mutex_unlock(&visual_lock);
 
-    if (failed) {
-        free(b.data);
-        return NULL;
-    }
-    if (!b.data)
-        b.data = strdup("(No visual experiences found.)\n");
-    return b.data;
+    return failed ? -1 : 0;
 }
 
-char *r2_visual_recent(int limit)
+static int visual_collect_row(void *context, int64_t id, const char *row, size_t length)
 {
-    return visual_query(
-        "SELECT created_utc,source,model,description,image_path "
-        "FROM r2_visual_experiences ORDER BY id DESC LIMIT ?",
-        NULL, limit);
+    (void)id;
+    struct response_buffer *text = context;
+    if (length > SIZE_MAX - text->length - 1) return -1;
+    char *next = realloc(text->data, text->length + length + 1);
+    if (!next) return -1;
+    text->data = next;
+    memcpy(text->data + text->length, row, length + 1);
+    text->length += length;
+    return 0;
+}
+
+int r2_visual_visit_search(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    if (!query || !*query || !visit) return -1;
+    return visual_query(query, limit, visit, context);
 }
 
 char *r2_visual_search(const char *query, int limit)
 {
-    if (!query || !*query) return r2_visual_recent(limit);
-    return visual_query(
-        "SELECT created_utc,source,model,description,image_path "
-        "FROM r2_visual_experiences WHERE instr(lower(description),lower(?))>0 "
-        "OR instr(lower(source),lower(?))>0 ORDER BY id DESC LIMIT ?",
-        query, limit);
+    struct response_buffer text = {0};
+    if (visual_query(query && *query ? query : NULL, limit, visual_collect_row, &text) != 0) {
+        free(text.data);
+        return NULL;
+    }
+    return text.data ? text.data : strdup("(No visual experiences found.)\n");
+}
+
+char *r2_visual_recent(int limit)
+{
+    return r2_visual_search(NULL, limit);
 }

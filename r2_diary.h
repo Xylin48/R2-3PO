@@ -80,6 +80,13 @@ char *r2_diary_search(
     int limit
 );
 
+/* Visit complete rows by SQLite ID. Row text is borrowed for the callback.
+ * Return nonzero from the callback to stop. Discard partial results on error.
+ * Callbacks must not reenter the provider. */
+int r2_diary_visit_search(const char *query, int limit,
+    int (*visit)(void *context, int64_t id, const char *row, size_t length),
+    void *context);
+
 
 /* ============================================================
    REFLECTION

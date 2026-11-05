@@ -112,7 +112,7 @@ require(
     "keyword ranking retains only top results and avoids quadratic C and full-table SQL sorts",
 )
 require(
-    "r2_diary_search" in builder and "r2_visual_search" in builder,
+    "r2_diary_visit_search" in builder and "r2_visual_visit_search" in builder,
     "the same associations also search the separate diary and visual experience stores",
 )
 association_start = core.find("static char *r2_collect_associated_records(")
@@ -120,8 +120,8 @@ association_end = core.find("static pthread_mutex_t r2_associative_query_cache_l
 association_search = core[association_start:association_end] if association_start >= 0 and association_end > association_start else ""
 require(
     "searches < 6" in association_search
-    and "associated_keywords, associated_count, r2_diary_search" in builder
-    and "associated_keywords, associated_count, r2_visual_search" in builder,
+    and "associated_keywords, associated_count, r2_diary_visit_search" in builder
+    and "associated_keywords, associated_count, r2_visual_visit_search" in builder,
     "diary and visual retrieval retain full selected records across bounded search slots",
 )
 require(

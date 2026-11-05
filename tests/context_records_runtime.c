@@ -46,10 +46,22 @@ static void expect_contains(char *actual, const char *complete)
     if (!actual || !strstr(actual, complete)) fprintf(stderr, "Complete-content check %d failed (returned=%zu expected=%zu).\n", check, actual ? strlen(actual) : 0, strlen(complete));
     assert(actual && strstr(actual, complete)); free(actual);
 }
-static char *search_quoted_sentinel(const char *query, int limit)
+static int search_quoted_sentinel(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
     (void)query; (void)limit;
-    return strdup("An actual record quotes No visual experiences matched and No Life Log events matched.\nTAIL");
+    const char row[] = "(No visual experiences found.)\nTAIL";
+    return visit(context, 1, row, sizeof(row) - 1);
+}
+
+static void expect_copies(char *actual, const char *complete, size_t expected)
+{
+    assert(actual);
+    size_t count = 0, length = strlen(complete);
+    for (const char *match = actual; (match = strstr(match, complete)); match += length)
+        ++count;
+    assert(count == expected);
+    free(actual);
 }
 static void insert_visual(sqlite3 *connection, const char *description, int image)
 {
@@ -99,12 +111,17 @@ int main(void)
     insert_visual(connection, visual_text, 1); insert_visual(connection, "another visual row", 2);
     verify_complete_reads();
 
-    char keywords[MAX_MEMORY_KEYWORDS][64] = {{"DIARY-END"}};
-    char *associated = r2_collect_associated_records(keywords, 1, r2_diary_search);
-    expect_contains(associated, diary_text);
+    char keywords[MAX_MEMORY_KEYWORDS][64] = {{"DIARY-END"}, {"DIARY"}};
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 1);
+    assert(r2_diary_write(diary_text) == 0);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 2);
     snprintf(keywords[0], sizeof(keywords[0]), "VISUAL-END");
-    expect_contains(r2_collect_associated_records(keywords, 1, r2_visual_search), visual_text);
+    snprintf(keywords[1], sizeof(keywords[1]), "visual-source");
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 1);
+    insert_visual(connection, visual_text, 3);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 2);
     expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel), "TAIL");
+    expect_copies(r2_visual_search("not-in-the-fixture", 2), "(No visual experiences found.)\n", 1);
     char *assembled = strdup(memory_text); assert(assembled);
     assert(r2_append_association_section(&assembled, "DIARY:\n", diary_text) == 0);
     assert(r2_append_association_section(&assembled, "VISUAL:\n", visual_text) == 0);
@@ -124,16 +141,18 @@ int main(void)
     failed_provider = 0;
 
     /* Real queries must discard even a valid first row if their next step fails. */
-    failed_sql = "SELECT entry,created_at FROM diary_entries"; allowed_rows = 1;
+    failed_sql = "SELECT entry,created_at,id FROM diary_entries"; allowed_rows = 1;
     assert(!r2_diary_recent(20));
     allowed_rows = 1; assert(!r2_diary_search("%", 20));
     allowed_rows = 1; assert(!r2_diary_build_reflection_context(20));
-    allowed_rows = 0; assert(!r2_collect_associated_records(keywords, 1, r2_diary_search));
+    snprintf(keywords[0], sizeof(keywords[0]), "DIARY-END");
+    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_diary_visit_search));
     failed_sql = "SELECT id,local_time,category,event_type"; allowed_rows = 1;
     assert(!r2_diary_build_reflection_context(20));
     failed_sql = "SELECT created_utc,source,model,description"; allowed_rows = 1;
     assert(!r2_visual_recent(20));
-    allowed_rows = 0; assert(!r2_collect_associated_records(keywords, 1, r2_visual_search));
+    snprintf(keywords[0], sizeof(keywords[0]), "VISUAL-END");
+    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_visual_visit_search));
     failed_sql = NULL;
     assert(sqlite3_close(connection) == SQLITE_OK);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();

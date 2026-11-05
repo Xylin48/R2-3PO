@@ -34,11 +34,13 @@ static int test_valid_utf8(const unsigned char *s)
     return 1;
 }
 
-static char *fake_associated_search(const char *query, int limit)
+static int fake_associated_search(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
     (void)query;
     (void)limit;
-    return strdup("A\xe2\x98\x83ZZZZ");
+    const char text[] = "A\xe2\x98\x83ZZZZ\n";
+    return visit(context, 1, text, sizeof(text) - 1);
 }
 
 static void clear_test_messages(void)
