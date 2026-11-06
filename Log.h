@@ -219,6 +219,17 @@ char *r2_log_status_report(void);
  */
 char *r2_log_recent(int limit);
 /* Search returns matched events plus a bounded one-hop expansion of explicit r2_log_links. */
+/* Structured boundaries are authoritative even when event text contains blank
+ * lines or text resembling another event header. Caller releases the batch. */
+typedef struct { int64_t event_id; size_t offset, length; } R2LogRecordSpan;
+typedef struct {
+    char *text;
+    R2LogRecordSpan *records;
+    size_t count;
+} R2LogRecordBatch;
+int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch);
+void r2_log_release_records(R2LogRecordBatch *batch);
+
 char *r2_log_search(const char *query, int limit);
 
 /* Return non-zero when initialized. */

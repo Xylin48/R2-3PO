@@ -11,12 +11,12 @@ launcher = (ROOT / "R2_Launch_Code.sh").read_text(encoding="utf-8")
 ears = (ROOT / "Ears.c").read_text(encoding="utf-8")
 ears_header = (ROOT / "Ears.h").read_text(encoding="utf-8")
 
-start = core.index("char *r2_ears_listen_cancelable(unsigned seconds,")
+start = core.index("char *r2_ears_listen_source_cancelable(unsigned seconds,")
 end = core.index("int r2_ears_start(void)", start)
 bridge = core[start:end]
 
 assert "r2_ears_read(ears, pcm, wanted)" in bridge
-assert "r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata)" in bridge
+assert "r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata)" in bridge
 capture_start = core.index("static void *r2_ears_capture_worker(void *unused)")
 capture_end = core.index("static int r2_ears_write_recent_audio(", capture_start)
 capture_worker = core[capture_start:capture_end]
@@ -35,7 +35,7 @@ assert '"%s/whisper.wav"' in bridge
 assert "if (!normalized_ok)" in bridge
 assert "unlink(whisper_path)" in bridge
 convert = core[core.index("static int r2_ears_write_whisper_wav("):
-               core.index("char *r2_ears_listen_cancelable(unsigned seconds,")]
+               core.index("char *r2_ears_listen_source_cancelable(unsigned seconds,")]
 assert "16000U" in convert and "32000U" in convert
 assert "const uint32_t normalized_bytes = raw_pcm_bytes / 6U;" in convert
 assert "fread(input, 12U, count, raw)" in convert
@@ -70,8 +70,8 @@ assert not re.search(r"else\s+child\s*=\s*-1\s*;", wait_error_path), (
     "do not discard the live child PID on unexpected waitpid errors"
 )
 assert "return r2_ears_listen_cancelable(seconds, NULL, NULL);" in core
-assert 'shell_talk(transcript)' in shell
-conversation_start = shell.index("static void shell_talk_inner(const char *message)")
+assert 'shell_talk_with_speech_event(transcript, speech_event_id)' in shell
+conversation_start = shell.index("static void shell_talk_inner(const char *message, int64_t speech_event_id)")
 conversation_end = shell.index("static void shell_talk(const char *message)", conversation_start)
 conversation_entry = shell[conversation_start:conversation_end]
 assert 'r2_talk(message)' in conversation_entry, (

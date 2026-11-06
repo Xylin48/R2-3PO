@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <stdint.h>
 
 static sqlite3 *sj_db;
 static pthread_mutex_t sj_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -100,6 +102,10 @@ int r2_sj_init(void)
         " linked_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"
         " FOREIGN KEY(event_id) REFERENCES r2_log_events(id),"
         " FOREIGN KEY(diary_entry_id) REFERENCES diary_entries(id)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS r2_sensory_journal_reflection_links ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " diary_entry_id INTEGER NOT NULL REFERENCES diary_entries(id)"
         ");"
         "CREATE INDEX IF NOT EXISTS r2_sensory_journal_diary_entry_idx "
         "ON r2_sensory_journal_diary_links(diary_entry_id);";
@@ -255,6 +261,26 @@ int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
     return rc == SQLITE_DONE && changed == 1 ? 0 : -1;
 }
 
+int r2_sj_link_reflection(int64_t event_id, int64_t diary_entry_id)
+{
+    if (event_id <= 0 || diary_entry_id <= 0) return -1;
+    pthread_mutex_lock(&sj_lock);
+    if (!sj_ready || !sj_db) { pthread_mutex_unlock(&sj_lock); return -1; }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(sj_db,
+        "INSERT OR REPLACE INTO r2_sensory_journal_reflection_links(event_id,diary_entry_id) "
+        "SELECT e.id,d.id FROM r2_log_events e JOIN diary_entries d ON d.id=? "
+        "WHERE e.id=? AND e.category='thinking' AND e.event_type='reflection_completed';",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_entry_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int changed = rc == SQLITE_DONE ? sqlite3_changes(sj_db) : 0;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&sj_lock);
+    return rc == SQLITE_DONE && changed == 1 ? 0 : -1;
+}
+
 int64_t r2_sj_note(const char *note, const char *details)
 {
     if (!note || !*note) return -1;
@@ -274,23 +300,25 @@ static char *sj_query(const char *query, int limit)
 
     const char *sql_recent =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,CASE WHEN "
+        "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (SELECT COUNT(*) FROM diary_entries match_row "
         "WHERE match_row.entry=e.details)<>1 "
-        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
+        "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
+        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
         "ORDER BY e.id DESC LIMIT ?;";
     const char *sql_search =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,CASE WHEN "
+        "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (SELECT COUNT(*) FROM diary_entries match_row "
         "WHERE match_row.entry=e.details)<>1 "
-        "THEN NULL ELSE d.diary_entry_id END FROM r2_sensory_journal j "
+        "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
+        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
         "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
         "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
         "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
@@ -301,7 +329,6 @@ static char *sj_query(const char *query, int limit)
     }
     if (query) {
         size_t n = strlen(query);
-        if (n > 1024) n = 1024;
         /* Treat user search text literally: LIKE's %, _, and our escape
            character must not silently broaden the requested search. */
         if (n > ((size_t)-1 - 3) / 2) {
@@ -341,7 +368,6 @@ static char *sj_query(const char *query, int limit)
     if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
     out[0] = '\0';
     int rc;
-    int intentionally_truncated = 0;
     int serialization_failed = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const unsigned char *utc = sqlite3_column_text(st, 1);
@@ -367,13 +393,17 @@ static char *sj_query(const char *query, int limit)
             serialization_failed = 1;
             break;
         }
-        if (len + (size_t)needed + 1 > 2 * 1024 * 1024) {
-            intentionally_truncated = 1;
+        if (len == SIZE_MAX || (size_t)needed > SIZE_MAX - len - 1) {
+            serialization_failed = 1;
+            errno = EOVERFLOW;
             break;
         }
         if (len + (size_t)needed + 1 > cap) {
             size_t next = cap;
-            while (next < len + (size_t)needed + 1) next *= 2;
+            while (next < len + (size_t)needed + 1) {
+                if (next > SIZE_MAX / 2) { next = len + (size_t)needed + 1; break; }
+                next *= 2;
+            }
             char *grown = realloc(out, next);
             if (!grown) { free(out); out = NULL; break; }
             out = grown; cap = next;
@@ -393,18 +423,13 @@ static char *sj_query(const char *query, int limit)
     }
     sqlite3_finalize(st);
     pthread_mutex_unlock(&sj_lock);
-    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
+    if (serialization_failed || rc != SQLITE_DONE) {
         free(out);
         return NULL;
     }
     if (out && len == 0)
         snprintf(out, cap, "%s", query ? "No Sensory Journal entries matched.\n" :
                                       "The Sensory Journal contains no entries yet.\n");
-    if (out && intentionally_truncated) {
-        const char *note = "[Sensory Journal output truncated at 2 MiB; remaining entries are still stored.]\n";
-        size_t note_len = strlen(note);
-        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
-    }
     return out;
 }
 

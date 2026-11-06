@@ -2,6 +2,7 @@
 #define R2_DIARY_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * ============================================================
@@ -67,6 +68,8 @@ int r2_diary_reconnect_history(int limit);
 int r2_diary_write(
     const char *entry
 );
+/* Stable ID of the actual inserted row, protected by the diary write lock. */
+int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out);
 
 char *r2_diary_recent(
     int count
@@ -76,6 +79,13 @@ char *r2_diary_search(
     const char *query,
     int limit
 );
+
+/* Visit complete rows by SQLite ID. Row text is borrowed for the callback.
+ * Return nonzero from the callback to stop. Discard partial results on error.
+ * Callbacks must not reenter the provider. */
+int r2_diary_visit_search(const char *query, int limit,
+    int (*visit)(void *context, int64_t id, const char *row, size_t length),
+    void *context);
 
 
 /* ============================================================

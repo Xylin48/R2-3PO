@@ -41,6 +41,14 @@ require("json_object_object_add(root, \"model\", json_object_new_string(MODEL))"
         and "if (options) {" not in function,
         "old unchecked metadata/options paths are absent")
 
+require("CURLcode setup_rc = curl_easy_setopt(curl, (option), (value));" in function
+        and "if (setup_rc != CURLE_OK)" in function
+        and "R2_OLLAMA_SETOPT(CURLOPT_WRITEFUNCTION, curl_write)" in function,
+        "transport setup fails before performing a partially configured request")
+require("r2_fit_complete_input(required_context_chars, num_ctx, &num_predict)" in function
+        and 'ollama_json_object_add_checked(request_options, "num_predict"' in function,
+        "complete input can reallocate generation reserve with a checked options update")
+
 progress_start = source.find("static int ollama_progress(")
 progress_end = source.find("\nint r2_ollama_vision_request_begin", progress_start)
 if progress_start < 0 or progress_end <= progress_start:
@@ -65,5 +73,13 @@ require("ollama_response_contract_valid(response_role, response_done)" in respon
         and 'strcmp(role, "assistant") == 0 && done == 1' in source
         and 'ollama_invalid_completion_contract' in response,
         "only a complete assistant response is accepted as the final answer")
+
+
+require('!strcmp(done_reason, "length")' in response
+        and '"ollama_output_limit_reached"' in response,
+        "an explicit generation-limit stop is retained as incomplete evidence, not a completed reply")
+require("json_object_get_string_len(content)" in response
+        and '"ollama_invalid_final_text"' in response,
+        "embedded-NUL final text cannot silently become an accepted prefix")
 
 print("Ollama request configuration smoke test passed.")

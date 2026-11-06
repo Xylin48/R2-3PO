@@ -27,6 +27,8 @@ typedef struct {
     pa_mainloop *loop;
     pa_context *context;
     uint64_t deadline_ms;
+    int (*cancelled)(void *);
+    void *userdata;
     int done;
     int failed;
     char *default_source;
@@ -198,6 +200,10 @@ static void r2_discovery_sink_info(pa_context *ctx, const pa_sink_info *info,
 static int r2_discovery_pump(R2PulseScan *scan, int *done)
 {
     while (!*done) {
+        if (scan->cancelled && scan->cancelled(scan->userdata)) {
+            errno = ECANCELED;
+            return -1;
+        }
         if (r2_discovery_now_ms() >= scan->deadline_ms) {
             errno = ETIMEDOUT;
             return -1;
@@ -227,14 +233,16 @@ static int r2_discovery_run(R2PulseScan *scan, pa_operation *operation)
     return result;
 }
 
-int r2_audio_discover(R2AudioDiscovery *result)
+int r2_audio_discover_cancelable(R2AudioDiscovery *result,
+                                  int (*cancelled)(void *), void *userdata)
 {
     if (!result) { errno = EINVAL; return -1; }
     memset(result, 0, sizeof(*result));
     result->playback_pid = -1;
     result->playback_sink = PA_INVALID_INDEX;
 
-    R2PulseScan scan = {0};
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+    R2PulseScan scan = {.cancelled = cancelled, .userdata = userdata};
     scan.data.playback_pid = -1;
     scan.data.playback_sink = PA_INVALID_INDEX;
     scan.resolving_output_slot = SIZE_MAX;
@@ -250,6 +258,7 @@ int r2_audio_discover(R2AudioDiscovery *result)
         goto fail;
     int ready = 0;
     while (!ready) {
+        if (cancelled && cancelled(userdata)) { errno = ECANCELED; goto fail; }
         pa_context_state_t state = pa_context_get_state(scan.context);
         if (state == PA_CONTEXT_READY) ready = 1;
         else if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
@@ -301,6 +310,7 @@ int r2_audio_discover(R2AudioDiscovery *result)
             !scan.data.desktop_monitor) goto fail;
     }
 
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; goto fail; }
     pa_context_disconnect(scan.context);
     pa_context_unref(scan.context);
     pa_mainloop_free(scan.loop);
@@ -320,4 +330,9 @@ fail:
     r2_audio_discovery_free(&scan.data);
     errno = errno ? errno : EIO;
     return -1;
+}
+
+int r2_audio_discover(R2AudioDiscovery *result)
+{
+    return r2_audio_discover_cancelable(result, NULL, NULL);
 }

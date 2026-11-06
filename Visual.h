@@ -1,6 +1,7 @@
 #ifndef R2_VISUAL_H
 #define R2_VISUAL_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "Eyes.h"
 
@@ -32,6 +33,13 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
 /* Read recent visual experiences as context; caller frees result. */
 char *r2_visual_recent(int limit);
 char *r2_visual_search(const char *query, int limit);
+
+/* Visit complete rows by SQLite ID. Row text is borrowed for the callback.
+ * Return nonzero from the callback to stop. Discard partial results on error.
+ * Callbacks must not reenter the provider. */
+int r2_visual_visit_search(const char *query, int limit,
+    int (*visit)(void *context, int64_t id, const char *row, size_t length),
+    void *context);
 
 #ifdef __cplusplus
 }

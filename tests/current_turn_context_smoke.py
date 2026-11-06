@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
 
 recall_start = core.find("static int r2_query_explicitly_requests_recall(")
-recall_end = core.find("/* Clip only at a record boundary", recall_start)
+recall_end = core.find("\n}\n", recall_start)
 if recall_start < 0 or recall_end < 0:
     raise SystemExit("Could not isolate the explicit-recall detector.")
 recall_detector = core[recall_start:recall_end]
@@ -103,7 +103,7 @@ require(
     and '"[R2 Prompt Audit] stage=%s payload_chars=%zu' in core,
     "prompt diagnostics distinguish associative planning from the actual answer and retry, making input-length discrepancies traceable",
 )
-recent_start = core.find("char *r2_recent_conversation_context(")
+recent_start = core.find("static char *r2_build_recent_conversation_context(")
 recent_end = core.find("static char *chat_with_relevant_memories(", recent_start)
 if recent_start < 0 or recent_end < 0:
     raise SystemExit("Could not isolate recent conversation context selection.")
@@ -121,7 +121,7 @@ require(
 )
 imagination = (ROOT / "Imagination.c").read_text(encoding="utf-8")
 require(
-    "r2_recent_conversation_context(NULL, 1800)" in imagination,
+    "r2_recent_conversation_context_complete(NULL)" in imagination,
     "Imagination retains the current user turn instead of excluding a matching scenario string",
 )
 require(

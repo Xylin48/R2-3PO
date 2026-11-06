@@ -28,7 +28,7 @@ if impl_end < 0:
     raise SystemExit("Could not isolate the conversation implementation.")
 implementation = core[impl_start:impl_end]
 
-shell_start = shell.index("static void shell_talk_inner(const char *message)")
+shell_start = shell.index("static void shell_talk_inner(const char *message, int64_t speech_event_id)")
 shell_end = shell.find("\n/*", shell_start)
 shell_talk = shell[shell_start:shell_end if shell_end >= 0 else len(shell)]
 
@@ -47,6 +47,11 @@ require(
     "The action result is still in the conversation; please ask me again" in implementation
     and "does not rerun the completed action" in implementation,
     "failed post-action generation preserves the completed action result without replaying the action",
+)
+require(
+    "r2_talk_with_speech_event(message, speech_event_id)" in shell_talk
+    and "r2_talk(message)" in shell_talk,
+    "typed and recognized speech use the same shell reply and fallback handling",
 )
 require(
     "if (!reply || !*reply)" in shell_talk

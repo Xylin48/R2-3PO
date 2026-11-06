@@ -253,9 +253,10 @@ static void seed_legacy_diary_entries(void)
         "CREATE TABLE diary_entries ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "entry TEXT NOT NULL,"
-        "timestamp TEXT NOT NULL);"
-        "INSERT INTO diary_entries(entry,timestamp) "
-        "VALUES('legacy schema migration fixture','2001-02-03 04:05:06');",
+        "timestamp TEXT, created TEXT);"
+        "INSERT INTO diary_entries(entry,timestamp,created) VALUES"
+        "('legacy schema migration fixture','2001-02-03 04:05:06','2000-01-01 00:00:00'),"
+        "('legacy alternate date',NULL,'2002-03-04 05:06:07');",
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 }
@@ -281,6 +282,16 @@ static void *write_concurrent_diary_entries(void *opaque)
     return NULL;
 }
 
+static int visit_legacy_diary(void *context, int64_t id, const char *row, size_t length)
+{
+    int *count = context;
+    assert(id == 1);
+    assert(length == strlen(row));
+    assert(strcmp(row, "[2001-02-03 04:05:06]\nlegacy schema migration fixture\n\n") == 0);
+    ++*count;
+    return 0;
+}
+
 static void verify_legacy_diary_migration(void)
 {
     sqlite3 *db = NULL;
@@ -295,8 +306,16 @@ static void verify_legacy_diary_migration(void)
     assert(entry && strcmp((const char *)entry, "legacy schema migration fixture") == 0);
     assert(created && strcmp((const char *)created, "2001-02-03 04:05:06") == 0);
     sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT created_at,timestamp,created FROM diary_entries WHERE entry='legacy alternate date'",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(st, 0), "2002-03-04 05:06:07") == 0);
+    assert(sqlite3_column_type(st, 1) == SQLITE_NULL);
+    assert(strcmp((const char *)sqlite3_column_text(st, 2), "2002-03-04 05:06:07") == 0);
+    sqlite3_finalize(st);
     assert(sqlite3_exec(db,
-        "DELETE FROM diary_entries WHERE entry='legacy schema migration fixture'",
+        "DELETE FROM diary_entries WHERE entry IN ('legacy schema migration fixture','legacy alternate date')",
         NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 }
@@ -308,6 +327,10 @@ int main(void)
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     seed_legacy_diary_entries();
     assert(r2_diary_init() == 0);
+    int legacy_rows = 0;
+    assert(r2_diary_visit_search("legacy schema migration fixture", 2,
+                                 visit_legacy_diary, &legacy_rows) == 0);
+    assert(legacy_rows == 1);
     verify_legacy_diary_migration();
     /* Simulate a ledger created before reward-to-Life-Log columns existed. */
     assert(create_legacy_reward_db() == 0);

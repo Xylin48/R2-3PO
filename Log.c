@@ -170,7 +170,7 @@ static int valid_text(const char *value)
     return value && value[0] != '\0';
 }
 
-/* Bounded append helper for query results. */
+/* Grow to preserve complete selected query records; never clip their text. */
 static int append_text(char **buffer, size_t *length, size_t *capacity,
                        const char *format, ...)
 {
@@ -188,8 +188,9 @@ static int append_text(char **buffer, size_t *length, size_t *capacity,
         return -1;
     }
 
-    if ((size_t)needed > R2_LOG_MAX_TEXT - *length) {
+    if (*length == SIZE_MAX || (size_t)needed > SIZE_MAX - *length - 1) {
         va_end(args);
+        errno = EOVERFLOW;
         return -1;
     }
 
@@ -199,8 +200,8 @@ static int append_text(char **buffer, size_t *length, size_t *capacity,
         size_t next = *capacity ? *capacity : 4096;
 
         while (next < required) {
-            if (next > R2_LOG_MAX_TEXT / 2) {
-                next = R2_LOG_MAX_TEXT;
+            if (next > SIZE_MAX / 2) {
+                next = required;
                 break;
             }
             next *= 2;
@@ -888,8 +889,7 @@ int64_t r2_log_event(
     if (!valid_text(event_type) || !valid_text(summary))
         return -1;
 
-    if (strlen(event_type) > 128 || strlen(summary) > 8192 ||
-        (details && strlen(details) > R2_LOG_MAX_TEXT)) {
+    if (strlen(event_type) > 128 || strlen(summary) > 8192) {
         errno = E2BIG;
         return -1;
     }
@@ -1061,18 +1061,23 @@ int64_t r2_log_conversation_turn(const char *user_text,
 
     size_t user_len = strlen(user_text);
     size_t assistant_len = strlen(assistant_text);
-    const size_t max_each = R2_LOG_MAX_TEXT / 2 - 128;
-    if (user_len > max_each) user_len = max_each;
-    if (assistant_len > max_each) assistant_len = max_each;
-
-    size_t details_size = user_len + assistant_len + 128;
+    const char user_prefix[] = "USER SAID:\n";
+    const char reply_prefix[] = "\nR2 REPLIED:\n";
+    size_t overhead = sizeof(user_prefix) - 1 + sizeof(reply_prefix);
+    if (user_len > SIZE_MAX - overhead ||
+        assistant_len > SIZE_MAX - overhead - user_len) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    size_t details_size = user_len + assistant_len + overhead;
     char *details = malloc(details_size);
     if (!details) return -1;
-
-    snprintf(details, details_size,
-             "USER SAID:\n%.*s\nR2 REPLIED:\n%.*s",
-             (int)user_len, user_text,
-             (int)assistant_len, assistant_text);
+    memcpy(details, user_prefix, sizeof(user_prefix) - 1);
+    memcpy(details + sizeof(user_prefix) - 1, user_text, user_len);
+    memcpy(details + sizeof(user_prefix) - 1 + user_len,
+           reply_prefix, sizeof(reply_prefix) - 1);
+    memcpy(details + sizeof(user_prefix) - 1 + user_len + sizeof(reply_prefix) - 1,
+           assistant_text, assistant_len + 1);
 
     char summary[1024];
     size_t preview = user_len;
@@ -1099,8 +1104,8 @@ int64_t r2_log_conversation_turn(const char *user_text,
         "(event_id,user_text,assistant_text) VALUES(?,?,?);",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, user_text, (int)user_len, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, assistant_text, (int)assistant_len, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, user_text, (sqlite3_uint64)user_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 3, assistant_text, (sqlite3_uint64)assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     if (rc != SQLITE_DONE)
         fprintf(stderr, "[R2 Life Log] Conversation archive insert failed: %s\n",
@@ -2176,7 +2181,20 @@ static int event_id_seen(const int64_t *ids, size_t count, int64_t id)
     return 0;
 }
 
-static char *query_events(const char *query, int limit)
+static int log_record_span(R2LogRecordBatch *batch, int64_t id,
+                             size_t start, size_t end)
+{
+    if (!batch) return 0;
+    if (end < start || batch->count >= SIZE_MAX / sizeof(*batch->records)) return -1;
+    R2LogRecordSpan *grown = realloc(batch->records,
+                                    (batch->count + 1) * sizeof(*grown));
+    if (!grown) return -1;
+    batch->records = grown;
+    batch->records[batch->count++] = (R2LogRecordSpan){id, start, end - start};
+    return 0;
+}
+
+static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
 {
     sqlite3_stmt *statement = NULL;
     sqlite3_stmt *link_statement = NULL;
@@ -2312,6 +2330,7 @@ static char *query_events(const char *query, int limit)
         int memory_saved = sqlite3_column_int(statement, 8);
 
         if (!base_already_seen) {
+        size_t record_start = length;
         if (append_text(&output, &length, &capacity,
                         "[%" PRId64 "] %s | %s | %s/%s\n"
                         "  Summary: %s\n"
@@ -2344,6 +2363,9 @@ static char *query_events(const char *query, int limit)
             break;
         }
 
+        if (log_record_span(batch, id, record_start, length) != 0) {
+            free(output); output = NULL; break;
+        }
         }
 
         if (query && link_statement && linked_total < 8) {
@@ -2378,12 +2400,10 @@ static char *query_events(const char *query, int limit)
                 const unsigned char *linked_summary = sqlite3_column_text(link_statement, 5);
                 const unsigned char *linked_details = sqlite3_column_text(link_statement, 6);
                 const unsigned char *linked_source = sqlite3_column_text(link_statement, 7);
+                size_t record_start = length;
                 int notes_length = sqlite3_column_bytes(link_statement, 1);
                 int summary_length = sqlite3_column_bytes(link_statement, 5);
                 int details_length = sqlite3_column_bytes(link_statement, 6);
-                if (notes_length > 400) notes_length = 400;
-                if (summary_length > 400) summary_length = 400;
-                if (details_length > 600) details_length = 600;
 
                 if (append_text(&output, &length, &capacity,
                                 "  Linked event [%" PRId64 "] via %s | %s/%s\n"
@@ -2421,6 +2441,9 @@ static char *query_events(const char *query, int limit)
                     output = NULL;
                     break;
                 }
+                if (log_record_span(batch, linked_id, record_start, length) != 0) {
+                    free(output); output = NULL; break;
+                }
                 ++linked_total;
                 ++links_for_event;
             }
@@ -2452,7 +2475,7 @@ static char *query_events(const char *query, int limit)
 
 char *r2_log_recent(int limit)
 {
-    return query_events(NULL, limit);
+    return query_events(NULL, limit, NULL);
 }
 
 char *r2_log_search(const char *query, int limit)
@@ -2460,5 +2483,22 @@ char *r2_log_search(const char *query, int limit)
     if (!valid_text(query))
         return r2_log_recent(limit);
 
-    return query_events(query, limit);
+    return query_events(query, limit, NULL);
+}
+
+int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch)
+{
+    if (!batch) { errno = EINVAL; return -1; }
+    memset(batch, 0, sizeof(*batch));
+    batch->text = query_events(valid_text(query) ? query : NULL, limit, batch);
+    if (!batch->text) { r2_log_release_records(batch); return -1; }
+    return 0;
+}
+
+void r2_log_release_records(R2LogRecordBatch *batch)
+{
+    if (!batch) return;
+    free(batch->text);
+    free(batch->records);
+    memset(batch, 0, sizeof(*batch));
 }

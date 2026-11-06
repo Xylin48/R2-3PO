@@ -112,17 +112,17 @@ require(
     "keyword ranking retains only top results and avoids quadratic C and full-table SQL sorts",
 )
 require(
-    "r2_diary_search" in builder and "r2_visual_search" in builder,
+    "r2_diary_visit_search" in builder and "r2_visual_visit_search" in builder,
     "the same associations also search the separate diary and visual experience stores",
 )
 association_start = core.find("static char *r2_collect_associated_records(")
-association_end = core.find("static void r2_append_association_section(", association_start)
+association_end = core.find("static pthread_mutex_t r2_associative_query_cache_lock", association_start)
 association_search = core[association_start:association_end] if association_start >= 0 and association_end > association_start else ""
 require(
     "searches < 6" in association_search
-    and "r2_diary_search, 1400" in builder
-    and "r2_visual_search, 1400" in builder,
-    "diary and visual retrieval have enough search slots and context space to contribute more than one tiny snippet",
+    and "associated_keywords, associated_count, r2_diary_visit_search" in builder
+    and "associated_keywords, associated_count, r2_visual_visit_search" in builder,
+    "diary and visual retrieval retain full selected records across bounded search slots",
 )
 require(
     "RELATED DIARY REFLECTIONS" in builder and "RELATED VISUAL EXPERIENCES" in builder,
@@ -135,10 +135,9 @@ require(
 )
 require(
     "#define R2_TURN_MEMORY_LIMIT 10" in core
-    and "#define R2_TURN_MEMORY_CHARS 6000" in core
-    and "#define R2_TURN_HISTORY_CHARS 6000" in core
+    and "r2_bound_context_records" not in builder
     and "#define R2_TURN_HISTORY_SEARCHES 12" in core,
-    "ordinary turns receive a substantial memory/history budget instead of a tiny default allocation",
+    "ordinary turns select substantial memory/history record counts without clipping selected text",
 )
 require(
     "#define OLLAMA_MAX_SYSTEM_TOTAL_CHARS 42000" in core

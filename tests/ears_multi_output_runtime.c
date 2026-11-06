@@ -14,9 +14,11 @@ static FakeOutput opened[32];
 static size_t opened_count = 0;
 static pthread_mutex_t fake_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int __wrap_r2_ears_open_desktop_source(R2Ears *receiver, const char *source)
+int __wrap_r2_ears_open_desktop_source_cancelable(R2Ears *receiver, const char *source,
+                                                int (*cancelled)(void *), void *userdata)
 {
     assert(receiver && source && *source);
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
     pthread_mutex_lock(&fake_lock);
     assert(opened_count < sizeof(opened) / sizeof(opened[0]));
     opened[opened_count].receiver = receiver;

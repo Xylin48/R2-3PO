@@ -111,8 +111,12 @@ int r2_ollama_vision_request_should_abort(void);
  * by the caller with free().
  */
 char *r2_talk(const char *message);
-/* Caller frees; returns a bounded recent user/assistant transcript with tool payloads excluded. */
+/* Same serialized conversation path, with an exact persisted speech-event link. */
+char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id);
+/* Caller frees. Bounded display preview of recent human-facing turns. */
 char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars);
+/* Caller frees. Complete selected turns, with internal tool payloads excluded. */
+char *r2_recent_conversation_context_complete(const char *exclude_latest);
 
 
 /*
@@ -354,7 +358,11 @@ int r2_vision_close(void);
 int r2_ears_start(void);
 /* Watch claims only a newly created stream. Zero means already owned or failed. */
 uint64_t r2_ears_start_for_watch(const char *source);
+uint64_t r2_ears_start_for_watch_cancelable(const char *source,
+                                            int (*cancelled)(void *), void *userdata);
 uint64_t r2_ears_start_desktop_for_watch(const char *monitor);
+uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
+                                                    int (*cancelled)(void *), void *userdata);
 /* Stop only the precise stream generation started by Watch; safe after replacement. */
 int r2_ears_stop_if_watch_owned(uint64_t token);
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token);
@@ -372,7 +380,13 @@ int r2_ears_status_desktop(void);
 /* Independent simultaneous desktop output captures. Watch owns these
  * supplemental sources; the ordinary desktop Ears API remains primary. */
 int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary);
+/* Cancellation predicates must be thread-safe, nonblocking reads of owner
+ * state. Stop must also signal pending opens before joining the coordinator. */
+int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char *primary,
+                                      int (*cancelled)(void *), void *userdata);
 void r2_ears_extra_stop_all(void);
+/* Interrupt only pending supplementary opens before joining Watch. */
+void r2_ears_extra_cancel_pending(void);
 size_t r2_ears_extra_source_count(void);
 int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output);
 int r2_ears_stop(void);
@@ -384,6 +398,11 @@ char *r2_ears_listen(unsigned seconds);
 char *r2_ears_listen_cancelable(unsigned seconds,
                                 int (*cancelled)(void *userdata),
                                 void *userdata);
+/* Optional outputs are initialized to NULL/0; caller frees the full captured
+ * source. Its identity is sampled with PCM, never after recognition finishes. */
+char *r2_ears_listen_source_cancelable(unsigned seconds,
+                                       int (*cancelled)(void *), void *userdata,
+                                       char **source_out, int64_t *event_id_out);
 
 
 /* ============================================================

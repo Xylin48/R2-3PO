@@ -25,6 +25,17 @@ int64_t r2_log_sensory(const char *sense, const char *observation,
     return 1;
 }
 
+static int visit_legacy_visual(void *context, int64_t id, const char *row, size_t length)
+{
+    int *count = context;
+    assert(id == 1);
+    assert(length == strlen(row));
+    assert(strcmp(row, "[2020-01-02T03:04:05Z] source=legacy-camera model=unknown "
+                       "image=/legacy/old.jpg\nold frame\n\n") == 0);
+    ++*count;
+    return 0;
+}
+
 int main(void)
 {
     char path[] = "/tmp/r2-visual-legacy-smoke-XXXXXX";
@@ -36,18 +47,30 @@ int main(void)
     assert(sqlite3_exec(visual_db,
         "CREATE TABLE r2_visual_experiences ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "created_at TEXT NOT NULL,"
+        "created_at TEXT,"
         "timestamp TEXT NOT NULL,"
-        "file_path TEXT NOT NULL,"
+        "file_path TEXT,"
         "path TEXT NOT NULL,"
         "source TEXT NOT NULL,"
         "description TEXT NOT NULL);"
         "INSERT INTO r2_visual_experiences(created_at,timestamp,file_path,path,source,description) "
         "VALUES('2020-01-02T03:04:05Z','2020-01-02T03:04:05Z',"
-        "'/legacy/old.jpg','/legacy/old.jpg','legacy-camera','old frame');",
+        "'/legacy/old.jpg','/legacy/old.jpg','legacy-camera','old frame'),"
+        "(NULL,'2020-02-03T04:05:06Z','','/legacy/alternate.jpg','another camera','alternate aliases');",
         NULL, NULL, NULL) == SQLITE_OK);
 
     assert(visual_migrate_schema() == SQLITE_OK);
+    visual_initialized = 1;
+    int legacy_rows = 0;
+    assert(r2_visual_visit_search("legacy-camera", 2, visit_legacy_visual, &legacy_rows) == 0);
+    assert(legacy_rows == 1);
+    char *legacy = r2_visual_search("old frame", 2);
+    assert(legacy && strstr(legacy, "image=/legacy/old.jpg\nold frame\n\n"));
+    free(legacy);
+    legacy = r2_visual_search("alternate aliases", 2);
+    assert(legacy && strstr(legacy, "[2020-02-03T04:05:06Z] source=another camera "
+                                  "model=unknown image=/legacy/alternate.jpg"));
+    free(legacy);
 
     sqlite3_stmt *st = NULL;
     assert(sqlite3_prepare_v2(visual_db,

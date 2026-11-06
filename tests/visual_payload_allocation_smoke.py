@@ -25,7 +25,7 @@ for helper, next_marker in (
     require("!= 0" in block, "JSON insertion return code is checked")
 
 start = source.find("static void publish_focus_region_impl(")
-end = source.find("\nstatic void publish_focus_region(json_object *focus)", start)
+end = source.find("\nstatic void publish_committed_focus(", start)
 require(start >= 0 and end > start, "focus metadata implementation exists")
 focus = source[start:end]
 for key in ('"x"', '"y"', '"width"', '"height"', '"label"'):
@@ -60,4 +60,15 @@ require("json_object_object_add(root," not in builder and
         "json_object_array_add(images," not in builder,
         "vision request has no unchecked direct JSON insertions")
 
+require("CURLcode setup_rc = curl_easy_setopt(curl, (option), (value));" in builder
+        and "R2_VISION_SETOPT(CURLOPT_WRITEFUNCTION, response_write)" in builder
+        and "if (!headers)" in builder and "request_cleanup:" in builder,
+        "handle/header/option failures abort before transport and share cleanup")
+require("visual_parse_complete_json(response.data, response.length)" in builder
+        and '"vision_output_limit_reached"' in builder
+        and '"vision_invalid_final_text"' in builder,
+        "vision rejects prefix-only JSON, generation-limited output and embedded-NUL text")
+require("visual_generation != generation_snapshot" in source
+        and "int same_library =" in source,
+        "an in-flight observation cannot populate a replacement visual-library session")
 print("Vision JSON allocation and ownership smoke passed.")

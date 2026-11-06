@@ -24,7 +24,7 @@ struct R2AudioCapture {
     pa_context *context;
     pa_stream *stream;
     pa_time_event *connect_timeout;
-    int mainloop_started;
+    atomic_int mainloop_started;
     int connect_timed_out;
     atomic_int cancelled;
     /* A peek fragment stays valid until dropped. Retain its offset so
@@ -78,6 +78,7 @@ R2AudioCapture *r2_audio_capture_new(void)
     R2AudioCapture *capture = calloc(1, sizeof(*capture));
     if (!capture) return NULL;
     atomic_init(&capture->cancelled, 0);
+    atomic_init(&capture->mainloop_started, 0);
     capture->mainloop = pa_threaded_mainloop_new();
     if (!capture->mainloop) {
         free(capture);
@@ -91,9 +92,12 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
 {
     if (!capture || !source || !*source || !format ||
         !pa_sample_spec_valid(format) || fragment_bytes == 0 ||
-        fragment_bytes > UINT32_MAX || capture->mainloop_started ||
-        atomic_load(&capture->cancelled)) {
+        fragment_bytes > UINT32_MAX || capture->mainloop_started) {
         errno = EINVAL;
+        return -1;
+    }
+    if (atomic_load(&capture->cancelled)) {
+        errno = ECANCELED;
         return -1;
     }
     if (pa_threaded_mainloop_start(capture->mainloop) < 0) {

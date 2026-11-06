@@ -560,11 +560,11 @@ static int diary_entries_migrate_schema(void)
         char sql[512];
         int n = snprintf(sql, sizeof(sql),
                          "UPDATE diary_entries SET created_at=%s "
-                         "WHERE created_at IS NULL OR created_at='';", legacy);
+                         "WHERE (created_at IS NULL OR created_at='') "
+                         "AND %s IS NOT NULL AND %s<>'';", legacy, legacy, legacy);
         if (n < 0 || (size_t)n >= sizeof(sql) ||
             sqlite3_exec(r2_diary_db, sql, NULL, NULL, NULL) != SQLITE_OK)
             return SQLITE_ERROR;
-        break;
     }
     if (sqlite3_exec(r2_diary_db,
             "UPDATE diary_entries SET created_at=CURRENT_TIMESTAMP "
@@ -1078,7 +1078,7 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
 }
 
 static int r2_diary_write_unlocked(
-    const char *entry
+    const char *entry, int64_t *entry_id_out
 )
 {
     char timestamp[64];
@@ -1139,6 +1139,7 @@ static int r2_diary_write_unlocked(
     diary_entry_id = diary_insert_entry_row(entry, timestamp);
     if (diary_entry_id <= 0)
         return -1;
+    if (entry_id_out) *entry_id_out = diary_entry_id;
 
     /* Evaluate the explicitly configured identity-correction rule after
        the authoritative row exists. Reward metadata never copies diary prose. */
@@ -1226,12 +1227,18 @@ static int r2_diary_write_unlocked(
     return 0;
 }
 
-int r2_diary_write(const char *entry)
+int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 {
+    if (entry_id_out) *entry_id_out = 0;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
+}
+
+int r2_diary_write(const char *entry)
+{
+    return r2_diary_write_with_id(entry, NULL);
 }
 
 
@@ -1246,369 +1253,115 @@ int r2_diary_write(const char *entry)
  * ============================================================
  */
 
-char *r2_diary_recent(
-    int limit
-)
+/* Append complete serialized records; the row limit chooses records, not a
+ * prefix of their contents. Allocation/SQLite errors never return partial text. */
+static int diary_append_record(char **out, size_t *length, const char *record)
 {
-    sqlite3_stmt *statement = NULL;
-
-    char *result_text;
-
-    size_t capacity = 4096;
-    size_t length = 0;
-
-    int result;
-
-    if (!r2_diary_db)
-    {
-        return NULL;
-    }
-
-    if (limit <= 0)
-        limit = R2_DEFAULT_DIARY_LIMIT;
-    if (limit > 20)
-        limit = 20;
-
-    result_text = malloc(
-        capacity
-    );
-
-    if (!result_text)
-    {
-        return NULL;
-    }
-
-    result_text[0] = '\0';
-
-    result = sqlite3_prepare_v2(
-        r2_diary_db,
-
-        "SELECT entry, created_at "
-        "FROM diary_entries "
-        "ORDER BY id DESC "
-        "LIMIT ?;",
-
-        -1,
-        &statement,
-        NULL
-    );
-
-    if (result != SQLITE_OK)
-    {
-        free(result_text);
-        return NULL;
-    }
-
-    result = sqlite3_bind_int(statement, 1, limit);
-    if (result != SQLITE_OK) {
-        sqlite3_finalize(statement);
-        free(result_text);
-        return NULL;
-    }
-
-    int step_result;
-    while ((step_result = sqlite3_step(statement)) == SQLITE_ROW)
-    {
-        const char *entry;
-        const char *created;
-
-        size_t required;
-
-        entry = (const char *)
-            sqlite3_column_text(
-                statement,
-                0
-            );
-
-        created = (const char *)
-            sqlite3_column_text(
-                statement,
-                1
-            );
-
-        if (!entry)
-        {
-            entry = "";
-        }
-
-        if (!created)
-        {
-            created = "";
-        }
-
-        size_t entry_length = strlen(entry);
-        if (entry_length > 50000)
-            entry_length = 50000;
-        required = entry_length + strlen(created) + 64;
-
-        if (
-            length + required + 1
-            >= capacity
-        )
-        {
-            size_t new_capacity =
-                capacity * 2;
-
-            while (
-                length + required + 1
-                >= new_capacity
-            )
-            {
-                new_capacity *= 2;
-            }
-
-            char *expanded =
-                realloc(
-                    result_text,
-                    new_capacity
-                );
-
-            if (!expanded)
-            {
-                sqlite3_finalize(
-                    statement
-                );
-
-                free(result_text);
-
-                return NULL;
-            }
-
-            result_text = expanded;
-            capacity = new_capacity;
-        }
-
-        length += (size_t)snprintf(
-            result_text + length,
-            capacity - length,
-
-            "[%s]\n%.*s\n\n",
-
-            created,
-            (int)entry_length,
-            entry
-        );
-    }
-
-    if (step_result != SQLITE_DONE) {
-        sqlite3_finalize(statement);
-        free(result_text);
-        return NULL;
-    }
-
-    sqlite3_finalize(statement);
-    return result_text;
+    size_t n = strlen(record);
+    if (*length == SIZE_MAX || n > SIZE_MAX - *length - 1) { errno = EOVERFLOW; return -1; }
+    char *grown = realloc(*out, *length + n + 1);
+    if (!grown) return -1;
+    memcpy(grown + *length, record, n + 1);
+    *out = grown;
+    *length += n;
+    return 0;
 }
 
-
-/* ============================================================
- * SEARCH DIARY
- * ============================================================
- */
-
-char *r2_diary_search(
-    const char *search_term,
-    int limit
-)
+static int diary_query(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
+    if (!r2_diary_db) return -1;
     sqlite3_stmt *statement = NULL;
-
-    char *result_text;
-
-    size_t capacity = 4096;
-    size_t length = 0;
-
-    int result;
-
-    if (
-        !r2_diary_db
-        ||
-        !search_term
-        ||
-        !*search_term
-    )
-    {
-        return NULL;
+    char *pattern = NULL;
+    int rc;
+    const char *sql = query
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ? ORDER BY id DESC LIMIT ?;"
+        : "SELECT entry,created_at,id FROM diary_entries ORDER BY id DESC LIMIT ?;";
+    rc = sqlite3_prepare_v2(r2_diary_db, sql, -1, &statement, NULL);
+    if (rc != SQLITE_OK) goto failed;
+    if (query) {
+        size_t n = strlen(query);
+        if (n > SIZE_MAX - 3) { errno = EOVERFLOW; goto failed; }
+        pattern = malloc(n + 3);
+        if (!pattern) goto failed;
+        pattern[0] = '%'; memcpy(pattern + 1, query, n);
+        pattern[n + 1] = '%'; pattern[n + 2] = '\0';
+        rc = sqlite3_bind_text64(statement, 1, pattern, (sqlite3_uint64)n + 2,
+                                 SQLITE_TRANSIENT, SQLITE_UTF8);
+        free(pattern); pattern = NULL;
+        if (rc != SQLITE_OK) goto failed;
     }
-
-    if (limit <= 0)
-        limit = 20;
-    if (limit > 20)
-        limit = 20;
-
-    result_text = malloc(
-        capacity
-    );
-
-    if (!result_text)
-    {
-        return NULL;
+    rc = sqlite3_bind_int(statement, query ? 2 : 1, limit);
+    if (rc != SQLITE_OK) goto failed;
+    while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        const char *entry = (const char *)sqlite3_column_text(statement, 0);
+        const char *created = (const char *)sqlite3_column_text(statement, 1);
+        /* A C-string API cannot truthfully return an embedded-NUL prefix. */
+        for (int i = 0; i < 2; ++i) {
+            const char *text = i ? created : entry;
+            if ((!text && sqlite3_column_type(statement, i) != SQLITE_NULL) ||
+                (text && strlen(text) != (size_t)sqlite3_column_bytes(statement, i))) goto failed;
+        }
+        char *row = NULL;
+        int n = asprintf(&row, "[%s]\n%s\n\n", created ? created : "", entry ? entry : "");
+        if (n < 0) goto failed;
+        int append_rc = visit(context, sqlite3_column_int64(statement, 2), row, (size_t)n);
+        free(row);
+        if (append_rc != 0) goto failed;
     }
-
-    result_text[0] = '\0';
-
-    result = sqlite3_prepare_v2(
-        r2_diary_db,
-
-        "SELECT entry, created_at "
-        "FROM diary_entries "
-        "WHERE entry LIKE ? "
-        "ORDER BY id DESC "
-        "LIMIT ?;",
-
-        -1,
-        &statement,
-        NULL
-    );
-
-    if (result != SQLITE_OK)
-    {
-        free(result_text);
-        return NULL;
-    }
-
-    {
-        size_t term_length = strlen(search_term);
-        if (term_length > 4096) {
-            sqlite3_finalize(statement);
-            free(result_text);
-            errno = E2BIG;
-            return NULL;
-        }
-        size_t pattern_size = term_length + 3;
-
-        char *pattern =
-            malloc(pattern_size);
-
-        if (!pattern)
-        {
-            sqlite3_finalize(
-                statement
-            );
-
-            free(result_text);
-
-            return NULL;
-        }
-
-        snprintf(
-            pattern,
-            pattern_size,
-            "%%%s%%",
-            search_term
-        );
-
-        result = sqlite3_bind_text(
-            statement,
-            1,
-            pattern,
-            -1,
-            SQLITE_TRANSIENT
-        );
-        if (result == SQLITE_OK)
-            result = sqlite3_bind_int(statement, 2, limit);
-        if (result != SQLITE_OK) {
-            free(pattern);
-            sqlite3_finalize(statement);
-            free(result_text);
-            return NULL;
-        }
-
-        free(pattern);
-    }
-
-    int step_result;
-    while ((step_result = sqlite3_step(statement)) == SQLITE_ROW)
-    {
-        const char *entry;
-        const char *created;
-
-        size_t required;
-
-        entry = (const char *)
-            sqlite3_column_text(
-                statement,
-                0
-            );
-
-        created = (const char *)
-            sqlite3_column_text(
-                statement,
-                1
-            );
-
-        if (!entry)
-        {
-            entry = "";
-        }
-
-        if (!created)
-        {
-            created = "";
-        }
-
-        size_t entry_length = strlen(entry);
-        if (entry_length > 50000)
-            entry_length = 50000;
-        required = entry_length + strlen(created) + 64;
-
-        if (
-            length + required + 1
-            >= capacity
-        )
-        {
-            size_t new_capacity =
-                capacity * 2;
-
-            while (
-                length + required + 1
-                >= new_capacity
-            )
-            {
-                new_capacity *= 2;
-            }
-
-            char *expanded =
-                realloc(
-                    result_text,
-                    new_capacity
-                );
-
-            if (!expanded)
-            {
-                sqlite3_finalize(
-                    statement
-                );
-
-                free(result_text);
-
-                return NULL;
-            }
-
-            result_text = expanded;
-            capacity = new_capacity;
-        }
-
-        length += (size_t)snprintf(
-            result_text + length,
-            capacity - length,
-
-            "[%s]\n%.*s\n\n",
-
-            created,
-            (int)entry_length,
-            entry
-        );
-    }
-
-    if (step_result != SQLITE_DONE) {
-        sqlite3_finalize(statement);
-        free(result_text);
-        return NULL;
-    }
-
+    if (rc != SQLITE_DONE) goto failed;
     sqlite3_finalize(statement);
-    return result_text;
+    return 0;
+failed:
+    sqlite3_finalize(statement);
+    free(pattern);
+    return -1;
+}
+
+struct diary_query_text {
+    char *data;
+    size_t length;
+};
+
+static int diary_collect_row(void *context, int64_t id, const char *row, size_t length)
+{
+    (void)id;
+    (void)length;
+    struct diary_query_text *text = context;
+    return diary_append_record(&text->data, &text->length, row);
+}
+
+static char *diary_query_string(const char *query, int limit)
+{
+    struct diary_query_text text = {.data = strdup("")};
+    if (!text.data) return NULL;
+    if (diary_query(query, limit, diary_collect_row, &text) != 0) {
+        free(text.data);
+        return NULL;
+    }
+    return text.data;
+}
+
+int r2_diary_visit_search(const char *query, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    if (!query || !*query || !visit) return -1;
+    if (limit <= 0 || limit > 20) limit = 20;
+    return diary_query(query, limit, visit, context);
+}
+
+char *r2_diary_recent(int limit)
+{
+    if (limit <= 0) limit = R2_DEFAULT_DIARY_LIMIT;
+    if (limit > 20) limit = 20;
+    return diary_query_string(NULL, limit);
+}
+
+char *r2_diary_search(const char *search_term, int limit)
+{
+    if (!search_term || !*search_term) return NULL;
+    if (limit <= 0 || limit > 20) limit = 20;
+    return diary_query_string(search_term, limit);
 }
 
 
@@ -1634,16 +1387,15 @@ static char *r2_diary_recent_life_log(int limit)
 {
     sqlite3_stmt *st = NULL;
     char *out = NULL;
-    size_t length = 0, capacity = 12288;
+    size_t length = 0;
     int rc;
-    int intentionally_truncated = 0;
 
     if (!r2_diary_db || !r2_log_is_initialized())
-        return strdup("Life Log is not initialized.");
+        return NULL;
     if (limit <= 0) limit = 16;
     if (limit > 40) limit = 40;
 
-    out = malloc(capacity);
+    out = malloc(64);
     if (!out) return NULL;
     out[0] = '\0';
 
@@ -1657,13 +1409,14 @@ static char *r2_diary_recent_life_log(int limit)
         "ORDER BY id DESC LIMIT ?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK) {
+        sqlite3_finalize(st);
         free(out);
-        return strdup("Life Log query unavailable; diary history remains available.");
+        return NULL;
     }
     if (sqlite3_bind_int(st, 1, limit) != SQLITE_OK) {
         sqlite3_finalize(st);
         free(out);
-        return strdup("Life Log query could not bind its row limit.");
+        return NULL;
     }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
@@ -1674,66 +1427,30 @@ static char *r2_diary_recent_life_log(int limit)
         const char *summary = (const char *)sqlite3_column_text(st, 4);
         const char *details = (const char *)sqlite3_column_text(st, 5);
         const char *source = (const char *)sqlite3_column_text(st, 6);
-        char detail_excerpt[321] = "";
-
-        /* Conversation bodies are not copied here; their indexed summaries
-           remain available without injecting full conversation transcripts. */
-        if (details && category && strcmp(category, "conversation") != 0)
-            snprintf(detail_excerpt, sizeof(detail_excerpt), "%.320s", details);
-
-        int needed = snprintf(NULL, 0,
-            "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s\n",
-            (int64_t)id,
-            time_text ? time_text : "time unavailable",
-            category ? category : "unknown",
-            type ? type : "unknown",
-            summary ? summary : "",
-            source ? source : "unknown",
-            detail_excerpt[0] ? " | details=" : "",
-            detail_excerpt);
-        if (needed < 0) continue;
-
-        size_t required = (size_t)needed + 1;
-        if (length + required >= capacity) {
-            size_t next = capacity;
-            while (length + required >= next && next < 65536) next *= 2;
-            if (next > 65536) next = 65536;
-            if (length + required >= next) {
-                intentionally_truncated = 1;
-                break;
+        const char *fields[] = {time_text, category, type, summary, details, source};
+        for (int i = 0; i < 6; ++i) {
+            if ((!fields[i] && sqlite3_column_type(st, i + 1) != SQLITE_NULL) ||
+                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i + 1))) {
+                sqlite3_finalize(st); free(out); return NULL;
             }
-            char *grown = realloc(out, next);
-            if (!grown) {
-                sqlite3_finalize(st);
-                free(out);
-                return NULL;
-            }
-            out = grown;
-            capacity = next;
         }
-
-        snprintf(out + length, capacity - length,
+        char *row = NULL;
+        int n = asprintf(&row,
             "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s\n",
-            (int64_t)id,
-            time_text ? time_text : "time unavailable",
-            category ? category : "unknown",
-            type ? type : "unknown",
-            summary ? summary : "",
-            source ? source : "unknown",
-            detail_excerpt[0] ? " | details=" : "",
-            detail_excerpt);
-        length += required - 1;
+            (int64_t)id, time_text ? time_text : "time unavailable",
+            category ? category : "unknown", type ? type : "unknown",
+            summary ? summary : "", source ? source : "unknown",
+            details && *details ? " | details=" : "", details ? details : "");
+        if (n < 0) { sqlite3_finalize(st); free(out); return NULL; }
+        int append_rc = diary_append_record(&out, &length, row);
+        free(row);
+        if (append_rc != 0) { sqlite3_finalize(st); free(out); return NULL; }
     }
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE && !intentionally_truncated) {
-        free(out);
-        return strdup("Life Log query ended unexpectedly; partial results were discarded.");
-    }
-    if (length == 0)
-        snprintf(out, capacity, "No relevant Life Log events yet.\n");
+    if (rc != SQLITE_DONE) { free(out); return NULL; }
+    if (length == 0) strcpy(out, "No relevant Life Log events yet.\n");
     return out;
 }
-
 
 char *r2_diary_build_reflection_context(
     int diary_limit
@@ -1742,15 +1459,12 @@ char *r2_diary_build_reflection_context(
     char *recent;
     char *life_log;
     char *memories;
-    char *result;
-    size_t required;
+    char *result = NULL;
     char timestamp[64];
 
     r2_diary_get_time(timestamp, sizeof(timestamp));
 
     recent = r2_diary_recent(diary_limit);
-    if (!recent)
-        recent = strdup("No previous diary entries.");
 
     /* Give reflection the diary, structured event history, and relevant
        searchable memories together. Each remains a distinct evidence source. */
@@ -1759,10 +1473,6 @@ char *r2_diary_build_reflection_context(
         "recent experiences, successful corrections, repeated mistakes, "
         "creator identity, learned lessons, and context relevant to reflection");
 
-    if (!recent) recent = strdup("Diary history unavailable.");
-    if (!life_log) life_log = strdup("Life Log context unavailable.");
-    if (!memories) memories = strdup("Relevant persistent memories unavailable.");
-
     if (!recent || !life_log || !memories) {
         free(recent);
         free(life_log);
@@ -1770,16 +1480,7 @@ char *r2_diary_build_reflection_context(
         return NULL;
     }
 
-    required = strlen(recent) + strlen(life_log) + strlen(memories) + 2048;
-    result = malloc(required);
-    if (!result) {
-        free(recent);
-        free(life_log);
-        free(memories);
-        return NULL;
-    }
-
-    snprintf(result, required,
+    int written = asprintf(&result,
         "CURRENT TIME:\n%s\n\n"
         "R2'S PREVIOUS PRIVATE DIARY ENTRIES:\n"
         "----------------------------------------\n%s"
@@ -1814,6 +1515,7 @@ char *r2_diary_build_reflection_context(
     free(recent);
     free(life_log);
     free(memories);
+    if (written < 0) return NULL;
     return result;
 }
 

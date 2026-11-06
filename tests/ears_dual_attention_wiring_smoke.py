@@ -23,15 +23,15 @@ assert "r2_ears_listen_cancelable(" not in capture
 assert "r2_ears_listen_cancelable(" not in desktop_capture
 assert "r2_ears_write_desktop_recent_audio(" in core
 assert "r2_ears_write_desktop_buffered_audio(" in core
-listen_start = core.index("char *r2_ears_listen_cancelable(unsigned seconds,")
+listen_start = core.index("char *r2_ears_listen_source_cancelable(unsigned seconds,")
 listen_end = core.index("char *r2_ears_listen(unsigned seconds)", listen_start)
 listen = core[listen_start:listen_end]
-assert "if (r2_ears_desktop_requested)" in listen
+assert "if (r2_ears_desktop_requested || named_primary)" in listen
 assert "r2_ears_write_desktop_buffered_audio" in listen
 assert "r2_ears_write_desktop_recent_audio" in listen
 assert "r2_ears_write_buffered_audio" in listen
 assert "r2_ears_write_recent_audio" in listen
-assert "r2_ears_open_microphone(ears)" in listen
+assert "r2_ears_open_input(ears, NULL, &request)" in listen
 parser_start = core.index("static char *r2_process_ears_listen_request(")
 parser_end = core.index("static char *process_tools_with_status(", parser_start)
 parser = core[parser_start:parser_end]
@@ -51,8 +51,8 @@ watch = shell[shell.index("static void *shell_watch_worker(void *unused)"):
 assert "managed_microphone" in watch and "managed_desktop" in watch
 assert "wanted_audio" not in watch
 # Watch must claim only newly opened capture generations and only stop its own.
-assert "r2_ears_start_desktop_for_watch(audio.desktop_monitor)" in watch
-assert "r2_ears_start_for_watch(audio.microphone_source)" in watch
+assert "r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor," in watch
+assert "r2_ears_start_for_watch_cancelable(audio.microphone_source," in watch
 assert "r2_ears_stop_desktop_if_watch_owned(managed_desktop)" in watch
 assert "r2_ears_stop_if_watch_owned(managed_microphone)" in watch
 assert "r2_ears_start_desktop()" not in watch and "r2_ears_start()" not in watch

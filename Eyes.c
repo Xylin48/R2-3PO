@@ -12,6 +12,8 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/prctl.h>
 #include <stdio.h>
@@ -100,6 +102,7 @@ struct R2Eyes
     uint64_t frame_count;
     uint64_t timestamp;
     uint64_t last_log_timestamp;
+    uint64_t preview_session;
     int auxiliary_display; /* No V-Webcam takeover: only real Eyes drives it. */
 
     R2VisionEvent event;
@@ -113,6 +116,13 @@ struct R2Eyes
 #define R2_VWEBCAM_DIR "/tmp/r2-vwebcam-r2"
 #define R2_VWEBCAM_MAX_W 960U
 #define R2_VWEBCAM_MAX_H 540U
+static _Atomic uint64_t active_preview_session;
+
+uint64_t r2_eyes_preview_session(void)
+{
+    return atomic_load(&active_preview_session);
+}
+
 static pid_t r2_vwebcam_pid = -1;
 static uint64_t r2_vwebcam_last_publish_ms = 0;
 static uint64_t r2_vwebcam_last_status_ms = 0;
@@ -163,11 +173,12 @@ static void r2_vwebcam_write_status(const R2Eyes *eyes, int active)
     FILE *fp = fopen(tmp, "w");
     if (!fp)
         return;
-    int failed = fprintf(fp, "%d\n%s\n%u\n%u\n%llu\n%llu\n",
+    int failed = fprintf(fp, "%d\n%s\n%u\n%u\n%llu\n%llu\n%llu\n",
         active ? 1 : 0, source,
         eyes ? eyes->format.width : 0, eyes ? eyes->format.height : 0,
         (unsigned long long)(eyes ? eyes->frame_count : 0),
-        (unsigned long long)(eyes ? eyes->timestamp : 0)) < 0;
+        (unsigned long long)(eyes ? eyes->timestamp : 0),
+        (unsigned long long)(eyes ? eyes->preview_session : 0)) < 0;
     if (fclose(fp) != 0)
         failed = 1;
     if (!failed) {
@@ -186,6 +197,19 @@ static void r2_vwebcam_write_status(const R2Eyes *eyes, int active)
     }
 }
 
+static void r2_vwebcam_begin_session(R2Eyes *eyes)
+{
+    uint64_t session = 0;
+    ssize_t size;
+    do {
+        size = getrandom(&session, sizeof(session), GRND_NONBLOCK);
+    } while (size < 0 && errno == EINTR);
+    /* A failed token allocation leaves the preview unavailable for this open. */
+    eyes->preview_session = size == (ssize_t)sizeof(session) ? session : 0;
+    atomic_store(&active_preview_session, eyes->preview_session);
+    r2_vwebcam_write_status(eyes, 1);
+}
+
 static void r2_vwebcam_publish_frame(const R2Eyes *eyes)
 {
     const char *display = getenv("DISPLAY");
@@ -196,6 +220,7 @@ static void r2_vwebcam_publish_frame(const R2Eyes *eyes)
         eyes->timestamp - r2_vwebcam_last_publish_ms < 100)
         return;
     if (!eyes || !eyes->open || !eyes->frame_buffer ||
+        !eyes->preview_session || eyes->preview_session != r2_eyes_preview_session() ||
         !eyes->format.width || !eyes->format.height ||
         r2_vwebcam_prepare_dir() != 0)
         return;
@@ -226,7 +251,8 @@ static void r2_vwebcam_publish_frame(const R2Eyes *eyes)
     FILE *fp = fopen(tmp, "wb");
     if (!fp)
         return;
-    int failed = fprintf(fp, "P6\n%u %u\n255\n", dw, dh) < 0;
+    int failed = fprintf(fp, "P6\n# r2-preview %llu\n%u %u\n255\n",
+                         (unsigned long long)eyes->preview_session, dw, dh) < 0;
     unsigned char row[R2_VWEBCAM_MAX_W * 3U];
     for (unsigned int y = 0; !failed && y < dh; ++y) {
         size_t sy = ((size_t)y * height) / dh;
@@ -974,6 +1000,14 @@ void r2_eyes_close(R2Eyes *eyes)
     if (!eyes)
         return;
 
+    uint64_t session = eyes->preview_session;
+    int clear_preview = session
+        ? atomic_compare_exchange_strong(&active_preview_session, &session, 0)
+        : !eyes->auxiliary_display && !r2_eyes_preview_session();
+    if (clear_preview)
+        r2_vwebcam_write_status(eyes, 0);
+    eyes->preview_session = 0;
+
     if (eyes->stream)
     {
         pclose(eyes->stream);
@@ -993,7 +1027,6 @@ void r2_eyes_close(R2Eyes *eyes)
     }
 
     eyes->open = 0;
-    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 0);
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_NONE;
     eyes->frame_count = 0;
@@ -1129,7 +1162,7 @@ static int r2_eyes_open_internal(
 
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
     if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     char details[768];
@@ -1300,7 +1333,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
              "video rendering window %lu", window_id);
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
     if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
     r2_log_sensory("vision_source_opened",
                    "R2 Eyes connected to an active rendered video window.",
@@ -1404,7 +1437,7 @@ int r2_eyes_open_vlc(
     /* source_name was populated from the visible VLC window title above. */
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
     if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
 
     r2_log_sensory("vision_source_opened",
@@ -1502,8 +1535,12 @@ int r2_eyes_capture(
     eyes->frame.frame_number =
         eyes->frame_count;
 
-    if (!eyes->auxiliary_display) r2_vwebcam_publish_frame(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_write_status(eyes, 1);
+    eyes->frame.preview_session = eyes->preview_session;
+    if (!eyes->auxiliary_display && eyes->preview_session &&
+        eyes->preview_session == r2_eyes_preview_session()) {
+        r2_vwebcam_publish_frame(eyes);
+        r2_vwebcam_write_status(eyes, 1);
+    }
 
     /*
      * Record a bounded-rate sensory journal heartbeat instead of

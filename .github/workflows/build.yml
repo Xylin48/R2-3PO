@@ -164,7 +164,7 @@ jobs:
 
       - name: Exercise source discovery with synthetic microphone and desktop playback
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread -lpthread -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_mainloop_iterate
           /tmp/r2-ears-source-discovery-smoke
 
       - name: Wake a truly blocked asynchronous Pulse read on stop
@@ -184,12 +184,63 @@ jobs:
 
       - name: Capture every simultaneous desktop output independently and preserve PCM identities
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_multi_output_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-multi-output -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_multi_output_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-multi-output -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_ears_read
           /tmp/r2-ears-multi-output
+
+      - name: Cancel supplementary output handshakes before joining Watch
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_discover_cancelable
+          /tmp/r2-ears-extra-connect-cancel
+
+      - name: Cancel a real libpulse handshake stalled on a silent local server
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_connect_cancel_runtime.c AudioCapture.c -o /tmp/r2-ears-connect-cancel -lpulse -lpthread
+          /tmp/r2-ears-connect-cancel
+
+      - name: Preserve source-specific raw primary history generations and journal identities
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_primary_history_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-primary-history -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_log_sensory
+          /tmp/r2-ears-primary-history
+
+      - name: Exercise visual request response encoder and library session boundaries
+        run: |
+          VISUAL_ROOT="$(mktemp -d /tmp/r2-visual-request-XXXXXX)"
+          trap 'rm -rf "$VISUAL_ROOT"' EXIT
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$VISUAL_ROOT\"" -Dmain=r2_program_main -c r2.c -o /tmp/r2-visual-request-core.o
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$VISUAL_ROOT\"" tests/visual_request_runtime.c /tmp/r2-visual-request-core.o shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-visual-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_init -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=curl_slist_append -Wl,--wrap=mkstemps -Wl,--wrap=write -Wl,--wrap=close -Wl,--wrap=read -Wl,--wrap=fork -Wl,--wrap=waitpid -Wl,--wrap=kill -Wl,--wrap=clock_gettime -Wl,--wrap=r2_ollama_vision_request_begin -Wl,--wrap=r2_ollama_vision_request_end -Wl,--wrap=r2_ollama_vision_request_should_abort -Wl,--wrap=r2_eyes_preview_session
+          /tmp/r2-visual-request
+
+      - name: Exercise complete real request allocation transport setup and incomplete output
+        run: |
+          REQUEST_ROOT="$(mktemp -d /tmp/r2-inference-request-XXXXXX)"
+          trap 'rm -rf "$REQUEST_ROOT"' EXIT
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$REQUEST_ROOT\"" tests/inference_request_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-inference-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=json_object_object_add
+          /tmp/r2-inference-request
+
+      - name: Preserve complete diary visual and learning context across read failures
+        run: |
+          RECORD_ROOT="$(mktemp -d /tmp/r2-context-records-XXXXXX)"
+          trap 'rm -rf "$RECORD_ROOT"' EXIT
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$RECORD_ROOT\"" tests/context_records_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-context-records -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_reward_context -Wl,--wrap=r2_addiction_report -Wl,--wrap=r2_retrieve_memories -Wl,--wrap=sqlite3_step -Wl,--wrap=malloc
+          /tmp/r2-context-records
+
+      - name: Preserve complete recall records and exact reflection evidence
+        run: |
+          RECALL_ROOT="$(mktemp -d /tmp/r2-recall-reflection-XXXXXX)"
+          trap 'rm -rf "$RECALL_ROOT"' EXIT
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$RECALL_ROOT\"" tests/recall_reflection_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-recall-reflection -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_reality_context -Wl,--wrap=r2_reward_context -Wl,--wrap=r2_addiction_report
+          /tmp/r2-recall-reflection
+
+      - name: Persist exact selected audio sources and complete transcript/conversation payloads
+        run: |
+          PROVENANCE_ROOT="$(mktemp -d /tmp/r2-audio-provenance-XXXXXX)"
+          trap 'rm -rf "$PROVENANCE_ROOT"' EXIT
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$PROVENANCE_ROOT\"" tests/audio_provenance_persistence_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-audio-provenance -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_get_event -Wl,--wrap=waitpid -Wl,--wrap=getdelim
+          /tmp/r2-audio-provenance
 
       - name: Check live Watch ownership tokens against external capture takeover
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_ears_open_desktop_cancelable
           /tmp/r2-ears-watch-ownership
 
       - name: Require source-specific raw hearing, deliberate attention, and shutdown

@@ -360,13 +360,12 @@ static int init_attempt_active = 0;
 /* curl_global_cleanup is valid only after a successful global initialization. */
 static int curl_global_initialized = 0;
 static int startup_memory_loaded = 0;
-static int watch_running = 0;
+static atomic_int watch_running = ATOMIC_VAR_INIT(0);
 static int diary_initialized = 0;
 /* These flags are consumed by the tool dispatcher before the capture implementation. */
 static atomic_int ears_capture_running = ATOMIC_VAR_INIT(0);
-/* Send stop intent before waiting for a one-shot microphone read's mutex.
- * Cooperative cancellation is bounded by the next successful PCM read;
- * a stuck pa_simple_read still requires an asynchronously cancelable backend. */
+/* Send stop intent before waiting for a one-shot microphone lifecycle
+ * mutex; the asynchronous transport can also wake an already blocked read. */
 static atomic_uint ears_stop_requesters = ATOMIC_VAR_INIT(0);
 static atomic_int ears_desktop_capture_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int r2_ears_recent_requested = 0;
@@ -374,6 +373,50 @@ static _Thread_local int r2_ears_desktop_requested = 0;
 /* Set only by an explicit EARS_LISTEN request for an exact other output. */
 static _Thread_local const char *r2_ears_extra_requested = NULL;
 static char *r2_ears_desktop_available_sources(void);
+/* Provenance belongs to the active serialized turn, not to a later device
+ * snapshot. Tool-selected speech and shell speech share this exact ID path. */
+typedef struct {
+    int64_t *events;
+    size_t count;
+} R2AudioTurnEvidence;
+static _Thread_local R2AudioTurnEvidence *r2_audio_turn_evidence = NULL;
+static _Thread_local int64_t r2_input_speech_event = 0;
+
+static void r2_audio_turn_record(int64_t event_id)
+{
+    R2AudioTurnEvidence *evidence = r2_audio_turn_evidence;
+    if (!evidence || event_id <= 0) return;
+    for (size_t i = 0; i < evidence->count; ++i)
+        if (evidence->events[i] == event_id) return;
+    int64_t *events = NULL;
+    if (evidence->count < SIZE_MAX / sizeof(*evidence->events))
+        events = realloc(evidence->events, (evidence->count + 1) * sizeof(*events));
+    if (!events) {
+        fprintf(stderr, "[Ears] Speech event %lld exists, but turn-link allocation failed.\n",
+                (long long)event_id);
+        return;
+    }
+    evidence->events = events;
+    evidence->events[evidence->count++] = event_id;
+}
+
+static void r2_audio_evidence_link(int64_t turn_event_id, const R2AudioTurnEvidence *evidence,
+                                    const char *relationship)
+{
+    if (turn_event_id <= 0 || !evidence) return;
+    for (size_t i = 0; i < evidence->count; ++i)
+        if (r2_log_link(turn_event_id, evidence->events[i],
+                        relationship,
+                        "Exact locally recognized audio event; availability alone is not interpretation.") != 0)
+            fprintf(stderr, "[Ears] Could not link turn %lld to speech event %lld.\n",
+                    (long long)turn_event_id, (long long)evidence->events[i]);
+}
+
+
+static void r2_audio_turn_link(int64_t event_id, const R2AudioTurnEvidence *evidence)
+{
+    r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_turn");
+}
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
@@ -761,33 +804,42 @@ static char *read_entire_file(const char *path)
     if (!f)
         return NULL;
 
-    if (fseek(f, 0, SEEK_END) != 0) {
+    struct stat before;
+    if (fstat(fileno(f), &before) != 0) {
+        int saved = errno;
         fclose(f);
+        errno = saved;
         return NULL;
     }
-
-    long n = ftell(f);
-
-    if (n < 0) {
+    if (!S_ISREG(before.st_mode)) {
         fclose(f);
+        errno = EINVAL;
         return NULL;
     }
-
-    rewind(f);
-
-    char *buf = malloc((size_t)n + 1);
-
-    if (!buf) {
-        fclose(f);
+    char *buf = NULL;
+    size_t capacity = 0;
+    errno = 0;
+    ssize_t got = getdelim(&buf, &capacity, '\0', f);
+    int failed = ferror(f);
+    int saved = errno;
+    if (got < 0 && !failed && feof(f)) {
+        free(buf);
+        buf = strdup("");
+        if (!buf) { saved = errno; failed = 1; }
+        else got = 0;
+    }
+    if (got >= 0 && (memchr(buf, '\0', (size_t)got) ||
+        (S_ISREG(before.st_mode) && before.st_size > 0 &&
+         (uintmax_t)got < (uintmax_t)before.st_size))) {
+        failed = 1;
+        saved = EIO;
+    }
+    if (fclose(f) != 0) { failed = 1; saved = errno; }
+    if (got < 0 || failed) {
+        free(buf);
+        errno = saved ? saved : EIO;
         return NULL;
     }
-
-    size_t got = fread(buf, 1, (size_t)n, f);
-
-    fclose(f);
-
-    buf[got] = '\0';
-
     return buf;
 }
 
@@ -3531,6 +3583,70 @@ static int ollama_response_contract_valid(const char *role, int done)
     return role && strcmp(role, "assistant") == 0 && done == 1;
 }
 
+/* Helper callers also supply system instructions without the conversation's
+ * section headings. Only explicitly identified historical/learning snapshots
+ * may be optional; an unknown system contract must not disappear. */
+static int r2_inference_unit_required(const Message *message, size_t index, size_t current_user)
+{
+    if (!message->role || strcmp(message->role, "system"))
+        return current_user != SIZE_MAX && index >= current_user;
+    const char *content = message->content ? message->content : "";
+    if (!strncmp(content, "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n",
+                 sizeof("RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n") - 1))
+        return 1;
+    int priority = r2_inference_system_priority(content, ollama_authoritative_user_query);
+    return priority <= 4 || (priority == 6 &&
+        strncmp(content, "PERSISTENT LEARNING CONTEXT", strlen("PERSISTENT LEARNING CONTEXT")));
+}
+
+/* Reassign unused generation capacity to complete required input without
+ * increasing the configured model context or changing any input bytes. */
+static int r2_fit_complete_input(size_t required_bytes, int num_ctx, int *num_predict)
+{
+    if (!num_predict || num_ctx <= 576 || *num_predict < 1 ||
+        *num_predict > num_ctx - 512) { errno = EINVAL; return -1; }
+    size_t current = (size_t)(num_ctx - *num_predict - 512) * 32U / 10U;
+    if (required_bytes <= current) return 0;
+    /* The existing byte/token estimate is an allocation heuristic, not a
+       tokenizer guarantee. Preserve the existing 512-token safety margin
+       and at least the established 64-token generation floor. */
+    size_t maximum = (size_t)(num_ctx - 512 - 64) * 32U / 10U;
+    if (required_bytes > maximum) { errno = E2BIG; return -1; }
+    size_t input_tokens = (required_bytes * 10U + 31U) / 32U;
+    int fitted = num_ctx - 512 - (int)input_tokens;
+    if (fitted < 64) { errno = E2BIG; return -1; }
+    *num_predict = fitted;
+    return 0;
+}
+
+/* Final allocation is in whole messages. Provisional category budgets may
+ * suggest optional context, but cannot shorten instructions or selected recall. */
+static int r2_preserve_inference_units(const Message *msgs, size_t count,
+                                       unsigned char *include, size_t *limits,
+                                       size_t current_user, size_t override_length,
+                                       size_t input_budget, size_t *required_out)
+{
+    size_t required = override_length;
+    for (size_t i = 0; i < count; ++i) {
+        int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
+        if (!mandatory) continue;
+        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
+        if (n > SIZE_MAX - required) { errno = EOVERFLOW; return -1; }
+        required += n;
+    }
+    if (required_out) *required_out = required;
+    if (required > input_budget) { errno = E2BIG; return -1; }
+    size_t used = required;
+    for (size_t i = 0; i < count; ++i) {
+        int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
+        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
+        if (mandatory) { include[i] = 1; limits[i] = n; }
+        else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
+        else { include[i] = 0; limits[i] = 0; }
+    }
+    return 0;
+}
+
 static char *ollama_chat_with_limit(
     Message *msgs,
     size_t count,
@@ -4005,6 +4121,49 @@ static char *ollama_chat_with_limit(
         ++recent_count;
     }
 
+    size_t complete_override_length = system_override ? strlen(system_override) : 0;
+    size_t actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+    size_t required_context_chars = 0;
+    int preservation_rc = r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
+                                    complete_override_length, actual_input_budget,
+                                    &required_context_chars);
+    if (preservation_rc != 0 && errno == E2BIG) {
+        int previous_predict = num_predict;
+        if (r2_fit_complete_input(required_context_chars, num_ctx, &num_predict) == 0) {
+            struct json_object *request_options = NULL;
+            if (!json_object_object_get_ex(root, "options", &request_options) ||
+                ollama_json_object_add_checked(request_options, "num_predict",
+                                               json_object_new_int(num_predict)) != 0) {
+                free(include); free(limits); json_object_put(arr); json_object_put(root);
+                return NULL;
+            }
+            actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+            preservation_rc = r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
+                                    complete_override_length, actual_input_budget, &required_context_chars);
+            fprintf(stderr, "[R2 Ollama] Complete input retained by reallocating generation reserve: "
+                            "%d -> %d tokens; context remains %d.\n",
+                    previous_predict, num_predict, num_ctx);
+        }
+    }
+    if (preservation_rc != 0) {
+        fprintf(stderr,
+                "[R2 Ollama] Complete instructions, selected recall and current turn require %zu bytes; "
+                "configured input allocation is %zu. No partial evidence was sent.\n",
+                required_context_chars, actual_input_budget);
+        free(include); free(limits); json_object_put(arr); json_object_put(root);
+        return NULL;
+    }
+    if (system_override && complete_override_length != override_length) {
+        struct json_object *message = json_object_array_get_idx(arr, 0);
+        struct json_object *complete = json_object_new_string(system_override);
+        if (!complete || json_object_object_add(message, "content", complete) != 0) {
+            if (complete) json_object_put(complete);
+            free(include); free(limits); json_object_put(arr); json_object_put(root);
+            return NULL;
+        }
+        override_length = complete_override_length;
+    }
+
     /*
      * Never send a prefix of the active user message as if it were the whole
      * turn. Adaptive context budgets may shrink system/history content, but
@@ -4221,20 +4380,34 @@ static char *ollama_chat_with_limit(
     }
     char curl_error[CURL_ERROR_SIZE] = {0};
 
-    curl_easy_setopt(curl, CURLOPT_URL, ollama_url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(payload));
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds > 0 ? timeout_seconds : 180L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ollama_progress);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    /* Never perform a partially configured request: a failed write callback
+       could otherwise route raw model output to libcurl's default stdout. */
+#define R2_OLLAMA_SETOPT(option, value) \
+    do { \
+        CURLcode setup_rc = curl_easy_setopt(curl, (option), (value)); \
+        if (setup_rc != CURLE_OK) { \
+            fprintf(stderr, "[R2 Ollama] Request option %d failed: %s.\n", \
+                    (int)(option), curl_easy_strerror(setup_rc)); \
+            curl_slist_free_all(headers); curl_easy_cleanup(curl); \
+            json_object_put(root); free(b.data); return NULL; \
+        } \
+    } while (0)
+    R2_OLLAMA_SETOPT(CURLOPT_URL, ollama_url);
+    R2_OLLAMA_SETOPT(CURLOPT_HTTPHEADER, headers);
+    R2_OLLAMA_SETOPT(CURLOPT_POST, 1L);
+    R2_OLLAMA_SETOPT(CURLOPT_POSTFIELDS, payload);
+    R2_OLLAMA_SETOPT(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(payload));
+    R2_OLLAMA_SETOPT(CURLOPT_WRITEFUNCTION, curl_write);
+    R2_OLLAMA_SETOPT(CURLOPT_WRITEDATA, &b);
+    R2_OLLAMA_SETOPT(CURLOPT_ERRORBUFFER, curl_error);
+    R2_OLLAMA_SETOPT(CURLOPT_CONNECTTIMEOUT, 10L);
+    R2_OLLAMA_SETOPT(CURLOPT_TIMEOUT, timeout_seconds > 0 ? timeout_seconds : 180L);
+    R2_OLLAMA_SETOPT(CURLOPT_NOSIGNAL, 1L);
+    R2_OLLAMA_SETOPT(CURLOPT_NOPROGRESS, 0L);
+    R2_OLLAMA_SETOPT(CURLOPT_XFERINFOFUNCTION, ollama_progress);
+    R2_OLLAMA_SETOPT(CURLOPT_TCP_KEEPALIVE, 1L);
+
+#undef R2_OLLAMA_SETOPT
 
     if (ollama_background_mode) {
         /* Never queue background reflection/bookkeeping ahead of a live turn. */
@@ -4360,7 +4533,15 @@ static char *ollama_chat_with_limit(
             content && json_object_is_type(content, json_type_string)) {
             const char *text = json_object_get_string(content);
             if (text) {
-                content_chars = strlen(text);
+                content_chars = (size_t)json_object_get_string_len(content);
+                if (strlen(text) != content_chars) {
+                    fprintf(stderr, "[R2 Ollama] Rejected embedded NUL in final-channel text; no prefix was accepted.\n");
+                    if (r2_log_is_initialized() && r2_log_event(R2_LOG_ERROR, "ollama_invalid_final_text",
+                            "Model final-channel text contains an embedded NUL; escaped evidence retained, not a reply or executed action.",
+                            json_object_to_json_string_ext(content, JSON_C_TO_STRING_PLAIN), MODEL) <= 0)
+                        fprintf(stderr, "[R2 Ollama] Could not archive escaped invalid final-channel evidence.\n");
+                    json_object_put(resp); return NULL;
+                }
                 if (*text) result = xstrdup(text);
             }
         }
@@ -4430,6 +4611,19 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
+    /* done=true ends the HTTP exchange, but an explicit generation-limit
+       stop is not a complete reply or a safe executable action request. */
+    if (!strcmp(done_reason, "length")) {
+        fprintf(stderr, "[R2 Ollama] Generation limit reached; incomplete final-channel output "
+                        "was rejected (bytes=%zu, stage=%s).\n", content_chars,
+                ollama_audit_stage ? ollama_audit_stage : "unspecified");
+        if (r2_log_is_initialized() && r2_log_event(R2_LOG_ERROR, "ollama_output_limit_reached",
+                "Incomplete model output reached its generation limit; not a completed reply or executed action.",
+                result ? result : "No final-channel text was returned; private reasoning was not archived.", MODEL) <= 0)
+            fprintf(stderr, "[R2 Ollama] Could not archive the incomplete final-channel output.\n");
+        free(result); json_object_put(resp); return NULL;
+    }
+
     if (!result) {
         /*
          * Do not print the model's private thinking text. Its presence/length,
@@ -4494,8 +4688,14 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt,
     if (num_predict > 2048) num_predict = 2048;
 
     int previous_mode = ollama_background_mode;
+    const char *previous_query = ollama_authoritative_user_query;
+    const char *previous_stage = ollama_audit_stage;
     ollama_background_mode = 1;
+    ollama_authoritative_user_query = user_prompt;
+    ollama_audit_stage = "isolated-generation";
     char *result = ollama_chat_with_limit(messages, 2, NULL, num_predict, 600L);
+    ollama_audit_stage = previous_stage;
+    ollama_authoritative_user_query = previous_query;
     ollama_background_mode = previous_mode;
     return result;
 }
@@ -5167,21 +5367,19 @@ static char *r2_retry_direct_answer(Message *messages_copy,
      * statements as evidence, while keeping the retry much smaller than the
      * full transcript. The current user message remains separate and authoritative.
      */
-    char *recent_context = r2_recent_conversation_context(query, 3000U);
+    char *recent_context = r2_recent_conversation_context_complete(query);
+    if (!recent_context) {
+        free(retry_system_prompt);
+        return NULL;
+    }
     char *recent_context_message = NULL;
-    if (recent_context && *recent_context) {
-        static const char recent_context_heading[] =
-            "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n";
-        size_t heading_length = sizeof(recent_context_heading) - 1;
-        size_t recent_length = strlen(recent_context);
-        if (recent_length <= SIZE_MAX - heading_length - 1U) {
-            recent_context_message = malloc(heading_length + recent_length + 1U);
-            if (recent_context_message) {
-                memcpy(recent_context_message, recent_context_heading, heading_length);
-                memcpy(recent_context_message + heading_length, recent_context,
-                       recent_length + 1U);
-            }
-        }
+    if (*recent_context &&
+        asprintf(&recent_context_message,
+                 "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n%s",
+                 recent_context) < 0) {
+        free(recent_context);
+        free(retry_system_prompt);
+        return NULL;
     }
     free(recent_context);
 
@@ -5221,18 +5419,11 @@ static char *r2_retry_direct_answer(Message *messages_copy,
     return retry;
 }
 
-/*
- * Give ordinary turns a substantial bounded evidence budget: normal conversation
- * still searches persistent memory, Life Log, diary, and visual experiences, while
- * explicit recall receives a larger ceiling. The Ollama payload builder applies
- * a second hardware-aware cap so these retrieval budgets do not override RAM headroom.
- */
+/* Search counts select the records made available for this turn. Complete
+ * selected contents are preserved; only the real configured inference window
+ * determines whether the final request can proceed. */
 #define R2_TURN_MEMORY_LIMIT 10
-#define R2_TURN_MEMORY_CHARS 6000
-#define R2_TURN_HISTORY_CHARS 6000
 #define R2_TURN_HISTORY_SEARCHES 12
-#define R2_RECALL_MEMORY_CHARS 18000
-#define R2_RECALL_HISTORY_CHARS 14000
 #define R2_RECALL_HISTORY_SEARCHES 16
 
 /*
@@ -5303,23 +5494,6 @@ static int r2_query_explicitly_requests_recall(const char *query)
     return 0;
 }
 
-/* Clip only at a record boundary when possible, so a memory is not half-sent. */
-static void r2_bound_context_records(char *context, size_t max_chars)
-{
-    if (!context || max_chars == 0)
-        return;
-    size_t length = strlen(context);
-    if (length <= max_chars)
-        return;
-
-    size_t cut = max_chars;
-    while (cut > 0 && context[cut] != '\n')
-        --cut;
-    if (cut == 0)
-        cut = r2_utf8_safe_prefix_length(context, max_chars);
-    context[cut] = '\0';
-}
-
 /*
  * Ask the same local model to interpret the current message for retrieval,
  * not to answer it. These associative cues are used only to search R2's
@@ -5327,106 +5501,82 @@ static void r2_bound_context_records(char *context, size_t max_chars)
  * as facts. Retrieval is attempted on every turn, regardless of whether the
  * user says "remember" or uses any other special phrase.
  */
-typedef char *(*R2AssociationSearchFn)(const char *, int);
+typedef int (*R2AssociationSearchFn)(
+    const char *, int, int (*)(void *, int64_t, const char *, size_t), void *);
 
 /* Search other existing experience stores with the same model-generated cues.
    This is read-only retrieval: it does not rewrite or promote stored records. */
-static char *r2_collect_associated_records(
-    char keywords[MAX_MEMORY_KEYWORDS][64],
-    size_t keyword_count,
-    R2AssociationSearchFn search_fn,
-    size_t max_chars)
+static int r2_append_association_section(char **context, const char *heading, const char *records)
 {
-    if (!search_fn || max_chars == 0)
-        return xstrdup("");
-
-    char *out = calloc(max_chars + 1, 1);
-    if (!out)
-        return NULL;
-
-    size_t used = 0;
-    int searches = 0;
-    for (size_t i = 0; i < keyword_count && searches < 6 && used < max_chars; ++i) {
-        if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i]))
-            continue;
-
-        char *found = search_fn(keywords[i], 2);
-        ++searches;
-        if (!found || !*found) {
-            free(found);
-            continue;
-        }
-
-        if (strstr(found, "No Life Log events matched") ||
-            strstr(found, "The Life Log contains no events") ||
-            strstr(found, "No visual experiences matched")) {
-            free(found);
-            continue;
-        }
-
-        /* Avoid repeating the same entry when several cues hit it. */
-        if (used && strstr(out, found)) {
-            free(found);
-            continue;
-        }
-
-        size_t n = strlen(found);
-        if (n > max_chars - used)
-            n = max_chars - used;
-        while (n > 0 && found[n - 1] != '\n')
-            --n;
-        if (n == 0)
-            n = r2_utf8_safe_prefix_length(found, max_chars - used);
-        if (n == 0) {
-            free(found);
-            break;
-        }
-
-        if (used)
-            out[used++] = '\n';
-        if (n > max_chars - used)
-            n = r2_utf8_safe_prefix_length(found, max_chars - used);
-        if (n == 0) {
-            free(found);
-            break;
-        }
-        memcpy(out + used, found, n);
-        used += n;
-        out[used] = '\0';
-        free(found);
-    }
-
-    if (used == 0) {
-        free(out);
-        return xstrdup("");
-    }
-    return out;
+    if (!context || !*context || !heading || !records) { errno = EINVAL; return -1; }
+    if (!*records) return 0;
+    size_t old_n = strlen(*context), heading_n = strlen(heading), records_n = strlen(records);
+    if (old_n > SIZE_MAX - 4 || heading_n > SIZE_MAX - 4 - old_n ||
+        records_n > SIZE_MAX - 4 - old_n - heading_n) { errno = EOVERFLOW; return -1; }
+    size_t total = old_n + heading_n + records_n + 4;
+    char *joined = malloc(total);
+    if (!joined) return -1;
+    snprintf(joined, total, "%s%s%s%s\n", *context, old_n ? "\n\n" : "", heading, records);
+    free(*context); *context = joined;
+    return 0;
 }
 
-static void r2_append_association_section(
-    char **context,
-    const char *heading,
-    const char *records)
+typedef struct {
+    char *text;
+    size_t length;
+    int64_t *ids;
+    size_t count;
+} R2HistorySelection;
+
+static void r2_history_release(R2HistorySelection *history)
 {
-    if (!context || !*context || !heading || !records || !*records)
-        return;
+    free(history->text); free(history->ids);
+    memset(history, 0, sizeof(*history));
+}
 
-    size_t old_n = strlen(*context);
-    size_t heading_n = strlen(heading);
-    size_t records_n = strlen(records);
-    if (old_n > SIZE_MAX - heading_n - records_n - 8)
-        return;
+/* Each selection belongs to one store. Equal IDs across stores and equal
+ * text from distinct rows do not identify the same experience. */
+static int r2_history_append_unique_row(void *context, int64_t id,
+                                        const char *row, size_t length)
+{
+    R2HistorySelection *history = context;
+    for (size_t i = 0; i < history->count; ++i) {
+        if (history->ids[i] == id) return 0;
+    }
+    if (history->length == SIZE_MAX || length > SIZE_MAX - history->length - 1 ||
+        history->count >= SIZE_MAX / sizeof(*history->ids)) return -1;
 
-    size_t total = old_n + heading_n + records_n + 8;
-    char *joined = malloc(total);
-    if (!joined)
-        return;
+    int64_t *ids = realloc(history->ids, (history->count + 1) * sizeof(*ids));
+    if (!ids) return -1;
+    history->ids = ids;
+    char *text = realloc(history->text, history->length + length + 1);
+    if (!text) return -1;
+    history->text = text;
+    memcpy(text + history->length, row, length);
+    history->length += length;
+    text[history->length] = '\0';
+    history->ids[history->count++] = id;
+    return 0;
+}
 
-    snprintf(joined, total, "%s%s%s%s%s",
-             *context, old_n ? "\n\n" : "",
-             heading, records, "\n");
-    free(*context);
-    *context = joined;
+/* Search/row counts bound selection while the visitor receives complete rows.
+ * Discard all accumulated rows if a provider or allocation fails. */
+static char *r2_collect_associated_records(
+    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, R2AssociationSearchFn search_fn)
+{
+    if (!search_fn) { errno = EINVAL; return NULL; }
+    R2HistorySelection selection = {0};
+    int searches = 0;
+    for (size_t i = 0; i < keyword_count && searches < 6; ++i) {
+        if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i])) continue;
+        ++searches;
+        if (search_fn(keywords[i], 2, r2_history_append_unique_row, &selection) != 0) {
+            r2_history_release(&selection);
+            return NULL;
+        }
+    }
+    free(selection.ids);
+    return selection.text ? selection.text : xstrdup("");
 }
 
 static pthread_mutex_t r2_associative_query_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -5636,13 +5786,11 @@ static int r2_recent_message_is_tool_payload(const char *content)
 /* Return only recent human-facing turns for grounded hypothetical generation.
    Pinned system/archive context and internal tool payloads are deliberately
    excluded; this transcript is contextual evidence, not a new instruction. */
-char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars)
+static char *r2_build_recent_conversation_context(const char *exclude_latest,
+                                                 size_t max_chars, int complete)
 {
-    /* Treat max_chars as a hard cap; do not silently inflate small budgets. */
     if (max_chars == 0) return xstrdup("");
-    if (max_chars > 8192) max_chars = 8192;
-    char *out = calloc(max_chars + 1, 1);
-    if (!out) return NULL;
+    if (!complete && max_chars > 8192) max_chars = 8192;
 
     size_t selected[8];
     size_t found = 0;
@@ -5680,154 +5828,84 @@ char *r2_recent_conversation_context(const char *exclude_latest, size_t max_char
         const Message *m = &messages.items[selected[included]];
         size_t role_length = strcmp(m->role, "user") == 0 ? 6U : 4U;
         size_t content_length = strlen(m->content);
-        if (content_length > 1000U)
+        if (!complete && content_length > 1000U)
             content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
-        size_t line_length = role_length + content_length + 1U;
-        size_t separator_length = 0U;
-        if (selected_chars > max_chars ||
-            separator_length > max_chars - selected_chars ||
-            line_length > max_chars - selected_chars - separator_length)
+        size_t remaining = max_chars - selected_chars;
+        if (remaining <= role_length || content_length >= remaining - role_length) {
+            if (complete) {
+                pthread_mutex_unlock(&messages_lock);
+                errno = EOVERFLOW;
+                return NULL;
+            }
             break;
-        selected_chars += separator_length + line_length;
+        }
+        selected_chars += role_length + content_length + 1U;
         ++included;
     }
 
+    size_t capacity = complete ? selected_chars : max_chars;
+    if (capacity == SIZE_MAX) {
+        pthread_mutex_unlock(&messages_lock);
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    char *out = malloc(capacity + 1);
+    if (!out) {
+        pthread_mutex_unlock(&messages_lock);
+        return NULL;
+    }
     size_t used = 0;
     if (found > 0 && included == 0) {
-        /* A single very long newest turn may exceed a tiny caller budget.
-         * Preserve that turn with an explicit truncation marker, not stale history. */
+        /* Keep the legacy finite-budget preview's explicit truncation marker. */
         const Message *m = &messages.items[selected[0]];
         const char *role = strcmp(m->role, "user") == 0 ? "User: " : "R2: ";
         const char marker[] = " [truncated]\n";
-        size_t role_length = strlen(role);
-        size_t marker_length = sizeof(marker) - 1;
-        size_t available = max_chars > role_length + marker_length
-            ? max_chars - role_length - marker_length : 0;
-        size_t safe_available = r2_utf8_safe_prefix_length(
-            m->content, available);
-        int written = snprintf(out, max_chars + 1, "%s%.*s%s",
-            role, (int)safe_available, m->content, marker);
-        if (written > 0)
-            used = (size_t)written > max_chars ? max_chars : (size_t)written;
+        size_t overhead = strlen(role) + sizeof(marker) - 1;
+        size_t available = max_chars > overhead ? max_chars - overhead : 0;
+        size_t safe_available = r2_utf8_safe_prefix_length(m->content, available);
+        snprintf(out, capacity + 1, "%s%.*s%s", role, (int)safe_available, m->content, marker);
     } else {
         for (size_t n = included; n > 0; --n) {
             const Message *m = &messages.items[selected[n - 1]];
-            size_t remaining = max_chars - used;
+            const char *role = strcmp(m->role, "user") == 0 ? "User: " : "R2: ";
+            size_t role_length = strlen(role);
             size_t content_length = strlen(m->content);
-            if (content_length > 1000U)
+            if (!complete && content_length > 1000U)
                 content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
-            int written = snprintf(out + used, remaining + 1,
-                "%s: %.*s\n",
-                strcmp(m->role, "user") == 0 ? "User" : "R2",
-                (int)content_length, m->content);
-            if (written < 0 || (size_t)written > remaining)
-                break; /* Defensive: selection above guarantees whole lines fit. */
-            used += (size_t)written;
+            memcpy(out + used, role, role_length);
+            used += role_length;
+            memcpy(out + used, m->content, content_length);
+            used += content_length;
+            out[used++] = '\n';
         }
+        out[used] = '\0';
     }
     pthread_mutex_unlock(&messages_lock);
     return out;
 }
 
-/* Append complete Life Log event records once per durable event ID.
- * Keyword searches overlap heavily, so duplicates waste bounded context. */
-static int r2_history_has_event_id(
-    const char *history,
-    const char *record,
-    size_t record_length)
+char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars)
 {
-    if (!history || !record)
-        return 0;
-
-    size_t start = 0;
-    while (start < record_length &&
-           (record[start] == '\n' || record[start] == '\r'))
-        ++start;
-    if (start >= record_length || record[start] != '[')
-        return 0;
-
-    size_t close = start + 1;
-    while (close < record_length &&
-           isdigit((unsigned char)record[close]))
-        ++close;
-    if (close == start + 1 || close >= record_length ||
-        record[close] != ']')
-        return 0;
-
-    size_t token_length = close - start + 1;
-    const char *cursor = history;
-    while ((cursor = strchr(cursor, '[')) != NULL) {
-        if ((cursor == history ||
-             (cursor - history >= 2 && cursor[-1] == '\n' &&
-              cursor[-2] == '\n')) &&
-            strlen(cursor) > token_length &&
-            strncmp(cursor, record + start, token_length) == 0 &&
-            cursor[token_length] == ' ')
-            return 1;
-        ++cursor;
-    }
-    return 0;
+    return r2_build_recent_conversation_context(exclude_latest, max_chars, 0);
 }
 
-static int r2_history_append_unique_records(
-    char **history,
-    size_t *history_length,
-    size_t max_chars,
-    const char *found,
-    size_t found_length)
+char *r2_recent_conversation_context_complete(const char *exclude_latest)
 {
-    if (!history || !*history || !history_length || !found)
-        return -1;
+    return r2_build_recent_conversation_context(exclude_latest, SIZE_MAX, 1);
+}
 
-    size_t position = 0;
-    while (position < found_length) {
-        while (position < found_length &&
-               (found[position] == '\n' || found[position] == '\r'))
-            ++position;
-        if (position >= found_length)
-            break;
-
-        size_t start = position;
-        size_t separator = found_length;
-        for (size_t i = position; i + 1 < found_length; ++i) {
-            if (found[i] == '\n' && found[i + 1] == '\n') {
-                separator = i;
-                break;
-            }
-        }
-
-        /* Keep the record's final newline but not the blank separator. */
-        size_t record_end = separator < found_length
-            ? separator + 1 : found_length;
-        size_t record_length = record_end - start;
-        position = separator < found_length
-            ? separator + 2 : found_length;
-        if (record_length == 0)
-            continue;
-
-        if (r2_history_has_event_id(
-                *history, found + start, record_length))
-            continue;
-
-        size_t separator_length = *history_length ? 1 : 0;
-        if (*history_length > max_chars ||
-            separator_length > max_chars - *history_length ||
-            record_length > max_chars - *history_length - separator_length)
-            continue;
-
-        size_t new_length = *history_length +
-                            separator_length + record_length;
-        if (new_length == SIZE_MAX)
-            return -1;
-        char *grown = realloc(*history, new_length + 1);
-        if (!grown)
-            return -1;
-        *history = grown;
-        if (separator_length)
-            (*history)[(*history_length)++] = '\n';
-        memcpy(*history + *history_length, found + start, record_length);
-        *history_length += record_length;
-        (*history)[*history_length] = '\0';
+/* Append complete Life Log event records once per durable event ID. */
+static int r2_history_append_unique_records(R2HistorySelection *history,
+                                             const R2LogRecordBatch *batch)
+{
+    if (!history || !batch || !batch->text || (batch->count && !batch->records)) return -1;
+    size_t text_length = strlen(batch->text);
+    for (size_t i = 0; i < batch->count; ++i) {
+        R2LogRecordSpan record = batch->records[i];
+        if (record.offset > text_length || record.length > text_length - record.offset ||
+            record.event_id <= 0) return -1;
+        if (r2_history_append_unique_row(history, record.event_id,
+                batch->text + record.offset, record.length) != 0) return -1;
     }
     return 0;
 }
@@ -5837,7 +5915,7 @@ static char *chat_with_relevant_memories(
 {
     /*
        Preserve the user's original message as an actual user turn.
-       Historical memory and Life Log evidence is bounded and kept with the
+       Historical memory and Life Log evidence is kept with the
        leading system context, before dialogue begins. Live Reality is refreshed
        separately, and live visual evidence is never cached here. The permanent
        conversation is never modified by retrieval.
@@ -5846,10 +5924,6 @@ static char *chat_with_relevant_memories(
     int explicit_recall = r2_query_explicitly_requests_recall(query);
     int memory_limit = explicit_recall ? MAX_RELEVANT_MEMORIES
                                        : R2_TURN_MEMORY_LIMIT;
-    size_t memory_char_limit = explicit_recall ? R2_RECALL_MEMORY_CHARS
-                                               : R2_TURN_MEMORY_CHARS;
-    size_t history_char_limit = explicit_recall ? R2_RECALL_HISTORY_CHARS
-                                                : R2_TURN_HISTORY_CHARS;
     int history_search_limit = explicit_recall ? R2_RECALL_HISTORY_SEARCHES
                                                : R2_TURN_HISTORY_SEARCHES;
 
@@ -5874,7 +5948,6 @@ static char *chat_with_relevant_memories(
     } else {
         fprintf(stderr, "[R2 Context] Reused persistent-memory retrieval from RAM cache.\n");
     }
-    r2_bound_context_records(memory_context, memory_char_limit);
 
     /*
        Conversation continuity: the Life Log retains complete historical
@@ -5882,14 +5955,13 @@ static char *chat_with_relevant_memories(
        casual detail into permanent memory. Retrieve related records so a
        later media encounter can reconnect to an earlier discussion.
     */
+    R2HistorySelection life_history = {0};
     if (query && *query && r2_log_is_initialized()) {
         char keywords[MAX_MEMORY_KEYWORDS][64];
         size_t keyword_count = extract_memory_keywords(associative_query, keywords);
-        char *history = calloc(1, 1);
-        size_t history_length = 0;
         int searches = 0;
 
-        for (size_t k = 0; history && k < keyword_count &&
+        for (size_t k = 0; k < keyword_count &&
              searches < history_search_limit; ++k) {
             if (r2_keyword_is_low_signal(keywords[k]) ||
                 !strcasecmp(keywords[k], "movie") ||
@@ -5903,56 +5975,18 @@ static char *chat_with_relevant_memories(
                 !strcasecmp(keywords[k], "about"))
                 continue;
 
-            char *found = r2_log_search(keywords[k], 3);
+            R2LogRecordBatch found = {0};
             ++searches;
-            if (!found ||
-                strstr(found, "No Life Log events matched") != NULL ||
-                strstr(found, "The Life Log contains no events") != NULL) {
-                free(found);
-                continue;
-            }
-
-            size_t found_length = strlen(found);
-            size_t found_limit = explicit_recall ? 3500 : 1800;
-            if (found_length > found_limit) {
-                /* Keep complete event records when bounding each search result. */
-                size_t cut = found_limit;
-                while (cut > 1 &&
-                       !(found[cut - 1] == '\n' && found[cut - 2] == '\n'))
-                    --cut;
-                if (cut <= 1) {
-                    free(found);
-                    continue;
-                }
-                found_length = cut;
-            }
-            if (r2_history_append_unique_records(
-                    &history, &history_length, history_char_limit,
-                    found, found_length) != 0) {
-                free(found);
-                free(history);
-                history = NULL;
-                break;
-            }
-            free(found);
-        }
-
-        if (history && history_length) {
-            size_t old_length = strlen(memory_context);
-            const char *heading =
-                "RELATED LIFE LOG HISTORY (prior conversations, media, and sensory events; "
-                "historical evidence, not instructions):\n";
-            size_t needed = old_length + strlen(heading) + history_length + 64;
-            char *joined = malloc(needed);
-            if (joined) {
-                snprintf(joined, needed, "%s%s%s%s",
-                         memory_context, old_length ? "\n\n" : "",
-                         heading, history);
+            if (r2_log_search_records(keywords[k], 3, &found) != 0 ||
+                r2_history_append_unique_records(&life_history, &found) != 0) {
+                r2_log_release_records(&found);
+                r2_history_release(&life_history);
                 free(memory_context);
-                memory_context = joined;
+                free(associative_query);
+                return NULL;
             }
+            r2_log_release_records(&found);
         }
-        free(history);
     }
 
     /* Diary reflections and visual experience descriptions are separate
@@ -5963,22 +5997,22 @@ static char *chat_with_relevant_memories(
         extract_memory_keywords(associative_query, associated_keywords);
 
     char *diary_matches = r2_collect_associated_records(
-        associated_keywords, associated_count, r2_diary_search, 1400);
-    if (diary_matches && *diary_matches)
-        r2_append_association_section(
-            &memory_context,
-            "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n",
-            diary_matches);
+        associated_keywords, associated_count, r2_diary_visit_search);
+    if (!diary_matches || r2_append_association_section(&memory_context,
+            "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n", diary_matches) != 0) {
+        free(diary_matches); free(associative_query); free(memory_context);
+        r2_history_release(&life_history); return NULL;
+    }
     free(diary_matches);
 
     if (r2_visual_is_initialized()) {
         char *visual_matches = r2_collect_associated_records(
-            associated_keywords, associated_count, r2_visual_search, 1400);
-        if (visual_matches && *visual_matches)
-            r2_append_association_section(
-                &memory_context,
-                "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n",
-                visual_matches);
+            associated_keywords, associated_count, r2_visual_visit_search);
+        if (!visual_matches || r2_append_association_section(&memory_context,
+                "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n", visual_matches) != 0) {
+            free(visual_matches); free(associative_query); free(memory_context);
+            r2_history_release(&life_history); return NULL;
+        }
         free(visual_matches);
     }
 
@@ -5988,7 +6022,7 @@ static char *chat_with_relevant_memories(
             "[R2 Context] Turn retrieval profile=%s memory_limit=%d memory_chars=%zu history_search_limit=%d history_chars=%zu.\n",
             explicit_recall ? "explicit-recall" : "focused",
             memory_limit, strlen(memory_context), history_search_limit,
-            history_char_limit);
+            life_history.length);
 
     /*
      * Historical visual records are memory, not a substitute for current sight.
@@ -6001,17 +6035,9 @@ static char *chat_with_relevant_memories(
     if (r2_visual_is_initialized() &&
         (visual_requested || (eyes && r2_eyes_is_open(eyes)))) {
         char *prior_visual = r2_visual_recent(3);
-        if (prior_visual && *prior_visual) {
-            size_t old_n = strlen(memory_context);
-            size_t visual_n = strlen(prior_visual);
-            char *joined = malloc(old_n + visual_n + 160);
-            if (joined) {
-                snprintf(joined, old_n + visual_n + 160,
-                         "%s%sPRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n%s\n",
-                         memory_context, old_n ? "\n\n" : "", prior_visual);
-                free(memory_context);
-                memory_context = joined;
-            }
+        if (!prior_visual || r2_append_association_section(&memory_context,
+                "PRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n", prior_visual) != 0) {
+            free(prior_visual); free(memory_context); r2_history_release(&life_history); return NULL;
         }
         free(prior_visual);
     }
@@ -6035,32 +6061,33 @@ static char *chat_with_relevant_memories(
             const char unavailable[] =
                 "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request. "
                 "Do not claim to see the current scene from historical memories.";
-            size_t old_n = strlen(memory_context);
-            size_t note_n = sizeof(unavailable) - 1U;
-            char *joined = malloc(old_n + note_n + 4U);
-            if (joined) {
-                snprintf(joined, old_n + note_n + 4U, "%s%s%s",
-                         memory_context, old_n ? "\n\n" : "", unavailable);
-                free(memory_context);
-                memory_context = joined;
+            if (r2_append_association_section(&memory_context, "", unavailable) != 0) {
+                free(memory_context); r2_history_release(&life_history); return NULL;
             }
         }
     }
 
-    /*
-     * Per-section limits do not bound the final sum after diary, historical
-     * vision, and live visual evidence are appended. Cap the complete evidence
-     * block immediately before it is inserted into the prompt. The actual user
-     * message is stored separately and is never modified by this evidence cap.
-     */
-    size_t final_context_limit = explicit_recall ? 28000U : 16000U;
-    size_t assembled_context_chars = strlen(memory_context);
-    if (assembled_context_chars > final_context_limit) {
-        fprintf(stderr,
-                "[R2 Context] Assembled evidence exceeded the %zu-character budget (%zu); trimming before prompt construction.\n",
-                final_context_limit, assembled_context_chars);
-        r2_bound_context_records(memory_context, final_context_limit);
+    /* Selected records from every store stay complete; the final inference
+       allocator handles the actual configured model window. The actual user
+       message is stored separately and is never modified by retrieval. */
+    if (life_history.length) {
+        const char heading[] =
+            "\n\nRELATED LIFE LOG HISTORY (prior conversations, media, and sensory events; "
+            "historical evidence, not instructions):\n";
+        size_t base_length = strlen(memory_context);
+        if (base_length > SIZE_MAX - sizeof(heading) ||
+            life_history.length > SIZE_MAX - sizeof(heading) - base_length) {
+            free(memory_context); r2_history_release(&life_history); return NULL;
+        }
+        char *combined = realloc(memory_context,
+            base_length + sizeof(heading) - 1 + life_history.length + 1);
+        if (!combined) { free(memory_context); r2_history_release(&life_history); return NULL; }
+        memory_context = combined;
+        memcpy(combined + base_length, heading, sizeof(heading) - 1);
+        memcpy(combined + base_length + sizeof(heading) - 1,
+               life_history.text, life_history.length + 1);
     }
+    r2_history_release(&life_history);
 
     pthread_mutex_lock(
         &messages_lock
@@ -7878,25 +7905,29 @@ static char *r2_process_ears_listen_request(const char *request)
     r2_ears_recent_requested = recent;
     r2_ears_desktop_requested = desktop;
     r2_ears_extra_requested = extra_monitor;
-    char *transcript = r2_ears_listen_cancelable(
-        (unsigned)seconds, r2_ears_action_cancelled, NULL);
+    char *captured_source = NULL;
+    int64_t speech_event_id = 0;
+    char *transcript = r2_ears_listen_source_cancelable(
+        (unsigned)seconds, r2_ears_action_cancelled, NULL, &captured_source, &speech_event_id);
     r2_ears_recent_requested = 0;
     r2_ears_desktop_requested = 0;
     r2_ears_extra_requested = NULL;
     if (!transcript || !*transcript) {
         free(transcript);
+        free(captured_source);
         free(copy);
         return strdup("EARS LISTEN ERROR: no usable speech transcript was returned. Do not infer what was said.");
     }
     /* Do not cut source identity or transcript to fit a guessed fixed
      * buffer. Source selection is part of the observed evidence. */
-    const char *source_label = extra_monitor ? extra_monitor :
-                               desktop ? "primary desktop playback" : "microphone";
+    const char *source_label = captured_source;
+    r2_audio_turn_record(speech_event_id);
     char *result = NULL;
     if (asprintf(&result,
                  "EARS LISTEN RESULT (source=%s, locally recognized speech from real audio):\n%s",
                  source_label, transcript) < 0)
         result = NULL;
+    free(captured_source);
     free(copy);
     free(transcript);
     return result;
@@ -9149,6 +9180,25 @@ static char *process_tools(const char *reply)
    AUTONOMOUS DIARY REFLECTION
    ============================================================ */
 
+/* Persist the actual diary row and exact evidence relationships together in
+ * the existing stores; matching repeated reflection prose is unnecessary. */
+static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence *evidence,
+                                int64_t *event_id_out)
+{
+    if (event_id_out) *event_id_out = 0;
+    int64_t diary_id = 0;
+    if (r2_diary_write_with_id(reflection, &diary_id) != 0) return -1;
+    int64_t event_id = r2_log_thinking("reflection_completed",
+                                     "Private diary reflection was written.", reflection);
+    if (event_id > 0) {
+        if (r2_sj_link_reflection(event_id, diary_id) != 0)
+            fprintf(stderr, "[R2 diary] Could not persist exact reflection-to-diary link.\n");
+        r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_reflection");
+        if (event_id_out) *event_id_out = event_id;
+    } else fprintf(stderr, "[R2 diary] Diary row saved, but completion event could not be persisted.\n");
+    return 0;
+}
+
 static void *autonomous_thinking(void *arg)
 {
     (void)arg;
@@ -9298,6 +9348,7 @@ static void *autonomous_thinking(void *arg)
         char *reflection = ollama_chat_with_limit(
             &m, 1, prompt, 1024, 600L);
 
+        R2AudioTurnEvidence speech_evidence = {0};
         /* Autonomous reflection can deliberately use the SAME sensor decision,
            media attention or listening tools as the conversation brain. Raw
            variation alone never forces a visual description or transcription. */
@@ -9321,7 +9372,10 @@ static void *autonomous_thinking(void *arg)
                 action_result = r2_process_media_see_request(trim(media_request));
             } else if (ears_request) {
                 heading = "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:";
+                R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
+                r2_audio_turn_evidence = &speech_evidence;
                 action_result = r2_process_ears_listen_request(ears_request);
+                r2_audio_turn_evidence = previous_evidence;
             } else if (sources_request) {
                 heading = "RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:";
                 action_result = r2_ears_desktop_available_sources();
@@ -9376,6 +9430,7 @@ static void *autonomous_thinking(void *arg)
 
         if (shutting_down || !atomic_load(&diary_running)) {
             free(reflection);
+            free(speech_evidence.events);
             break;
         }
 
@@ -9389,6 +9444,7 @@ static void *autonomous_thinking(void *arg)
                          "An autonomous reflection result was discarded because a foreground conversation took priority.",
                          NULL, "autonomous_thinking");
             last_reflection_ms = r2_log_elapsed_ms();
+            free(speech_evidence.events);
             continue;
         }
 
@@ -9397,14 +9453,12 @@ static void *autonomous_thinking(void *arg)
                          "Autonomous reflection generation failed.",
                          NULL, "autonomous_thinking");
             last_reflection_ms = r2_log_elapsed_ms();
+            free(speech_evidence.events);
             continue;
         }
 
-        if (r2_diary_write(reflection) == 0) {
-            int64_t reflection_event_id =
-                r2_log_thinking("reflection_completed",
-                                "Autonomous diary reflection was written.",
-                                reflection);
+        int64_t reflection_event_id = 0;
+        if (r2_store_reflection(reflection, &speech_evidence, &reflection_event_id) == 0) {
             log_structured_self_report(reflection, reflection_event_id);
             r2_log_continuity("r2_private_reflection", "routine",
                               "Private autonomous reflection",
@@ -9424,6 +9478,7 @@ static void *autonomous_thinking(void *arg)
 
         last_reflection_ms = r2_log_elapsed_ms();
         free(reflection);
+        free(speech_evidence.events);
         char cycle_details[128];
         snprintf(cycle_details, sizeof(cycle_details),
                  "duration_ms=%llu",
@@ -9799,32 +9854,32 @@ int r2_diary_active(void)
 
 static char *append_reality_context(char *base)
 {
+    if (!base) return NULL;
     char *reality = r2_reality_context();
     char *reward = r2_reward_context();
     char *addiction = r2_addiction_report();
-    size_t base_n = base ? strlen(base) : 0;
-    size_t reality_n = reality ? strlen(reality) : 0;
-    size_t reward_n = reward ? strlen(reward) : 0;
-    size_t addiction_n = addiction ? strlen(addiction) : 0;
-    if (!base && !reality && !reward && !addiction) return NULL;
-    size_t n = base_n + reality_n + reward_n + addiction_n + 160;
-    char *combined = malloc(n);
-    if (combined) {
-        snprintf(combined, n, "%s%s%s%s%s%s%s",
-            base ? base : "",
-            base_n && reality_n ? "\n\n" : "",
-            reality ? reality : "",
-            (base_n || reality_n) && reward_n ? "\n\n" : "",
-            reward ? reward : "",
-            (base_n || reality_n || reward_n) && addiction_n ? "\n\n" : "",
-            addiction ? addiction : "");
+    char *combined = NULL;
+    if (!reality || !reward || !addiction) {
+        fprintf(stderr, "[R2 Reflection] Required state context could not be read.\n");
+        goto cleanup;
     }
+    size_t n = 7; /* Three separators and the terminating NUL. */
+    const char *parts[] = {base, reality, reward, addiction};
+    for (size_t i = 0; i < 4; ++i) {
+        size_t length = strlen(parts[i]);
+        if (length > SIZE_MAX - n) { errno = EOVERFLOW; goto cleanup; }
+        n += length;
+    }
+    combined = malloc(n);
+    if (combined) snprintf(combined, n, "%s\n\n%s\n\n%s\n\n%s", base, reality, reward, addiction);
+cleanup:
     free(base);
     free(reality);
     free(reward);
     free(addiction);
     return combined;
 }
+
 
 int r2_write_diary(void)
 {
@@ -9853,7 +9908,7 @@ int r2_write_diary(void)
 
     if (!reflection) return -1;
 
-    int rc = r2_diary_write(reflection);
+    int rc = r2_store_reflection(reflection, NULL, NULL);
     free(reflection);
     return rc;
 }
@@ -11141,6 +11196,7 @@ static pthread_mutex_t ears_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t ears_recent_length = 0;
 static size_t ears_recent_write_position = 0;
 static uint64_t ears_recent_total_bytes = 0;
+static uint64_t ears_recent_generation = 1;
 static pthread_t ears_capture_thread;
 static int ears_capture_thread_started = 0;
 /* The desktop sink monitor never shares the microphone's stream or history. */
@@ -11153,6 +11209,81 @@ static unsigned char ears_desktop_recent_audio[R2_EARS_RECENT_CAPACITY];
 static size_t ears_desktop_recent_length = 0;
 static size_t ears_desktop_recent_write_position = 0;
 static uint64_t ears_desktop_recent_total_bytes = 0;
+static uint64_t ears_desktop_recent_generation = 1;
+/* Pending opens have a separate lifetime lock so stop never waits behind
+ * the lifecycle mutex before notifying a connecting transport. */
+static pthread_mutex_t ears_open_pointer_lock = PTHREAD_MUTEX_INITIALIZER;
+static R2Ears *ears_pending_open[2] = {NULL, NULL};
+static int ears_pending_watch[2] = {0, 0};
+static atomic_uint_fast64_t ears_open_epoch[2] = {ATOMIC_VAR_INIT(1), ATOMIC_VAR_INIT(1)};
+static atomic_uint_fast64_t ears_watch_stop_epoch = ATOMIC_VAR_INIT(1);
+static atomic_uint ears_desktop_stop_requesters = ATOMIC_VAR_INIT(0);
+typedef struct {
+    int desktop, watch;
+    uint_fast64_t epoch, watch_epoch;
+    int (*cancelled)(void *);
+    void *userdata;
+} R2EarsOpenRequest;
+
+static int r2_ears_open_cancelled(void *userdata)
+{
+    R2EarsOpenRequest *request = userdata;
+    return shutting_down ||
+        atomic_load(request->desktop ? &ears_desktop_stop_requesters : &ears_stop_requesters) ||
+        atomic_load(&ears_open_epoch[request->desktop]) != request->epoch ||
+        (request->watch && (atomic_load(&ears_watch_stop_epoch) != request->watch_epoch ||
+                           !r2_sense_auto_allowed(request->desktop ? 3 : 2))) ||
+        (request->cancelled && request->cancelled(request->userdata));
+}
+
+static R2EarsOpenRequest r2_ears_open_request(int desktop, int watch,
+                                             int (*cancelled)(void *), void *userdata)
+{
+    return (R2EarsOpenRequest){desktop, watch,
+        atomic_load(&ears_open_epoch[desktop]), atomic_load(&ears_watch_stop_epoch),
+        cancelled, userdata};
+}
+
+static void r2_ears_cancel_pending_source(int desktop)
+{
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    atomic_fetch_add(&ears_open_epoch[desktop], 1);
+    if (ears_pending_open[desktop]) r2_ears_cancel(ears_pending_open[desktop]);
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+}
+
+static void r2_ears_cancel_pending_inputs(int watch_only)
+{
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    if (watch_only) atomic_fetch_add(&ears_watch_stop_epoch, 1);
+    for (int i = 0; i < 2; ++i) {
+        if (!watch_only) atomic_fetch_add(&ears_open_epoch[i], 1);
+        if (ears_pending_open[i] && (!watch_only || ears_pending_watch[i]))
+            r2_ears_cancel(ears_pending_open[i]);
+    }
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+}
+
+/* Caller owns the corresponding lifecycle mutex until this returns. */
+static int r2_ears_open_input(R2Ears *receiver, const char *source,
+                              R2EarsOpenRequest *request)
+{
+    if (!receiver || r2_ears_open_cancelled(request)) { errno = ECANCELED; return -1; }
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    ears_pending_open[request->desktop] = receiver;
+    ears_pending_watch[request->desktop] = request->watch;
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+    int rc = request->desktop && !source
+        ? r2_ears_open_desktop_cancelable(receiver, r2_ears_open_cancelled, request)
+        : r2_ears_open_source_cancelable(receiver, source, r2_ears_open_cancelled, request);
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    ears_pending_open[request->desktop] = NULL;
+    int stopped = r2_ears_open_cancelled(request);
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+    if (stopped) { r2_ears_close(receiver); errno = ECANCELED; return -1; }
+    return rc;
+}
+
 static pthread_t ears_desktop_capture_thread;
 static int ears_desktop_capture_thread_started = 0;
 
@@ -11207,6 +11338,11 @@ static void r2_ears_notice_pcm_change(const unsigned char *pcm, size_t size,
 static void *r2_ears_capture_worker(void *unused)
 {
     (void)unused;
+    R2HearingEvent source = {0};
+    if (r2_ears_get_event(ears, &source) != 0) {
+        atomic_store(&ears_capture_running, 0);
+        return NULL;
+    }
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
     unsigned prior_audio_level = 0;
     int have_prior_audio = 0;
@@ -11218,12 +11354,12 @@ static void *r2_ears_capture_worker(void *unused)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous microphone stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
-                               "Ears");
+                               source.source_name);
             break;
         }
         r2_ears_notice_pcm_change(pcm, (size_t)got,
                                    &prior_audio_level, &have_prior_audio,
-                                   &last_audio_notice, "microphone");
+                                   &last_audio_notice, source.source_name);
         pthread_mutex_lock(&ears_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_recent_write_position;
@@ -11243,6 +11379,7 @@ static void *r2_ears_capture_worker(void *unused)
         ears_recent_total_bytes += count;
         pthread_mutex_unlock(&ears_recent_lock);
     }
+    r2_ears_release_event(&source);
     atomic_store(&ears_capture_running, 0);
     return NULL;
 }
@@ -11251,6 +11388,11 @@ static void *r2_ears_capture_worker(void *unused)
 static void *r2_ears_desktop_capture_worker(void *unused)
 {
     (void)unused;
+    R2HearingEvent source = {0};
+    if (r2_ears_get_event(ears_desktop, &source) != 0) {
+        atomic_store(&ears_desktop_capture_running, 0);
+        return NULL;
+    }
     unsigned char pcm[1920]; /* 10 ms at 48 kHz, stereo, signed 16-bit PCM. */
     unsigned prior_audio_level = 0;
     int have_prior_audio = 0;
@@ -11262,12 +11404,12 @@ static void *r2_ears_desktop_capture_worker(void *unused)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous desktop playback stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
-                               "Ears desktop");
+                               source.source_name);
             break;
         }
         r2_ears_notice_pcm_change(pcm, (size_t)got,
                                    &prior_audio_level, &have_prior_audio,
-                                   &last_audio_notice, "desktop_playback");
+                                   &last_audio_notice, source.source_name);
         pthread_mutex_lock(&ears_desktop_recent_lock);
         size_t count = (size_t)got;
         size_t first = R2_EARS_RECENT_CAPACITY - ears_desktop_recent_write_position;
@@ -11287,6 +11429,7 @@ static void *r2_ears_desktop_capture_worker(void *unused)
         ears_desktop_recent_total_bytes += count;
         pthread_mutex_unlock(&ears_desktop_recent_lock);
     }
+    r2_ears_release_event(&source);
     atomic_store(&ears_desktop_capture_running, 0);
     return NULL;
 }
@@ -11320,6 +11463,35 @@ typedef struct R2ExtraDesktop {
 static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ExtraDesktop *extra_desktop_head = NULL;
 static atomic_uint_fast64_t extra_desktop_generation = ATOMIC_VAR_INIT(1);
+/* This lock never waits on the reconciliation lock. It protects only the
+ * pending receiver's lifetime so stop can reach an in-progress connect. */
+static pthread_mutex_t extra_desktop_pending_lock = PTHREAD_MUTEX_INITIALIZER;
+static R2Ears *extra_desktop_pending = NULL;
+static atomic_uint_fast64_t extra_desktop_stop_epoch = ATOMIC_VAR_INIT(1);
+static atomic_uint extra_desktop_stoppers = ATOMIC_VAR_INIT(0);
+
+void r2_ears_extra_cancel_pending(void)
+{
+    pthread_mutex_lock(&extra_desktop_pending_lock);
+    atomic_fetch_add(&extra_desktop_stop_epoch, 1);
+    if (extra_desktop_pending) r2_ears_cancel(extra_desktop_pending);
+    pthread_mutex_unlock(&extra_desktop_pending_lock);
+}
+
+typedef struct {
+    uint_fast64_t epoch;
+    int (*cancelled)(void *);
+    void *userdata;
+} R2ExtraDesktopOpen;
+
+static int r2_extra_desktop_open_cancelled(void *userdata)
+{
+    const R2ExtraDesktopOpen *request = userdata;
+    return shutting_down || atomic_load(&extra_desktop_stoppers) ||
+        atomic_load(&extra_desktop_stop_epoch) != request->epoch ||
+        (request->cancelled && request->cancelled(request->userdata)) ||
+        !r2_sense_auto_allowed(3);
+}
 
 static void *r2_extra_desktop_worker(void *arg)
 {
@@ -11390,6 +11562,8 @@ static int r2_extra_desktop_wanted(const R2AudioDiscovery *audio,
 
 void r2_ears_extra_stop_all(void)
 {
+    atomic_fetch_add(&extra_desktop_stoppers, 1);
+    r2_ears_extra_cancel_pending();
     pthread_mutex_lock(&extra_desktop_lock);
     while (extra_desktop_head) {
         R2ExtraDesktop *old = extra_desktop_head;
@@ -11397,14 +11571,26 @@ void r2_ears_extra_stop_all(void)
         r2_extra_desktop_destroy(old);
     }
     pthread_mutex_unlock(&extra_desktop_lock);
+    atomic_fetch_sub(&extra_desktop_stoppers, 1);
 }
 
 /* A discovery failure leaves all existing captures intact. A successful
  * snapshot is authoritative only for output availability, not attention. */
-int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
+int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char *primary,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (!audio) { errno = EINVAL; return -1; }
+    R2ExtraDesktopOpen request = {
+        atomic_load(&extra_desktop_stop_epoch), cancelled, userdata
+    };
     pthread_mutex_lock(&extra_desktop_lock);
+    if (shutting_down || atomic_load(&extra_desktop_stoppers) ||
+        atomic_load(&extra_desktop_stop_epoch) != request.epoch ||
+        (cancelled && cancelled(userdata))) {
+        pthread_mutex_unlock(&extra_desktop_lock);
+        errno = ECANCELED;
+        return -1;
+    }
     R2ExtraDesktop **slot = &extra_desktop_head;
     while (*slot) {
         R2ExtraDesktop *entry = *slot;
@@ -11419,6 +11605,11 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
     int result = 0;
     if (r2_sense_auto_allowed(3)) {
         for (size_t i = 0; i < audio->playback_output_count; ++i) {
+            if (r2_extra_desktop_open_cancelled(&request)) {
+                result = -1;
+                errno = ECANCELED;
+                break;
+            }
             const char *monitor = audio->playback_outputs[i].monitor;
             if (!r2_extra_desktop_wanted(audio, primary, monitor))
                 continue;
@@ -11446,9 +11637,20 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
             /* Nothing is published to readers until the stream opens and
              * the worker exists. If the server refuses the monitor, leave
              * its identity available for retry at the next poll. */
-            if (r2_ears_open_desktop_source(entry->receiver, entry->monitor) != 0) {
+            pthread_mutex_lock(&extra_desktop_pending_lock);
+            extra_desktop_pending = entry->receiver;
+            pthread_mutex_unlock(&extra_desktop_pending_lock);
+            int opened = r2_ears_open_desktop_source_cancelable(
+                entry->receiver, entry->monitor,
+                r2_extra_desktop_open_cancelled, &request);
+            pthread_mutex_lock(&extra_desktop_pending_lock);
+            extra_desktop_pending = NULL;
+            int cancelled_open = r2_extra_desktop_open_cancelled(&request);
+            pthread_mutex_unlock(&extra_desktop_pending_lock);
+            if (opened != 0 || cancelled_open) {
                 r2_extra_desktop_destroy(entry);
                 result = -1;
+                if (cancelled_open) { errno = ECANCELED; break; }
                 continue;
             }
             atomic_store(&entry->running, 1);
@@ -11468,6 +11670,11 @@ int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
     }
     pthread_mutex_unlock(&extra_desktop_lock);
     return result;
+}
+
+int r2_ears_extra_reconcile(const R2AudioDiscovery *audio, const char *primary)
+{
+    return r2_ears_extra_reconcile_cancelable(audio, primary, NULL, NULL);
 }
 
 size_t r2_ears_extra_source_count(void)
@@ -11629,7 +11836,7 @@ static int r2_ears_extra_write_pcm(const char *monitor, uint32_t bytes,
 
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11655,9 +11862,10 @@ static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
 
 /* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11667,6 +11875,12 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_tota
             return -1;
         }
         pthread_mutex_lock(&ears_recent_lock);
+        if (ears_recent_generation != generation) {
+            pthread_mutex_unlock(&ears_recent_lock);
+            free(snapshot);
+            errno = ECANCELED;
+            return -1;
+        }
         uint64_t captured_since_request = ears_recent_total_bytes >= start_total
             ? ears_recent_total_bytes - start_total : 0;
         if (captured_since_request >= bytes_needed &&
@@ -11707,7 +11921,7 @@ static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_tota
 /* Desktop samples are independently available to R2's chosen attention. */
 static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11733,9 +11947,10 @@ static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav
 
 /* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t start_total,
+                                      uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed > R2_EARS_RECENT_CAPACITY)
+    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
         return -1;
     unsigned char *snapshot = malloc(bytes_needed);
     if (!snapshot) return -1;
@@ -11745,6 +11960,12 @@ static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t st
             return -1;
         }
         pthread_mutex_lock(&ears_desktop_recent_lock);
+        if (ears_desktop_recent_generation != generation) {
+            pthread_mutex_unlock(&ears_desktop_recent_lock);
+            free(snapshot);
+            errno = ECANCELED;
+            return -1;
+        }
         uint64_t captured_since_request = ears_desktop_recent_total_bytes >= start_total
             ? ears_desktop_recent_total_bytes - start_total : 0;
         if (captured_since_request >= bytes_needed &&
@@ -11887,10 +12108,14 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
  * R2_WHISPER_MODEL must name a readable local GGML Whisper model. No network is
  * used and the microphone is released before inference begins.
  */
-char *r2_ears_listen_cancelable(unsigned seconds,
-                                  int (*cancelled)(void *userdata),
-                                  void *userdata)
+char *r2_ears_listen_source_cancelable(unsigned seconds,
+                                       int (*cancelled)(void *userdata), void *userdata,
+                                       char **source_out, int64_t *event_id_out)
 {
+    if (source_out) *source_out = NULL;
+    if (event_id_out) *event_id_out = 0;
+    R2HearingEvent captured_event = {0};
+    int64_t speech_event_id = 0;
     const char *model = getenv("R2_WHISPER_MODEL");
     const char *cli = getenv("R2_WHISPER_CLI");
     struct stat model_stat;
@@ -11905,9 +12130,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     const uint32_t bytes_per_second = 48000U * 2U * 2U;
     uint32_t total_bytes;
     int capture_ok = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(r2_ears_desktop_requested, 0, cancelled, userdata);
 
-    if ((cancelled && cancelled(userdata)) ||
-        atomic_load(&ears_stop_requesters) != 0) return NULL;
+    if (r2_ears_open_cancelled(&request)) return NULL;
     if (seconds < 1U || seconds > 15U) {
         fprintf(stderr, "[Ears] Listen duration must be between 1 and 15 seconds.\n");
         return NULL;
@@ -11952,7 +12177,19 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     if (fwrite(empty_header, 1, sizeof(empty_header), wav) != sizeof(empty_header))
         goto cleanup;
 
+    int named_primary = 0;
     if (r2_ears_extra_requested) {
+        pthread_mutex_lock(&ears_desktop_capture_lock);
+        R2HearingEvent primary = {0};
+        named_primary = ears_desktop && atomic_load(&ears_desktop_capture_running) &&
+            r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name &&
+            !strcmp(primary.source_name, r2_ears_extra_requested);
+        r2_ears_release_event(&primary);
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+    }
+    if (r2_ears_extra_requested && !named_primary) {
+        captured_event.source_name = strdup(r2_ears_extra_requested);
+        if (!captured_event.source_name) goto cleanup;
         /* Deliberate per-monitor attention: never preempt mic/primary
          * capture or mix other independent desktop outputs into this WAV. */
         if (r2_ears_extra_write_pcm(r2_ears_extra_requested, total_bytes, wav,
@@ -11962,24 +12199,23 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             r2_ears_write_wav_header(wav, total_bytes) == 0 &&
             fflush(wav) == 0)
             capture_ok = 1;
-    } else {
-    pthread_mutex_lock(&ears_capture_lock);
-    if (atomic_load(&ears_stop_requesters) != 0) {
-        pthread_mutex_unlock(&ears_capture_lock);
-        goto cleanup;
-    }
-    if (r2_ears_desktop_requested) {
+    } else if (r2_ears_desktop_requested || named_primary) {
         pthread_mutex_lock(&ears_desktop_capture_lock);
         if (!atomic_load(&ears_desktop_capture_running)) {
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] No active desktop audio stream to inspect.\n");
+            goto cleanup;
+        }
+        if (r2_ears_get_event(ears_desktop, &captured_event) != 0 ||
+            !captured_event.source_name ||
+            (r2_ears_extra_requested &&
+             strcmp(captured_event.source_name, r2_ears_extra_requested))) {
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
             goto cleanup;
         }
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_desktop_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
             if (audio_rc == 0 && !shutting_down &&
                 !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
@@ -11988,17 +12224,27 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         } else {
             pthread_mutex_lock(&ears_desktop_recent_lock);
             uint64_t start_desktop_total = ears_desktop_recent_total_bytes;
+            uint64_t generation = ears_desktop_recent_generation;
             pthread_mutex_unlock(&ears_desktop_recent_lock);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
-            pthread_mutex_unlock(&ears_capture_lock);
-            if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, wav,
+            if (r2_ears_write_desktop_recent_audio(total_bytes, start_desktop_total, generation, wav,
                                                    cancelled, userdata) == 0 &&
                 !shutting_down && !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
                 fflush(wav) == 0)
                 capture_ok = 1;
         }
-    } else if (atomic_load(&ears_capture_running)) {
+    } else {
+    pthread_mutex_lock(&ears_capture_lock);
+    if (r2_ears_open_cancelled(&request)) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        goto cleanup;
+    }
+    if (atomic_load(&ears_capture_running)) {
+        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+            pthread_mutex_unlock(&ears_capture_lock);
+            goto cleanup;
+        }
         if (r2_ears_recent_requested) {
             int audio_rc = r2_ears_write_buffered_audio(total_bytes, wav);
             pthread_mutex_unlock(&ears_capture_lock);
@@ -12010,9 +12256,10 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         } else {
             pthread_mutex_lock(&ears_recent_lock);
             uint64_t start_total = ears_recent_total_bytes;
+            uint64_t generation = ears_recent_generation;
             pthread_mutex_unlock(&ears_recent_lock);
             pthread_mutex_unlock(&ears_capture_lock);
-            if (r2_ears_write_recent_audio(total_bytes, start_total, wav, cancelled, userdata) == 0 &&
+            if (r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata) == 0 &&
                 !shutting_down && !(cancelled && cancelled(userdata)) &&
                 r2_ears_write_wav_header(wav, total_bytes) == 0 &&
                 fflush(wav) == 0)
@@ -12024,12 +12271,24 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No continuously buffered audio is available to inspect.\n");
             goto cleanup;
         }
-        if (!ears || r2_ears_open_microphone(ears) != 0) {
+        if (!ears || r2_ears_open_input(ears, NULL, &request) != 0) {
             pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
             goto cleanup;
         }
+        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+            r2_ears_close(ears);
+            pthread_mutex_unlock(&ears_capture_lock);
+            goto cleanup;
+        }
         own_mic = 1;
+        /* Keep direct capture cancellable through the whole blocking read,
+         * not merely its connection handshake. Shutdown signals this stable
+         * receiver before joining any worker that requested the utterance. */
+        pthread_mutex_lock(&ears_open_pointer_lock);
+        ears_pending_open[0] = ears;
+        ears_pending_watch[0] = 0;
+        pthread_mutex_unlock(&ears_open_pointer_lock);
         uint32_t captured_bytes = 0;
         while (captured_bytes < total_bytes && !shutting_down &&
                atomic_load(&ears_stop_requesters) == 0 &&
@@ -12048,6 +12307,9 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             captured_bytes += (uint32_t)got;
         }
         if (own_mic) {
+            pthread_mutex_lock(&ears_open_pointer_lock);
+            ears_pending_open[0] = NULL;
+            pthread_mutex_unlock(&ears_open_pointer_lock);
             r2_ears_close(ears);
             own_mic = 0;
         }
@@ -12059,7 +12321,7 @@ char *r2_ears_listen_cancelable(unsigned seconds,
             fflush(wav) == 0)
             capture_ok = 1;
     }
-    } /* ordinary microphone / primary desktop capture */
+    } /* ordinary microphone capture */
     if (fclose(wav) != 0) capture_ok = 0;
     wav = NULL;
 
@@ -12132,16 +12394,13 @@ char *r2_ears_listen_cancelable(unsigned seconds,
     {
         FILE *text_fp = fopen(transcript_path, "rb");
         if (!text_fp) goto cleanup;
-        transcript = malloc(16385U);
-        if (!transcript) { fclose(text_fp); goto cleanup; }
-        size_t n = fread(transcript, 1, 16384U, text_fp);
+        size_t capacity = 0;
+        ssize_t n = getdelim(&transcript, &capacity, '\0', text_fp);
         int read_error = ferror(text_fp);
-        int extra = fgetc(text_fp);
-        fclose(text_fp);
-        if (read_error || extra != EOF || memchr(transcript, '\0', n) != NULL) {
+        if (fclose(text_fp) != 0) read_error = 1;
+        if (n < 0 || read_error || memchr(transcript, '\0', (size_t)n) != NULL) {
             free(transcript); transcript = NULL; goto cleanup;
         }
-        transcript[n] = '\0';
         char *start = transcript;
         while (*start && isspace((unsigned char)*start)) ++start;
         char *end = start + strlen(start);
@@ -12154,11 +12413,13 @@ char *r2_ears_listen_cancelable(unsigned seconds,
         transcript = NULL;
         goto cleanup;
     }
-    if (transcript && r2_log_is_initialized())
-        r2_log_sensory("speech_transcribed",
-                       "R2 Ears transcribed a short microphone utterance locally.",
-                       "The transcript is passed into the normal conversation pipeline; raw audio is not persisted.",
-                       "r2_ears_listen");
+    if (transcript && r2_log_is_initialized()) {
+        speech_event_id = r2_log_sensory("speech_transcribed",
+                       "R2 locally transcribed explicitly selected real audio.",
+                       transcript, captured_event.source_name);
+        if (speech_event_id <= 0)
+            fprintf(stderr, "[Ears] Transcript returned, but its exact source event could not be persisted.\n");
+    }
     if (!transcript && !cancelled)
         fprintf(stderr, "[Ears] Whisper returned no usable transcript. Try speaking clearly and listening again.\n");
 
@@ -12183,7 +12444,19 @@ cleanup:
     if (whisper_path[0]) unlink(whisper_path);
     if (transcript_path[0]) unlink(transcript_path);
     rmdir(temp_dir);
+    if (transcript && source_out) {
+        *source_out = captured_event.source_name;
+        captured_event.source_name = NULL;
+    }
+    if (transcript && event_id_out && speech_event_id > 0) *event_id_out = speech_event_id;
+    r2_ears_release_event(&captured_event);
     return transcript;
+}
+
+char *r2_ears_listen_cancelable(unsigned seconds,
+                                int (*cancelled)(void *), void *userdata)
+{
+    return r2_ears_listen_source_cancelable(seconds, cancelled, userdata, NULL, NULL);
 }
 
 char *r2_ears_listen(unsigned seconds)
@@ -12193,9 +12466,11 @@ char *r2_ears_listen(unsigned seconds)
 
 /* Microphone retains the existing Ears bridge and its history, including
  * direct speech capture. It never takes over the separate desktop monitor. */
-static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source)
+static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source,
+                                int (*cancelled)(void *), void *userdata)
 {
     if (watch_token_out) *watch_token_out = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(0, watch_token_out != NULL, cancelled, userdata);
     pthread_mutex_lock(&ears_capture_lock);
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
         /* An explicit start takes over an existing Watch-owned stream. */
@@ -12208,13 +12483,13 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
         pthread_join(ears_capture_thread, NULL);
         ears_capture_thread_started = 0;
     }
-    int rc = ears ? (microphone_source ? r2_ears_open_microphone_source(ears, microphone_source)
-                                       : r2_ears_open_microphone(ears)) : -1;
+    int rc = r2_ears_open_input(ears, microphone_source, &request);
     if (rc == 0) {
         pthread_mutex_lock(&ears_recent_lock);
         ears_recent_length = 0;
         ears_recent_write_position = 0;
         ears_recent_total_bytes = 0;
+        ++ears_recent_generation;
         pthread_mutex_unlock(&ears_recent_lock);
         atomic_store(&ears_capture_running, 1);
         if (pthread_create(&ears_capture_thread, NULL,
@@ -12241,21 +12516,31 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
 
 int r2_ears_start(void)
 {
-    return r2_ears_start_input(NULL, NULL);
+    return r2_ears_start_input(NULL, NULL, NULL, NULL);
 }
 
 uint64_t r2_ears_start_for_watch(const char *source)
 {
     if (!source || !*source) return 0;
     uint64_t token = 0;
-    return r2_ears_start_input(&token, source) == 0 ? token : 0;
+    return r2_ears_start_input(&token, source, NULL, NULL) == 0 ? token : 0;
+}
+
+uint64_t r2_ears_start_for_watch_cancelable(const char *source,
+                                            int (*cancelled)(void *), void *userdata)
+{
+    if (!source || !*source) return 0;
+    uint64_t token = 0;
+    return r2_ears_start_input(&token, source, cancelled, userdata) == 0 ? token : 0;
 }
 
 /* Playback monitor has its own Pulse stream, worker and rolling history.
  * It can run alongside the microphone and shuts down independently. */
-static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *monitor)
+static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *monitor,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (watch_token_out) *watch_token_out = 0;
+    R2EarsOpenRequest request = r2_ears_open_request(1, watch_token_out != NULL, cancelled, userdata);
     pthread_mutex_lock(&ears_desktop_capture_lock);
     if (atomic_load(&ears_desktop_capture_running) &&
         ears_desktop_capture_thread_started) {
@@ -12275,13 +12560,13 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
         return -1;
     }
     pthread_mutex_unlock(&ears_desktop_pointer_lock);
-    int rc = monitor ? r2_ears_open_desktop_source(ears_desktop, monitor)
-                     : r2_ears_open_desktop(ears_desktop);
+    int rc = r2_ears_open_input(ears_desktop, monitor, &request);
     if (rc == 0) {
         pthread_mutex_lock(&ears_desktop_recent_lock);
         ears_desktop_recent_length = 0;
         ears_desktop_recent_write_position = 0;
         ears_desktop_recent_total_bytes = 0;
+        ++ears_desktop_recent_generation;
         pthread_mutex_unlock(&ears_desktop_recent_lock);
         atomic_store(&ears_desktop_capture_running, 1);
         if (pthread_create(&ears_desktop_capture_thread, NULL,
@@ -12308,19 +12593,29 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
 
 int r2_ears_start_desktop(void)
 {
-    return r2_ears_start_desktop_impl(NULL, NULL);
+    return r2_ears_start_desktop_impl(NULL, NULL, NULL, NULL);
 }
 
 uint64_t r2_ears_start_desktop_for_watch(const char *monitor)
 {
     if (!monitor || !*monitor) return 0;
     uint64_t token = 0;
-    return r2_ears_start_desktop_impl(&token, monitor) == 0 ? token : 0;
+    return r2_ears_start_desktop_impl(&token, monitor, NULL, NULL) == 0 ? token : 0;
+}
+
+uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
+                                                    int (*cancelled)(void *), void *userdata)
+{
+    if (!monitor || !*monitor) return 0;
+    uint64_t token = 0;
+    return r2_ears_start_desktop_impl(&token, monitor, cancelled, userdata) == 0 ? token : 0;
 }
 
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
     if (!watch_only) {
+        atomic_fetch_add(&ears_desktop_stop_requesters, 1);
+        r2_ears_cancel_pending_source(1);
         /* An explicit desktop-close choice covers every output, not just
          * the historical default monitor. Independent mic stays open. */
         r2_ears_extra_stop_all();
@@ -12348,8 +12643,10 @@ static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
     ears_desktop_recent_length = 0;
     ears_desktop_recent_write_position = 0;
     ears_desktop_recent_total_bytes = 0;
+    ++ears_desktop_recent_generation;
     pthread_mutex_unlock(&ears_desktop_recent_lock);
     pthread_mutex_unlock(&ears_desktop_capture_lock);
+    if (!watch_only) atomic_fetch_sub(&ears_desktop_stop_requesters, 1);
     return 0;
 }
 
@@ -12431,6 +12728,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
      * A Watch cleanup cannot cancel another caller's one-shot capture. */
     if (!watch_only) {
         atomic_fetch_add(&ears_stop_requesters, 1);
+        r2_ears_cancel_pending_source(0);
         r2_ears_cancel(ears); /* wake a direct listen BEFORE waiting for its mutex */
     }
     pthread_mutex_lock(&ears_capture_lock);
@@ -12450,6 +12748,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
     ears_recent_length = 0;
     ears_recent_write_position = 0;
     ears_recent_total_bytes = 0;
+    ++ears_recent_generation;
     pthread_mutex_unlock(&ears_recent_lock);
     pthread_mutex_unlock(&ears_capture_lock);
     if (!watch_only) atomic_fetch_sub(&ears_stop_requesters, 1);
@@ -12495,6 +12794,8 @@ int r2_watch_start(void)
 int r2_watch_stop(void)
 {
     watch_running = 0;
+    r2_ears_extra_cancel_pending();
+    r2_ears_cancel_pending_inputs(1);
     r2_log_event(R2_LOG_SENSORY, "watch_stopped",
                  "R2 Watch mode was stopped.", NULL, "r2_watch_stop");
     return 0;
@@ -12514,6 +12815,8 @@ void r2_request_shutdown(void)
     shutting_down = 1;
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
+    r2_ears_extra_cancel_pending();
+    r2_ears_cancel_pending_inputs(0);
 }
 
 int r2_request_restart(void)
@@ -12921,18 +13224,13 @@ static char *build_learning_context(void)
 {
     char *reward = r2_reward_context();
     char *addiction = r2_addiction_report();
-    size_t cap = 2400;
-    char *context = malloc(cap);
-    if (context) {
-        snprintf(context, cap,
+    char *context = NULL;
+    if (reward && addiction && asprintf(&context,
             "PERSISTENT LEARNING CONTEXT\n"
-            "REWARD/REINFORCEMENT SUMMARY:\n%.900s\n\n"
-            "REPEATED-INTEREST SUMMARY:\n%.900s\n",
-            reward ? reward : "(reinforcement context unavailable)",
-            addiction ? addiction : "(repeated-interest history unavailable)");
-    }
-    free(reward);
-    free(addiction);
+            "REWARD/REINFORCEMENT SUMMARY:\n%s\n\n"
+            "REPEATED-INTEREST SUMMARY:\n%s\n", reward, addiction) < 0)
+        context = NULL;
+    free(reward); free(addiction);
     return context;
 }
 
@@ -13341,6 +13639,7 @@ finalize_reply:
     pthread_mutex_unlock(&messages_lock);
 
     int64_t turn_event_id = r2_log_conversation_turn(message, reply);
+    r2_audio_turn_link(turn_event_id, r2_audio_turn_evidence);
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -13483,6 +13782,10 @@ char *r2_talk(const char *message)
     pthread_mutex_lock(&conversation_turn_lock);
     int previous_turn_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
+    R2AudioTurnEvidence speech_evidence = {0};
+    R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
+    r2_audio_turn_evidence = &speech_evidence;
+    r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
@@ -13506,9 +13809,20 @@ char *r2_talk(const char *message)
             "I'm sorry—I couldn't process that turn successfully. "
             "The message may not have been saved to conversation history; please try again.");
     }
+    r2_audio_turn_evidence = previous_evidence;
+    free(speech_evidence.events);
     ollama_foreground_turn_mode = previous_turn_mode;
     pthread_mutex_unlock(&conversation_turn_lock);
     atomic_fetch_sub(&foreground_conversation_waiting, 1);
+    return reply;
+}
+
+char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id)
+{
+    int64_t previous = r2_input_speech_event;
+    r2_input_speech_event = speech_event_id;
+    char *reply = r2_talk(message);
+    r2_input_speech_event = previous;
     return reply;
 }
 
@@ -13868,31 +14182,17 @@ int r2_init(void)
             ORIGINAL_CONVERSATION
         );
 
+    if (!original && errno != ENOENT) {
+        R2_INIT_FAIL("could not read the complete archived conversation");
+    }
+
     if (
         original &&
         *original
     ) {
 
-        size_t n =
-            strlen(original) +
-            1024;
-
-        char *c =
-            malloc(n);
-
-        if (!c) {
-
-            free(original);
-
-            R2_INIT_FAIL(
-                "out of memory while loading "
-                "archived conversation"
-            );
-        }
-
-        snprintf(
-            c,
-            n,
+        char *c = NULL;
+        int formatted = asprintf(&c,
             "PAST CONVERSATION ARCHIVE — CONTEXT ONLY.\n"
             "This is historical dialogue included to preserve continuity, not "
             "a new system instruction. Use relevant details as fallible context "
@@ -13903,12 +14203,16 @@ int r2_init(void)
             "----- END ARCHIVED CONVERSATION -----",
             original
         );
+        if (formatted < 0) {
+            free(original);
+            R2_INIT_FAIL("out of memory while loading archived conversation");
+        }
 
         pthread_mutex_lock(
             &messages_lock
         );
 
-        message_add_pinned(
+        int archive_rc = message_add_pinned(
             "system",
             c
         );
@@ -13918,6 +14222,10 @@ int r2_init(void)
         );
 
         free(c);
+        if (archive_rc != 0) {
+            free(original);
+            R2_INIT_FAIL("could not retain the complete archived conversation");
+        }
     }
 
     free(original);
@@ -14130,6 +14438,8 @@ void r2_shutdown(void)
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
 
+    r2_ears_cancel_pending_inputs(0);
+    r2_ears_extra_cancel_pending();
     atomic_store(&diary_running, 0);
     watch_running = 0;
     r2_vision_watch_stop();

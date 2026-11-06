@@ -15,7 +15,7 @@ def require(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 
-start = core.find("char *r2_recent_conversation_context(")
+start = core.find("static char *r2_build_recent_conversation_context(")
 end = core.find("/* Append complete Life Log event records", start)
 if start < 0 or end < 0:
     raise SystemExit("Could not isolate recent conversation context builder.")
@@ -28,7 +28,7 @@ require(
 )
 require(
     "size_t included = 0;" in builder
-    and "line_length > max_chars - selected_chars - separator_length" in builder
+    and "content_length >= remaining - role_length" in builder
     and "++included;" in builder,
     "only complete recent message lines are budgeted before formatting",
 )
@@ -54,11 +54,11 @@ require(
     and core.count("content, OLLAMA_MAX_MESSAGE_CHARS);") == 2
     and not re.search(r"^\s+length = OLLAMA_MAX_MESSAGE_CHARS;$", core, re.MULTILINE)
     and not re.search(r"^\s+length = OLLAMA_MAX_SYSTEM_MESSAGE_CHARS;$", core, re.MULTILINE),
-    "Ollama hard byte caps clip system overrides and message bodies at UTF-8 boundaries",
+    "provisional Ollama byte budgets use UTF-8 boundaries before final whole-message reservation",
 )
 require(
-    "cut = r2_utf8_safe_prefix_length(context, max_chars);" in core
-    and "n = r2_utf8_safe_prefix_length(found, max_chars - used);" in core,
-    "shared retrieved-evidence and associated-record caps preserve UTF-8 boundaries when no full record fits",
+    "r2_bound_context_records" not in core
+    and "r2_preserve_inference_units(msgs, count" in core,
+    "selected retrieval remains whole; final inference allocation checks actual capacity",
 )
 print("Recent conversation context budget smoke passed.")

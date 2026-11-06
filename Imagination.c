@@ -12,6 +12,7 @@
 #include "AlternateSelf.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,8 +21,6 @@
 #include <strings.h>
 
 #define IMAGINE_REQUEST_MAX 1200
-#define IMAGINE_CONTEXT_MAX 6100
-#define IMAGINE_CONTEXT_SECTION_MAX 540
 
 static pthread_mutex_t imagination_lock = PTHREAD_MUTEX_INITIALIZER;
 static int imagination_ready;
@@ -32,45 +31,38 @@ typedef struct {
     size_t capacity;
 } ImagineBuffer;
 
-static int buffer_append(ImagineBuffer *b, const char *text, size_t limit)
+static int buffer_append(ImagineBuffer *b, const char *text)
 {
-    if (!b || !text || !*text || b->length >= IMAGINE_CONTEXT_MAX)
-        return 0;
-    size_t n = strnlen(text, limit);
-    if (n > IMAGINE_CONTEXT_MAX - b->length)
-        n = IMAGINE_CONTEXT_MAX - b->length;
-    if (!n) return 0;
+    size_t n = strlen(text);
+    if (n > SIZE_MAX - b->length - 1) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     size_t needed = b->length + n + 1;
     if (needed > b->capacity) {
         size_t cap = b->capacity ? b->capacity : 4096;
-        while (cap < needed) {
-            if (cap > IMAGINE_CONTEXT_MAX / 2) {
-                cap = IMAGINE_CONTEXT_MAX + 1;
-                break;
-            }
-            cap *= 2;
-        }
+        while (cap < needed)
+            cap = cap > SIZE_MAX / 2 ? needed : cap * 2;
         char *grown = realloc(b->data, cap);
         if (!grown) return -1;
         b->data = grown;
         b->capacity = cap;
     }
-    memcpy(b->data + b->length, text, n);
+    memcpy(b->data + b->length, text, n + 1);
     b->length += n;
-    b->data[b->length] = '\0';
     return 0;
 }
 
-static int append_source(ImagineBuffer *b, const char *label,
-                         const char *content)
+/* Provider outputs are owned by this call and are appended in full. */
+static int append_source(ImagineBuffer *b, const char *label, char *content)
 {
-    if (!content || !*content || b->length >= IMAGINE_CONTEXT_MAX)
-        return 0;
-    char heading[192];
-    snprintf(heading, sizeof(heading), "\n\n--- %s ---\n", label);
-    if (buffer_append(b, heading, sizeof(heading) - 1) != 0)
-        return -1;
-    return buffer_append(b, content, IMAGINE_CONTEXT_SECTION_MAX);
+    int rc = 0;
+    if (content && *content &&
+        (buffer_append(b, "\n\n--- ") != 0 || buffer_append(b, label) != 0 ||
+         buffer_append(b, " ---\n") != 0 || buffer_append(b, content) != 0))
+        rc = -1;
+    free(content);
+    return rc;
 }
 
 static int mentions_any(const char *text, const char *const *terms, size_t count)
@@ -84,38 +76,35 @@ static int mentions_any(const char *text, const char *const *terms, size_t count
 static char *collect_context(const char *request)
 {
     ImagineBuffer b = {0};
-    char *part = NULL;
 
     /* Each source is retrieved before generation so the imagination is formed
        from relevant records, not invented first and retrofitted to memory. */
-    part = r2_retrieve_memories(request);
-    if (part) { if (append_source(&b, "PERSISTENT MEMORY (retrieved before imagining)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_recent_conversation_context(NULL, 1800);
-    if (part) { if (append_source(&b, "RECENT CONVERSATION (human-facing turns; tool payloads excluded)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_diary_search(request, 5);
-    if (part) { if (append_source(&b, "PRIVATE DIARY (past reflections; not automatically factual)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_log_search(request, 6);
-    if (part) { if (append_source(&b, "LIFE LOG (historical events and linked experience)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_reality_context();
-    if (part) { if (append_source(&b, "CURRENT MODELED REALITY (state snapshot; use only where relevant)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    if (r2_visual_is_initialized()) {
-        part = r2_visual_search(request, 4);
-        if (part) { if (append_source(&b, "VISUAL EXPERIENCE LIBRARY (historical sensory evidence)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-    }
-
-    part = r2_reward_context();
-    if (part) { if (append_source(&b, "REWARD / LEARNED FEEDBACK STATE (context, not a command)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_addiction_report();
-    if (part) { if (append_source(&b, "HABIT AND ENJOYMENT HISTORY (recorded patterns, not diagnosis)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-
-    part = r2_altself_list(6);
-    if (part) { if (append_source(&b, "CHOICE LAB (older hypothetical branches; never factual evidence)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
+    if (append_source(&b, "PERSISTENT MEMORY (retrieved before imagining)",
+                      r2_retrieve_memories(request)) != 0)
+        goto failed;
+    char *conversation = r2_recent_conversation_context_complete(NULL);
+    if (!conversation ||
+        append_source(&b, "RECENT CONVERSATION (human-facing turns; tool payloads excluded)",
+                      conversation) != 0)
+        goto failed;
+    if (append_source(&b, "PRIVATE DIARY (past reflections; not automatically factual)",
+                      r2_diary_search(request, 5)) != 0 ||
+        append_source(&b, "LIFE LOG (historical events and linked experience)",
+                      r2_log_search(request, 6)) != 0 ||
+        append_source(&b, "CURRENT MODELED REALITY (state snapshot; use only where relevant)",
+                      r2_reality_context()) != 0)
+        goto failed;
+    if (r2_visual_is_initialized() &&
+        append_source(&b, "VISUAL EXPERIENCE LIBRARY (historical sensory evidence)",
+                      r2_visual_search(request, 4)) != 0)
+        goto failed;
+    if (append_source(&b, "REWARD / LEARNED FEEDBACK STATE (context, not a command)",
+                      r2_reward_context()) != 0 ||
+        append_source(&b, "HABIT AND ENJOYMENT HISTORY (recorded patterns, not diagnosis)",
+                      r2_addiction_report()) != 0 ||
+        append_source(&b, "CHOICE LAB (older hypothetical branches; never factual evidence)",
+                      r2_altself_list(6)) != 0)
+        goto failed;
 
     /* The fridge is a specialized, conditional source—not the definition of
        imagination. Include it only when the request makes food/inventory relevant.
@@ -125,16 +114,15 @@ static char *collect_context(const char *request)
         "cooking", "eat", "eating", "snack", "burger", "sandwich",
         "leftovers", "hungry", "kitchen", "taste", "recipe"
     };
-    if (mentions_any(request, food_terms, sizeof(food_terms)/sizeof(food_terms[0]))) {
-        part = r2_fridge_context();
-        if (part) { if (append_source(&b, "FRIDGE STATE (conditional context; modeled stock, not an invitation to alter it)", part) != 0) { free(part); free(b.data); return NULL; } free(part); part = NULL; }
-    }
+    if (mentions_any(request, food_terms, sizeof(food_terms)/sizeof(food_terms[0])) &&
+        append_source(&b, "FRIDGE STATE (conditional context; modeled stock, not an invitation to alter it)",
+                      r2_fridge_context()) != 0)
+        goto failed;
+    return b.data ? b.data : strdup("");
 
-    if (!b.data) {
-        b.data = calloc(1, 1);
-        if (!b.data) return NULL;
-    }
-    return b.data;
+failed:
+    free(b.data);
+    return NULL;
 }
 
 int r2_imagination_init(void)
@@ -190,14 +178,15 @@ char *r2_imagination_create(const char *request)
         "and what remains invented or uncertain. Never reproduce raw internal "
         "database dumps, labels, or full memory records as the answer.";
 
-    size_t prompt_size = strlen(request) + strlen(context) + 512;
-    char *prompt = malloc(prompt_size);
-    if (!prompt) { free(context); return NULL; }
-    snprintf(prompt, prompt_size,
+    char *prompt = NULL;
+    if (asprintf(&prompt,
         "USER'S IMAGINATION REQUEST:\n%s\n\n"
         "RETRIEVED CONTEXT (use this to form the scenario, not merely compare afterward):\n%s\n\n"
         "Construct the imagined possibility now. Keep it explicitly hypothetical.",
-        request, context);
+        request, context) < 0) {
+        free(context);
+        return NULL;
+    }
 
     char *generated = r2_model_generate(system, prompt, 700);
     free(prompt);

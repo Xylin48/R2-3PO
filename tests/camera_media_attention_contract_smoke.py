@@ -23,7 +23,12 @@ assert "r2_visual_analyze_frame" not in media[:media.index("char *r2_vision_medi
 assert "media_visual_change_notice" in media
 assert "r2_eyes_set_auxiliary(media_eyes, 1)" in media
 assert "int auxiliary_display;" in eyes
-assert "if (!eyes->auxiliary_display) r2_vwebcam_publish_frame(eyes)" in eyes
+capture = eyes[eyes.index("int r2_eyes_capture("):eyes.index("   FRAME ACCESS")]
+assert (
+    "if (!eyes->auxiliary_display && eyes->preview_session &&\n"
+    "        eyes->preview_session == r2_eyes_preview_session()) {\n"
+    "        r2_vwebcam_publish_frame(eyes);"
+) in capture
 assert "if (!eyes->auxiliary_display) r2_vwebcam_stop_viewer()" in eyes
 
 camera = core[core.index("static void *vision_watch_capture_worker("):

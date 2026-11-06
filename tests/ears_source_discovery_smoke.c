@@ -8,9 +8,58 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <pthread.h>
+
+pa_context_state_t __real_pa_context_get_state(const pa_context *);
+pa_context_state_t __wrap_pa_context_get_state(const pa_context *context)
+{
+    if ((uintptr_t)context == 1) return PA_CONTEXT_READY;
+    return __real_pa_context_get_state(context);
+}
+int __real_pa_mainloop_iterate(pa_mainloop *, int, int *);
+int __wrap_pa_mainloop_iterate(pa_mainloop *loop, int block, int *result)
+{
+    if ((uintptr_t)loop == 1) return 0;
+    return __real_pa_mainloop_iterate(loop, block, result);
+}
+static atomic_int cancel_scan = ATOMIC_VAR_INIT(0);
+static int scan_cancelled(void *unused)
+{
+    (void)unused;
+    return atomic_load(&cancel_scan);
+}
+static void *cancel_discovery(void *unused)
+{
+    (void)unused;
+    struct timespec pause = {0, 20000000L};
+    nanosleep(&pause, NULL);
+    atomic_store(&cancel_scan, 1);
+    return NULL;
+}
 
 int main(void)
 {
+    /* Pending native metadata queries remain cancellable without waiting
+     * for the full discovery deadline or claiming a device disappeared. */
+    uint64_t started = r2_discovery_now_ms();
+    R2PulseScan stalled = {
+        .loop = (pa_mainloop *)(uintptr_t)1,
+        .context = (pa_context *)(uintptr_t)1,
+        .deadline_ms = started + 2500, .cancelled = scan_cancelled
+    };
+    pthread_t stopping;
+    assert(pthread_create(&stopping, NULL, cancel_discovery, NULL) == 0);
+    assert(r2_discovery_pump(&stalled, &stalled.done) == -1 && errno == ECANCELED);
+    assert(pthread_join(stopping, NULL) == 0);
+    assert(r2_discovery_now_ms() - started < 1000);
+    R2AudioDiscovery cancelled_result;
+    memset(&cancelled_result, 0x5a, sizeof(cancelled_result));
+    assert(r2_audio_discover_cancelable(&cancelled_result, scan_cancelled, NULL) == -1);
+    assert(errno == ECANCELED && !cancelled_result.microphone_source &&
+           !cancelled_result.playback_output_count && !cancelled_result.desktop_monitor);
+    r2_audio_discovery_free(&cancelled_result);
+
     R2PulseScan scan = {0};
     scan.data.playback_pid = -1;
     scan.data.playback_sink = PA_INVALID_INDEX;

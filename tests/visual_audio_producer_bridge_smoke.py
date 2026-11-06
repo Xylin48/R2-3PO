@@ -31,7 +31,7 @@ assert 'r2_eyes_start_vlc(' not in vision
 worker = shell[shell.index("static void *shell_watch_worker(void *unused)"):
                shell.index("static void shell_watch_start(void)")]
 assert "audio.playback_pid" in worker
-assert "r2_audio_discover(&audio)" in worker
+assert "r2_audio_discover_cancelable(" in worker
 assert "r2_vision_window_for_pid(playback_pid)" in worker
 assert "wanted_media == 3 ? media_window" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
