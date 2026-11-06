@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char last_prompt[12000];
+static char last_prompt[30000];
 static int branch_creates;
 static int feedback_events;
 static int links;
@@ -30,11 +30,19 @@ static int check(int ok, const char *message)
 
 char *r2_retrieve_memories(const char *query)
 {
-    (void)query; return strdup("MEMORY_SENTINEL: the first movie was watched in the CRT room.");
+    (void)query;
+    const char head[] = "MEMORY_SENTINEL: the first movie was watched in the CRT room.";
+    const char tail[] = "MEMORY_TAIL";
+    char *record = malloc(sizeof(head) - 1 + 9000 + sizeof(tail));
+    if (!record) return NULL;
+    memcpy(record, head, sizeof(head) - 1);
+    memset(record + sizeof(head) - 1, 'x', 9000);
+    memcpy(record + sizeof(head) - 1 + 9000, tail, sizeof(tail));
+    return record;
 }
-char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars)
+char *r2_recent_conversation_context_complete(const char *exclude_latest)
 {
-    (void)exclude_latest; (void)max_chars;
+    if (exclude_latest) return NULL;
     return strdup("CONVERSATION_SENTINEL: the user described the CRT and a movie.");
 }
 char *r2_diary_search(const char *query, int limit)
@@ -125,6 +133,7 @@ int main(void)
     if (!check(result && strstr(result, "hypothetical imagination") && strstr(result, "remembered CRT room"),
                "generate and persist a hypothetical scenario")) goto done;
     if (!check(strstr(last_prompt, "MEMORY_SENTINEL")
+               && strstr(last_prompt, "MEMORY_TAIL")
                && strstr(last_prompt, "CONVERSATION_SENTINEL")
                && strstr(last_prompt, "DIARY_SENTINEL")
                && strstr(last_prompt, "LIFELOG_SENTINEL")

@@ -15,7 +15,7 @@ def require(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 
-start = core.find("char *r2_recent_conversation_context(")
+start = core.find("static char *r2_build_recent_conversation_context(")
 end = core.find("/* Append complete Life Log event records", start)
 if start < 0 or end < 0:
     raise SystemExit("Could not isolate recent conversation context builder.")
@@ -28,7 +28,7 @@ require(
 )
 require(
     "size_t included = 0;" in builder
-    and "line_length > max_chars - selected_chars - separator_length" in builder
+    and "content_length >= remaining - role_length" in builder
     and "++included;" in builder,
     "only complete recent message lines are budgeted before formatting",
 )

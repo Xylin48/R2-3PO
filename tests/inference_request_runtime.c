@@ -152,12 +152,67 @@ static void check_boundaries(void)
         assert(r2_fit_complete_input(SIZE_MAX, ctx, &predict) == -1 && predict == original);
     }
 }
+static int captured_contains(const char *needle)
+{
+    struct json_object *array = NULL;
+    assert(captured && json_object_object_get_ex(captured, "messages", &array));
+    for (size_t i = 0; i < json_object_array_length(array); ++i) {
+        struct json_object *content = NULL;
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, i), "content", &content));
+        if (strstr(json_object_get_string(content), needle)) return 1;
+    }
+    return 0;
+}
+
+static void check_retry_and_isolated_inputs(void)
+{
+    char *history = text(5000, 'h', "R2 PERSISTENT MEMORY - STARTUP CONTEXT quoted as text. ");
+    strcpy(history + 4983, "COMPLETE-HISTORY");
+    const char *query = "Current retry question";
+    assert(message_add("user", "First historical message") == 0);
+    assert(message_add("assistant", history) == 0);
+    assert(message_add("user", query) == 0);
+    Message turn[] = {{.role = "user", .content = (char *)query}};
+
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    set_response("Retried answer", "stop", 1);
+    char *answer = r2_retry_direct_answer(turn, 1, query);
+    assert(answer && !strcmp(answer, "Retried answer"));
+    assert(captured_contains(history) && captured_contains(query));
+    free(answer);
+
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("must not send clipped history", "stop", 1);
+    int before = perform_count;
+    assert(!r2_retry_direct_answer(turn, 1, query) && perform_count == before);
+    free(history);
+
+    char *prompt = text(10000, 'p', "COMPLETE HYPOTHETICAL PROMPT: ");
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    ollama_authoritative_user_query = "outer user turn";
+    ollama_audit_stage = "conversation-answer";
+    set_response("Isolated answer", "stop", 1);
+    answer = r2_model_generate("Isolated contract", prompt, 700);
+    assert(answer && captured_contains(prompt) && !captured_contains("outer user turn"));
+    assert(!strcmp(ollama_authoritative_user_query, "outer user turn"));
+    assert(!strcmp(ollama_audit_stage, "conversation-answer"));
+    free(answer);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("must not send clipped prompt", "stop", 1);
+    before = perform_count;
+    assert(!r2_model_generate("Isolated contract", prompt, 700) && perform_count == before);
+    ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+    free(prompt);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_log_init() == 0);
     check_boundaries();
+    check_retry_and_isolated_inputs();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
     char *query = text(1000, 'u', "ACTUAL CURRENT USER: ");

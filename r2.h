@@ -113,8 +113,10 @@ int r2_ollama_vision_request_should_abort(void);
 char *r2_talk(const char *message);
 /* Same serialized conversation path, with an exact persisted speech-event link. */
 char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id);
-/* Caller frees; returns a bounded recent user/assistant transcript with tool payloads excluded. */
+/* Caller frees. Bounded display preview of recent human-facing turns. */
 char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars);
+/* Caller frees. Complete selected turns, with internal tool payloads excluded. */
+char *r2_recent_conversation_context_complete(const char *exclude_latest);
 
 
 /*

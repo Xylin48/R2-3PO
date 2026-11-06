@@ -3591,6 +3591,9 @@ static int r2_inference_unit_required(const Message *message, size_t index, size
     if (!message->role || strcmp(message->role, "system"))
         return current_user != SIZE_MAX && index >= current_user;
     const char *content = message->content ? message->content : "";
+    if (!strncmp(content, "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n",
+                 sizeof("RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n") - 1))
+        return 1;
     int priority = r2_inference_system_priority(content, ollama_authoritative_user_query);
     return priority <= 4 || (priority == 6 &&
         strncmp(content, "PERSISTENT LEARNING CONTEXT", strlen("PERSISTENT LEARNING CONTEXT")));
@@ -4685,8 +4688,14 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt,
     if (num_predict > 2048) num_predict = 2048;
 
     int previous_mode = ollama_background_mode;
+    const char *previous_query = ollama_authoritative_user_query;
+    const char *previous_stage = ollama_audit_stage;
     ollama_background_mode = 1;
+    ollama_authoritative_user_query = user_prompt;
+    ollama_audit_stage = "isolated-generation";
     char *result = ollama_chat_with_limit(messages, 2, NULL, num_predict, 600L);
+    ollama_audit_stage = previous_stage;
+    ollama_authoritative_user_query = previous_query;
     ollama_background_mode = previous_mode;
     return result;
 }
@@ -5358,21 +5367,19 @@ static char *r2_retry_direct_answer(Message *messages_copy,
      * statements as evidence, while keeping the retry much smaller than the
      * full transcript. The current user message remains separate and authoritative.
      */
-    char *recent_context = r2_recent_conversation_context(query, 3000U);
+    char *recent_context = r2_recent_conversation_context_complete(query);
+    if (!recent_context) {
+        free(retry_system_prompt);
+        return NULL;
+    }
     char *recent_context_message = NULL;
-    if (recent_context && *recent_context) {
-        static const char recent_context_heading[] =
-            "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n";
-        size_t heading_length = sizeof(recent_context_heading) - 1;
-        size_t recent_length = strlen(recent_context);
-        if (recent_length <= SIZE_MAX - heading_length - 1U) {
-            recent_context_message = malloc(heading_length + recent_length + 1U);
-            if (recent_context_message) {
-                memcpy(recent_context_message, recent_context_heading, heading_length);
-                memcpy(recent_context_message + heading_length, recent_context,
-                       recent_length + 1U);
-            }
-        }
+    if (*recent_context &&
+        asprintf(&recent_context_message,
+                 "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n%s",
+                 recent_context) < 0) {
+        free(recent_context);
+        free(retry_system_prompt);
+        return NULL;
     }
     free(recent_context);
 
@@ -5779,13 +5786,11 @@ static int r2_recent_message_is_tool_payload(const char *content)
 /* Return only recent human-facing turns for grounded hypothetical generation.
    Pinned system/archive context and internal tool payloads are deliberately
    excluded; this transcript is contextual evidence, not a new instruction. */
-char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars)
+static char *r2_build_recent_conversation_context(const char *exclude_latest,
+                                                 size_t max_chars, int complete)
 {
-    /* Treat max_chars as a hard cap; do not silently inflate small budgets. */
     if (max_chars == 0) return xstrdup("");
-    if (max_chars > 8192) max_chars = 8192;
-    char *out = calloc(max_chars + 1, 1);
-    if (!out) return NULL;
+    if (!complete && max_chars > 8192) max_chars = 8192;
 
     size_t selected[8];
     size_t found = 0;
@@ -5823,53 +5828,70 @@ char *r2_recent_conversation_context(const char *exclude_latest, size_t max_char
         const Message *m = &messages.items[selected[included]];
         size_t role_length = strcmp(m->role, "user") == 0 ? 6U : 4U;
         size_t content_length = strlen(m->content);
-        if (content_length > 1000U)
+        if (!complete && content_length > 1000U)
             content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
-        size_t line_length = role_length + content_length + 1U;
-        size_t separator_length = 0U;
-        if (selected_chars > max_chars ||
-            separator_length > max_chars - selected_chars ||
-            line_length > max_chars - selected_chars - separator_length)
+        size_t remaining = max_chars - selected_chars;
+        if (remaining <= role_length || content_length >= remaining - role_length) {
+            if (complete) {
+                pthread_mutex_unlock(&messages_lock);
+                errno = EOVERFLOW;
+                return NULL;
+            }
             break;
-        selected_chars += separator_length + line_length;
+        }
+        selected_chars += role_length + content_length + 1U;
         ++included;
     }
 
+    size_t capacity = complete ? selected_chars : max_chars;
+    if (capacity == SIZE_MAX) {
+        pthread_mutex_unlock(&messages_lock);
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    char *out = malloc(capacity + 1);
+    if (!out) {
+        pthread_mutex_unlock(&messages_lock);
+        return NULL;
+    }
     size_t used = 0;
     if (found > 0 && included == 0) {
-        /* A single very long newest turn may exceed a tiny caller budget.
-         * Preserve that turn with an explicit truncation marker, not stale history. */
+        /* Keep the legacy finite-budget preview's explicit truncation marker. */
         const Message *m = &messages.items[selected[0]];
         const char *role = strcmp(m->role, "user") == 0 ? "User: " : "R2: ";
         const char marker[] = " [truncated]\n";
-        size_t role_length = strlen(role);
-        size_t marker_length = sizeof(marker) - 1;
-        size_t available = max_chars > role_length + marker_length
-            ? max_chars - role_length - marker_length : 0;
-        size_t safe_available = r2_utf8_safe_prefix_length(
-            m->content, available);
-        int written = snprintf(out, max_chars + 1, "%s%.*s%s",
-            role, (int)safe_available, m->content, marker);
-        if (written > 0)
-            used = (size_t)written > max_chars ? max_chars : (size_t)written;
+        size_t overhead = strlen(role) + sizeof(marker) - 1;
+        size_t available = max_chars > overhead ? max_chars - overhead : 0;
+        size_t safe_available = r2_utf8_safe_prefix_length(m->content, available);
+        snprintf(out, capacity + 1, "%s%.*s%s", role, (int)safe_available, m->content, marker);
     } else {
         for (size_t n = included; n > 0; --n) {
             const Message *m = &messages.items[selected[n - 1]];
-            size_t remaining = max_chars - used;
+            const char *role = strcmp(m->role, "user") == 0 ? "User: " : "R2: ";
+            size_t role_length = strlen(role);
             size_t content_length = strlen(m->content);
-            if (content_length > 1000U)
+            if (!complete && content_length > 1000U)
                 content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
-            int written = snprintf(out + used, remaining + 1,
-                "%s: %.*s\n",
-                strcmp(m->role, "user") == 0 ? "User" : "R2",
-                (int)content_length, m->content);
-            if (written < 0 || (size_t)written > remaining)
-                break; /* Defensive: selection above guarantees whole lines fit. */
-            used += (size_t)written;
+            memcpy(out + used, role, role_length);
+            used += role_length;
+            memcpy(out + used, m->content, content_length);
+            used += content_length;
+            out[used++] = '\n';
         }
+        out[used] = '\0';
     }
     pthread_mutex_unlock(&messages_lock);
     return out;
+}
+
+char *r2_recent_conversation_context(const char *exclude_latest, size_t max_chars)
+{
+    return r2_build_recent_conversation_context(exclude_latest, max_chars, 0);
+}
+
+char *r2_recent_conversation_context_complete(const char *exclude_latest)
+{
+    return r2_build_recent_conversation_context(exclude_latest, SIZE_MAX, 1);
 }
 
 /* Append complete Life Log event records once per durable event ID. */
