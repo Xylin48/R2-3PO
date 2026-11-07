@@ -197,41 +197,29 @@ char *r2_imagination_create(const char *request)
         return NULL;
     }
 
-    /* Persist through the existing Choice Lab / Life Log. No parallel memory
-       database is created, and the generated scene is never a factual memory. */
-    char assumptions[4600];
-    snprintf(assumptions, sizeof(assumptions),
+    static const char assumptions[] =
         "IMAGINATION RECORD — hypothetical only; not a real event, observation, "
-        "or belief update. Request: %.900s\n"
-        "Context sources retrieved before generation: persistent memory; private "
-        "diary; Life Log; current modeled Reality; visual experience library when "
-        "available; reward/learned feedback state; habit/enjoyment history; "
-        "Choice Lab. Fridge state was conditionally retrieved only for a food/"
-        "inventory-related request. Full context was supplied to the imagination "
-        "model but is intentionally not duplicated into this record.\n"
-        "Learning rule: inaccurate imagination is not punished; accuracy feedback "
-        "must be evidence-based.\nRelevant retrieved context snapshot (abbreviated): %.2300s",
-        request, context);
+        "or belief update. The complete retrieved context is archived separately "
+        "on this branch. Accuracy feedback must be evidence-based.";
+    static const char saved_format[] =
+        "%s\n\n[Saved as hypothetical imagination / Choice Lab branch #%lld. "
+        "It has not been added to factual memory or real-world state.]";
 
-    int64_t branch = r2_altself_create(
-        "Imagination: scenario",
-        request,
-        assumptions,
-        "Not evaluated yet. This imagined scene is not automatically a prediction.",
-        generated,
-        0);
-
-    if (branch < 1) {
-        free(generated);
-        free(context);
-        return NULL;
+    /* Reserve the response before committing the branch. */
+    size_t generated_length = strlen(generated);
+    size_t response_overhead = sizeof(saved_format) + 20;
+    char *out = generated_length <= SIZE_MAX - response_overhead
+        ? malloc(generated_length + response_overhead) : NULL;
+    if (out) {
+        int64_t branch = r2_altself_create_imagination(request, assumptions, generated, context);
+        if (branch > 0)
+            snprintf(out, generated_length + response_overhead, saved_format,
+                     generated, (long long)branch);
+        else {
+            free(out);
+            out = NULL;
+        }
     }
-
-    size_t out_size = strlen(generated) + 160;
-    char *out = malloc(out_size);
-    if (out)
-        snprintf(out, out_size, "%s\n\n[Saved as hypothetical imagination / Choice Lab branch #%lld. It has not been added to factual memory or real-world state.]",
-                 generated, (long long)branch);
 
     free(generated);
     free(context);
@@ -257,38 +245,34 @@ int r2_imagination_feedback(long long branch_id, const char *assessment,
     /* Positive reinforcement requires an explicit evidence note. */
     if (accurate && (!notes || !*notes)) return -2;
 
-    char *branch = r2_altself_show((int64_t)branch_id);
-    if (!branch || strstr(branch, "No Alternate-Self branches found") ||
-        !strstr(branch, "Imagination: scenario")) {
-        free(branch);
-        return -1;
-    }
+    if (r2_altself_is_imagination((int64_t)branch_id) != 1) return -1;
 
-    char details[2400];
-    snprintf(details, sizeof(details),
+    char *details = NULL;
+    if (asprintf(&details,
         "Imagination branch #%lld received explicit feedback: %s. "
-        "Feedback notes: %.1200s. Incorrect or unresolved imagination is "
+        "Feedback notes: %s. Incorrect or unresolved imagination is "
         "not punished and does not invalidate the act of exploring a possibility.",
-        branch_id, assessment, notes && *notes ? notes : "(none)");
+        branch_id, assessment, notes && *notes ? notes : "(none)") < 0)
+        return -1;
 
     int64_t event_id = r2_log_event(R2_LOG_HYPOTHETICAL,
         "imagination_feedback", "Feedback recorded for a hypothetical imagination.",
         details, "Imagination.c");
-    free(branch);
-    if (event_id < 0) return -1;
-    (void)r2_altself_link_event((int64_t)branch_id, event_id,
-        "feedback_for_imagination",
-        "Explicit feedback about a hypothetical branch; this link does not convert the branch into a factual event.");
+    free(details);
+    if (event_id <= 0) return -1;
+    if (r2_altself_link_event((int64_t)branch_id, event_id, "feedback_for_imagination",
+            "Explicit feedback about a hypothetical branch; this link does not convert the branch into a factual event.") != 0)
+        return 3;
 
     if (accurate) {
-        char target[96];
+        char target[96], reason[128];
         snprintf(target, sizeof(target), "imagination_branch_%lld", branch_id);
-        /* Positive-only reinforcement; no negative reward is applied for any
-           non-accurate result. Feedback is recorded separately from factual memory. */
-                int reward_rc = r2_reward_apply_once(target, "verified_imagination", 1,
-                                             details, 0);
-        if (reward_rc < 0) return 1; /* Feedback persisted; reinforcement unavailable. */
-        if (reward_rc > 0) return 2; /* Do not repeatedly reward the same branch. */
+        snprintf(reason, sizeof(reason), "Verified imagination feedback recorded in Life Log event #%lld.",
+                 (long long)event_id);
+        /* Positive-only reinforcement. The full notes stay on the linked event. */
+        int reward_rc = r2_reward_apply_once(target, "verified_imagination", 1, reason, 0);
+        if (reward_rc < 0) return 1;
+        if (reward_rc > 0) return 2;
     }
     return 0;
 }

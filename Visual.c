@@ -1234,6 +1234,13 @@ int r2_visual_visit_search(const char *query, int limit,
     return visual_query(query, limit, visit, context);
 }
 
+int r2_visual_visit_recent(int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    if (!visit) return -1;
+    return visual_query(NULL, limit, visit, context);
+}
+
 char *r2_visual_search(const char *query, int limit)
 {
     struct response_buffer text = {0};

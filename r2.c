@@ -5561,22 +5561,55 @@ static int r2_history_append_unique_row(void *context, int64_t id,
 
 /* Search/row counts bound selection while the visitor receives complete rows.
  * Discard all accumulated rows if a provider or allocation fails. */
-static char *r2_collect_associated_records(
-    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, R2AssociationSearchFn search_fn)
+static int r2_collect_associated_rows(
+    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count,
+    R2AssociationSearchFn search_fn, R2HistorySelection *selection)
 {
-    if (!search_fn) { errno = EINVAL; return NULL; }
-    R2HistorySelection selection = {0};
+    if (!search_fn) { errno = EINVAL; return -1; }
     int searches = 0;
     for (size_t i = 0; i < keyword_count && searches < 6; ++i) {
         if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i])) continue;
         ++searches;
-        if (search_fn(keywords[i], 2, r2_history_append_unique_row, &selection) != 0) {
-            r2_history_release(&selection);
-            return NULL;
-        }
+        if (search_fn(keywords[i], 2, r2_history_append_unique_row, selection) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static char *r2_collect_associated_records(
+    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, R2AssociationSearchFn search_fn)
+{
+    R2HistorySelection selection = {0};
+    if (r2_collect_associated_rows(keywords, keyword_count, search_fn, &selection) != 0) {
+        r2_history_release(&selection);
+        return NULL;
     }
     free(selection.ids);
     return selection.text ? selection.text : xstrdup("");
+}
+
+static int r2_append_visual_associations(char **context,
+    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, int include_recent)
+{
+    R2HistorySelection selection = {0};
+    int rc = r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search, &selection);
+    if (rc == 0 && selection.text)
+        rc = r2_append_association_section(context,
+            "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n",
+            selection.text);
+    if (rc == 0 && include_recent) {
+        /* Retain the row identities while accumulating the second section. */
+        free(selection.text);
+        selection.text = NULL;
+        selection.length = 0;
+        rc = r2_visual_visit_recent(3, r2_history_append_unique_row, &selection);
+        if (rc == 0 && selection.text)
+            rc = r2_append_association_section(context,
+                "PRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n",
+                selection.text);
+    }
+    r2_history_release(&selection);
+    return rc;
 }
 
 static pthread_mutex_t r2_associative_query_cache_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -6005,15 +6038,12 @@ static char *chat_with_relevant_memories(
     }
     free(diary_matches);
 
-    if (r2_visual_is_initialized()) {
-        char *visual_matches = r2_collect_associated_records(
-            associated_keywords, associated_count, r2_visual_visit_search);
-        if (!visual_matches || r2_append_association_section(&memory_context,
-                "RELATED VISUAL EXPERIENCES (historical descriptions, not current vision):\n", visual_matches) != 0) {
-            free(visual_matches); free(associative_query); free(memory_context);
-            r2_history_release(&life_history); return NULL;
-        }
-        free(visual_matches);
+    int visual_requested = query_requests_visual_context(query);
+    if (r2_visual_is_initialized() &&
+        r2_append_visual_associations(&memory_context, associated_keywords, associated_count,
+            visual_requested || (eyes && r2_eyes_is_open(eyes))) != 0) {
+        free(associative_query); free(memory_context);
+        r2_history_release(&life_history); return NULL;
     }
 
     free(associative_query);
@@ -6031,16 +6061,6 @@ static char *chat_with_relevant_memories(
      * decides what, if anything, deserves attention. Ordinary conversation
      * never opens a camera silently.
      */
-    int visual_requested = query_requests_visual_context(query);
-    if (r2_visual_is_initialized() &&
-        (visual_requested || (eyes && r2_eyes_is_open(eyes)))) {
-        char *prior_visual = r2_visual_recent(3);
-        if (!prior_visual || r2_append_association_section(&memory_context,
-                "PRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n", prior_visual) != 0) {
-            free(prior_visual); free(memory_context); r2_history_release(&life_history); return NULL;
-        }
-        free(prior_visual);
-    }
     if (visual_requested && atomic_load(&eyes_auto_allowed) &&
         (!eyes || !r2_eyes_is_open(eyes))) {
         /* An explicit request to see permits opening Eyes; ordinary turns do not. */
@@ -8659,9 +8679,16 @@ static char *process_tools_with_status(
                     branch_id > 0 && *assessment;
         }
         int rc = valid ? r2_imagination_feedback(branch_id, assessment, notes) : -1;
-        APPEND("IMAGINATION FEEDBACK %s.\n",
-               rc == 0 ? "RESULT: evidence feedback saved; branch remains hypothetical" :
-                         "ERROR: expected branch_id|assessment|evidence notes");
+        const char *feedback_status;
+        switch (rc) {
+        case 0: feedback_status = "RESULT: evidence feedback saved; branch remains hypothetical"; break;
+        case 1: feedback_status = "RESULT: evidence feedback saved; reward unavailable"; break;
+        case 2: feedback_status = "RESULT: evidence feedback saved; branch was already rewarded"; break;
+        case 3: feedback_status = "PARTIAL: evidence event saved; branch link failed and reward was skipped"; break;
+        case -2: feedback_status = "ERROR: an accurate assessment requires evidence notes"; break;
+        default: feedback_status = "ERROR: could not save feedback for the requested imagination branch"; break;
+        }
+        APPEND("IMAGINATION FEEDBACK %s.\n", feedback_status);
         free(entry);
     }
 
