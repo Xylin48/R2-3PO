@@ -151,17 +151,21 @@ static char *generate_with_context(const char *system, const char *request,
         const char *heading = round
             ? "REVIEW NOTES (model interpretations of the archived evidence; preserve uncertainty)"
             : "RETRIEVED CONTEXT (use this to form the scenario, not merely compare afterward)";
-        if (asprintf(&prompt,
+        static const char final_format[] =
             "USER'S IMAGINATION REQUEST:\n%s\n\n%s:\n%s\n\n"
-            "Construct the imagined possibility now. Keep it explicitly hypothetical.",
-            request, heading, evidence) < 0)
-            goto failed;
+            "Construct the imagined possibility now. Keep it explicitly hypothetical.";
+        int fixed_length = snprintf(NULL, 0, final_format, request, heading, "");
+        if (fixed_length < 0) goto failed;
         int ctx = r2_ollama_context_tokens();
         if (ctx <= 1212) goto failed;
         size_t final_capacity = (size_t)(ctx - 512 - 700) * 32U / 10U;
         size_t system_length = strlen(system);
+        size_t evidence_length = strlen(evidence);
         if (system_length <= final_capacity &&
-            strlen(prompt) <= final_capacity - system_length) {
+            (size_t)fixed_length <= final_capacity - system_length &&
+            evidence_length <= final_capacity - system_length - (size_t)fixed_length) {
+            if (asprintf(&prompt, final_format, request, heading, evidence) < 0)
+                goto failed;
             char *result = r2_model_generate(system, prompt, 700);
             free(prompt);
             free(working);
@@ -193,7 +197,6 @@ static char *generate_with_context(const char *system, const char *request,
             input_capacity - overhead <= framing_reserve + 4)
             goto failed;
         size_t chunk_capacity = input_capacity - overhead - framing_reserve;
-        size_t evidence_length = strlen(evidence);
         ImagineBuffer notes = {0};
         size_t offset = 0;
         while (offset < evidence_length) {
