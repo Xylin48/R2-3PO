@@ -751,3 +751,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 
 - Continued the branch-save trace after the archive and feedback changes. SQLite can return `SQLITE_DONE` for an insert skipped by a trigger. The old code then returned the last successful row ID from that connection, which could identify a different branch.
 - Require one actual inserted row before reading its ID. The real SQLite fixture saves one branch, installs an ignore trigger, attempts another save, and verifies the second call fails instead of claiming the old ID. This does not change the independent Life Log record for the hypothetical attempt.
+
+### R2-AUD-2026-11-06-051 — Deduplicate keyword and recent visual recall by row ID
+
+- Continued the previously deferred trace of `chat_with_relevant_memories` through keyword and recent Visual SQL, read locks, identity retention, result assembly, and cleanup. A row selected by keyword could be repeated in the adjacent recent-visual section, consuming inference capacity and overstating repeated evidence.
+- Reuse the same Visual row-ID selection across the two sections. Keep the existing order and select unrelated recent rows as before. Equal text stored under distinct IDs remains distinct. The original text-based recent/search APIs still support other callers. The caller discards the partially built inference context on query or allocation failure.
+- The SQLite fixture verifies two equal-text visual rows survive once per identity, while a separate recent-only row remains present. This audit covers the two directly assembled visual recall sections. Broader Reality context can still contain its own historical visual projection.

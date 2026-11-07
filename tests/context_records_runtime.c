@@ -120,6 +120,13 @@ int main(void)
     expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 1);
     insert_visual(connection, visual_text, 3);
     expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 2);
+    char *visual_context = strdup("");
+    assert(visual_context);
+    assert(r2_append_visual_associations(&visual_context, keywords, 1, 1) == 0);
+    assert(strstr(visual_context, "RELATED VISUAL EXPERIENCES"));
+    assert(strstr(visual_context, "PRIOR VISUAL EXPERIENCES"));
+    assert(strstr(visual_context, "another visual row"));
+    expect_copies(visual_context, visual_text, 2);
     expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel), "TAIL");
     expect_copies(r2_visual_search("not-in-the-fixture", 2), "(No visual experiences found.)\n", 1);
     char *assembled = strdup(memory_text); assert(assembled);

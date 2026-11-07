@@ -41,6 +41,10 @@ int r2_visual_visit_search(const char *query, int limit,
     int (*visit)(void *context, int64_t id, const char *row, size_t length),
     void *context);
 
+int r2_visual_visit_recent(int limit,
+    int (*visit)(void *context, int64_t id, const char *row, size_t length),
+    void *context);
+
 #ifdef __cplusplus
 }
 #endif
