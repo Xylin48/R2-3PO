@@ -14,6 +14,10 @@ static CURLoption failed_option;
 static int fail_predict_update;
 static char *response_body;
 static struct json_object *captured;
+static int capture_reviews;
+static char *reviewed_bytes;
+static size_t reviewed_size;
+static int staged_calls;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -44,7 +48,39 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     (void)curl; ++perform_count;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
+    if (captured) json_object_put(captured);
     captured = json_tokener_parse(posted); assert(captured);
+    if (capture_reviews) {
+        struct json_object *array = NULL;
+        assert(json_object_object_get_ex(captured, "messages", &array));
+        size_t request_bytes = 0;
+        for (size_t i = 0; i < json_object_array_length(array); ++i) {
+            struct json_object *content = NULL;
+            assert(json_object_object_get_ex(json_object_array_get_idx(array, i), "content", &content));
+            const char *value = json_object_get_string(content);
+            request_bytes += strlen(value);
+            if (strncmp(value, "EVIDENCE REVIEW\n", strlen("EVIDENCE REVIEW\n"))) continue;
+            ++staged_calls;
+            unsigned round;
+            size_t begin, end, total;
+            const char *position = strstr(value, "\nRound ");
+            assert(position && sscanf(position, "\nRound %u, bytes [%zu,%zu) of %zu.",
+                                      &round, &begin, &end, &total) == 4);
+            const char *fragment = strstr(value, "BEGIN FRAGMENT\n");
+            assert(fragment);
+            fragment += strlen("BEGIN FRAGMENT\n");
+            assert(strlen(fragment) == end - begin);
+            if (round == 0) {
+                assert(begin == reviewed_size && end <= total);
+                char *grown = realloc(reviewed_bytes, end + 1);
+                assert(grown);
+                reviewed_bytes = grown;
+                memcpy(grown + begin, fragment, end - begin + 1);
+                reviewed_size = end;
+            }
+        }
+        assert(request_bytes <= (size_t)(4096 - 512 - 512) * 32U / 10U);
+    }
     size_t n = strlen(response_body), split = n / 3;
     assert(write_response(response_body, 1, split, write_data) == split);
     assert(write_response(response_body + split, 1, n - split, write_data) == n - split);
@@ -262,6 +298,41 @@ static void check_imagination_persistence_and_feedback(void)
     free(notes);
 }
 
+static void check_staged_imagination(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    assert(init_db() == 0 && r2_diary_init() == 0);
+    assert(r2_altself_init() == 0 && r2_imagination_init() == 0);
+    char *evidence = text(45000, 'e', "A historical hypothetical with complete evidence: ");
+    strcpy(evidence + 44987, "EVIDENCE-TAIL");
+    assert(r2_altself_create("Evidence source", "A previous possibility", evidence, NULL, NULL, 0) > 0);
+    set_response("Hypothetical staged output with preserved uncertainty.", "stop", 1);
+    capture_reviews = 1;
+    char *result = r2_imagination_create("Imagine a grounded possibility.");
+    capture_reviews = 0;
+    assert(result && staged_calls > 1 && reviewed_size > 45000 && strstr(reviewed_bytes, evidence));
+    free(result);
+    char *latest = r2_altself_list(1);
+    long long branch = 0;
+    assert(latest && sscanf(latest, "Branch #%lld", &branch) == 1);
+    free(latest);
+    r2_altself_shutdown();
+    assert(r2_altself_init() == 0);
+    char *stored = r2_altself_show(branch);
+    assert(stored && strstr(stored, reviewed_bytes) && strstr(stored, "IMAGINATION PROCESSING NOTES"));
+    free(stored);
+    free(evidence);
+    free(reviewed_bytes);
+    reviewed_bytes = NULL;
+    r2_imagination_shutdown();
+    r2_altself_shutdown();
+    r2_diary_shutdown();
+    r2_reward_shutdown();
+    r2_addiction_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -334,6 +405,7 @@ int main(void)
     stored = r2_log_search("ollama_output_limit_reached", 10);
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
+    check_staged_imagination();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);
