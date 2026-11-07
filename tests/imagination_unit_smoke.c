@@ -21,6 +21,8 @@ static int links;
 static int reward_calls;
 static int rewards_applied;
 static int reward_already_applied;
+static int fail_link;
+static int long_note_recorded;
 
 static int check(int ok, const char *message)
 {
@@ -81,32 +83,34 @@ int64_t r2_log_continuity(const char *key, const char *type, const char *title,
 int64_t r2_log_event(R2LogCategory category, const char *type,
                      const char *summary, const char *details, const char *source)
 {
-    (void)category; (void)type; (void)summary; (void)details; (void)source;
+    (void)category; (void)type; (void)summary; (void)source;
+    if (details && strstr(details, "EVIDENCE-TAIL")) long_note_recorded = 1;
     ++feedback_events; return feedback_events;
 }
-int64_t r2_altself_create(const char *name, const char *scenario,
-                          const char *assumptions, const char *predicted_outcome,
-                          const char *conclusion, int64_t evidence_event_id)
+int64_t r2_altself_create_imagination(const char *scenario, const char *assumptions,
+                                      const char *outcome, const char *context)
 {
-    (void)name; (void)scenario; (void)assumptions; (void)predicted_outcome;
-    (void)conclusion; (void)evidence_event_id; ++branch_creates;
+    if (!scenario || !assumptions || !outcome || !context ||
+        !strstr(context, "MEMORY_TAIL") || !strstr(context, "CHOICE_SENTINEL")) return -1;
+    ++branch_creates;
     return 40 + branch_creates;
 }
-char *r2_altself_show(int64_t id)
+int r2_altself_is_imagination(int64_t id)
 {
-    if (id == 41 || id == 42) return strdup("id|Imagination: scenario|active");
-    return strdup("No Alternate-Self branches found.");
+    return id == 41 || id == 42;
 }
 int r2_altself_link_event(int64_t branch_id, int64_t event_id,
                           const char *relationship, const char *notes)
 {
     (void)branch_id; (void)event_id; (void)relationship; (void)notes;
+    if (fail_link) return -1;
     ++links; return 0;
 }
 int r2_reward_apply_once(const char *target, const char *source, int points,
                          const char *reason, int voluntary_choice)
 {
-    (void)target; (void)source; (void)points; (void)reason; (void)voluntary_choice;
+    (void)target; (void)source; (void)points; (void)voluntary_choice;
+    if (!reason || strlen(reason) > 128 || !strstr(reason, "Life Log event #")) return -1;
     ++reward_calls;
     if (reward_already_applied) return 1;
     reward_already_applied = 1;
@@ -159,8 +163,19 @@ int main(void)
     if (!check(r2_imagination_feedback(41, "accurate", "") == -2,
                "positive feedback requires evidence notes")) goto done;
     if (!check(rewards_applied == 0, "missing evidence does not reward")) goto done;
-    if (!check(r2_imagination_feedback(41, "accurate", "Later direct observation matched the prediction.") == 0,
-               "evidence-backed accurate feedback is accepted")) goto done;
+    if (!check(r2_imagination_feedback(43, "accurate", "Wrong branch type.") == -1 &&
+               feedback_events == 1 && reward_calls == 0,
+               "feedback rejects a non-imagination branch")) goto done;
+    fail_link = 1;
+    if (!check(r2_imagination_feedback(41, "accurate", "Evidence link failed.") == 3 &&
+               feedback_events == 2 && reward_calls == 0,
+               "an unlinked event cannot trigger a reward")) goto done;
+    fail_link = 0;
+    char long_note[3000];
+    memset(long_note, 'n', sizeof(long_note));
+    strcpy(long_note + sizeof(long_note) - sizeof("EVIDENCE-TAIL"), "EVIDENCE-TAIL");
+    if (!check(r2_imagination_feedback(41, "accurate", long_note) == 0 && long_note_recorded,
+               "full long feedback is saved and reinforced by event reference")) goto done;
     if (!check(rewards_applied == 1 && links == 2,
                "feedback is linked to the hypothetical branch and accurate feedback rewards once")) goto done;
     if (!check(r2_imagination_feedback(41, "accurate", "The same observation still matches.") == 2

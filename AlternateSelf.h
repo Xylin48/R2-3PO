@@ -14,6 +14,11 @@ void r2_altself_shutdown(void);
 int64_t r2_altself_create(const char *name, const char *scenario,
                          const char *assumptions, const char *predicted_outcome,
                          const char *conclusion, int64_t evidence_event_id);
+/* Store the complete prompt evidence with an explicitly typed imagination branch. */
+int64_t r2_altself_create_imagination(const char *scenario, const char *assumptions,
+                                      const char *outcome, const char *context);
+/* 1 for imagination, 0 for another or missing branch, -1 on query failure. */
+int r2_altself_is_imagination(int64_t branch_id);
 /* Import a hypothetical already recorded by the Life Log without duplicating it. */
 int64_t r2_altself_import_hypothesis(const char *scenario,
                                     const char *assumptions,

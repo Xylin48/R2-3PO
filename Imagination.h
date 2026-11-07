@@ -19,6 +19,8 @@ char *r2_imagination_create(const char *request);
  * Record explicit evidence-based feedback for a saved imagination branch.
  * Accepted assessments: accurate, partial, incorrect, unresolved.
  * Inaccurate/unresolved outcomes are not punished.
+ * 0: saved and linked, 1: reward unavailable, 2: already rewarded.
+ * 3: feedback event saved, branch link failed. Negative means rejected.
  */
 int r2_imagination_feedback(long long branch_id, const char *assessment,
                             const char *notes);

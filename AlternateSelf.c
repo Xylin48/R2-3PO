@@ -6,6 +6,7 @@
 #include "Log.h"
 #include "r2_diary.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdio.h>
@@ -171,6 +172,8 @@ static int migrate_altself_schema(void)
         {"assumptions", "TEXT"},
         {"predicted_outcome", "TEXT"},
         {"conclusion", "TEXT"},
+        {"branch_kind", "TEXT"},
+        {"imagination_context", "TEXT"},
         {"status", "TEXT NOT NULL DEFAULT 'active'"},
         {"evidence_event_id", "INTEGER"},
         {"log_event_id", "INTEGER NOT NULL DEFAULT 0"},
@@ -189,6 +192,10 @@ static int migrate_altself_schema(void)
         "WHERE created_utc IS NULL OR created_utc='';"
         "UPDATE r2_alternate_self_branches SET updated_utc=CURRENT_TIMESTAMP "
         "WHERE updated_utc IS NULL OR updated_utc='';"
+        "UPDATE r2_alternate_self_branches SET branch_kind=CASE "
+        "WHEN name='Imagination: scenario' COLLATE BINARY "
+        "AND instr(assumptions,'IMAGINATION RECORD — hypothetical only;')=1 "
+        "THEN 'imagination' ELSE 'counterfactual' END WHERE branch_kind IS NULL;"
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_status_idx "
         "ON r2_alternate_self_branches(status,id);"
         "CREATE INDEX IF NOT EXISTS r2_alternate_self_log_event_idx "
@@ -224,6 +231,8 @@ int r2_altself_init(void)
         " assumptions TEXT,"
         " predicted_outcome TEXT,"
         " conclusion TEXT,"
+        " branch_kind TEXT,"
+        " imagination_context TEXT,"
         " status TEXT NOT NULL DEFAULT 'active',"
         " evidence_event_id INTEGER,"
         " log_event_id INTEGER NOT NULL,"
@@ -262,9 +271,10 @@ void r2_altself_shutdown(void)
     pthread_mutex_unlock(&as_lock);
 }
 
-int64_t r2_altself_create(const char *name, const char *scenario,
-                          const char *assumptions, const char *predicted_outcome,
-                          const char *conclusion, int64_t evidence_event_id)
+static int64_t create_branch(const char *name, const char *scenario,
+                             const char *assumptions, const char *predicted_outcome,
+                             const char *conclusion, int64_t evidence_event_id,
+                             const char *imagination_context)
 {
     if (!name || !*name || !scenario || !*scenario) return -1;
     pthread_mutex_lock(&as_lock);
@@ -295,8 +305,8 @@ int64_t r2_altself_create(const char *name, const char *scenario,
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
-        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind,imagination_context)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?);", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
@@ -304,6 +314,12 @@ int64_t r2_altself_create(const char *name, const char *scenario,
     if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 5, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);
     if (rc == SQLITE_OK) rc = evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, evidence_event_id) : sqlite3_bind_null(st, 6);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 8,
+        imagination_context ? "imagination" : "counterfactual", -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = imagination_context
+        ? sqlite3_bind_text64(st, 9, imagination_context, strlen(imagination_context),
+                             SQLITE_TRANSIENT, SQLITE_UTF8)
+        : sqlite3_bind_null(st, 9);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(as_db) : -1;
     sqlite3_finalize(st);
@@ -312,6 +328,42 @@ int64_t r2_altself_create(const char *name, const char *scenario,
         r2_log_link(evidence_event_id, event_id, "evidence_for_hypothesis",
                     "Evidence is referenced for comparison; it is not altered by this branch.");
     return id;
+}
+
+int64_t r2_altself_create(const char *name, const char *scenario,
+                          const char *assumptions, const char *predicted_outcome,
+                          const char *conclusion, int64_t evidence_event_id)
+{
+    return create_branch(name, scenario, assumptions, predicted_outcome,
+                         conclusion, evidence_event_id, NULL);
+}
+
+int64_t r2_altself_create_imagination(const char *scenario, const char *assumptions,
+                                      const char *outcome, const char *context)
+{
+    if (!context) return -1;
+    return create_branch("Imagination: scenario", scenario, assumptions,
+                         "Not evaluated yet. This imagined scene is not automatically a prediction.",
+                         outcome, 0, context);
+}
+
+int r2_altself_is_imagination(int64_t branch_id)
+{
+    if (branch_id <= 0) return 0;
+    pthread_mutex_lock(&as_lock);
+    if (!as_ready || !as_db) {
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(as_db,
+        "SELECT 1 FROM r2_alternate_self_branches WHERE id=? AND branch_kind='imagination';",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, branch_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&as_lock);
+    return rc == SQLITE_ROW ? 1 : rc == SQLITE_DONE ? 0 : -1;
 }
 
 int64_t r2_altself_import_hypothesis(const char *scenario,
@@ -361,8 +413,8 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     }
     rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc)"
-        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);", -1, &st, NULL);
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'counterfactual');", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
@@ -471,73 +523,69 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
         pthread_mutex_unlock(&as_lock);
         return NULL;
     }
-    size_t cap=4096,len=0;
-    char *out=malloc(cap);
-    if (!out) { sqlite3_finalize(st); pthread_mutex_unlock(&as_lock); return NULL; }
-    out[0]='\0';
-    int rc;
-    int intentionally_truncated = 0;
-    int serialization_failed = 0;
-    while ((rc=sqlite3_step(st))==SQLITE_ROW) {
-        int64_t id=sqlite3_column_int64(st,0);
-        const unsigned char *name=sqlite3_column_text(st,1);
-        const unsigned char *scenario=sqlite3_column_text(st,2);
-        const unsigned char *assumptions=sqlite3_column_text(st,3);
-        const unsigned char *outcome=sqlite3_column_text(st,4);
-        const unsigned char *conclusion=sqlite3_column_text(st,5);
-        const unsigned char *status=sqlite3_column_text(st,6);
-        int64_t evidence=sqlite3_column_int64(st,7);
-        const unsigned char *created=sqlite3_column_text(st,8);
-        int needed=snprintf(NULL,0,
-            "Branch #%lld [%s] %s\n  Scenario: %s\n  Assumptions: %s\n"
-            "  Predicted outcome: %s\n  Tentative conclusion: %s\n"
-            "  Evidence event ID: %lld\n  Created UTC: %s\n\n",
-            (long long)id,status?(const char*)status:"unknown",
-            name?(const char*)name:"unnamed",
-            scenario?(const char*)scenario:"",
-            assumptions?(const char*)assumptions:"(none)",
-            outcome?(const char*)outcome:"(not specified)",
-            conclusion?(const char*)conclusion:"(not specified)",
-            (long long)evidence,
-            created?(const char*)created:"unknown");
-        if (needed < 0) { serialization_failed = 1; break; }
-        if (len + (size_t)needed + 2 > 1024 * 1024) {
-            intentionally_truncated = 1;
-            break;
-        }
-        if (len+(size_t)needed+2>cap) {
-            size_t next=cap; while(next<len+(size_t)needed+2) next*=2;
-            char *grown=realloc(out,next); if(!grown){free(out);out=NULL;break;}
-            out=grown;cap=next;
-        }
-        snprintf(out+len,cap-len,
-            "Branch #%lld [%s] %s\n  Scenario: %s\n  Assumptions: %s\n"
-            "  Predicted outcome: %s\n  Tentative conclusion: %s\n"
-            "  Evidence event ID: %lld\n  Created UTC: %s\n\n",
-            (long long)id,status?(const char*)status:"unknown",
-            name?(const char*)name:"unnamed",
-            scenario?(const char*)scenario:"",
-            assumptions?(const char*)assumptions:"(none)",
-            outcome?(const char*)outcome:"(not specified)",
-            conclusion?(const char*)conclusion:"(not specified)",
-            (long long)evidence,
-            created?(const char*)created:"unknown");
-        len+=(size_t)needed;
-    }
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&as_lock);
-    if (serialization_failed || (rc != SQLITE_DONE && !intentionally_truncated)) {
-        free(out);
+    size_t capacity = 4096, used = 0;
+    char *out = malloc(capacity);
+    if (!out) {
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&as_lock);
         return NULL;
     }
-    if (out && !len) snprintf(out,cap,"No Alternate-Self branches found.\n");
-    if (out && intentionally_truncated) {
-        const char *note = "[Alternate-Self output truncated at 1 MiB; all branches remain stored.]\n";
-        size_t note_len = strlen(note);
-        if (len + note_len + 1 <= cap) memcpy(out + len, note, note_len + 1);
+    out[0] = '\0';
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *fields[10] = {0};
+        const int count = sqlite3_column_count(st);
+        for (int i = 1; i < count; ++i) {
+            if (i == 7) continue; /* evidence event ID */
+            fields[i] = (const char *)sqlite3_column_text(st, i);
+            if ((!fields[i] && sqlite3_column_type(st, i) != SQLITE_NULL) ||
+                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i)))
+                goto failed;
+        }
+        char *row = NULL;
+        int n = asprintf(&row,
+            "Branch #%lld [%s] %s\n  Scenario: %s\n  Assumptions: %s\n"
+            "  Predicted outcome: %s\n  Tentative conclusion: %s\n"
+            "  Evidence event ID: %lld\n  Created UTC: %s\n%s%s%s\n",
+            (long long)sqlite3_column_int64(st, 0),
+            fields[6] ? fields[6] : "unknown", fields[1] ? fields[1] : "unnamed",
+            fields[2] ? fields[2] : "", fields[3] ? fields[3] : "(none)",
+            fields[4] ? fields[4] : "(not specified)", fields[5] ? fields[5] : "(not specified)",
+            (long long)sqlite3_column_int64(st, 7), fields[8] ? fields[8] : "unknown",
+            fields[9] ? "  Archived imagination context (input evidence):\n" : "",
+            fields[9] ? fields[9] : "", fields[9] ? "\n" : "");
+        if (n < 0) goto failed;
+        if ((size_t)n > SIZE_MAX - used - 1) {
+            free(row);
+            errno = EOVERFLOW;
+            goto failed;
+        }
+        size_t needed = used + (size_t)n + 1;
+        if (needed > capacity) {
+            size_t next = capacity;
+            while (next < needed) next = next > SIZE_MAX / 2 ? needed : next * 2;
+            char *grown = realloc(out, next);
+            if (!grown) { free(row); goto failed; }
+            out = grown;
+            capacity = next;
+        }
+        memcpy(out + used, row, (size_t)n + 1);
+        used += (size_t)n;
+        free(row);
     }
+    if (rc != SQLITE_DONE) goto failed;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&as_lock);
+    if (!used) strcpy(out, "No Alternate-Self branches found.\n");
     return out;
+
+failed:
+    free(out);
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&as_lock);
+    return NULL;
 }
+
 char *r2_altself_list(int limit)
 {
     if (limit < 1) limit = 25;
@@ -547,7 +595,7 @@ char *r2_altself_list(int limit)
 }
 char *r2_altself_show(int64_t id)
 {
-    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc "
+    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc,imagination_context "
                     "FROM r2_alternate_self_branches WHERE id=?;",id,0,0);
 }
 char *r2_altself_compare(int64_t a, int64_t b)

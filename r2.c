@@ -8659,9 +8659,16 @@ static char *process_tools_with_status(
                     branch_id > 0 && *assessment;
         }
         int rc = valid ? r2_imagination_feedback(branch_id, assessment, notes) : -1;
-        APPEND("IMAGINATION FEEDBACK %s.\n",
-               rc == 0 ? "RESULT: evidence feedback saved; branch remains hypothetical" :
-                         "ERROR: expected branch_id|assessment|evidence notes");
+        const char *feedback_status;
+        switch (rc) {
+        case 0: feedback_status = "RESULT: evidence feedback saved; branch remains hypothetical"; break;
+        case 1: feedback_status = "RESULT: evidence feedback saved; reward unavailable"; break;
+        case 2: feedback_status = "RESULT: evidence feedback saved; branch was already rewarded"; break;
+        case 3: feedback_status = "PARTIAL: evidence event saved; branch link failed and reward was skipped"; break;
+        case -2: feedback_status = "ERROR: an accurate assessment requires evidence notes"; break;
+        default: feedback_status = "ERROR: could not save feedback for the requested imagination branch"; break;
+        }
+        APPEND("IMAGINATION FEEDBACK %s.\n", feedback_status);
         free(entry);
     }
 

@@ -206,6 +206,56 @@ static void check_retry_and_isolated_inputs(void)
     free(prompt);
 }
 
+static void check_imagination_persistence_and_feedback(void)
+{
+    assert(r2_altself_init() == 0 && r2_reward_init() == 0);
+    char *context = text(10000, 'c', "Complete evidence snapshot");
+    char *notes = text(3000, 'n', "Long feedback evidence");
+    strcpy(context + 9988, "CONTEXT-TAIL");
+    strcpy(notes + 2987, "FEEDBACK-TAIL");
+    int64_t branch = r2_altself_create_imagination(
+        "Real database fixture", "Hypothetical", "A possible scene", context);
+    assert(branch > 0);
+    r2_altself_shutdown();
+    assert(r2_altself_init() == 0);
+    char *archived = r2_altself_show(branch);
+    assert(archived && strstr(archived, context));
+    free(archived);
+
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER deny_feedback_link BEFORE INSERT ON r2_alternate_self_event_links "
+        "BEGIN SELECT RAISE(ABORT,'fixture rejects link'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    char target[96];
+    snprintf(target, sizeof(target), "imagination_branch_%lld", (long long)branch);
+    assert(r2_imagination_feedback(branch, "accurate", notes) == 3);
+    assert(r2_reward_current_modifier(target) == 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER deny_feedback_link;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_imagination_feedback(branch, "accurate", notes) == 0);
+    assert(r2_imagination_feedback(branch, "accurate", notes) == 2);
+    sqlite3_stmt *read = NULL;
+    assert(sqlite3_prepare_v2(fixture,
+        "SELECT e.details FROM r2_log_events e JOIN r2_alternate_self_event_links l "
+        "ON l.event_id=e.id WHERE l.branch_id=? AND l.relation='feedback_for_imagination';",
+        -1, &read, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(read, 1, branch) == SQLITE_OK);
+    int linked = 0;
+    while (sqlite3_step(read) == SQLITE_ROW) {
+        const char *details = (const char *)sqlite3_column_text(read, 0);
+        assert(details && strstr(details, notes));
+        ++linked;
+    }
+    assert(linked == 2);
+    sqlite3_finalize(read);
+    sqlite3_close(fixture);
+    r2_reward_shutdown();
+    r2_altself_shutdown();
+    free(context);
+    free(notes);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -277,6 +327,7 @@ int main(void)
     r2_log_shutdown(); assert(r2_log_init() == 0);
     stored = r2_log_search("ollama_output_limit_reached", 10);
     assert(stored && strstr(stored, partial)); free(stored);
+    check_imagination_persistence_and_feedback();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);

@@ -44,6 +44,11 @@ static int ensure_log_schema(void)
         "SELECT 2,'Unlinked legacy branch','Legacy scenario without Life Log link','active',0,"
         "'2020-01-02T00:00:00Z','2020-01-02T00:00:00Z' "
         "WHERE NOT EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=2);"
+        "INSERT INTO r2_alternate_self_branches"
+        "(id,name,scenario,assumptions,status,log_event_id,created_utc,updated_utc) "
+        "SELECT 3,'Imagination: scenario','Old generated scene',"
+        "'IMAGINATION RECORD — hypothetical only; legacy prefix','active',MIN(id),"
+        "'2020-01-03T00:00:00Z','2020-01-03T00:00:00Z' FROM r2_log_events;"
         "CREATE TABLE IF NOT EXISTS r2_alternate_self_event_links ("
         "branch_id INTEGER NOT NULL,event_id INTEGER NOT NULL,relation TEXT NOT NULL,"
         "details TEXT,created_utc TEXT NOT NULL,PRIMARY KEY(branch_id,event_id,relation));";
@@ -221,6 +226,34 @@ int main(void)
                strstr(view, "Would I still like X if I knew Y?"),
                "list all saved what-if branches")) goto done;
     free(view); view = NULL;
+
+    if (!check(r2_altself_is_imagination(3) == 1 && r2_altself_is_imagination(1) == 0,
+               "recognize historical generated branch without changing its ID")) goto done;
+    int64_t ordinary = r2_altself_create("Imagination: scenario", "An ordinary counterfactual",
+        "IMAGINATION RECORD — hypothetical only; quoted marker", NULL, NULL, 0);
+    if (!check(ordinary > 0 && r2_altself_is_imagination(ordinary) == 0,
+               "ordinary branches cannot self-identify as generated imagination")) goto done;
+    const size_t archive_length = 1100000;
+    char *archive = malloc(archive_length + 1);
+    if (!archive) goto done;
+    memset(archive, 'a', archive_length);
+    memcpy(archive + archive_length - sizeof("ARCHIVE-END") + 1, "ARCHIVE-END", sizeof("ARCHIVE-END"));
+    int64_t imagined = r2_altself_create_imagination(
+        "New imagination", "Provenance kept with the branch.", "A hypothetical result.", archive);
+    int64_t large = r2_altself_create("Large historical note", "An intact branch note",
+        archive, NULL, NULL, 0);
+    r2_altself_shutdown();
+    int reopened = r2_altself_init() == 0;
+    view = reopened && imagined > 0 ? r2_altself_show(imagined) : NULL;
+    int archived = view && strstr(view, archive);
+    free(view); view = NULL;
+    if (reopened) view = r2_altself_list(20);
+    int listed = view && large > 0 && strstr(view, archive) &&
+        strstr(view, "Legacy branch") && !strstr(view, "Archived imagination context");
+    free(archive);
+    if (!check(archived && listed && r2_altself_is_imagination(imagined) == 1 &&
+               r2_altself_is_imagination(ordinary) == 0,
+               "persist and recover exact large text without recursively listing archived evidence")) goto done;
 
     passed = 1;
 done:
