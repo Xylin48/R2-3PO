@@ -757,3 +757,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Continued the previously deferred trace of `chat_with_relevant_memories` through keyword and recent Visual SQL, read locks, identity retention, result assembly, and cleanup. A row selected by keyword could be repeated in the adjacent recent-visual section, consuming inference capacity and overstating repeated evidence.
 - Reuse the same Visual row-ID selection across the two sections. Keep the existing order and select unrelated recent rows as before. Equal text stored under distinct IDs remains distinct. The original text-based recent/search APIs still support other callers. The caller discards the partially built inference context on query or allocation failure.
 - The SQLite fixture verifies two equal-text visual rows survive once per identity, while a separate recent-only row remains present. This audit covers the two directly assembled visual recall sections. Broader Reality context can still contain its own historical visual projection.
+
+### Verification checkpoint for R2-AUD-2026-11-06-049 through 051
+
+- Full GitHub workflow passed at code commit `b17f4fecbbf65e741ee9f11af1209d6ecf837d55`. [Run 42331642269](https://github.com/Xylin48/R2-3PO/actions/runs/42331642269)
+- Strict local build, real temporary SQLite restart and failure-injection checks, and selected workflow steps passed. Published trees matched the local Git trees. Model transport in the inference fixture is synthetic. User hardware, exact model-token accounting and staged inference beyond one window remain open.
+- Draft [PR #181](https://github.com/Xylin48/R2-3PO/pull/181) continues the complete PR #180 tree. PR #180 and `main` are untouched. This checkpoint changes documentation only. Continue with oversized-input inference and the live runtime acceptance work before the deferred fridge stock update.
