@@ -321,7 +321,8 @@ static int64_t create_branch(const char *name, const char *scenario,
                              SQLITE_TRANSIENT, SQLITE_UTF8)
         : sqlite3_bind_null(st, 9);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(as_db) : -1;
+    int64_t id = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1
+        ? sqlite3_last_insert_rowid(as_db) : -1;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
     if (id > 0 && evidence_event_id > 0)

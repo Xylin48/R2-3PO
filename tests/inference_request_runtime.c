@@ -216,14 +216,20 @@ static void check_imagination_persistence_and_feedback(void)
     int64_t branch = r2_altself_create_imagination(
         "Real database fixture", "Hypothetical", "A possible scene", context);
     assert(branch > 0);
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER ignore_new_branch BEFORE INSERT ON r2_alternate_self_branches "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_altself_create_imagination("Ignored branch", "Hypothetical", "Possible", context) < 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER ignore_new_branch;", NULL, NULL, NULL) == SQLITE_OK);
     r2_altself_shutdown();
     assert(r2_altself_init() == 0);
     char *archived = r2_altself_show(branch);
     assert(archived && strstr(archived, context));
     free(archived);
 
-    sqlite3 *fixture = NULL;
-    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
     assert(sqlite3_exec(fixture,
         "CREATE TRIGGER deny_feedback_link BEFORE INSERT ON r2_alternate_self_event_links "
         "BEGIN SELECT RAISE(ABORT,'fixture rejects link'); END;",
