@@ -3691,6 +3691,10 @@ static char *ollama_chat_with_limit(
     if (ollama_json_object_add_checked(root, "model",
                                        json_object_new_string(MODEL)) != 0 ||
         ollama_json_object_add_checked(root, "stream",
+                                       json_object_new_boolean(0)) != 0 ||
+        ollama_json_object_add_checked(root, "truncate",
+                                       json_object_new_boolean(0)) != 0 ||
+        ollama_json_object_add_checked(root, "shift",
                                        json_object_new_boolean(0)) != 0) {
         json_object_put(root);
         return NULL;

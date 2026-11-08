@@ -12,6 +12,8 @@ static void *write_data;
 static int perform_count, cleanup_count;
 static CURLoption failed_option;
 static int fail_predict_update;
+static const char *failed_metadata;
+static long fixture_http_status = 200;
 static char *response_body;
 static struct json_object *captured;
 static int capture_reviews;
@@ -24,6 +26,7 @@ int __real_json_object_object_add(struct json_object *, const char *, struct jso
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
 {
     struct json_object *existing = NULL;
+    if (failed_metadata && !strcmp(key, failed_metadata)) return -1;
     if (fail_predict_update && !strcmp(key, "num_predict") &&
         json_object_object_get_ex(object, key, &existing)) return -1;
     return __real_json_object_object_add(object, key, value);
@@ -52,6 +55,11 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     assert(write_response && write_data && response_body);
     if (captured) json_object_put(captured);
     captured = json_tokener_parse(posted); assert(captured);
+    struct json_object *flag = NULL;
+    assert(json_object_object_get_ex(captured, "truncate", &flag) &&
+           json_object_is_type(flag, json_type_boolean) && !json_object_get_boolean(flag));
+    assert(json_object_object_get_ex(captured, "shift", &flag) &&
+           json_object_is_type(flag, json_type_boolean) && !json_object_get_boolean(flag));
     if (capture_reviews) {
         struct json_object *array = NULL;
         assert(json_object_object_get_ex(captured, "messages", &array));
@@ -91,7 +99,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
 CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
 {
     (void)curl; assert(info == CURLINFO_RESPONSE_CODE);
-    va_list ap; va_start(ap, info); *va_arg(ap, long *) = 200; va_end(ap);
+    va_list ap; va_start(ap, info); *va_arg(ap, long *) = fixture_http_status; va_end(ap);
     return CURLE_OK;
 }
 void __real_curl_easy_cleanup(CURL *);
@@ -483,6 +491,19 @@ int main(void)
         assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60) && perform_count == before);
     }
     failed_option = 0;
+    const char *metadata[] = {"truncate", "shift"};
+    for (size_t i = 0; i < sizeof(metadata) / sizeof(metadata[0]); ++i) {
+        failed_metadata = metadata[i];
+        int sent = perform_count;
+        assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60) && perform_count == sent);
+    }
+    failed_metadata = NULL;
+    set_response("must not accept a server-rejected prompt", "stop", 1);
+    fixture_http_status = 400;
+    int rejected_before = perform_count;
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60) &&
+           perform_count == rejected_before + 1);
+    fixture_http_status = 200;
     char *partial = text(70000, 'p', "[RUN] this is incomplete output; never execute\n");
     set_response(partial, "length", 1);
     assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));

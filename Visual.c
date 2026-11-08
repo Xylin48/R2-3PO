@@ -503,6 +503,8 @@ static char *call_vision_model(const char *image_base64, const char *question,
         goto build_failure;
     if (visual_json_object_add_checked(root, "model", json_object_new_string(model)) != 0 ||
         visual_json_object_add_checked(root, "stream", json_object_new_boolean(0)) != 0 ||
+        visual_json_object_add_checked(root, "truncate", json_object_new_boolean(0)) != 0 ||
+        visual_json_object_add_checked(root, "shift", json_object_new_boolean(0)) != 0 ||
         visual_json_object_add_checked(root, "think", json_object_new_boolean(0)) != 0 ||
         visual_json_object_add_checked(root, "format", json_object_new_string("json")) != 0 ||
         visual_json_object_add_checked(root, "keep_alive", json_object_new_string("10m")) != 0)

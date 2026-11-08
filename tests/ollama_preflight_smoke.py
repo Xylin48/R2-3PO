@@ -55,6 +55,8 @@ class OllamaPreflightSmoke(unittest.TestCase):
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
         self.assertIs(payload["think"], True)
+        self.assertIs(payload["truncate"], False)
+        self.assertIs(payload["shift"], False)
         self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
         self.assertEqual(payload["options"]["temperature"], 1.0)
         self.assertEqual(payload["options"]["top_p"], 0.95)
@@ -65,6 +67,8 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(payload["options"]["num_batch"], 128)
         self.assertTrue(read.call_args_list[2].args[0].endswith("/api/chat"))
         vision_payload = read.call_args_list[2].kwargs["payload"]
+        self.assertIs(vision_payload["truncate"], False)
+        self.assertIs(vision_payload["shift"], False)
         self.assertNotIn("num_batch", vision_payload["options"])
         png_bytes = base64.b64decode(vision_payload["messages"][1]["images"][0])
         self.assertEqual(png_bytes[:8], bytes((137, 80, 78, 71, 13, 10, 26, 10)))
@@ -101,6 +105,8 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(options["num_gpu"], 20)
         self.assertEqual(options["num_ctx"], 8192)
         vision_payload = read.call_args_list[2].kwargs["payload"]
+        self.assertIs(vision_payload["truncate"], False)
+        self.assertIs(vision_payload["shift"], False)
         self.assertEqual(vision_payload["options"]["num_gpu"], 20)
         self.assertEqual(vision_payload["options"]["num_ctx"], 8192)
         self.assertEqual(vision_payload["options"]["num_predict"], 512)

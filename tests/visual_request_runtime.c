@@ -147,6 +147,11 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     assert(write_response && write_data && body);
     if (request_copy) json_object_put(request_copy);
     request_copy = visual_parse_complete_json(posted, strlen(posted)); assert(request_copy);
+    json_object *flag = NULL;
+    assert(json_object_object_get_ex(request_copy, "truncate", &flag) &&
+           json_object_is_type(flag, json_type_boolean) && !json_object_get_boolean(flag));
+    assert(json_object_object_get_ex(request_copy, "shift", &flag) &&
+           json_object_is_type(flag, json_type_boolean) && !json_object_get_boolean(flag));
     if (switch_preview_during_request) {
         switch_preview_during_request = 0;
         ++fixture_preview_session;
