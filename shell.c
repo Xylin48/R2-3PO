@@ -518,6 +518,7 @@ static void shell_help(void)
         "      Show the latest Life Log events.\n"
         "\n"
         "  log status\n"
+        "  log context <archive_id>\n"
         "      Show Life Log counts and current session information.\n"
         "\n"
         "  log search <text>\n"
@@ -960,6 +961,16 @@ static void shell_log(const char *argument)
         result = r2_log_recent(25);
     } else if (!strcasecmp(argument, "status")) {
         result = r2_log_status_report();
+    } else if (shell_starts_with(argument, "context ")) {
+        const char *id_text = shell_trim((char *)argument + 8);
+        char *end = NULL;
+        errno = 0;
+        long long id = strtoll(id_text, &end, 10);
+        if (errno || end == id_text || *end || id <= 0) {
+            printf("[Expected log context <positive archive ID>.]\n");
+            return;
+        }
+        result = r2_log_read_context_review((int64_t)id);
     } else if (shell_starts_with(argument, "search ")) {
         const char *query = shell_trim((char *)argument + 7);
         result = r2_log_search(query, 50);

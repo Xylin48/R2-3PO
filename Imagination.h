@@ -1,6 +1,8 @@
 #ifndef R2_IMAGINATION_H
 #define R2_IMAGINATION_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -8,6 +10,12 @@ extern "C" {
 /* Initialize and shut down the hypothetical-experience subsystem. */
 int r2_imagination_init(void);
 void r2_imagination_shutdown(void);
+
+/* Review complete context until the returned notes fit max_note_bytes.
+ * Both outputs are caller-owned. processing_notes contains every review pass.
+ * Context that already fits is copied without inference. Failure returns NULL. */
+char *r2_review_context(const char *request, const char *context,
+                         size_t max_note_bytes, char **processing_notes);
 
 /*
  * Generate a context-informed hypothetical scenario and store it as a

@@ -18,6 +18,7 @@ static int capture_reviews;
 static char *reviewed_bytes;
 static size_t reviewed_size;
 static int staged_calls;
+static int fail_transport_at;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -46,6 +47,7 @@ CURLcode __wrap_curl_easy_setopt(CURL *curl, CURLoption option, ...)
 CURLcode __wrap_curl_easy_perform(CURL *curl)
 {
     (void)curl; ++perform_count;
+    if (perform_count == fail_transport_at) return CURLE_COULDNT_CONNECT;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
     if (captured) json_object_put(captured);
@@ -220,7 +222,13 @@ static void check_retry_and_isolated_inputs(void)
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;
-    assert(!r2_retry_direct_answer(turn, 1, query) && perform_count == before);
+    answer = r2_retry_direct_answer(turn, 1, query);
+    assert(answer && perform_count > before + 1);
+    assert(captured_contains(query) && !captured_contains(history));
+    free(answer);
+    char *snapshot = r2_log_read_context_review(1);
+    assert(snapshot && strstr(snapshot, history));
+    free(snapshot);
     free(history);
 
     char *prompt = text(10000, 'p', "COMPLETE HYPOTHETICAL PROMPT: ");
@@ -298,6 +306,88 @@ static void check_imagination_persistence_and_feedback(void)
     free(notes);
 }
 
+static void check_foreground_context_review(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    char *history = text(60000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    strcpy(history + 59985, "FULL-RECALL-END");
+    const char *query = "Explain what happened in the earlier conversation.";
+    const char *policy = "Conversation policy: preserve evidence and uncertainty.";
+    const char *reality = "PERSISTENT REALITY CONTEXT\nCurrent state is exact.";
+    const char *handoff = "[R2_INTERNAL_TOOL_RESULT]\nAn action already completed.";
+    Message turn[] = {
+        {.role="system", .content=(char *)policy},
+        {.role="system", .content=history},
+        {.role="system", .content=(char *)reality},
+        {.role="user", .content=(char *)query},
+        {.role="assistant", .content="[R2_INTERNAL_TOOL_REQUEST]\nCompleted"},
+        {.role="user", .content=(char *)handoff, .internal_tool_result=1},
+    };
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    ollama_foreground_turn_mode = 1;
+    set_response("Review notes or answer from the synthetic model.", "stop", 1);
+    capture_reviews = 1;
+    char *answer = r2_foreground_chat(turn, 6, "Complete contract", query, 2048, 60);
+    capture_reviews = 0;
+    assert(answer && staged_calls > 1 && reviewed_size > 60000 && strstr(reviewed_bytes, history));
+    assert(captured_contains(query) && captured_contains(policy) &&
+           captured_contains(reality) && captured_contains(handoff) &&
+           captured_contains("model interpretations"));
+    assert(!strcmp(turn[1].content, history));
+    free(answer);
+    free(reviewed_bytes); reviewed_bytes = NULL; reviewed_size = 0; staged_calls = 0;
+    r2_log_shutdown();
+    assert(r2_log_init() == 0);
+    char *stored = r2_log_read_context_review(2);
+    assert(stored && strstr(stored, history));
+    free(stored);
+    stored = r2_log_search("context_reviewed", 10);
+    assert(stored && !strstr(stored, history) && strstr(stored, "context_archive_id="));
+    free(stored);
+    set_response("Intermediate review failure", "stop", 1);
+    fail_transport_at = perform_count + 2;
+    assert(!r2_foreground_chat(turn, 6, "Complete contract", query, 2048, 60));
+    assert(perform_count == fail_transport_at);
+    fail_transport_at = 0;
+    assert(!r2_log_read_context_review(3));
+
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER reject_context_archive BEFORE INSERT ON r2_log_context_reviews "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    set_response("Reviewed all input but cannot archive it.", "stop", 1);
+    assert(!r2_foreground_chat(turn, 6, "Complete contract", query, 2048, 60));
+    assert(!r2_log_read_context_review(3) && !captured_contains("context archive #"));
+    assert(sqlite3_exec(fixture, "DROP TRIGGER reject_context_archive;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "INSERT INTO r2_log_context_reviews(request,original_context,review_notes) "
+        "VALUES('corrupt archive',CAST(x'410042' AS TEXT),'notes');", NULL, NULL, NULL) == SQLITE_OK);
+    assert(!r2_log_read_context_review(3));
+    assert(sqlite3_exec(fixture, "DELETE FROM r2_log_context_reviews WHERE id=3;",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(fixture);
+
+    char *large_policy = text(60000, 'p', "Immutable policy");
+    turn[0].content = large_policy;
+    int before = perform_count;
+    assert(!r2_foreground_chat(turn, 6, "Complete contract", query, 2048, 60) &&
+           perform_count == before);
+    free(large_policy);
+    turn[0].content = (char *)policy;
+    turn[1].content = "CURRENT TURN RETRIEVED CONTEXT\nA small complete record.";
+    set_response("A direct small-context answer.", "stop", 1);
+    before = perform_count;
+    answer = r2_foreground_chat(turn, 6, "Complete contract", query, 512, 60);
+    assert(answer && perform_count == before + 1 && captured_contains(turn[1].content));
+    free(answer);
+    free(history);
+    ollama_foreground_turn_mode = 0;
+    ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+}
+
 static void check_staged_imagination(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
@@ -340,6 +430,7 @@ int main(void)
     assert(r2_log_init() == 0);
     check_boundaries();
     check_retry_and_isolated_inputs();
+    check_foreground_context_review();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
     char *query = text(1000, 'u', "ACTUAL CURRENT USER: ");

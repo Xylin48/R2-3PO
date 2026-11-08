@@ -209,6 +209,12 @@ int64_t r2_log_hypothetical(const char *scenario,
                             const char *conclusion,
                             const char *origin);
 
+/* Complete inference snapshots use an archive outside ordinary event recall.
+ * Returned text is caller-owned. Missing or unreadable snapshots return NULL. */
+int64_t r2_log_archive_context_review(const char *request, const char *original,
+                                       const char *notes);
+char *r2_log_read_context_review(int64_t archive_id);
+
 /* Life Log overview. Caller frees returned text. */
 char *r2_log_status_report(void);
 

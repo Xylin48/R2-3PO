@@ -526,6 +526,13 @@ static int ensure_tables(void)
         " origin TEXT,"
         " FOREIGN KEY(event_id) REFERENCES r2_log_events(id)"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_context_reviews ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " request TEXT NOT NULL,"
+        " original_context TEXT NOT NULL,"
+        " review_notes TEXT NOT NULL,"
+        " created_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_system_snapshots ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -1916,6 +1923,67 @@ int64_t r2_log_hypothetical(const char *scenario,
     sqlite3_finalize(st);
     pthread_mutex_unlock(&log_lock);
     return rc == SQLITE_DONE ? event_id : -1;
+}
+
+/* Keep complete processing snapshots outside ordinary event recall so later
+ * requests cannot recursively retrieve copies of previous snapshots. */
+int64_t r2_log_archive_context_review(const char *request, const char *original,
+                                       const char *notes)
+{
+    if (!request || !original || !notes) return -1;
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "INSERT INTO r2_log_context_reviews(request,original_context,review_notes) VALUES(?,?,?);",
+        -1, &st, NULL);
+    const char *fields[] = {request, original, notes};
+    for (int i = 0; i < 3 && rc == SQLITE_OK; ++i)
+        rc = sqlite3_bind_text64(st, i + 1, fields[i], strlen(fields[i]), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int64_t id = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1
+        ? sqlite3_last_insert_rowid(log_db) : -1;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return id;
+}
+
+char *r2_log_read_context_review(int64_t id)
+{
+    if (id <= 0) return NULL;
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db) {
+        pthread_mutex_unlock(&log_lock);
+        return NULL;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT request,original_context,review_notes FROM r2_log_context_reviews WHERE id=?;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    char *out = NULL;
+    if (rc == SQLITE_ROW) {
+        const char *fields[3];
+        for (int i = 0; i < 3; ++i) {
+            fields[i] = (const char *)sqlite3_column_text(st, i);
+            if (!fields[i] || strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i))
+                goto done;
+        }
+        if (asprintf(&out,
+            "CONTEXT REVIEW SNAPSHOT\nRequest:\n%s\n\n"
+            "ORIGINAL HISTORICAL CONTEXT:\n%s\n\n"
+            "MODEL REVIEW NOTES (interpretations, not new observations):\n%s",
+            fields[0], fields[1], fields[2]) < 0)
+            out = NULL;
+    }
+done:
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return out;
 }
 
 char *r2_log_status_report(void)
