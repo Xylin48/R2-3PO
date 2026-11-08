@@ -73,7 +73,16 @@ int main(void)
     assert(snprintf(decoder, sizeof(decoder), "%s/ffmpeg", root) < (int)sizeof(decoder));
     assert(snprintf(ready, sizeof(ready), "%s/ready", root) < (int)sizeof(ready));
     assert(snprintf(release, sizeof(release), "%s/release", root) < (int)sizeof(release));
-    write_executable(probe, "#!/bin/sh\nprintf '2x2\\n'\n");
+    write_executable(probe,
+        "#!/usr/bin/python3\n"
+        "import os, signal, sys\n"
+        "if sys.argv[-1] == 'probe-stalled':\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
+        "        f.write(str(os.getpid()))\n"
+        "    while True: signal.pause()\n"
+        "print('2x2')\n"
+        "if sys.argv[-1] == 'probe-failed': sys.exit(7)\n");
     write_executable(decoder,
         "#!/usr/bin/python3\n"
         "import os, signal, sys, time\n"
@@ -109,11 +118,21 @@ int main(void)
     shutting_down = 0;
     assert(r2_eyes_init(&eyes) == 0);
 
+    /* Opening has a bounded metadata budget even before a capture worker can
+     * exist. An exit error cannot legitimize plausible dimensions either. */
+    double start = monotonic_seconds();
+    assert(r2_eyes_open_file(eyes, "probe-stalled") == -1);
+    assert(monotonic_seconds() - start < 7.0 && !r2_eyes_is_open(eyes));
+    pid_t child = wait_for_child(ready);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+    assert(r2_eyes_open_file(eyes, "probe-failed") == -1);
+
     /* Stop must wake a worker blocked before its first complete frame. */
     assert(r2_eyes_open_file(eyes, "stalled") == 0);
     assert(r2_vision_watch_start() == 0);
-    pid_t child = wait_for_child(ready);
-    double start = monotonic_seconds();
+    child = wait_for_child(ready);
+    start = monotonic_seconds();
     assert(r2_vision_watch_stop() == 0);
     assert(monotonic_seconds() - start < 2.0);
     assert(!r2_vision_watch_active() && r2_eyes_is_open(eyes));

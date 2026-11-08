@@ -1386,12 +1386,15 @@ static void *shell_watch_worker(void *unused)
             r2_ears_status_desktop() > 0;
         int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
-        int vlc_available = r2_vision_vlc_available() && desktop_playing;
+        int vlc_available = desktop_playing && r2_vision_vlc_available();
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
         long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
         unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
@@ -1498,7 +1501,9 @@ static void *shell_watch_worker(void *unused)
             free(primary_source);
         }
 
+snapshot_finished:
         if (audio_known) r2_audio_discovery_free(&audio);
+        if (shell_watch_cancelled(NULL)) break;
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)

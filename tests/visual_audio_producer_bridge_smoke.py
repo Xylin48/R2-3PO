@@ -25,7 +25,7 @@ assert "r2_discovery_pid(pid)" in probe
 assert "r2_audio_discover(&sources)" in ears
 vision = eyes[eyes.index("unsigned long r2_eyes_window_for_pid(long pid)"):
               eyes.index("static FILE *r2_eyes_start_vlc(")]
-assert 'xdotool search --onlyvisible --pid' in vision
+assert '"xdotool", "search", "--onlyvisible", "--pid"' in vision
 assert 'r2_eyes_probe_vlc_dimensions(candidate' in vision
 assert 'r2_eyes_start_vlc(' not in vision
 worker = shell[shell.index("static void *shell_watch_worker(void *unused)"):

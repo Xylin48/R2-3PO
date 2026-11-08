@@ -252,7 +252,7 @@ jobs:
       - name: Exercise playback producer to live X11 window geometry lookup
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c Eyes.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
-          /tmp/r2-eyes-window-discovery-test
+          timeout -k 2s 25s /tmp/r2-eyes-window-discovery-test
 
       - name: Protect camera and media from stale Watch ownership and manual takeover races
         run: |

@@ -369,42 +369,22 @@ static uint64_t r2_eyes_timestamp(void)
            ((uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
-static char *r2_eyes_shell_quote(const char *input)
+/* Read-only discovery must not wait indefinitely for ffprobe or X11. The
+ * five-second read budget applies to an entire metadata operation, including
+ * all candidates in one window lookup, followed by bounded child cleanup.
+ * It never limits continuous frame capture. */
+#define R2_EYES_PROBE_MS 5000U
+static uint64_t r2_eyes_monotonic_ms(void);
+static char *r2_eyes_query(char *const argv[], uint64_t deadline);
+static uint64_t r2_eyes_probe_deadline(void)
 {
-    if (!input)
-        return NULL;
-
-    size_t length = strlen(input);
-    if (length > (SIZE_MAX - 3) / 4)
-        return NULL;
-    size_t max_size = (length * 4) + 3;
-
-    char *output = malloc(max_size);
-
-    if (!output)
-        return NULL;
-
-    char *p = output;
-
-    *p++ = '\'';
-
-    for (size_t i = 0; i < length; ++i)
-    {
-        if (input[i] == '\'')
-        {
-            memcpy(p, "'\\''", 4);
-            p += 4;
-        }
-        else
-        {
-            *p++ = input[i];
-        }
-    }
-
-    *p++ = '\'';
-    *p = '\0';
-
-    return output;
+    uint64_t now = r2_eyes_monotonic_ms();
+    return now >= UINT64_MAX - R2_EYES_PROBE_MS ? 0 : now + R2_EYES_PROBE_MS;
+}
+static int r2_eyes_probe_expired(uint64_t deadline)
+{
+    uint64_t now = r2_eyes_monotonic_ms();
+    return !deadline || now == UINT64_MAX || now >= deadline;
 }
 
 static int r2_eyes_probe_dimensions(
@@ -424,76 +404,35 @@ static int r2_eyes_probe_dimensions(
         return 0;
     }
 
-    char *quoted_source =
-        r2_eyes_shell_quote(source);
-
-    if (!quoted_source)
-        return -1;
-
-    char command[4096];
-
-    int command_length = snprintf(
-        command,
-        sizeof(command),
-        "ffprobe "
-        "-v error "
-        "-select_streams v:0 "
-        "-show_entries stream=width,height "
-        "-of csv=p=0:s=x "
-        "%s",
-        quoted_source
-    );
-
-    free(quoted_source);
-
-    if (command_length < 0 || (size_t)command_length >= sizeof(command))
-        return -1;
-
-    FILE *probe = popen(command, "r");
-
-    if (!probe)
-        return -1;
-
-    char dimensions[128];
-    int result = fgets(dimensions, sizeof(dimensions), probe) ? 0 : -1;
-    int status = pclose(probe);
-    if (result != 0 || status == -1 ||
-        !WIFEXITED(status) || WEXITSTATUS(status) != 0)
-        return -1;
+    char *argv[] = {"ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+        (char *)source, NULL};
+    char *dimensions = r2_eyes_query(argv, r2_eyes_probe_deadline());
+    if (!dimensions) return -1;
 
     char *separator = strchr(dimensions, 'x');
-    if (!separator)
-        return -1;
-    *separator = '\0';
-
-    errno = 0;
-    char *end = NULL;
-    unsigned long w = strtoul(dimensions, &end, 10);
-    if (errno || end == dimensions)
-        return -1;
-    while (*end && isspace((unsigned char)*end)) ++end;
-    if (*end != '\0')
-        return -1;
-
-    errno = 0;
-    char *height_text = separator + 1;
-    unsigned long h = strtoul(height_text, &end, 10);
-    if (errno || end == height_text)
-        return -1;
-    while (*end && isspace((unsigned char)*end)) ++end;
-    if (*end != '\0' || w == 0 || h == 0 ||
-        w > UINT32_MAX || h > UINT32_MAX)
-        return -1;
-
-    if ((size_t)w > R2_EYES_MAX_FRAME_BYTES / 3U / (size_t)h)
-        return -1;
-    size_t required = (size_t)w * (size_t)h * 3U;
-    if (required > R2_EYES_MAX_FRAME_BYTES)
-        return -1;
-
-    *width = (uint32_t)w;
-    *height = (uint32_t)h;
-
+    uint32_t w = 0, h = 0;
+    int valid = 0;
+    if (separator) {
+        *separator = '\0';
+        errno = 0;
+        char *end;
+        unsigned long a = strtoul(dimensions, &end, 10);
+        while (*end && isspace((unsigned char)*end)) ++end;
+        if (!errno && end != dimensions && !*end && a && a <= UINT32_MAX) {
+            w = (uint32_t)a;
+            const char *height_text = separator + 1;
+            unsigned long b = strtoul(height_text, &end, 10);
+            while (*end && isspace((unsigned char)*end)) ++end;
+            if (!errno && end != height_text && !*end && b && b <= UINT32_MAX)
+                h = (uint32_t)b;
+        }
+        valid = w && h && (size_t)w <= R2_EYES_MAX_FRAME_BYTES / 3U / (size_t)h;
+    }
+    free(dimensions);
+    if (!valid) { errno = EINVAL; return -1; }
+    *width = w;
+    *height = h;
     return 0;
 }
 
@@ -571,7 +510,7 @@ static uint64_t r2_eyes_monotonic_ms(void)
 
 /* Only the reader is nonblocking: the writer retains normal backpressure.
  * A private process group also permits cleanup of a decoder's helper children. */
-static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out)
+static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out, int quiet)
 {
     extern char **environ;
     int pipes[2];
@@ -597,6 +536,8 @@ static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out)
     if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
     if (rc == 0 && pipes[1] != STDOUT_FILENO)
         rc = posix_spawn_file_actions_addclose(&actions, pipes[1]);
+    if (rc == 0 && quiet)
+        rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     if (rc == 0)
         rc = posix_spawnp(child_out, argv[0], &actions, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
@@ -624,6 +565,7 @@ static void r2_eyes_close_stream(FILE *stream, pid_t *child)
     while (result < 0 && errno == EINTR);
     if (result == 0) {
         (void)kill(-*child, SIGTERM);
+        (void)kill(*child, SIGTERM); /* The owned child may have changed groups. */
         uint64_t start = r2_eyes_monotonic_ms();
         for (;;) {
             do { result = waitpid(*child, &status, WNOHANG); }
@@ -637,6 +579,7 @@ static void r2_eyes_close_stream(FILE *stream, pid_t *child)
         }
         if (result == 0) {
             (void)kill(-*child, SIGKILL);
+            (void)kill(*child, SIGKILL);
             do { result = waitpid(*child, &status, 0); }
             while (result < 0 && errno == EINTR);
         }
@@ -696,6 +639,60 @@ static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
     }
     eyes->pending_frame_bytes = 0;
     return 1;
+}
+
+/* Retain the complete query output, require a successful child exit, and
+ * discard the whole snapshot on timeout/read/allocation failure. */
+static char *r2_eyes_query(char *const argv[], uint64_t deadline)
+{
+    if (r2_eyes_probe_expired(deadline)) { errno = ETIMEDOUT; return NULL; }
+    R2Eyes process = {0};
+    process.stream = r2_eyes_spawn_stream(argv, &process.stream_child, 1);
+    if (!process.stream) return NULL;
+    char *output = NULL;
+    size_t length = 0, capacity = 0;
+    for (;;) {
+        if (r2_eyes_probe_expired(deadline)) { errno = ETIMEDOUT; break; }
+        struct pollfd input = {.fd = fileno(process.stream), .events = POLLIN};
+        int ready = poll(&input, 1, 50);
+        if (ready < 0) { if (errno == EINTR) continue; break; }
+        if (!ready) continue;
+        if (input.revents & POLLNVAL) { errno = EBADF; break; }
+        char block[4096];
+        ssize_t got = read(input.fd, block, sizeof(block));
+        if (got < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
+        if (got == 0) {
+            if (r2_eyes_stream_eof(&process, NULL, NULL) < 0) break;
+            if (!output) output = strdup("");
+            r2_eyes_close_stream(process.stream, &process.stream_child);
+            return output;
+        }
+        if (memchr(block, 0, (size_t)got)) { errno = EPROTO; break; }
+        if ((size_t)got > SIZE_MAX - length - 1U) { errno = EOVERFLOW; break; }
+        size_t needed = length + (size_t)got + 1U;
+        if (needed > capacity) {
+            size_t next = capacity ? capacity : 4096U;
+            while (next < needed) {
+                if (next > SIZE_MAX / 2U) { next = needed; break; }
+                next *= 2U;
+            }
+            char *grown = realloc(output, next);
+            if (!grown) break;
+            output = grown;
+            capacity = next;
+        }
+        memcpy(output + length, block, (size_t)got);
+        length += (size_t)got;
+        output[length] = '\0';
+    }
+    int saved = errno;
+    free(output);
+    r2_eyes_close_stream(process.stream, &process.stream_child);
+    errno = saved;
+    return NULL;
 }
 
 static void r2_eyes_reset_frame(R2Eyes *eyes)
@@ -772,7 +769,7 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
     char *file[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-re", "-i", (char *)input, "-vf", filter, "-f", "rawvideo", "-pix_fmt",
         "rgb24", "pipe:1", NULL};
-    return r2_eyes_spawn_stream(live_device ? camera : file, child_out);
+    return r2_eyes_spawn_stream(live_device ? camera : file, child_out, 0);
 }
 
 /* ============================================================
@@ -784,135 +781,61 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
  *
  * Eyes captures the VLC window itself, NOT the entire desktop.
  */
-static int r2_eyes_find_vlc_window(
-    unsigned long *window_id)
+static int r2_eyes_find_vlc_window(unsigned long *window_id, uint64_t deadline)
 {
-    if (!window_id)
-        return -1;
-
-    FILE *pipe =
-        popen(
-            "xdotool search --onlyvisible "
-            "--class '^vlc$' 2>/dev/null",
-            "r"
-        );
-
-    if (!pipe)
-        return -1;
-
-    unsigned long id = 0;
-
-    int result =
-        fscanf(pipe, "%lu", &id);
-
-    int status =
-        pclose(pipe);
-
-    if (result != 1 ||
-        status == -1 ||
-        id == 0)
-    {
-        return -1;
-    }
-
+    if (!window_id) return -1;
+    char *argv[] = {"xdotool", "search", "--onlyvisible", "--class", "^vlc$", NULL};
+    char *output = r2_eyes_query(argv, deadline);
+    if (!output) return -1;
+    char *end;
+    errno = 0;
+    unsigned long id = strtoul(output, &end, 10);
+    int valid = !errno && end != output && id && (!*end || isspace((unsigned char)*end));
+    free(output);
+    if (!valid) return -1;
     *window_id = id;
-
     return 0;
 }
 
 int r2_eyes_vlc_available(void)
 {
     unsigned long window_id = 0;
-    return r2_eyes_find_vlc_window(&window_id) == 0;
+    return r2_eyes_find_vlc_window(&window_id, r2_eyes_probe_deadline()) == 0;
 }
 
-/*
- * Determine the current VLC window dimensions.
- *
- * These dimensions become R2's native visual input size
- * for the VLC source.
- */
-static int r2_eyes_probe_vlc_dimensions(
-    unsigned long window_id,
-    uint32_t *width,
-    uint32_t *height)
+static int r2_eyes_probe_vlc_dimensions(unsigned long window_id,
+                                        uint32_t *width, uint32_t *height,
+                                        uint64_t deadline)
 {
-    if (!width ||
-        !height ||
-        window_id == 0)
-    {
-        return -1;
-    }
-
-    char command[256];
-
-    snprintf(
-        command,
-        sizeof(command),
-        "xdotool getwindowgeometry "
-        "--shell %lu 2>/dev/null",
-        window_id
-    );
-
-    FILE *pipe =
-        popen(command, "r");
-
-    if (!pipe)
-        return -1;
-
-    unsigned int w = 0;
-    unsigned int h = 0;
-
-    char line[128];
-
-    while (fgets(
-        line,
-        sizeof(line),
-        pipe))
-    {
-        unsigned int value;
-
-        if (sscanf(
-            line,
-            "WIDTH=%u",
-            &value) == 1)
-        {
-            w = value;
+    if (!width || !height || !window_id) return -1;
+    char window[32];
+    snprintf(window, sizeof(window), "%lu", window_id);
+    char *argv[] = {"xdotool", "getwindowgeometry", "--shell", window, NULL};
+    char *output = r2_eyes_query(argv, deadline);
+    if (!output) return -1;
+    uint32_t w = 0, h = 0;
+    int valid = 1;
+    char *save = NULL;
+    for (char *line = strtok_r(output, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        uint32_t *target = !strncmp(line, "WIDTH=", 6) ? &w :
+                           !strncmp(line, "HEIGHT=", 7) ? &h : NULL;
+        if (!target) continue;
+        const char *text = strchr(line, '=') + 1;
+        char *end;
+        errno = 0;
+        unsigned long value = strtoul(text, &end, 10);
+        while (*end && isspace((unsigned char)*end)) ++end;
+        if (errno || end == text || *end || !value || value > UINT32_MAX) {
+            valid = 0; break;
         }
-
-        if (sscanf(
-            line,
-            "HEIGHT=%u",
-            &value) == 1)
-        {
-            h = value;
-        }
+        *target = (uint32_t)value;
     }
-
-    int status =
-        pclose(pipe);
-
-    if (status == -1 ||
-        w == 0 ||
-        h == 0)
-    {
-        return -1;
+    free(output);
+    if (!valid || !w || !h || (size_t)w > R2_EYES_MAX_FRAME_BYTES / 3U / (size_t)h) {
+        errno = EINVAL; return -1;
     }
-
-    size_t required =
-        (size_t)w *
-        (size_t)h *
-        3;
-
-    if (required >
-        R2_EYES_MAX_FRAME_BYTES)
-    {
-        return -1;
-    }
-
-    *width = (uint32_t)w;
-    *height = (uint32_t)h;
-
+    *width = w;
+    *height = h;
     return 0;
 }
 
@@ -926,25 +849,33 @@ static int r2_eyes_probe_vlc_dimensions(
 unsigned long r2_eyes_window_for_pid(long pid)
 {
     if (pid <= 1 || pid > INT_MAX) return 0;
-    char command[160];
-    int n = snprintf(command, sizeof(command),
-                     "xdotool search --onlyvisible --pid %ld 2>/dev/null", pid);
-    if (n < 0 || (size_t)n >= sizeof(command)) return 0;
-    FILE *pipe = popen(command, "r");
-    if (!pipe) return 0;
-    unsigned long best = 0, candidate = 0;
+    uint64_t deadline = r2_eyes_probe_deadline();
+    char process_id[32];
+    snprintf(process_id, sizeof(process_id), "%ld", pid);
+    char *argv[] = {"xdotool", "search", "--onlyvisible", "--pid", process_id, NULL};
+    char *output = r2_eyes_query(argv, deadline);
+    if (!output) return 0;
+    unsigned long best = 0;
     uint64_t best_area = 0;
-    while (fscanf(pipe, "%lu", &candidate) == 1) {
-        uint32_t width = 0, height = 0;
-        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height) != 0)
-            continue;
-        uint64_t area = (uint64_t)width * height;
-        if (area > best_area) {
-            best = candidate;
-            best_area = area;
+    char *cursor = output;
+    while (*cursor) {
+        while (*cursor && isspace((unsigned char)*cursor)) ++cursor;
+        if (!*cursor) break;
+        char *end;
+        errno = 0;
+        unsigned long candidate = strtoul(cursor, &end, 10);
+        if (errno || end == cursor || !candidate || (*end && !isspace((unsigned char)*end))) {
+            best = 0; break;
         }
+        cursor = end;
+        uint32_t width = 0, height = 0;
+        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height, deadline) == 0) {
+            uint64_t area = (uint64_t)width * height;
+            if (area > best_area) { best = candidate; best_area = area; }
+        }
+        if (r2_eyes_probe_expired(deadline)) { best = 0; break; }
     }
-    (void)pclose(pipe);
+    free(output);
     return best;
 }
 
@@ -959,7 +890,7 @@ static FILE *r2_eyes_start_vlc(unsigned long window_id, pid_t *child_out)
         "-f", "x11grab", "-framerate", fps, "-window_id", window, "-draw_mouse", "0",
         "-i", (char *)display, "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt",
         "rgb24", "-r", fps, "pipe:1", NULL};
-    return r2_eyes_spawn_stream(argv, child_out);
+    return r2_eyes_spawn_stream(argv, child_out, 0);
 }
 
 /* ============================================================
@@ -1329,7 +1260,7 @@ int r2_eyes_window_available(unsigned long window_id)
 {
     uint32_t width = 0, height = 0;
     return window_id != 0 &&
-        r2_eyes_probe_vlc_dimensions(window_id, &width, &height) == 0;
+        r2_eyes_probe_vlc_dimensions(window_id, &width, &height, r2_eyes_probe_deadline()) == 0;
 }
 
 int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
@@ -1337,7 +1268,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     if (!eyes || window_id == 0) return -1;
     r2_eyes_close(eyes);
     uint32_t width = 0, height = 0;
-    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height) != 0 ||
+    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height, r2_eyes_probe_deadline()) != 0 ||
         r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
         r2_eyes_allocate_record_buffer(eyes) != 0)
         return -1;
@@ -1370,10 +1301,11 @@ int r2_eyes_open_vlc(
 
     r2_eyes_close(eyes);
 
+    uint64_t deadline = r2_eyes_probe_deadline();
     unsigned long window_id = 0;
 
     if (r2_eyes_find_vlc_window(
-            &window_id) != 0)
+            &window_id, deadline) != 0)
     {
         r2_log_sensory("vlc_window_not_found",
                        "R2 Eyes could not find a visible VLC window.",
@@ -1388,7 +1320,7 @@ int r2_eyes_open_vlc(
     if (r2_eyes_probe_vlc_dimensions(
             window_id,
             &width,
-            &height) != 0)
+            &height, deadline) != 0)
     {
         return -1;
     }
@@ -1432,24 +1364,31 @@ int r2_eyes_open_vlc(
      * useful for later history searches, but is not treated as proof of
      * the actual media contents.
      */
-    char title_command[256];
-    snprintf(title_command, sizeof(title_command),
-             "xdotool getwindowname %lu 2>/dev/null", window_id);
-    FILE *title_pipe = popen(title_command, "r");
-    char window_title[sizeof(eyes->source_name)] = "VLC";
-    if (title_pipe) {
-        if (!fgets(window_title, sizeof(window_title), title_pipe))
-            snprintf(window_title, sizeof(window_title), "VLC");
-        pclose(title_pipe);
-        size_t title_len = strlen(window_title);
-        while (title_len > 0 &&
-               (window_title[title_len - 1] == '\n' ||
-                window_title[title_len - 1] == '\r'))
-            window_title[--title_len] = '\0';
-        if (title_len == 0)
-            snprintf(window_title, sizeof(window_title), "VLC");
+    char window[32];
+    snprintf(window, sizeof(window), "%lu", window_id);
+    char *title_argv[] = {"xdotool", "getwindowname", window, NULL};
+    char *window_title = r2_eyes_query(title_argv, deadline);
+    if (!window_title && errno == ETIMEDOUT) {
+        r2_eyes_close(eyes);
+        errno = ETIMEDOUT;
+        return -1;
     }
-    snprintf(eyes->source_name, sizeof(eyes->source_name), "%s", window_title);
+    if (window_title) {
+        size_t length = strlen(window_title);
+        while (length && (window_title[length - 1] == '\n' || window_title[length - 1] == '\r'))
+            window_title[--length] = '\0';
+        /* The current public event representation still has a fixed source
+         * field. Do not silently present a partial title as the full identity. */
+        if (length >= sizeof(eyes->source_name)) {
+            free(window_title);
+            r2_eyes_close(eyes);
+            errno = EOVERFLOW;
+            return -1;
+        }
+    }
+    snprintf(eyes->source_name, sizeof(eyes->source_name), "%s",
+             window_title && *window_title ? window_title : "VLC");
+    free(window_title);
 
     eyes->frame_count = 0;
     eyes->timestamp = 0;
