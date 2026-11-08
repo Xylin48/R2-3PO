@@ -350,6 +350,7 @@ static int migrate_legacy_log_schema(void)
         {"r2_log_hypotheticals","conclusion","TEXT"},
         {"r2_log_hypotheticals","origin","TEXT"},
 
+        {"r2_log_context_reviews","conversation_event_id","INTEGER"},
         {"r2_log_system_snapshots","event_id","INTEGER NOT NULL DEFAULT 0"},
         {"r2_log_system_snapshots","hostname","TEXT"},
         {"r2_log_system_snapshots","operating_system","TEXT"},
@@ -531,6 +532,7 @@ static int ensure_tables(void)
         " request TEXT NOT NULL,"
         " original_context TEXT NOT NULL,"
         " review_notes TEXT NOT NULL,"
+        " conversation_event_id INTEGER,"
         " created_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
         "CREATE TABLE IF NOT EXISTS r2_log_system_snapshots ("
@@ -1951,6 +1953,29 @@ int64_t r2_log_archive_context_review(const char *request, const char *original,
     return id;
 }
 
+int r2_log_link_context_review(int64_t archive_id, int64_t conversation_id)
+{
+    if (archive_id <= 0 || conversation_id <= 0) return -1;
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "UPDATE r2_log_context_reviews SET conversation_event_id=?1 WHERE id=?2 "
+        "AND (conversation_event_id IS NULL OR conversation_event_id=?1) "
+        "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?1 AND event_type='conversation_turn');",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, conversation_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, archive_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int linked = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return linked ? 0 : -1;
+}
+
 char *r2_log_read_context_review(int64_t id)
 {
     if (id <= 0) return NULL;
@@ -1961,7 +1986,7 @@ char *r2_log_read_context_review(int64_t id)
     }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(log_db,
-        "SELECT request,original_context,review_notes FROM r2_log_context_reviews WHERE id=?;",
+        "SELECT request,original_context,review_notes,conversation_event_id FROM r2_log_context_reviews WHERE id=?;",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
@@ -1973,11 +1998,14 @@ char *r2_log_read_context_review(int64_t id)
             if (!fields[i] || strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i))
                 goto done;
         }
+        char linked[64] = "pending";
+        if (sqlite3_column_type(st, 3) != SQLITE_NULL)
+            snprintf(linked, sizeof(linked), "%lld", (long long)sqlite3_column_int64(st, 3));
         if (asprintf(&out,
-            "CONTEXT REVIEW SNAPSHOT\nRequest:\n%s\n\n"
+            "CONTEXT REVIEW SNAPSHOT\nConversation event ID: %s\nRequest:\n%s\n\n"
             "ORIGINAL HISTORICAL CONTEXT:\n%s\n\n"
             "MODEL REVIEW NOTES (interpretations, not new observations):\n%s",
-            fields[0], fields[1], fields[2]) < 0)
+            linked, fields[0], fields[1], fields[2]) < 0)
             out = NULL;
     }
 done:

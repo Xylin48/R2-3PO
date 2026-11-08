@@ -418,6 +418,35 @@ static void r2_audio_turn_link(int64_t event_id, const R2AudioTurnEvidence *evid
     r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_turn");
 }
 
+typedef struct {
+    int64_t *archives;
+    size_t count;
+} R2TurnContextReviews;
+static _Thread_local R2TurnContextReviews *r2_turn_context_reviews;
+
+static int r2_context_turn_record(int64_t archive_id)
+{
+    R2TurnContextReviews *scope = r2_turn_context_reviews;
+    if (!scope) return 0; /* Isolated inspection has no conversation owner. */
+    if (scope->count >= SIZE_MAX / sizeof(*scope->archives)) return -1;
+    int64_t *grown = realloc(scope->archives, (scope->count + 1) * sizeof(*grown));
+    if (!grown) return -1;
+    scope->archives = grown;
+    scope->archives[scope->count++] = archive_id;
+    return 0;
+}
+
+static void r2_context_turn_link(int64_t conversation_id)
+{
+    if (!r2_turn_context_reviews || conversation_id <= 0) return;
+    for (size_t i = 0; i < r2_turn_context_reviews->count; ++i) {
+        int64_t archive = r2_turn_context_reviews->archives[i];
+        if (r2_log_link_context_review(archive, conversation_id) != 0)
+            fprintf(stderr, "[R2 Context] Could not link review archive #%lld to conversation #%lld.\n",
+                    (long long)archive, (long long)conversation_id);
+    }
+}
+
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
 static char *append_reality_context(char *base);
 static void autonomous_needs_check(void);
@@ -4785,7 +4814,10 @@ static char *r2_foreground_chat(Message *messages, size_t count,
                     (long long)archive_id);
     }
     free(snapshot); free(trace);
-    if (archive_id <= 0) { free(notes); return NULL; }
+    if (archive_id <= 0 || r2_context_turn_record(archive_id) != 0) {
+        free(notes);
+        return NULL;
+    }
     char *replacement = NULL;
     if (asprintf(&replacement, heading_format, (long long)archive_id, notes) < 0) {
         free(notes); free(replacement);
@@ -13781,6 +13813,7 @@ finalize_reply:
 
     int64_t turn_event_id = r2_log_conversation_turn(message, reply);
     r2_audio_turn_link(turn_event_id, r2_audio_turn_evidence);
+    r2_context_turn_link(turn_event_id);
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -13923,6 +13956,9 @@ char *r2_talk(const char *message)
     pthread_mutex_lock(&conversation_turn_lock);
     int previous_turn_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
+    R2TurnContextReviews context_reviews = {0};
+    R2TurnContextReviews *previous_reviews = r2_turn_context_reviews;
+    r2_turn_context_reviews = &context_reviews;
     R2AudioTurnEvidence speech_evidence = {0};
     R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
     r2_audio_turn_evidence = &speech_evidence;
@@ -13950,6 +13986,8 @@ char *r2_talk(const char *message)
             "I'm sorry—I couldn't process that turn successfully. "
             "The message may not have been saved to conversation history; please try again.");
     }
+    r2_turn_context_reviews = previous_reviews;
+    free(context_reviews.archives);
     r2_audio_turn_evidence = previous_evidence;
     free(speech_evidence.events);
     ollama_foreground_turn_mode = previous_turn_mode;

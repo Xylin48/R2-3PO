@@ -323,6 +323,8 @@ static void check_foreground_context_review(void)
         {.role="assistant", .content="[R2_INTERNAL_TOOL_REQUEST]\nCompleted"},
         {.role="user", .content=(char *)handoff, .internal_tool_result=1},
     };
+    R2TurnContextReviews context_scope = {0};
+    r2_turn_context_reviews = &context_scope;
     ollama_authoritative_user_query = query;
     ollama_audit_stage = "conversation-answer";
     ollama_foreground_turn_mode = 1;
@@ -337,10 +339,18 @@ static void check_foreground_context_review(void)
     assert(!strcmp(turn[1].content, history));
     free(answer);
     free(reviewed_bytes); reviewed_bytes = NULL; reviewed_size = 0; staged_calls = 0;
+    int64_t conversation = r2_log_conversation_turn(query, "Verified answer");
+    int64_t repeated = r2_log_conversation_turn(query, "A different answer to the same text");
+    assert(conversation > 0 && repeated > 0 && conversation != repeated && context_scope.count == 1);
+    r2_context_turn_link(conversation);
+    assert(r2_log_link_context_review(context_scope.archives[0], conversation) == 0);
+    assert(r2_log_link_context_review(context_scope.archives[0], repeated) != 0);
     r2_log_shutdown();
     assert(r2_log_init() == 0);
     char *stored = r2_log_read_context_review(2);
-    assert(stored && strstr(stored, history));
+    char link[96];
+    snprintf(link, sizeof(link), "Conversation event ID: %lld", (long long)conversation);
+    assert(stored && strstr(stored, history) && strstr(stored, link));
     free(stored);
     stored = r2_log_search("context_reviewed", 10);
     assert(stored && !strstr(stored, history) && strstr(stored, "context_archive_id="));
@@ -383,6 +393,8 @@ static void check_foreground_context_review(void)
     assert(answer && perform_count == before + 1 && captured_contains(turn[1].content));
     free(answer);
     free(history);
+    free(context_scope.archives);
+    r2_turn_context_reviews = NULL;
     ollama_foreground_turn_mode = 0;
     ollama_authoritative_user_query = NULL;
     ollama_audit_stage = NULL;

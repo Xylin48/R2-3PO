@@ -214,6 +214,8 @@ int64_t r2_log_hypothetical(const char *scenario,
 int64_t r2_log_archive_context_review(const char *request, const char *original,
                                        const char *notes);
 char *r2_log_read_context_review(int64_t archive_id);
+/* Link once to an actual conversation event. Repeating the same link is safe. */
+int r2_log_link_context_review(int64_t archive_id, int64_t conversation_id);
 
 /* Life Log overview. Caller frees returned text. */
 char *r2_log_status_report(void);
