@@ -210,6 +210,20 @@ static int captured_contains(const char *needle)
     return 0;
 }
 
+static int64_t unavailable_camera_events(void)
+{
+    sqlite3 *fixture = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(fixture,
+        "SELECT count(*) FROM r2_log_events WHERE event_type='visual_input_unavailable';",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+    int64_t count = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+    return count;
+}
+
 static void check_retry_and_isolated_inputs(void)
 {
     char *history = text(5000, 'h', "R2 PERSISTENT MEMORY - STARTUP CONTEXT quoted as text. ");
@@ -243,9 +257,13 @@ static void check_retry_and_isolated_inputs(void)
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
     ollama_authoritative_user_query = "outer user turn";
     ollama_audit_stage = "conversation-answer";
+    int64_t camera_before = unavailable_camera_events();
+    ollama_autonomous_sensory_input = 1;
     set_response("Isolated answer", "stop", 1);
     answer = r2_model_generate("Isolated contract", prompt, 700);
     assert(answer && captured_contains(prompt) && !captured_contains("outer user turn"));
+    assert(unavailable_camera_events() == camera_before &&
+           ollama_autonomous_sensory_input == 1 && !ollama_isolated_request);
     assert(!strcmp(ollama_authoritative_user_query, "outer user turn"));
     assert(!strcmp(ollama_audit_stage, "conversation-answer"));
     free(answer);
@@ -253,8 +271,10 @@ static void check_retry_and_isolated_inputs(void)
     set_response("must not send clipped prompt", "stop", 1);
     before = perform_count;
     assert(!r2_model_generate("Isolated contract", prompt, 700) && perform_count == before);
+    assert(!ollama_isolated_request && ollama_autonomous_sensory_input == 1);
     ollama_authoritative_user_query = NULL;
     ollama_audit_stage = NULL;
+    ollama_autonomous_sensory_input = 0;
     free(prompt);
 }
 

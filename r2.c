@@ -162,6 +162,7 @@ static _Thread_local int ollama_progress_clock_valid = 0;
 static _Thread_local const char *ollama_authoritative_user_query = NULL;
 /* Only explicit foreground turns and autonomous reflection may receive live raw imagery. */
 static _Thread_local int ollama_autonomous_sensory_input = 0;
+static _Thread_local int ollama_isolated_request = 0;
 /* Labels prompt audits so intermediate planning calls cannot be confused with the final answer request. */
 static _Thread_local const char *ollama_audit_stage = "unspecified";
 static pthread_mutex_t post_turn_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -4281,6 +4282,7 @@ static char *ollama_chat_with_limit(
             *ollama_authoritative_user_query &&
             strstr(content, ollama_authoritative_user_query);
         if (i == current_user_index && !strcmp(role, "user") &&
+            !ollama_isolated_request &&
             (active_foreground_turn || ollama_autonomous_sensory_input)) {
             /* Live Eyes never becomes the movie. Chosen attention may add its
                separate display as image two on the same model turn. */
@@ -4721,6 +4723,8 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt,
     if (num_predict > 2048) num_predict = 2048;
 
     int previous_mode = ollama_background_mode;
+    int previous_isolated = ollama_isolated_request;
+    ollama_isolated_request = 1;
     const char *previous_query = ollama_authoritative_user_query;
     const char *previous_stage = ollama_audit_stage;
     ollama_background_mode = ollama_foreground_turn_mode ? 0 : 1;
@@ -4730,6 +4734,7 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt,
     ollama_audit_stage = previous_stage;
     ollama_authoritative_user_query = previous_query;
     ollama_background_mode = previous_mode;
+    ollama_isolated_request = previous_isolated;
     return result;
 }
 
