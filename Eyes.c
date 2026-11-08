@@ -6,6 +6,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
 #include <glob.h>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
@@ -88,7 +90,8 @@
 struct R2Eyes
 {
     FILE *stream;
-    int open;
+    pid_t stream_child; /* Direct FFmpeg child, rather than a popen shell. */
+    atomic_int open;
     int source_is_live;
     R2VisionOrigin origin;
     R2VideoFormat format;
@@ -557,39 +560,134 @@ static int r2_eyes_allocate_record_buffer(R2Eyes *eyes)
     return 0;
 }
 
-static int r2_eyes_read_exact(
-    FILE *stream,
-    unsigned char *buffer,
-    size_t size)
+static uint64_t r2_eyes_monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return UINT64_MAX;
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/* Only the reader is nonblocking: the writer retains normal backpressure.
+ * A private process group also permits cleanup of a decoder's helper children. */
+static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out)
+{
+    extern char **environ;
+    int pipes[2];
+    *child_out = -1;
+    if (pipe2(pipes, O_CLOEXEC) != 0) return NULL;
+    int flags = fcntl(pipes[0], F_GETFL);
+    if (flags < 0 || fcntl(pipes[0], F_SETFL, flags | O_NONBLOCK) < 0)
+        goto failed;
+    FILE *stream = fdopen(pipes[0], "r");
+    if (!stream) goto failed;
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) { errno = rc; fclose(stream); close(pipes[1]); return NULL; }
+    rc = posix_spawnattr_init(&attr);
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        fclose(stream); close(pipes[1]); errno = rc; return NULL;
+    }
+    rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    if (rc == 0) rc = posix_spawnattr_setpgroup(&attr, 0);
+    if (rc == 0) rc = posix_spawn_file_actions_addclose(&actions, pipes[0]);
+    if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+    if (rc == 0 && pipes[1] != STDOUT_FILENO)
+        rc = posix_spawn_file_actions_addclose(&actions, pipes[1]);
+    if (rc == 0)
+        rc = posix_spawnp(child_out, argv[0], &actions, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipes[1]);
+    if (rc != 0) { fclose(stream); errno = rc; return NULL; }
+    return stream;
+failed:
+    {
+        int saved = errno;
+        close(pipes[0]); close(pipes[1]); errno = saved;
+        return NULL;
+    }
+}
+
+/* Called after the reader ends. Terminate a stalled child with bounded
+ * graceful cleanup, then reap it before releasing its PID ownership. */
+static void r2_eyes_close_stream(FILE *stream, pid_t *child)
+{
+    if (stream) fclose(stream);
+    if (*child <= 0) return;
+    int status;
+    pid_t result;
+    do { result = waitpid(*child, &status, WNOHANG); }
+    while (result < 0 && errno == EINTR);
+    if (result == 0) {
+        (void)kill(-*child, SIGTERM);
+        uint64_t start = r2_eyes_monotonic_ms();
+        for (;;) {
+            do { result = waitpid(*child, &status, WNOHANG); }
+            while (result < 0 && errno == EINTR);
+            if (result != 0) break;
+            uint64_t now = r2_eyes_monotonic_ms();
+            if (start == UINT64_MAX || now == UINT64_MAX ||
+                now < start || now - start >= 250U) break;
+            struct timespec pause = {0, 10000000L};
+            while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
+        }
+        if (result == 0) {
+            (void)kill(-*child, SIGKILL);
+            do { result = waitpid(*child, &status, 0); }
+            while (result < 0 && errno == EINTR);
+        }
+    }
+    *child = -1;
+}
+
+static int r2_eyes_stream_eof(R2Eyes *eyes,
+                             int (*cancelled)(void *), void *userdata)
+{
+    /* Pipe EOF alone does not establish a successful decoder exit. */
+    if (eyes->stream_child <= 0) { errno = EIO; return -1; }
+    uint64_t start = r2_eyes_monotonic_ms();
+    for (;;) {
+        if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+        int status;
+        pid_t result;
+        do { result = waitpid(eyes->stream_child, &status, WNOHANG); }
+        while (result < 0 && errno == EINTR);
+        if (result == eyes->stream_child) {
+            eyes->stream_child = -1;
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+            errno = EIO; return -1;
+        }
+        if (result < 0) return -1;
+        uint64_t now = r2_eyes_monotonic_ms();
+        if (start == UINT64_MAX || now == UINT64_MAX ||
+            now < start || now - start >= 250U) { errno = ETIMEDOUT; return -1; }
+        struct timespec pause = {0, 5000000L};
+        while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
+    }
+}
+
+static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
+                              int (*cancelled)(void *), void *userdata)
 {
     size_t total = 0;
-
-    while (total < size)
-    {
-        size_t amount =
-            fread(
-                buffer + total,
-                1,
-                size - total,
-                stream
-            );
-
-        if (amount > 0)
-        {
-            total += amount;
-            continue;
+    while (total < size) {
+        if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+        struct pollfd input = {.fd = fileno(eyes->stream), .events = POLLIN};
+        int ready = poll(&input, 1, 100);
+        if (ready < 0) { if (errno == EINTR) continue; return -1; }
+        if (!ready) continue;
+        if (input.revents & POLLNVAL) { errno = EBADF; return -1; }
+        ssize_t got = read(input.fd, buffer + total, size - total);
+        if (got > 0) { total += (size_t)got; continue; }
+        if (got == 0) {
+            if (total) { errno = EPROTO; return -1; }
+            return r2_eyes_stream_eof(eyes, cancelled, userdata);
         }
-
-        /* A pipe ending between frames is normal EOF. EOF after a partial
-           raw frame is corruption: never report a truncated frame as a clean
-           end-of-stream, because callers may otherwise keep stale pixels. */
-        if (feof(stream))
-            return total == 0 ? 0 : -1;
-
-        if (ferror(stream))
-            return -1;
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     }
-
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
     return 1;
 }
 
@@ -654,72 +752,20 @@ static void r2_eyes_reset_event(R2Eyes *eyes)
         eyes->frame_count;
 }
 
-static FILE *r2_eyes_start_ffmpeg(
-    const char *input,
-    int live_device)
+static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *child_out)
 {
-    if (!input)
-        return NULL;
-
-    char *quoted_input =
-        r2_eyes_shell_quote(input);
-
-    if (!quoted_input)
-        return NULL;
-
-    char command[4096];
-    int command_length;
-
-    if (live_device)
-    {
-        command_length = snprintf(
-            command,
-            sizeof(command),
-            "ffmpeg "
-            "-nostdin "
-            "-hide_banner "
-            "-loglevel error "
-            "-f v4l2 "
-            "-framerate %d "
-            "-video_size 640x480 "
-            "-i %s "
-            "-vf format=rgb24 "
-            "-f rawvideo "
-            "-pix_fmt rgb24 "
-            "-r %d "
-            "pipe:1",
-            R2_EYES_FPS,
-            quoted_input,
-            R2_EYES_FPS
-        );
-    }
-    else
-    {
-        command_length = snprintf(
-            command,
-            sizeof(command),
-            "ffmpeg "
-            "-nostdin "
-            "-hide_banner "
-            "-loglevel error "
-            "-re "
-            "-i %s "
-            "-vf "
-            "\"fps=%d,format=rgb24\" "
-            "-f rawvideo "
-            "-pix_fmt rgb24 "
-            "pipe:1",
-            quoted_input,
-            R2_EYES_FPS
-        );
-    }
-
-    free(quoted_input);
-
-    if (command_length < 0 || (size_t)command_length >= sizeof(command))
-        return NULL;
-
-    return popen(command, "r");
+    if (!input) return NULL;
+    char fps[32], filter[64];
+    snprintf(fps, sizeof(fps), "%d", R2_EYES_FPS);
+    snprintf(filter, sizeof(filter), "fps=%d,format=rgb24", R2_EYES_FPS);
+    char *camera[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "v4l2", "-framerate", fps, "-video_size", "640x480", "-i", (char *)input,
+        "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-r", fps,
+        "pipe:1", NULL};
+    char *file[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-re", "-i", (char *)input, "-vf", filter, "-f", "rawvideo", "-pix_fmt",
+        "rgb24", "pipe:1", NULL};
+    return r2_eyes_spawn_stream(live_device ? camera : file, child_out);
 }
 
 /* ============================================================
@@ -895,55 +941,18 @@ unsigned long r2_eyes_window_for_pid(long pid)
     return best;
 }
 
-static FILE *r2_eyes_start_vlc(
-    unsigned long window_id)
+static FILE *r2_eyes_start_vlc(unsigned long window_id, pid_t *child_out)
 {
-    if (window_id == 0)
-        return NULL;
-
-    const char *display =
-        getenv("DISPLAY");
-
-    if (!display ||
-        display[0] == '\0')
-    {
-        return NULL;
-    }
-
-    char *quoted_display =
-        r2_eyes_shell_quote(display);
-
-    if (!quoted_display)
-        return NULL;
-
-    char command[4096];
-
-    snprintf(
-        command,
-        sizeof(command),
-        "ffmpeg "
-        "-nostdin "
-        "-hide_banner "
-        "-loglevel error "
-        "-f x11grab "
-        "-framerate %d "
-        "-window_id %lu "
-        "-draw_mouse 0 "
-        "-i %s "
-        "-vf \"format=rgb24\" "
-        "-f rawvideo "
-        "-pix_fmt rgb24 "
-        "-r %d "
-        "pipe:1",
-        R2_EYES_FPS,
-        window_id,
-        quoted_display,
-        R2_EYES_FPS
-    );
-
-    free(quoted_display);
-
-    return popen(command, "r");
+    const char *display = getenv("DISPLAY");
+    if (!window_id || !display || !*display) return NULL;
+    char fps[32], window[32];
+    snprintf(fps, sizeof(fps), "%d", R2_EYES_FPS);
+    snprintf(window, sizeof(window), "%lu", window_id);
+    char *argv[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "x11grab", "-framerate", fps, "-window_id", window, "-draw_mouse", "0",
+        "-i", (char *)display, "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt",
+        "rgb24", "-r", fps, "pipe:1", NULL};
+    return r2_eyes_spawn_stream(argv, child_out);
 }
 
 /* ============================================================
@@ -979,6 +988,8 @@ int r2_eyes_init(R2Eyes **eyes)
 
     instance->origin =
         R2_VISION_NONE;
+    instance->stream_child = -1;
+    atomic_init(&instance->open, 0);
 
     instance->frame_count = 0;
     instance->timestamp = 0;
@@ -1010,7 +1021,7 @@ void r2_eyes_close(R2Eyes *eyes)
 
     if (eyes->stream)
     {
-        pclose(eyes->stream);
+        r2_eyes_close_stream(eyes->stream, &eyes->stream_child);
         eyes->stream = NULL;
     }
 
@@ -1132,7 +1143,7 @@ static int r2_eyes_open_internal(
     FILE *stream =
         r2_eyes_start_ffmpeg(
             source,
-            live_device
+            live_device, &eyes->stream_child
         );
 
     if (!stream) {
@@ -1321,7 +1332,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
         r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
         r2_eyes_allocate_record_buffer(eyes) != 0)
         return -1;
-    FILE *stream = r2_eyes_start_vlc(window_id);
+    FILE *stream = r2_eyes_start_vlc(window_id, &eyes->stream_child);
     if (!stream) return -1;
     eyes->stream = stream;
     eyes->open = 1;
@@ -1389,7 +1400,7 @@ int r2_eyes_open_vlc(
 
     FILE *stream =
         r2_eyes_start_vlc(
-            window_id
+            window_id, &eyes->stream_child
         );
 
     if (!stream)
@@ -1452,8 +1463,13 @@ int r2_eyes_open_vlc(
    FRAME CAPTURE
    ============================================================ */
 
-int r2_eyes_capture(
-    R2Eyes *eyes)
+int r2_eyes_capture(R2Eyes *eyes)
+{
+    return r2_eyes_capture_cancelable(eyes, NULL, NULL);
+}
+
+int r2_eyes_capture_cancelable(R2Eyes *eyes,
+                               int (*cancelled)(void *), void *userdata)
 {
     if (!eyes ||
         !eyes->open ||
@@ -1466,9 +1482,7 @@ int r2_eyes_capture(
 
     int result =
         r2_eyes_read_exact(
-            eyes->stream,
-            eyes->frame_buffer,
-            eyes->frame_size
+            eyes, eyes->frame_buffer, eyes->frame_size, cancelled, userdata
         );
 
     if (result == 0)
@@ -1483,11 +1497,14 @@ int r2_eyes_capture(
 
     if (result < 0)
     {
-        r2_log_sensory("visual_frame_read_failed",
-                       "R2 Eyes encountered an error reading a visual frame.",
-                       "The capture stream reported a read error.",
-                       eyes->source_name);
+        int saved = errno;
+        if (saved != ECANCELED)
+            r2_log_sensory("visual_frame_read_failed",
+                           "R2 Eyes encountered an error reading a visual frame.",
+                           "The capture stream returned incomplete pixels or a decoder error.",
+                           eyes->source_name);
         r2_eyes_close(eyes);
+        errno = saved;
         return -1;
     }
 

@@ -10451,6 +10451,13 @@ static int query_requests_visual_context(const char *query)
     return 0;
 }
 
+/* Check without taking the capture mutex: stop must wake a stalled decoder
+ * before joining the worker that currently owns that mutex. */
+static int r2_vision_capture_cancelled(void *running)
+{
+    return shutting_down || (running && !atomic_load((atomic_int *)running));
+}
+
 /* Analyze the next real frame. Never starts a camera implicitly here. */
 static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
@@ -10489,7 +10496,7 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
             return NULL;
         }
 
-        int captured = r2_eyes_capture(eyes);
+        int captured = r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL);
         if (captured != 1) {
             pthread_mutex_unlock(&visual_capture_lock);
             r2_log_sensory("vision_frame_unavailable",
@@ -10561,7 +10568,8 @@ static void *r2_media_capture_worker(void *unused)
         R2VisionFrame frame = {0};
         R2VisionEvent event = {0};
         int captured = media_eyes && r2_eyes_is_open(media_eyes)
-            ? r2_eyes_capture(media_eyes) : -1;
+            ? r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled,
+                                          &media_capture_running) : -1;
         int available = captured == 1 &&
             r2_eyes_get_frame(media_eyes, &frame) == 0 &&
             r2_eyes_get_event(media_eyes, &event) == 0 &&
@@ -10885,7 +10893,8 @@ static void *vision_watch_capture_worker(void *unused)
 
         pthread_mutex_lock(&visual_capture_lock);
         int captured = (eyes && r2_eyes_is_open(eyes))
-            ? r2_eyes_capture(eyes) : -1;
+            ? r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled,
+                                          &vision_watch_running) : -1;
         int frame_ready = captured == 1 && eyes &&
             r2_eyes_get_frame(eyes, &frame) == 0 &&
             r2_eyes_get_event(eyes, &event) == 0 &&
@@ -10982,7 +10991,7 @@ static char *r2_vision_current_frame_base64(void)
     } else {
         pthread_mutex_lock(&visual_capture_lock);
         int captured = (eyes && r2_eyes_is_open(eyes))
-            ? r2_eyes_capture(eyes) : -1;
+            ? r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL) : -1;
         if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
             r2_eyes_get_event(eyes, &event) == 0 && frame.data && frame.size > 0) {
             frame_copy = malloc(frame.size);
@@ -11249,6 +11258,9 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out)
         eyes_watch_token = 0;
         r2_sense_set_auto_allowed(1, 1);
     }
+    /* Reopening a source cannot reuse the previous worker's frame snapshot
+     * or wait behind a stalled read while holding the source-owner mutex. */
+    (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     int rc = eyes ? r2_eyes_open_camera(eyes) : -1;
     pthread_mutex_unlock(&visual_capture_lock);
