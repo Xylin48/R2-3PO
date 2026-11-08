@@ -139,6 +139,8 @@ int r2_eyes_capture(R2Eyes *eyes);
  * reenter Eyes. */
 int r2_eyes_capture_cancelable(R2Eyes *eyes,
                                int (*cancelled)(void *), void *userdata);
+/* Frame access fails until a complete capture succeeds. A returned data pointer
+ * is borrowed and may be invalidated/overwritten by the next capture or close. */
 int r2_eyes_get_frame(R2Eyes *eyes,
                       R2VisionFrame *frame);
 

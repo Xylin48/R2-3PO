@@ -53,6 +53,16 @@ static int cancel_after_partial_read(void *userdata)
     return ++*checks >= 3;
 }
 
+static void assert_no_complete_frame(R2Eyes *receiver)
+{
+    R2VisionFrame frame = {0};
+    unsigned char output[12];
+    memset(output, 0xE7, sizeof(output));
+    assert(r2_eyes_get_frame(receiver, &frame) == -1);
+    assert(r2_eyes_copy_frame(receiver, output, sizeof(output)) == -1);
+    for (size_t i = 0; i < sizeof(output); ++i) assert(output[i] == 0xE7);
+}
+
 int main(void)
 {
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
@@ -74,12 +84,14 @@ int main(void)
         "    os.write(1, b'12345')\n"
         "elif mode == 'failed':\n"
         "    sys.exit(7)\n"
-        "elif mode == 'resumable':\n"
-        "    os.write(1, bytes(range(5)))\n"
+        "elif mode in ('resumable', 'resumable-after-frame'):\n"
+        "    split = 5 if mode == 'resumable' else 17\n"
+        "    end = 24 if mode == 'resumable' else 36\n"
+        "    os.write(1, bytes(range(split)))\n"
         "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
         "        f.write(str(os.getpid()))\n"
         "    while not os.path.exists(os.environ['R2_EYES_TEST_RELEASE']): time.sleep(.001)\n"
-        "    os.write(1, bytes(range(5, 24)))\n"
+        "    os.write(1, bytes(range(split, end)))\n"
         "else:\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "    if mode == 'stalled-partial': os.write(1, b'12345')\n"
@@ -114,16 +126,43 @@ int main(void)
     /* Cancellation must preserve the manually owned stream and the incomplete
      * frame, so resuming cannot shift all subsequent RGB pixels by five bytes. */
     assert(r2_eyes_open_file(eyes, "resumable") == 0);
+    child = wait_for_child(ready);
+    assert_no_complete_frame(eyes);
     int checks = 0;
     assert(r2_eyes_capture_cancelable(eyes, cancel_after_partial_read, &checks) == -1);
     assert(errno == ECANCELED && r2_eyes_is_open(eyes));
-    child = wait_for_child(ready);
+    assert_no_complete_frame(eyes);
     FILE *release_file = fopen(release, "w");
     assert(release_file && fclose(release_file) == 0);
     for (unsigned frame_index = 0; frame_index < 2; ++frame_index) {
         assert(r2_eyes_capture(eyes) == 1);
         R2VisionFrame frame = {0};
         assert(r2_eyes_get_frame(eyes, &frame) == 0 && frame.size == 12);
+        for (size_t i = 0; i < frame.size; ++i)
+            assert(frame.data[i] == frame_index * 12 + i);
+    }
+    assert(r2_eyes_capture(eyes) == 0 && !r2_eyes_is_open(eyes));
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unlink(release) == 0);
+
+    /* A partial next frame must not be exposed with the previous frame's
+     * valid metadata after it overwrites part of the shared pixel buffer. */
+    assert(r2_eyes_open_file(eyes, "resumable-after-frame") == 0);
+    child = wait_for_child(ready);
+    assert(r2_eyes_capture(eyes) == 1);
+    R2VisionFrame prior = {0};
+    assert(r2_eyes_get_frame(eyes, &prior) == 0 && prior.frame_number == 1);
+    checks = 0;
+    assert(r2_eyes_capture_cancelable(eyes, cancel_after_partial_read, &checks) == -1);
+    assert(errno == ECANCELED && r2_eyes_is_open(eyes));
+    assert_no_complete_frame(eyes);
+    release_file = fopen(release, "w");
+    assert(release_file && fclose(release_file) == 0);
+    for (unsigned frame_index = 1; frame_index < 3; ++frame_index) {
+        assert(r2_eyes_capture(eyes) == 1);
+        R2VisionFrame frame = {0};
+        assert(r2_eyes_get_frame(eyes, &frame) == 0 && frame.size == 12);
+        assert(frame.frame_number == frame_index + 1);
         for (size_t i = 0; i < frame.size; ++i)
             assert(frame.data[i] == frame_index * 12 + i);
     }

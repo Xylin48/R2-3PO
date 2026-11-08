@@ -98,6 +98,7 @@ struct R2Eyes
 
     unsigned char *frame_buffer;
     size_t frame_size;
+    int frame_ready; /* Pixels and frame metadata describe one complete capture. */
     size_t pending_frame_bytes; /* Retained across a cancelled reader, not across source close. */
 
     unsigned char *record_buffer;
@@ -1045,6 +1046,7 @@ void r2_eyes_close(R2Eyes *eyes)
 
     eyes->open = 0;
     eyes->pending_frame_bytes = 0;
+    eyes->frame_ready = 0;
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_NONE;
     eyes->frame_count = 0;
@@ -1487,6 +1489,7 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
         return -1;
     }
 
+    eyes->frame_ready = 0;
     int result =
         r2_eyes_read_exact(
             eyes, eyes->frame_buffer, eyes->frame_size, cancelled, userdata
@@ -1562,6 +1565,7 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
         eyes->frame_count;
 
     eyes->frame.preview_session = eyes->preview_session;
+    eyes->frame_ready = 1;
     if (!eyes->auxiliary_display && eyes->preview_session &&
         eyes->preview_session == r2_eyes_preview_session()) {
         r2_vwebcam_publish_frame(eyes);
@@ -1604,8 +1608,9 @@ int r2_eyes_get_frame(
 {
     if (!eyes ||
         !frame ||
-        !eyes->open)
+        !eyes->open || !eyes->frame_ready)
     {
+        errno = EAGAIN;
         return -1;
     }
 
@@ -1621,8 +1626,9 @@ ssize_t r2_eyes_copy_frame(
 {
     if (!eyes ||
         !buffer ||
-        !eyes->open)
+        !eyes->open || !eyes->frame_ready)
     {
+        errno = EAGAIN;
         return -1;
     }
 
