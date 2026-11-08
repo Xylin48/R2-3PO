@@ -940,8 +940,10 @@ int64_t r2_log_event(
         if (rc == SQLITE_OK) rc = bind_optional_text(statement, 9, source);
         if (rc == SQLITE_OK) rc = sqlite3_step(statement);
 
-        if (rc == SQLITE_DONE)
+        if (rc == SQLITE_DONE && sqlite3_changes(log_db) == 1)
             inserted_id = sqlite3_last_insert_rowid(log_db);
+        else if (rc == SQLITE_DONE)
+            fprintf(stderr, "[R2 Life Log] Event insert did not create a row.\n");
         else
             fprintf(stderr, "[R2 Life Log] Insert/bind failed: %s (SQLite code %d)\n",
                     sqlite3_errmsg(log_db), rc);
@@ -1161,7 +1163,8 @@ int r2_log_session_start(void)
         rc = sqlite3_bind_int64(statement, 3, (sqlite3_int64)r2_log_elapsed_ms());
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 4, (int)getpid());
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc == SQLITE_DONE) id = sqlite3_last_insert_rowid(log_db);
+    if (rc == SQLITE_DONE && sqlite3_changes(log_db) == 1)
+        id = sqlite3_last_insert_rowid(log_db);
 
     sqlite3_finalize(statement);
 

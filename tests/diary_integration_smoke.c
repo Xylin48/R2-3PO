@@ -342,6 +342,23 @@ int main(void)
     assert(scalar_int("SELECT COUNT(*) FROM diary_entries "
                       "WHERE timestamp=created_at AND timestamp<>'';") == 1);
 
+    /* A skipped authoritative row must not return the previous diary ID,
+     * review it for reward, create secondary links, or append a false mirror. */
+    sqlite3 *writer = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER ignore_diary_fixture BEFORE INSERT ON diary_entries "
+        "WHEN NEW.entry='ignored diary fixture' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    int before_reward = reward_total();
+    int64_t ignored_id = -1;
+    assert(r2_diary_write_with_id("ignored diary fixture", &ignored_id) == -1);
+    assert(ignored_id == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM diary_entries;") == 1);
+    assert(reward_total() == before_reward);
+    assert(sqlite3_exec(writer, "DROP TRIGGER ignore_diary_fixture;", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(writer);
+
     log_ready = 1;
     assert(r2_diary_reconnect_history(10) >= 1);
     assert(r2_reward_reconnect_history(10) >= 1);

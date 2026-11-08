@@ -1072,7 +1072,8 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
         }
     }
     int rc = sqlite3_step(st);
-    int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(r2_diary_db) : -1;
+    int64_t id = rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) == 1
+        ? sqlite3_last_insert_rowid(r2_diary_db) : -1;
     sqlite3_finalize(st);
     return id;
 }
