@@ -316,6 +316,10 @@ const char *r2_vision_model_name(void);
 int r2_vision_watch_start(void);
 int r2_vision_watch_stop(void);
 int r2_vision_watch_active(void);
+/* Discovery may claim only a worker it started; manual start revokes its claim. */
+uint64_t r2_vision_watch_start_for_watch(void);
+int r2_vision_watch_stop_if_watch_owned(uint64_t token);
+int r2_vision_watch_owns(uint64_t token);
 char *r2_vision_see(const char *question);
 char *r2_vision_recent(int limit);
 char *r2_vision_search(const char *query, int limit);

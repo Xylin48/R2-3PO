@@ -11,8 +11,8 @@ visual_header = (ROOT / "Visual.h").read_text(encoding="utf-8")
 # Eyes continuously captures and publishes a stable latest-frame snapshot.
 capture_start = core.index("static void *vision_watch_capture_worker(void *unused)")
 worker_start = core.index("static void *vision_watch_worker(void *unused)", capture_start)
-start_start = core.index("int r2_vision_watch_start(void)", worker_start)
-stop_start = core.index("int r2_vision_watch_stop(void)", start_start)
+start_start = core.index("static int r2_vision_watch_start_impl(", worker_start)
+stop_start = core.index("static int r2_vision_watch_stop_locked(", start_start)
 active_start = core.index("int r2_vision_watch_active(void)", stop_start)
 capture = core[capture_start:worker_start]
 worker = core[worker_start:start_start]

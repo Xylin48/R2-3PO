@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
 shell = (ROOT / "shell.c").read_text(encoding="utf-8")
 
-start = core.index("int r2_vision_watch_start(void)")
+start = core.index("static int r2_vision_watch_start_impl(")
 end = core.index("\nint r2_vision_watch_stop(void)", start)
 body = core[start:end]
 

@@ -98,6 +98,7 @@ struct R2Eyes
 
     unsigned char *frame_buffer;
     size_t frame_size;
+    size_t pending_frame_bytes; /* Retained across a cancelled reader, not across source close. */
 
     unsigned char *record_buffer;
     size_t record_size;
@@ -671,23 +672,28 @@ static int r2_eyes_stream_eof(R2Eyes *eyes,
 static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
                               int (*cancelled)(void *), void *userdata)
 {
-    size_t total = 0;
+    size_t total = eyes->pending_frame_bytes;
     while (total < size) {
         if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
         struct pollfd input = {.fd = fileno(eyes->stream), .events = POLLIN};
         int ready = poll(&input, 1, 100);
         if (ready < 0) { if (errno == EINTR) continue; return -1; }
         if (!ready) continue;
+        if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
         if (input.revents & POLLNVAL) { errno = EBADF; return -1; }
         ssize_t got = read(input.fd, buffer + total, size - total);
-        if (got > 0) { total += (size_t)got; continue; }
+        if (got > 0) {
+            total += (size_t)got;
+            eyes->pending_frame_bytes = total;
+            continue;
+        }
         if (got == 0) {
             if (total) { errno = EPROTO; return -1; }
             return r2_eyes_stream_eof(eyes, cancelled, userdata);
         }
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     }
-    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+    eyes->pending_frame_bytes = 0;
     return 1;
 }
 
@@ -1038,6 +1044,7 @@ void r2_eyes_close(R2Eyes *eyes)
     }
 
     eyes->open = 0;
+    eyes->pending_frame_bytes = 0;
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_NONE;
     eyes->frame_count = 0;
@@ -1498,8 +1505,10 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
     if (result < 0)
     {
         int saved = errno;
-        if (saved != ECANCELED)
-            r2_log_sensory("visual_frame_read_failed",
+        /* Stopping a worker is distinct from closing its caller-owned source.
+         * Preserve any partial frame for the next reader of this same stream. */
+        if (saved == ECANCELED) return -1;
+        r2_log_sensory("visual_frame_read_failed",
                            "R2 Eyes encountered an error reading a visual frame.",
                            "The capture stream returned incomplete pixels or a decoder error.",
                            eyes->source_name);

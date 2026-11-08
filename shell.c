@@ -1370,7 +1370,7 @@ static void *shell_watch_worker(void *unused)
     unsigned long managed_window_id = 0;
     uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
     uint64_t managed_desktop = 0;
-    int attached_visual = 0;
+    uint64_t attached_visual = 0; /* Watch-owned worker on a pre-opened camera */
 
     while (!shell_watch_cancelled(NULL)) {
         R2AudioDiscovery audio;
@@ -1406,10 +1406,14 @@ static void *shell_watch_worker(void *unused)
             r2_eyes_status() <= 0)
             managed_camera = r2_eyes_start_for_watch();
 
+        if (attached_visual &&
+            (!eyes_permitted || !r2_vision_watch_owns(attached_visual))) {
+            (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
+            attached_visual = 0;
+        }
         if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
-            !r2_vision_watch_active() && r2_vision_available() &&
-            r2_vision_watch_start() == 0)
-            attached_visual = 1;
+            !r2_vision_watch_active() && r2_vision_available())
+            attached_visual = r2_vision_watch_start_for_watch();
 
         /* Watch finds accessible media; R2 decides whether to watch it.
            Media capture is independent, and no semantic inference is triggered. */
@@ -1503,8 +1507,8 @@ static void *shell_watch_worker(void *unused)
 
     if (managed_camera)
         (void)r2_eyes_release_if_watch_owned(managed_camera);
-    else if (attached_visual)
-        (void)r2_vision_watch_stop();
+    if (attached_visual)
+        (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
     if (managed_media)
         (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
     if (managed_microphone)

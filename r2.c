@@ -175,6 +175,7 @@ static pthread_mutex_t vision_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int vision_watch_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
+static uint64_t vision_watch_owner_token = 0; /* protected by vision_watch_lock */
 static int query_requests_visual_context(const char *query);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
@@ -11074,8 +11075,9 @@ static void *vision_watch_worker(void *unused)
     vision_watch_worker_context = 0;
     return NULL;
 }
-int r2_vision_watch_start(void)
+static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
 {
+    if (watch_token_out) *watch_token_out = 0;
     if (!core_initialized || shutting_down || !r2_visual_is_initialized() ||
         r2_eyes_status() <= 0)
         return -1;
@@ -11087,9 +11089,13 @@ int r2_vision_watch_start(void)
         return -1;
     }
     if (vision_watch_thread_started && atomic_load(&vision_watch_running)) {
+        /* A manual start adopts this worker. Discovery cannot claim a worker
+         * that another caller started between its status check and this lock. */
+        if (!watch_token_out) vision_watch_owner_token = 0;
         pthread_mutex_unlock(&vision_watch_lock);
-        return 0;
+        return watch_token_out ? -1 : 0;
     }
+    vision_watch_owner_token = 0;
 
     /* Reap both completed workers before reusing their lifecycle state. */
     atomic_store(&vision_watch_running, 0);
@@ -11145,13 +11151,28 @@ int r2_vision_watch_start(void)
         return -1;
     }
     vision_watch_thread_started = 1;
+    if (watch_token_out) {
+        vision_watch_owner_token = (uint64_t)atomic_fetch_add(&visual_watch_next_token, 1);
+        *watch_token_out = vision_watch_owner_token;
+    }
     pthread_mutex_unlock(&vision_watch_lock);
     return 0;
 }
 
-int r2_vision_watch_stop(void)
+int r2_vision_watch_start(void)
 {
-    pthread_mutex_lock(&vision_watch_lock);
+    return r2_vision_watch_start_impl(NULL);
+}
+
+uint64_t r2_vision_watch_start_for_watch(void)
+{
+    uint64_t token = 0;
+    return r2_vision_watch_start_impl(&token) == 0 ? token : 0;
+}
+
+static int r2_vision_watch_stop_locked(void)
+{
+    vision_watch_owner_token = 0;
     atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
     pthread_cond_broadcast(&vision_watch_frame_cond);
@@ -11173,9 +11194,34 @@ int r2_vision_watch_stop(void)
     vision_watch_frame_generation = 0;
     vision_watch_capture_done = 0;
     pthread_mutex_unlock(&vision_watch_frame_lock);
-    pthread_mutex_unlock(&vision_watch_lock);
     return 0;
 }
+
+int r2_vision_watch_stop(void)
+{
+    pthread_mutex_lock(&vision_watch_lock);
+    int rc = r2_vision_watch_stop_locked();
+    pthread_mutex_unlock(&vision_watch_lock);
+    return rc;
+}
+
+int r2_vision_watch_stop_if_watch_owned(uint64_t token)
+{
+    pthread_mutex_lock(&vision_watch_lock);
+    int rc = token && token == vision_watch_owner_token
+        ? r2_vision_watch_stop_locked() : 0;
+    pthread_mutex_unlock(&vision_watch_lock);
+    return rc;
+}
+
+int r2_vision_watch_owns(uint64_t token)
+{
+    pthread_mutex_lock(&vision_watch_lock);
+    int owns = token && token == vision_watch_owner_token;
+    pthread_mutex_unlock(&vision_watch_lock);
+    return owns;
+}
+
 int r2_vision_watch_active(void)
 {
     return atomic_load(&vision_watch_running) ? 1 : 0;

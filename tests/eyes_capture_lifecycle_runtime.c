@@ -46,18 +46,27 @@ static void assert_reaped(pid_t child)
     assert(kill(child, 0) == -1 && errno == ESRCH);
 }
 
+static int cancel_after_partial_read(void *userdata)
+{
+    int *checks = userdata;
+    /* Before poll, after poll, then after the only available five bytes. */
+    return ++*checks >= 3;
+}
+
 int main(void)
 {
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
     assert(mkdtemp(root));
-    char probe[PATH_MAX], decoder[PATH_MAX], ready[PATH_MAX], path[PATH_MAX * 2];
+    char probe[PATH_MAX], decoder[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
+    char path[PATH_MAX * 2];
     assert(snprintf(probe, sizeof(probe), "%s/ffprobe", root) < (int)sizeof(probe));
     assert(snprintf(decoder, sizeof(decoder), "%s/ffmpeg", root) < (int)sizeof(decoder));
     assert(snprintf(ready, sizeof(ready), "%s/ready", root) < (int)sizeof(ready));
+    assert(snprintf(release, sizeof(release), "%s/release", root) < (int)sizeof(release));
     write_executable(probe, "#!/bin/sh\nprintf '2x2\\n'\n");
     write_executable(decoder,
         "#!/usr/bin/python3\n"
-        "import os, signal, sys\n"
+        "import os, signal, sys, time\n"
         "mode = sys.argv[sys.argv.index('-i') + 1]\n"
         "if mode == 'finite':\n"
         "    os.write(1, bytes(range(24)))\n"
@@ -65,6 +74,12 @@ int main(void)
         "    os.write(1, b'12345')\n"
         "elif mode == 'failed':\n"
         "    sys.exit(7)\n"
+        "elif mode == 'resumable':\n"
+        "    os.write(1, bytes(range(5)))\n"
+        "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
+        "        f.write(str(os.getpid()))\n"
+        "    while not os.path.exists(os.environ['R2_EYES_TEST_RELEASE']): time.sleep(.001)\n"
+        "    os.write(1, bytes(range(5, 24)))\n"
         "else:\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "    if mode == 'stalled-partial': os.write(1, b'12345')\n"
@@ -76,6 +91,7 @@ int main(void)
                     original ? original : "/usr/bin") < (int)sizeof(path));
     assert(setenv("PATH", path, 1) == 0);
     assert(setenv("R2_EYES_TEST_PID_FILE", ready, 1) == 0);
+    assert(setenv("R2_EYES_TEST_RELEASE", release, 1) == 0);
     assert(unsetenv("DISPLAY") == 0);
     core_initialized = 1;
     shutting_down = 0;
@@ -88,7 +104,61 @@ int main(void)
     double start = monotonic_seconds();
     assert(r2_vision_watch_stop() == 0);
     assert(monotonic_seconds() - start < 2.0);
-    assert(!r2_vision_watch_active() && !r2_eyes_is_open(eyes));
+    assert(!r2_vision_watch_active() && r2_eyes_is_open(eyes));
+    assert(kill(child, 0) == 0); /* Worker stop alone preserves the source owner. */
+    assert(r2_eyes_release_source() == 0);
+    assert(!r2_eyes_is_open(eyes));
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    /* Cancellation must preserve the manually owned stream and the incomplete
+     * frame, so resuming cannot shift all subsequent RGB pixels by five bytes. */
+    assert(r2_eyes_open_file(eyes, "resumable") == 0);
+    int checks = 0;
+    assert(r2_eyes_capture_cancelable(eyes, cancel_after_partial_read, &checks) == -1);
+    assert(errno == ECANCELED && r2_eyes_is_open(eyes));
+    child = wait_for_child(ready);
+    FILE *release_file = fopen(release, "w");
+    assert(release_file && fclose(release_file) == 0);
+    for (unsigned frame_index = 0; frame_index < 2; ++frame_index) {
+        assert(r2_eyes_capture(eyes) == 1);
+        R2VisionFrame frame = {0};
+        assert(r2_eyes_get_frame(eyes, &frame) == 0 && frame.size == 12);
+        for (size_t i = 0; i < frame.size; ++i)
+            assert(frame.data[i] == frame_index * 12 + i);
+    }
+    assert(r2_eyes_capture(eyes) == 0 && !r2_eyes_is_open(eyes));
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unlink(release) == 0);
+
+    /* Discovery can attach to a pre-opened camera, but a manual start adopts
+     * the worker and revokes its claim without replacing or stopping it. */
+    assert(r2_eyes_open_file(eyes, "stalled") == 0);
+    uint64_t old_token = r2_vision_watch_start_for_watch();
+    assert(old_token && r2_vision_watch_owns(old_token));
+    child = wait_for_child(ready);
+    assert(r2_vision_watch_start() == 0);
+    assert(!r2_vision_watch_owns(old_token));
+    assert(r2_vision_watch_start_for_watch() == 0);
+    assert(r2_vision_watch_stop_if_watch_owned(old_token) == 0);
+    assert(r2_vision_watch_active() && kill(child, 0) == 0);
+    assert(r2_vision_watch_stop() == 0);
+    assert(r2_eyes_is_open(eyes));
+    assert(r2_eyes_release_source() == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    /* A stale cleanup also cannot stop the next independently opened worker. */
+    assert(r2_eyes_open_file(eyes, "stalled") == 0);
+    uint64_t new_token = r2_vision_watch_start_for_watch();
+    assert(new_token && new_token != old_token && r2_vision_watch_owns(new_token));
+    child = wait_for_child(ready);
+    assert(r2_vision_watch_stop_if_watch_owned(old_token) == 0);
+    assert(r2_vision_watch_active() && kill(child, 0) == 0);
+    assert(r2_vision_watch_stop_if_watch_owned(new_token) == 0);
+    assert(!r2_vision_watch_active() && !r2_vision_watch_owns(new_token));
+    assert(r2_eyes_is_open(eyes));
+    assert(r2_eyes_release_source() == 0);
     assert_reaped(child);
     assert(unlink(ready) == 0);
 
@@ -124,6 +194,6 @@ int main(void)
     eyes = NULL;
     core_initialized = 0;
     assert(unlink(probe) == 0 && unlink(decoder) == 0 && rmdir(root) == 0);
-    puts("Stalled camera/media stop, partial-frame rejection, decoder exit failure, restart and child reaping passed.");
+    puts("Stalled camera/media stop, exact worker ownership, partial-frame rejection, decoder exit failure, restart and child reaping passed.");
     return 0;
 }

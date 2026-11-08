@@ -133,9 +133,10 @@ void r2_eyes_close(R2Eyes *eyes);
 
 /* Frame acquisition */
 int r2_eyes_capture(R2Eyes *eyes);
-/* One reader; stop/join it before reopening or freeing the source. A cancelled
- * partial frame closes the decoder, so no later frame can use misaligned pixels.
- * The thread-safe predicate must not block or reenter Eyes. */
+/* One reader; stop/join it before reopening or freeing the source. Cancellation
+ * leaves this source open and retains any partial frame for a later reader.
+ * Close explicitly to release it. The thread-safe predicate must not block or
+ * reenter Eyes. */
 int r2_eyes_capture_cancelable(R2Eyes *eyes,
                                int (*cancelled)(void *), void *userdata);
 int r2_eyes_get_frame(R2Eyes *eyes,
