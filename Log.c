@@ -1864,7 +1864,12 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
     rc = sqlite3_prepare_v2(log_db,
         "INSERT OR IGNORE INTO r2_log_links "
         "(from_event_id,to_event_id,relationship,notes,created_utc) "
-        "VALUES(?,?,?,?,?);", -1, &st, NULL);
+        "SELECT ?1,?2,?3,?4,?5 "
+        "WHERE EXISTS(SELECT 1 FROM r2_log_events WHERE id=?1) "
+        "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?2) "
+        "AND NOT EXISTS(SELECT 1 FROM r2_log_links "
+        "WHERE from_event_id=?1 AND to_event_id=?2 AND relationship=?3);",
+        -1, &st, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_bind_int64(st, 1, from_event_id);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, to_event_id);
@@ -1876,10 +1881,34 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
         if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 5, utc, -1, SQLITE_TRANSIENT);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("event link");
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) {
+        log_structured_insert_error("event link");
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    /* DONE can mean a duplicate, a missing endpoint, or an ignored insert.
+     * Accept retries only when the exact relationship actually exists. */
+    st = NULL;
+    rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_links l "
+        "JOIN r2_log_events f ON f.id=l.from_event_id "
+        "JOIN r2_log_events t ON t.id=l.to_event_id "
+        "WHERE l.from_event_id=?1 AND l.to_event_id=?2 AND l.relationship=?3 LIMIT 1;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, from_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, to_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, relationship, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE)
+        fprintf(stderr, "[R2 Life Log] Event link has no stored edge for %lld -> %lld.\n",
+                (long long)from_event_id, (long long)to_event_id);
+    else if (rc != SQLITE_ROW)
+        log_structured_insert_error("event link verification");
     sqlite3_finalize(st);
     pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc == SQLITE_ROW ? 0 : -1;
 }
 
 int64_t r2_log_hypothetical(const char *scenario,

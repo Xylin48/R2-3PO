@@ -145,6 +145,9 @@ int main(void)
         "CREATE TRIGGER ignore_fixture_sessions BEFORE INSERT ON r2_log_sessions "
         "BEGIN SELECT RAISE(IGNORE); END;",
         NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_link(7, 8, "related", "retry of a migrated edge") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_links WHERE from_event_id=7 "
+                          "AND to_event_id=8 AND relationship='related';") == 1);
     int indexed = journal_index_calls;
     int event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
     int session_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;");
