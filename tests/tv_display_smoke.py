@@ -170,6 +170,7 @@ class TVDisplaySmoke(unittest.TestCase):
     def test_vcr_client_accepts_transport_and_media_commands(self) -> None:
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",
                         "vcr insert /tmp/example-film.mp4", "vcr position 42.750",
+                        "vcr tape-position 42.750|/tmp/example|x11=film.mp4",
                         "media vcr_playback_started|/tmp/example-film.mp4",
                         "media vcr_playback_started|/tmp/example-film.mp4|x11=8412",
                         "media-path vcr_playback_started|/tmp/example|x11=film.mp4",
@@ -337,6 +338,22 @@ class TVDisplaySmoke(unittest.TestCase):
             "renderer 0",
             "renderer 8412|/tmp/movie|x11=literal.mp4",
         ])
+
+    def test_tape_switch_saves_outgoing_position_with_exact_path(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._loaded_path = "/tmp/outgoing|x11=tape.mp4"
+        display._last_transport = "play"
+        display._last_position_save = 0
+        display._player = type("Player", (), {"get_time": lambda self: 63125})()
+        with patch.object(TV, "send_control_command", return_value="OK") as send:
+            def replace(path, position, transport, audible):
+                send.assert_called_once_with("vcr tape-position 63.125|/tmp/outgoing|x11=tape.mp4")
+                display._loaded_path = path
+                display._last_transport = None
+
+            display._prepare_media = replace
+            display.sync_vcr_player("/tmp/next.mp4", "stop", 0, False)
+        self.assertEqual(display._loaded_path, "/tmp/next.mp4")
 
     def test_vcr_client_rejects_invalid_media_and_position(self) -> None:
         with self.assertRaises(ValueError):

@@ -76,6 +76,15 @@ def send_control_command(command: str) -> str:
                  or bool(marker) and _valid_x11_id(window_id)
                  and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
                  and len(path.encode("utf-8")) < 1100)
+    if command.startswith("vcr tape-position "):
+        seconds, marker, path = command[18:].partition("|")
+        try:
+            valid = (bool(marker) and 0 <= float(seconds) <= 604800
+                     and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
+                     and len(path.encode("utf-8")) <= 1024
+                     and len(command.encode("utf-8")) <= 1198)
+        except ValueError:
+            valid = False
     if command.startswith("vcr position "):
         try:
             seconds = float(command[13:])
@@ -332,7 +341,7 @@ class CRTDisplay:
         milliseconds = self._player.get_time()
         if milliseconds >= 0:
             try:
-                send_control_command(f"vcr position {milliseconds / 1000:.3f}")
+                send_control_command(f"vcr tape-position {milliseconds / 1000:.3f}|{self._loaded_path}")
                 self._last_position_save = now
             except (OSError, RuntimeError, ValueError):
                 pass
@@ -340,6 +349,7 @@ class CRTDisplay:
     def sync_vcr_player(self, path: str | None, transport: str, position: float,
                         audible: bool) -> None:
         if path != self._loaded_path:
+            self._save_vcr_position(force=True)
             if path is None:
                 if self._player:
                     self._player.stop()
@@ -348,6 +358,7 @@ class CRTDisplay:
             else:
                 self._prepare_media(path, position, transport, audible)
         elif path and self._player and transport != self._last_transport:
+            self._save_vcr_position(force=True)
             self._player.audio_set_mute(not audible)
             if transport == "play":
                 if self._player.play() < 0:

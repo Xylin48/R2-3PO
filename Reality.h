@@ -76,6 +76,7 @@ int r2_reality_tv_disconnect(const char *name);
 int r2_reality_tv_vcr_insert(const char *media_path);
 int r2_reality_tv_vcr_transport(const char *action); /* play, pause, stop, eject */
 int r2_reality_tv_vcr_set_position(double seconds);
+int r2_reality_tv_vcr_set_tape_position(const char *path, double seconds);
 
 #ifdef __cplusplus
 }

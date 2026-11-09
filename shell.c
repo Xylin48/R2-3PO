@@ -292,6 +292,17 @@ static void *tv_control_server(void *unused)
             reply = r2_reality_tv_vcr_transport("stop") == 0 ? "OK VCR stopped" : "ERROR no tape inserted";
         } else if (!strcmp(command, "vcr eject")) {
             reply = r2_reality_tv_vcr_transport("eject") == 0 ? "OK VCR tape ejected" : "ERROR no tape inserted";
+        } else if (!strncmp(command, "vcr tape-position ", 18)) {
+            char *value = command + 18;
+            char *path = strchr(value, '|');
+            if (path) {
+                *path++ = '\0';
+                char *end = NULL;
+                double seconds = strtod(value, &end);
+                if (end != value && *end == '\0' && isfinite(seconds) && seconds >= 0.0)
+                    reply = r2_reality_tv_vcr_set_tape_position(path, seconds) == 0
+                        ? "OK VCR tape position saved" : "ERROR could not save tape position";
+            }
         } else if (!strncmp(command, "vcr position ", 13)) {
             char *end = NULL;
             double seconds = strtod(command + 13, &end);
