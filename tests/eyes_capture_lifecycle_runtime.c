@@ -123,7 +123,7 @@ int main(void)
         "    os.write(1, bytes(range(split, end)))\n"
         "else:\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "    if mode == 'stalled-partial': os.write(1, b'12345')\n"
+        "    if mode in ('stalled-partial', ':test-stall'): os.write(1, b'12345')\n"
         "    if mode.startswith('long-frame:') or mode == ':test-display': os.write(1, bytes(range(12)))\n"
         "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
         "        f.write(str(os.getpid()))\n"
@@ -347,12 +347,63 @@ int main(void)
     assert_reaped(child);
     assert(unlink(ready) == 0 && unsetenv("DISPLAY") == 0);
 
+    /* A live window can remain discoverable while FFmpeg stops writing.
+     * Do not publish incomplete pixels or carry its focus into recovery. */
+    assert(setenv("DISPLAY", ":test-stall", 1) == 0);
+    uint64_t stalled = r2_vision_media_open_window_for_watch(123);
+    assert(stalled && stalled != replacement);
+    child = wait_for_child(ready);
+    assert(r2_vision_media_set_attention(1) == 0);
+    start = monotonic_seconds();
+    while (r2_vision_media_status() && monotonic_seconds() - start < 7.0) {
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    assert(!r2_vision_media_status());
+    assert(r2_vision_media_stop_if_watch_owned(stalled) == 0);
+    assert(!atomic_load(&media_attention_selected));
+    assert_no_complete_frame(media_eyes);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    assert(setenv("DISPLAY", ":test-display", 1) == 0);
+    replacement = r2_vision_media_open_window_for_watch(123);
+    assert(replacement && replacement != stalled);
+    child = wait_for_child(ready);
+    assert(r2_vision_media_stop_if_watch_owned(stalled) == 0);
+    assert(r2_vision_media_watch_owns(replacement) && !r2_vision_media_attention_status());
+    expected_source = "video rendering window 123";
+    observation = NULL;
+    start = monotonic_seconds();
+    while (!observation && monotonic_seconds() - start < 2.0) {
+        observation = r2_vision_media_see("recovered window");
+        if (!observation) {
+            struct timespec pause = {0, 1000000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    assert(observation);
+    free(observation);
+    assert(r2_vision_media_stop_if_watch_owned(replacement) == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unsetenv("DISPLAY") == 0);
+
+    /* A synchronous reader uses the same live recovery and error contract. */
+    assert(r2_eyes_open_device(eyes, "stalled-partial") == 0);
+    child = wait_for_child(ready);
+    start = monotonic_seconds();
+    assert(r2_eyes_capture(eyes) == -1 && errno == ETIMEDOUT);
+    assert(monotonic_seconds() - start < 7.0 && !r2_eyes_is_open(eyes));
+    assert_no_complete_frame(eyes);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
     r2_eyes_shutdown(media_eyes);
     media_eyes = NULL;
     r2_eyes_shutdown(eyes);
     eyes = NULL;
     core_initialized = 0;
     assert(unlink(probe) == 0 && unlink(decoder) == 0 && unlink(xdotool) == 0 && rmdir(root) == 0);
-    puts("Stalled camera/media stop, exact worker ownership, partial-frame rejection, decoder exit failure, restart, child reaping and full capture source identity passed.");
+    puts("Visual cancellation, live stall recovery, exact worker ownership, complete frames, child reaping and full source identity passed.");
     return 0;
 }

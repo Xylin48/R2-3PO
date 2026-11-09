@@ -375,9 +375,13 @@ static uint64_t r2_eyes_timestamp(void)
 
 /* Read-only discovery must not wait indefinitely for ffprobe or X11. The
  * five-second read budget applies to an entire metadata operation, including
- * all candidates in one window lookup, followed by bounded child cleanup.
- * It never limits continuous frame capture. */
+ * all candidates in one window lookup, followed by bounded child cleanup. */
 #define R2_EYES_PROBE_MS 5000U
+
+/* A live decoder normally supplies a frame every 100 ms. Allow startup and
+ * scheduling delays, but close a live pipe that cannot supply a whole frame.
+ * File playback retains its cancellable wait without a live-frame deadline. */
+#define R2_EYES_LIVE_FRAME_MS 5000U
 static uint64_t r2_eyes_monotonic_ms(void);
 static char *r2_eyes_query(char *const argv[], uint64_t deadline);
 static uint64_t r2_eyes_probe_deadline(void)
@@ -621,10 +625,26 @@ static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
                               int (*cancelled)(void *), void *userdata)
 {
     size_t total = eyes->pending_frame_bytes;
+    uint64_t start = 0;
+    if (eyes->source_is_live) {
+        start = r2_eyes_monotonic_ms();
+        if (start == UINT64_MAX) return -1;
+    }
     while (total < size) {
         if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+        int wait_ms = 100;
+        if (eyes->source_is_live) {
+            uint64_t now = r2_eyes_monotonic_ms();
+            if (now == UINT64_MAX) return -1;
+            if (now - start >= R2_EYES_LIVE_FRAME_MS) {
+                errno = ETIMEDOUT;
+                return -1;
+            }
+            uint64_t remaining = R2_EYES_LIVE_FRAME_MS - (now - start);
+            if (remaining < (uint64_t)wait_ms) wait_ms = (int)remaining;
+        }
         struct pollfd input = {.fd = fileno(eyes->stream), .events = POLLIN};
-        int ready = poll(&input, 1, 100);
+        int ready = poll(&input, 1, wait_ms);
         if (ready < 0) { if (errno == EINTR) continue; return -1; }
         if (!ready) continue;
         if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
@@ -1273,7 +1293,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     eyes->source_name = source;
     eyes->stream = stream;
     eyes->open = 1;
-    eyes->source_is_live = 0;
+    eyes->source_is_live = 1;
     eyes->origin = R2_VISION_WINDOW;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
@@ -1366,7 +1386,7 @@ int r2_eyes_open_vlc(
     eyes->source_name = window_title;
     eyes->stream = stream;
     eyes->open = 1;
-    eyes->source_is_live = 0;
+    eyes->source_is_live = 1;
     eyes->origin = R2_VISION_VLC;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
@@ -1430,7 +1450,9 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
         if (saved == ECANCELED) return -1;
         r2_log_sensory("visual_frame_read_failed",
                            "R2 Eyes encountered an error reading a visual frame.",
-                           "The capture stream returned incomplete pixels or a decoder error.",
+                           saved == ETIMEDOUT
+                               ? "A live decoder did not deliver a complete frame within its read budget."
+                               : "The capture stream returned incomplete pixels or a decoder error.",
                            eyes->source_name);
         r2_eyes_close(eyes);
         errno = saved;
