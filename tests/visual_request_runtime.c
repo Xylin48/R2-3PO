@@ -248,7 +248,11 @@ int main(void)
     failed_option = 0; assert(perform_count == before_perform && gate_begin_count == before_gate);
     defer_gate = 1; rejected_frame(&frame); defer_gate = 0; assert(perform_count == before_perform);
 
-    char source[1601]; memset(source, 's', sizeof(source)-1); source[1600]='\0'; memcpy(source, "camera | ", 9);
+    char source[70001];
+    memset(source, 's', sizeof(source) - 1);
+    memcpy(source, "camera | ", 9);
+    memcpy(source + sizeof(source) - sizeof("VISUAL-SOURCE-END"),
+           "VISUAL-SOURCE-END", sizeof("VISUAL-SOURCE-END"));
     char *description = malloc(90030); assert(description); memset(description, 'd', 90000); strcpy(description+90000, "VISUAL-COMPLETE-END");
     json_object *observation = json_object_new_object(); json_object_object_add(observation, "description", json_object_new_string(description));
     json_object_object_add(observation, "focus", NULL);
@@ -314,6 +318,21 @@ int main(void)
     rejected_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_overlay_insert", NULL, NULL, NULL) == SQLITE_OK);
 
+    uint64_t prior_focus = visual_focus_sequence;
+    assert(sqlite3_exec(visual_db, "CREATE TEMP TRIGGER skip_visual_insert "
+        "BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(IGNORE); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"skipped insert\",\"focus\":null}", "stop");
+    rejected_frame(&frame);
+    assert(visual_focus_sequence == prior_focus);
+    char skipped_path[PATH_MAX];
+    int skipped_length = snprintf(skipped_path, sizeof(skipped_path),
+        "%s/visual_%llu_%llu.jpg", library, (unsigned long long)frame.timestamp,
+        (unsigned long long)frame.frame_number);
+    assert(skipped_length > 0 && (size_t)skipped_length < sizeof(skipped_path));
+    assert(access(skipped_path, F_OK) == -1 && errno == ENOENT);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER skip_visual_insert", NULL, NULL, NULL) == SQLITE_OK);
+
     uint64_t focus_sequence = visual_focus_sequence;
     switch_preview_during_request = 1;
     frame.frame_number++;
@@ -349,7 +368,7 @@ int main(void)
     assert(unsetenv("DISPLAY")==0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init()==0 && r2_log_init()==0 && r2_sj_init()==0 && r2_visual_init(database,library)==0);
-    history=r2_visual_search("VISUAL-COMPLETE-END",10); assert(history && strstr(history,description) && strstr(history,source)); free(history);
+    history=r2_visual_search("VISUAL-SOURCE-END",10); assert(history && strstr(history,description) && strstr(history,source)); free(history);
     verify_event_link(source, description);
     assert(!gate_active && gate_end_count==perform_count && init_count==cleanup_count);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();

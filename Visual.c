@@ -849,13 +849,16 @@ static int visual_insert_compat(const char *created, const char *source,
     if (rc != SQLITE_OK) return rc;
     for (size_t i = 0; i < count && rc == SQLITE_OK; ++i) {
         if (values[i].type == VISUAL_TEXT)
-            rc = sqlite3_bind_text(st, (int)i + 1, values[i].text, -1, SQLITE_TRANSIENT);
+            rc = sqlite3_bind_text64(st, (int)i + 1, values[i].text,
+                                     strlen(values[i].text), SQLITE_TRANSIENT, SQLITE_UTF8);
         else if (values[i].type == VISUAL_INTEGER)
             rc = sqlite3_bind_int64(st, (int)i + 1, values[i].integer);
         else
             rc = sqlite3_bind_null(st, (int)i + 1);
     }
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(visual_db) != 1)
+        rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
     return rc;
 }
@@ -1124,8 +1127,12 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                                   (sqlite3_int64)frame->frame_number,
                                   (sqlite3_int64)frame->timestamp, event_id);
     char db_error[512] = "unknown SQLite error";
-    if (rc != SQLITE_DONE)
-        snprintf(db_error, sizeof(db_error), "%s", sqlite3_errmsg(visual_db));
+    if (rc != SQLITE_DONE) {
+        const char *message = sqlite3_errcode(visual_db) == SQLITE_OK
+            ? "The insert did not create a visual experience row."
+            : sqlite3_errmsg(visual_db);
+        snprintf(db_error, sizeof(db_error), "%s", message);
+    }
     if (rc == SQLITE_DONE)
         publish_committed_focus(request_sequence, frame->preview_session, focus);
     pthread_mutex_unlock(&visual_lock);
