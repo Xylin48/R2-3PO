@@ -50,11 +50,15 @@ int main(void)
                                 "unique identity seed event",
                                 "the user identity is linked from this event",
                                 "link-smoke");
+    char notes[70001];
+    memset(notes, 'N', sizeof(notes) - 1);
+    memcpy(notes + sizeof(notes) - sizeof("VISUAL-SOURCE-TAIL"),
+           "VISUAL-SOURCE-TAIL", sizeof("VISUAL-SOURCE-TAIL"));
     if (seed <= 0 || linked <= 0 || other <= 0 ||
         r2_log_link(seed, linked, "identity_evidence",
                     "explicit statement stored as a durable relationship link") != 0 ||
         r2_log_link(linked, other, "relationship_context",
-                    "another explicit edge from the matching relationship event") != 0) {
+                    notes) != 0) {
         fprintf(stderr, "Could not create linked identity test records.\n");
         r2_log_shutdown();
         return 1;
@@ -68,6 +72,7 @@ int main(void)
              strstr(from_seed, "subject=current_user; relation=mother_of; object=R2") &&
              strstr(from_seed, "related prior experience") &&
              strstr(from_seed, "relationship_context") &&
+             strstr(from_seed, notes) &&
              strstr(from_relation, "unique identity seed event") &&
              strstr(from_relation, "identity_evidence") &&
              strstr(from_relation, "related prior experience");

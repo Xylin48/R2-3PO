@@ -133,6 +133,14 @@ void r2_eyes_close(R2Eyes *eyes);
 
 /* Frame acquisition */
 int r2_eyes_capture(R2Eyes *eyes);
+/* One reader; stop/join it before reopening or freeing the source. Cancellation
+ * leaves this source open and retains any partial frame for a later reader.
+ * Close explicitly to release it. The thread-safe predicate must not block or
+ * reenter Eyes. */
+int r2_eyes_capture_cancelable(R2Eyes *eyes,
+                               int (*cancelled)(void *), void *userdata);
+/* Frame access fails until a complete capture succeeds. A returned data pointer
+ * is borrowed and may be invalidated/overwritten by the next capture or close. */
 int r2_eyes_get_frame(R2Eyes *eyes,
                       R2VisionFrame *frame);
 
@@ -143,10 +151,15 @@ ssize_t r2_eyes_copy_frame(
 );
 
 /* Event information */
+/* Legacy fixed-size event. Returns EOVERFLOW if the full source will not fit. */
 int r2_eyes_get_event(
     R2Eyes *eyes,
     R2VisionEvent *event
 );
+
+/* Caller owns the result. Hold the source lock across the frame and name copies
+   when sharing an Eyes receiver with another thread. */
+char *r2_eyes_copy_source(const R2Eyes *eyes);
 
 int r2_eyes_get_format(
     R2Eyes *eyes,

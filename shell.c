@@ -518,6 +518,7 @@ static void shell_help(void)
         "      Show the latest Life Log events.\n"
         "\n"
         "  log status\n"
+        "  log context <archive_id>\n"
         "      Show Life Log counts and current session information.\n"
         "\n"
         "  log search <text>\n"
@@ -960,6 +961,16 @@ static void shell_log(const char *argument)
         result = r2_log_recent(25);
     } else if (!strcasecmp(argument, "status")) {
         result = r2_log_status_report();
+    } else if (shell_starts_with(argument, "context ")) {
+        const char *id_text = shell_trim((char *)argument + 8);
+        char *end = NULL;
+        errno = 0;
+        long long id = strtoll(id_text, &end, 10);
+        if (errno || end == id_text || *end || id <= 0) {
+            printf("[Expected log context <positive archive ID>.]\n");
+            return;
+        }
+        result = r2_log_read_context_review((int64_t)id);
     } else if (shell_starts_with(argument, "search ")) {
         const char *query = shell_trim((char *)argument + 7);
         result = r2_log_search(query, 50);
@@ -1359,7 +1370,7 @@ static void *shell_watch_worker(void *unused)
     unsigned long managed_window_id = 0;
     uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
     uint64_t managed_desktop = 0;
-    int attached_visual = 0;
+    uint64_t attached_visual = 0; /* Watch-owned worker on a pre-opened camera */
 
     while (!shell_watch_cancelled(NULL)) {
         R2AudioDiscovery audio;
@@ -1375,12 +1386,15 @@ static void *shell_watch_worker(void *unused)
             r2_ears_status_desktop() > 0;
         int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
-        int vlc_available = r2_vision_vlc_available() && desktop_playing;
+        int vlc_available = desktop_playing && r2_vision_vlc_available();
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
         unsigned long media_window = atomic_load(&tv_live_video_window);
         int window_available = media_window &&
             r2_vision_window_available(media_window);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
         long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
         unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
@@ -1395,10 +1409,14 @@ static void *shell_watch_worker(void *unused)
             r2_eyes_status() <= 0)
             managed_camera = r2_eyes_start_for_watch();
 
+        if (attached_visual &&
+            (!eyes_permitted || !r2_vision_watch_owns(attached_visual))) {
+            (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
+            attached_visual = 0;
+        }
         if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
-            !r2_vision_watch_active() && r2_vision_available() &&
-            r2_vision_watch_start() == 0)
-            attached_visual = 1;
+            !r2_vision_watch_active() && r2_vision_available())
+            attached_visual = r2_vision_watch_start_for_watch();
 
         /* Watch finds accessible media; R2 decides whether to watch it.
            Media capture is independent, and no semantic inference is triggered. */
@@ -1483,7 +1501,9 @@ static void *shell_watch_worker(void *unused)
             free(primary_source);
         }
 
+snapshot_finished:
         if (audio_known) r2_audio_discovery_free(&audio);
+        if (shell_watch_cancelled(NULL)) break;
 
         struct timespec pause = {WATCH_POLL_INTERVAL, 0};
         while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
@@ -1492,8 +1512,8 @@ static void *shell_watch_worker(void *unused)
 
     if (managed_camera)
         (void)r2_eyes_release_if_watch_owned(managed_camera);
-    else if (attached_visual)
-        (void)r2_vision_watch_stop();
+    if (attached_visual)
+        (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
     if (managed_media)
         (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
     if (managed_microphone)

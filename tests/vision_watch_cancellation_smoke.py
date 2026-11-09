@@ -15,7 +15,7 @@ assert "pthread_cond_wait(&vision_watch_frame_cond" in worker
 assert "r2_visual_analyze_frame(" not in worker
 assert "call_vision_model(" not in worker
 
-stop_start = core.index("int r2_vision_watch_stop(void)")
+stop_start = core.index("static int r2_vision_watch_stop_locked(")
 stop_end = core.index("\nint r2_vision_watch_active(void)", stop_start)
 stop = core[stop_start:stop_end]
 assert stop.index("atomic_store(&vision_watch_running, 0)") < stop.index("pthread_join(vision_watch_thread, NULL)")

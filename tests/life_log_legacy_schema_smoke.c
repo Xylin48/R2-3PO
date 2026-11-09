@@ -16,10 +16,13 @@
 #error R2_DIARY_DATABASE must point to an isolated test database
 #endif
 
+static int journal_index_calls = 0;
+
 void r2_sj_index_event(int64_t event_id, const char *category,
                        const char *event_type, const char *source)
 {
     (void)event_id; (void)category; (void)event_type; (void)source;
+    ++journal_index_calls;
 }
 
 int r2_save_memory(const char *memory, const char *category)
@@ -129,6 +132,40 @@ int main(void)
         "Long microphone monitor identity must survive persistence.",
         NULL, long_source);
     assert(audio_id > 0);
+
+    /* SQLITE_DONE can describe an ignored insert. It must not return the
+     * previous event ID, index it as new evidence, or archive a fabricated turn. */
+    sqlite3 *writer = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER ignore_fixture_events BEFORE INSERT ON r2_log_events "
+        "WHEN NEW.event_type='ignored_fixture' OR "
+        "(NEW.event_type='conversation_turn' AND NEW.summary LIKE '%ignored exact turn%') "
+        "BEGIN SELECT RAISE(IGNORE); END;"
+        "CREATE TRIGGER ignore_fixture_sessions BEFORE INSERT ON r2_log_sessions "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    int indexed = journal_index_calls;
+    int event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
+    int session_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;");
+    int actual_session = scalar(writer, "SELECT MAX(id) FROM r2_log_sessions;");
+    assert(r2_log_sensory("ignored_fixture", "not persisted", NULL, "fixture") < 0);
+    assert(journal_index_calls == indexed);
+    assert(r2_log_conversation_turn("ignored exact turn", "not persisted") < 0);
+    assert(journal_index_calls == indexed);
+    assert(r2_log_session_start() == -1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events;") == event_count);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;") == session_count);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_conversations "
+                          "WHERE user_text='ignored exact turn';") == 0);
+    assert(sqlite3_exec(writer,
+        "DROP TRIGGER ignore_fixture_events; DROP TRIGGER ignore_fixture_sessions;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_sensory("fixture_after_ignore", "actually persisted", NULL, "fixture") > 0);
+    assert(journal_index_calls == indexed + 1);
+    assert(scalar(writer, "SELECT session_id FROM r2_log_events "
+                          "WHERE event_type='fixture_after_ignore';") == actual_session);
+    sqlite3_close(writer);
 
     sqlite3 *db = NULL;
     assert(sqlite3_open_v2(R2_DIARY_DATABASE, &db,

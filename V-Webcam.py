@@ -113,9 +113,12 @@ class VWebcam:
             if len(rows) < 6:
                 raise ValueError("incomplete preview status")
             session = int(rows[6] or 0) if len(rows) > 6 else None
+            source = rows[1].strip() or "Unknown"
+            if len(rows) > 7 and rows[7].startswith("source_hex="):
+                source = bytes.fromhex(rows[7][11:]).decode("utf-8", errors="replace")
             return {
                 "active": rows[0].strip() == "1",
-                "source": rows[1].strip() or "Unknown",
+                "source": source,
                 "width": int(rows[2] or 0),
                 "height": int(rows[3] or 0),
                 "frames": int(rows[4] or 0),

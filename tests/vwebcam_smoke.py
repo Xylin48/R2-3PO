@@ -41,6 +41,10 @@ def verify_session_matching() -> None:
         pixels = b"1 1\n255\n\x00\x80\xff"
         label = "complete " * 100
         region = {"x": 0, "y": 0, "width": 1, "height": 1, "label": label.strip()}
+        source = "  " + "é" * 700 + "\r\nlong exact title\n "
+        status.write_text("1\nlegacy label\n1\n1\n1\n123\n10\nsource_hex=" +
+                          source.encode().hex() + "\n")
+        assert viewer.status()["source"] == source
         status.write_text("1\nSame name\n1\n1\n1\n123\n10\n")
         frame.write_bytes(b"P6\n# r2-preview 10\n" + pixels)
         focus.write_text(json.dumps(dict(region, preview_session=10)))
@@ -109,7 +113,7 @@ def main() -> None:
     assert '#define R2_VWEBCAM_DIR "/tmp/r2-vwebcam-r2"' in visual
     assert "r2_vwebcam_publish_frame(eyes)" in eyes
     assert "r2_vwebcam_start_viewer()" in eyes and "r2_vwebcam_stop_viewer()" in eyes
-    assert "return total == 0 ? 0 : -1;" in eyes, (
+    assert "if (total) { errno = EPROTO; return -1; }" in eyes, (
         "partial raw frames must be reported as read failures, not clean EOF"
     )
     capture_start = eyes.index("int r2_eyes_capture(")

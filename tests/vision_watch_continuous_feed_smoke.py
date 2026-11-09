@@ -11,15 +11,15 @@ visual_header = (ROOT / "Visual.h").read_text(encoding="utf-8")
 # Eyes continuously captures and publishes a stable latest-frame snapshot.
 capture_start = core.index("static void *vision_watch_capture_worker(void *unused)")
 worker_start = core.index("static void *vision_watch_worker(void *unused)", capture_start)
-start_start = core.index("int r2_vision_watch_start(void)", worker_start)
-stop_start = core.index("int r2_vision_watch_stop(void)", start_start)
+start_start = core.index("static int r2_vision_watch_start_impl(", worker_start)
+stop_start = core.index("static int r2_vision_watch_stop_locked(", start_start)
 active_start = core.index("int r2_vision_watch_active(void)", stop_start)
 capture = core[capture_start:worker_start]
 worker = core[worker_start:start_start]
 start = core[start_start:stop_start]
 stop = core[stop_start:active_start]
 
-assert "r2_eyes_capture(eyes)" in capture
+assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in capture
 assert "vision_watch_latest_frame_data" in capture
 assert "memcpy(vision_watch_latest_frame_data, frame.data, frame.size)" in capture
 assert "++vision_watch_frame_generation" in capture
@@ -54,8 +54,8 @@ assert "Its presence is not an instruction to describe the image" in core
 helper_start = core.index("static char *r2_vision_current_frame_base64(void)\n{")
 helper_end = core.index("\nstatic void *vision_watch_worker(void *unused)", helper_start)
 helper = core[helper_start:helper_end]
-assert "r2_vision_copy_watched_frame(&frame, &event, &frame_copy)" in helper
-assert "r2_eyes_capture(eyes)" in helper
+assert "r2_vision_copy_watched_frame(&frame, &source, &frame_copy)" in helper
+assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in helper
 snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\n"):
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "vision_watch_latest_frame_data" in snapshot

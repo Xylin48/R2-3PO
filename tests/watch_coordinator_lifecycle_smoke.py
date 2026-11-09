@@ -49,7 +49,9 @@ assert "r2_eyes_watch_owns(managed_camera)" in worker
 assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
 assert "(void)r2_eyes_release_source();" not in worker
 assert "r2_sense_auto_allowed(1)" in worker
-assert "r2_vision_watch_start()" in worker
+assert "r2_vision_watch_start_for_watch()" in worker
+assert "r2_vision_watch_stop_if_watch_owned(attached_visual)" in worker
+assert "r2_vision_watch_owns(attached_visual)" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
 assert "r2_vision_media_open_vlc_for_watch()" in worker
 assert "r2_vision_media_watch_owns(managed_media_token)" in worker
