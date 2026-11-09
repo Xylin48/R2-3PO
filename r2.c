@@ -10555,6 +10555,21 @@ char *r2_vision_search(const char *query, int limit)
 
 
 
+/* Serialize the end of a media generation with attention and frame readers.
+ * The worker can end on its own while a lifecycle caller is joining it. */
+static void r2_vision_media_end_capture(void)
+{
+    pthread_mutex_lock(&media_frame_lock);
+    atomic_store(&media_capture_running, 0);
+    int had_attention = atomic_exchange(&media_attention_selected, 0);
+    pthread_mutex_unlock(&media_frame_lock);
+    if (had_attention)
+        r2_log_sensory("media_attention_source_lost",
+                       "The display R2 chose to watch stopped or was replaced.",
+                       "Focus was cleared because that source ended.",
+                       "media-attention");
+}
+
 /* A media display has its own receiver and latest-frame storage; it cannot
    replace or close the physical camera. Only an explicit media attention
    request sends these pixels to Qwen. */
@@ -10627,22 +10642,14 @@ static void *r2_media_capture_worker(void *unused)
         }
         have_previous = 1;
     }
-    atomic_store(&media_capture_running, 0);
+    r2_vision_media_end_capture();
     return NULL;
 }
 
-/* Caller holds media_lifecycle_lock; never close FFmpeg while capture is
-   reading. Independent media open/stop operations cannot overlap. */
+/* Caller holds media_lifecycle_lock. Join before closing or replacing Eyes. */
 static int r2_vision_media_stop_locked(void)
 {
-    atomic_store(&media_capture_running, 0);
-    /* Attention belongs to the selected display, not to whichever different
-       window Watch happens to discover after a playback source is replaced. */
-    if (atomic_exchange(&media_attention_selected, 0))
-        r2_log_sensory("media_attention_source_lost",
-                       "The display R2 chose to watch stopped or was replaced.",
-                       "Focus was cleared because that source ended, not because R2 chose to look away.",
-                       "media-attention");
+    r2_vision_media_end_capture();
     if (media_capture_thread_started) {
         pthread_join(media_capture_thread, NULL);
         media_capture_thread_started = 0;
@@ -10684,13 +10691,14 @@ static int r2_vision_media_open(int kind, unsigned long window,
         !atomic_load(&eyes_auto_allowed)) return -1;
     pthread_mutex_lock(&media_lifecycle_lock);
     if (shutting_down || !atomic_load(&eyes_auto_allowed) ||
-        (watch_token_out &&
-         (atomic_load(&media_capture_running) || media_capture_thread_started))) {
+        (watch_token_out && atomic_load(&media_capture_running))) {
         /* A manual/other caller may have opened a display between Watch's
          * status check and this lock. Watch must not replace that source. */
         pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
     }
+    /* A worker at EOF still has a joinable handle. Reap it before opening
+     * the newly discovered source even when its original owner was manual. */
     (void)r2_vision_media_stop_locked();
     media_watch_token = 0; /* a new source supersedes the old token */
     pthread_mutex_lock(&media_capture_lock);
@@ -10711,7 +10719,7 @@ static int r2_vision_media_open(int kind, unsigned long window,
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
-        atomic_store(&media_capture_running, 0);
+        r2_vision_media_end_capture();
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
@@ -10800,22 +10808,31 @@ int r2_vision_media_attention_status(void)
 }
 int r2_vision_media_set_attention(int watching)
 {
-    if (!watching) {
-        /* Repeated cleanup is not evidence of a second voluntary choice. */
-        if (atomic_exchange(&media_attention_selected, 0))
-            r2_log_sensory("media_attention_released",
-                           "R2 chose to look away from the media display.",
-                           "Camera Eyes and playback were left untouched.",
-                           "media-attention");
-        return 0;
-    }
-    if (!atomic_load(&eyes_auto_allowed) || !r2_vision_media_status())
+    pthread_mutex_lock(&media_lifecycle_lock);
+    pthread_mutex_lock(&media_frame_lock);
+    if (watching && (!atomic_load(&eyes_auto_allowed) ||
+                     !atomic_load(&media_capture_running))) {
+        pthread_mutex_unlock(&media_frame_lock);
+        pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
-    if (!atomic_exchange(&media_attention_selected, 1))
+    }
+    int changed;
+    if (watching)
+        changed = !atomic_exchange(&media_attention_selected, 1);
+    else
+        changed = atomic_exchange(&media_attention_selected, 0);
+    pthread_mutex_unlock(&media_frame_lock);
+    if (changed && watching)
         r2_log_sensory("media_attention_selected",
                        "R2 chose sustained attention to a real separate display.",
                        "Each subsequent active model turn may include its current frame, after camera Eyes.",
                        "media-attention");
+    else if (changed)
+        r2_log_sensory("media_attention_released",
+                       "R2 chose to look away from the media display.",
+                       "Camera Eyes and playback were left untouched.",
+                       "media-attention");
+    pthread_mutex_unlock(&media_lifecycle_lock);
     return 0;
 }
 
@@ -10823,10 +10840,11 @@ int r2_vision_media_set_attention(int watching)
    are generated just because R2 chose to keep looking at a display. */
 static char *r2_vision_media_current_frame_base64(void)
 {
-    if (!r2_vision_media_attention_status() ||
-        !r2_vision_media_status() || !atomic_load(&eyes_auto_allowed))
-        return NULL;
     pthread_mutex_lock(&media_frame_lock);
+    if (!r2_vision_media_attention_status() || !atomic_load(&eyes_auto_allowed)) {
+        pthread_mutex_unlock(&media_frame_lock);
+        return NULL;
+    }
     R2VisionFrame frame = media_latest_frame;
     unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
     if (copy) {
@@ -11039,11 +11057,8 @@ static char *r2_vision_current_frame_base64(void)
 
 static void *vision_watch_worker(void *unused)
 {
-    (void)unused;
+    char *source = unused;
     vision_watch_worker_context = 1;
-    pthread_mutex_lock(&visual_capture_lock);
-    char *source = r2_eyes_copy_source(eyes);
-    pthread_mutex_unlock(&visual_capture_lock);
     const char *source_name = source ? source : "Eyes";
 
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_started",
@@ -11136,9 +11151,17 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
     vision_watch_latest_frame_capacity = 0;
     pthread_mutex_unlock(&vision_watch_frame_lock);
 
+    pthread_mutex_lock(&visual_capture_lock);
+    char *source = r2_eyes_copy_source(eyes);
+    pthread_mutex_unlock(&visual_capture_lock);
+    if (!source) {
+        pthread_mutex_unlock(&vision_watch_lock);
+        return -1;
+    }
     atomic_store(&vision_watch_running, 1);
     if (pthread_create(&vision_watch_capture_thread, NULL,
                        vision_watch_capture_worker, NULL) != 0) {
+        free(source);
         atomic_store(&vision_watch_running, 0);
         pthread_mutex_lock(&vision_watch_frame_lock);
         vision_watch_capture_done = 1;
@@ -11152,7 +11175,8 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
     }
     vision_watch_capture_thread_started = 1;
 
-    if (pthread_create(&vision_watch_thread, NULL, vision_watch_worker, NULL) != 0) {
+    if (pthread_create(&vision_watch_thread, NULL, vision_watch_worker, source) != 0) {
+        free(source);
         atomic_store(&vision_watch_running, 0);
         pthread_mutex_lock(&vision_watch_frame_lock);
         pthread_cond_broadcast(&vision_watch_frame_cond);

@@ -322,6 +322,31 @@ int main(void)
     assert(unlink(ready) == 0);
     assert(unsetenv("DISPLAY") == 0);
 
+    /* A manual file can end before Watch discovers a separate display.
+     * Its ended worker must be joined and its old focus must expire. */
+    assert(r2_vision_open_file("resumable-after-frame") == 0);
+    child = wait_for_child(ready);
+    assert(r2_vision_media_set_attention(1) == 0);
+    release_file = fopen(release, "w");
+    assert(release_file && fclose(release_file) == 0);
+    for (int i = 0; i < 2000 && r2_vision_media_status(); ++i) {
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    assert(!r2_vision_media_status());
+    assert(!atomic_load(&media_attention_selected));
+    assert(r2_vision_media_set_attention(1) == -1);
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unlink(release) == 0);
+    assert(setenv("DISPLAY", ":test-display", 1) == 0);
+    uint64_t replacement = r2_vision_media_open_window_for_watch(123);
+    assert(replacement && r2_vision_media_watch_owns(replacement));
+    child = wait_for_child(ready);
+    assert(r2_vision_media_status() && !r2_vision_media_attention_status());
+    assert(r2_vision_media_stop_if_watch_owned(replacement) == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unsetenv("DISPLAY") == 0);
+
     r2_eyes_shutdown(media_eyes);
     media_eyes = NULL;
     r2_eyes_shutdown(eyes);
