@@ -798,33 +798,22 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
  *
  * Eyes captures the VLC window itself, NOT the entire desktop.
  */
-static int r2_eyes_find_vlc_window(unsigned long *window_id, uint64_t deadline)
+static int r2_eyes_parse_window_id(const char *cursor, char **end, unsigned long *id)
 {
-    if (!window_id) return -1;
-    char *argv[] = {"xdotool", "search", "--onlyvisible", "--class", "^vlc$", NULL};
-    char *output = r2_eyes_query(argv, deadline);
-    if (!output) return -1;
-    char *end;
+    if (*cursor < '0' || *cursor > '9') return -1;
     errno = 0;
-    unsigned long id = strtoul(output, &end, 10);
-    int valid = !errno && end != output && id && (!*end || isspace((unsigned char)*end));
-    free(output);
-    if (!valid) return -1;
-    *window_id = id;
+    unsigned long value = strtoul(cursor, end, 10);
+    if (errno || !value || value > UINT32_MAX ||
+        (**end && !isspace((unsigned char)**end))) return -1;
+    *id = value;
     return 0;
-}
-
-int r2_eyes_vlc_available(void)
-{
-    unsigned long window_id = 0;
-    return r2_eyes_find_vlc_window(&window_id, r2_eyes_probe_deadline()) == 0;
 }
 
 static int r2_eyes_probe_vlc_dimensions(unsigned long window_id,
                                         uint32_t *width, uint32_t *height,
                                         uint64_t deadline)
 {
-    if (!width || !height || !window_id) return -1;
+    if (!width || !height || !window_id || window_id > UINT32_MAX) return -1;
     char window[32];
     snprintf(window, sizeof(window), "%lu", window_id);
     char *argv[] = {"xdotool", "getwindowgeometry", "--shell", window, NULL};
@@ -856,20 +845,9 @@ static int r2_eyes_probe_vlc_dimensions(unsigned long window_id,
     return 0;
 }
 
-/*
- * Start an FFmpeg X11 capture attached specifically
- * to the VLC window.
- */
-/* Generic X11 input: connect a visible rendering window to the process
- * that is actually producing desktop audio. Never infer image contents from
- * the process name or synthesize descriptions before the brain attends. */
-unsigned long r2_eyes_window_for_pid(long pid)
+/* Select a render-sized visible candidate for either producer lookup. */
+static unsigned long r2_eyes_find_window(char *const argv[], uint64_t deadline)
 {
-    if (pid <= 1 || pid > INT_MAX) return 0;
-    uint64_t deadline = r2_eyes_probe_deadline();
-    char process_id[32];
-    snprintf(process_id, sizeof(process_id), "%ld", pid);
-    char *argv[] = {"xdotool", "search", "--onlyvisible", "--pid", process_id, NULL};
     char *output = r2_eyes_query(argv, deadline);
     if (!output) return 0;
     unsigned long best = 0;
@@ -879,9 +857,8 @@ unsigned long r2_eyes_window_for_pid(long pid)
         while (*cursor && isspace((unsigned char)*cursor)) ++cursor;
         if (!*cursor) break;
         char *end;
-        errno = 0;
-        unsigned long candidate = strtoul(cursor, &end, 10);
-        if (errno || end == cursor || !candidate || (*end && !isspace((unsigned char)*end))) {
+        unsigned long candidate;
+        if (r2_eyes_parse_window_id(cursor, &end, &candidate) != 0) {
             best = 0; break;
         }
         cursor = end;
@@ -896,15 +873,44 @@ unsigned long r2_eyes_window_for_pid(long pid)
     return best;
 }
 
-static FILE *r2_eyes_start_vlc(unsigned long window_id, pid_t *child_out)
+/* Match a visible rendering window to the process supplying desktop audio. */
+unsigned long r2_eyes_window_for_pid(long pid)
+{
+    if (pid <= 1 || pid > INT_MAX) return 0;
+    char process_id[32];
+    snprintf(process_id, sizeof(process_id), "%ld", pid);
+    char *argv[] = {"xdotool", "search", "--onlyvisible", "--pid", process_id, NULL};
+    return r2_eyes_find_window(argv, r2_eyes_probe_deadline());
+}
+
+static unsigned long r2_eyes_find_vlc_window(uint64_t deadline)
+{
+    char *argv[] = {"xdotool", "search", "--onlyvisible", "--class", "^vlc$", NULL};
+    return r2_eyes_find_window(argv, deadline);
+}
+
+unsigned long r2_eyes_vlc_window(void)
+{
+    return r2_eyes_find_vlc_window(r2_eyes_probe_deadline());
+}
+
+int r2_eyes_vlc_available(void)
+{
+    return r2_eyes_vlc_window() != 0;
+}
+
+static FILE *r2_eyes_start_vlc(unsigned long window_id, uint32_t width,
+                              uint32_t height, pid_t *child_out)
 {
     const char *display = getenv("DISPLAY");
     if (!window_id || !display || !*display) return NULL;
-    char fps[32], window[32];
+    char fps[32], window[32], size[32];
     snprintf(fps, sizeof(fps), "%d", R2_EYES_FPS);
     snprintf(window, sizeof(window), "%lu", window_id);
+    snprintf(size, sizeof(size), "%ux%u", width, height);
     char *argv[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-f", "x11grab", "-framerate", fps, "-window_id", window, "-draw_mouse", "0",
+        "-f", "x11grab", "-framerate", fps, "-window_id", window, "-video_size", size,
+        "-draw_mouse", "0",
         "-i", (char *)display, "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt",
         "rgb24", "-r", fps, "pipe:1", NULL};
     return r2_eyes_spawn_stream(argv, child_out, 0);
@@ -1285,7 +1291,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     char *source = NULL;
     if (asprintf(&source, "video rendering window %lu", window_id) < 0)
         return -1;
-    FILE *stream = r2_eyes_start_vlc(window_id, &eyes->stream_child);
+    FILE *stream = r2_eyes_start_vlc(window_id, width, height, &eyes->stream_child);
     if (!stream) {
         free(source);
         return -1;
@@ -1308,26 +1314,11 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     return 0;
 }
 
-int r2_eyes_open_vlc(
-    R2Eyes *eyes)
+static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
+                                        uint64_t deadline)
 {
-    if (!eyes)
-        return -1;
-
+    if (!eyes || !window_id) return -1;
     r2_eyes_close(eyes);
-
-    uint64_t deadline = r2_eyes_probe_deadline();
-    unsigned long window_id = 0;
-
-    if (r2_eyes_find_vlc_window(
-            &window_id, deadline) != 0)
-    {
-        r2_log_sensory("vlc_window_not_found",
-                       "R2 Eyes could not find a visible VLC window.",
-                       "VLC window capture requires a visible X11 VLC window and xdotool.",
-                       "VLC");
-        return -1;
-    }
 
     uint32_t width = 0;
     uint32_t height = 0;
@@ -1378,7 +1369,7 @@ int r2_eyes_open_vlc(
         if (!window_title) return -1;
     }
 
-    FILE *stream = r2_eyes_start_vlc(window_id, &eyes->stream_child);
+    FILE *stream = r2_eyes_start_vlc(window_id, width, height, &eyes->stream_child);
     if (!stream) {
         free(window_title);
         return -1;
@@ -1403,6 +1394,27 @@ int r2_eyes_open_vlc(
                    eyes->source_name);
 
     return 0;
+}
+
+int r2_eyes_open_vlc_window(R2Eyes *eyes, unsigned long window_id)
+{
+    return r2_eyes_open_vlc_window_impl(eyes, window_id, r2_eyes_probe_deadline());
+}
+
+int r2_eyes_open_vlc(R2Eyes *eyes)
+{
+    if (!eyes) return -1;
+    uint64_t deadline = r2_eyes_probe_deadline();
+    unsigned long window_id = r2_eyes_find_vlc_window(deadline);
+    if (!window_id) {
+        r2_eyes_close(eyes);
+        r2_log_sensory("vlc_window_not_found",
+                       "R2 Eyes could not find a visible VLC window.",
+                       "VLC window capture requires a visible X11 VLC window and xdotool.",
+                       "VLC");
+        return -1;
+    }
+    return r2_eyes_open_vlc_window_impl(eyes, window_id, deadline);
 }
 
 /* ============================================================

@@ -1355,6 +1355,67 @@ static int shell_watch_cancelled(void *unused)
     return atomic_load(&shell_watch_stop_requested) || r2_is_shutting_down();
 }
 
+typedef struct {
+    int kind; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
+    uint64_t token;
+    unsigned long window;
+} ShellWatchMedia;
+
+static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
+                                   int audio_known, int desktop_playing, long playback_pid)
+{
+    unsigned long published = atomic_load(&tv_live_video_window);
+    unsigned long wanted_window = 0;
+    int wanted_kind = 0;
+    if (eyes_permitted) {
+        if (published && r2_vision_window_available(published)) {
+            wanted_window = published;
+            wanted_kind = 3;
+        }
+        if (!wanted_window && !shell_watch_cancelled(NULL)) {
+            wanted_window = r2_vision_window_for_pid(playback_pid);
+            if (wanted_window) wanted_kind = 4;
+        }
+        if (!wanted_window && desktop_playing && !shell_watch_cancelled(NULL)) {
+            wanted_window = r2_vision_vlc_window();
+            if (wanted_window) wanted_kind = 2;
+        }
+    }
+    if (shell_watch_cancelled(NULL) || published != atomic_load(&tv_live_video_window))
+        return; /* Reconcile against the next complete publication snapshot. */
+
+    /* The CRT publisher can withdraw its own window independently of Pulse.
+       Failed Pulse discovery alone cannot withdraw a desktop source. */
+    if (managed->token &&
+        (!r2_vision_media_watch_owns(managed->token) ||
+         !r2_sense_auto_allowed(1) || r2_vision_media_status() <= 0 ||
+         (managed->kind == 3 && managed->window != published) ||
+         ((audio_known || wanted_kind == 3) &&
+          (managed->kind != wanted_kind || managed->window != wanted_window)))) {
+        (void)r2_vision_media_stop_if_watch_owned(managed->token);
+        *managed = (ShellWatchMedia){0};
+    }
+    if (!wanted_window || managed->token || shell_watch_cancelled(NULL) ||
+        r2_vision_media_status() || !r2_vision_available() ||
+        published != atomic_load(&tv_live_video_window))
+        return;
+
+    uint64_t token = wanted_kind == 2 ?
+        r2_vision_media_open_vlc_window_for_watch(wanted_window) :
+        r2_vision_media_open_window_for_watch(wanted_window);
+    if (!token) return;
+    if (shell_watch_cancelled(NULL) || published != atomic_load(&tv_live_video_window)) {
+        (void)r2_vision_media_stop_if_watch_owned(token);
+        return;
+    }
+    *managed = (ShellWatchMedia){.kind = wanted_kind, .token = token, .window = wanted_window};
+    r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
+                 "R2 can observe an independent real media display.",
+                 "The display does not replace physical Eyes or demand attention.",
+                 wanted_kind == 3 ? "CRT video renderer" :
+                 wanted_kind == 4 ? "visible X11 audio producer" : "VLC");
+}
+
 /*
  * Source discovery is inexpensive polling, not a continuous audio/video feed.
  * A source that actually becomes available owns its continuous capture until
@@ -1365,9 +1426,7 @@ static void *shell_watch_worker(void *unused)
 {
     (void)unused;
     uint64_t managed_camera = 0; /* exact Watch-owned camera generation */
-    int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
-    uint64_t managed_media_token = 0; /* only a Watch-opened generation */
-    unsigned long managed_window_id = 0;
+    ShellWatchMedia managed_media = {0};
     uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
     uint64_t managed_desktop = 0;
     uint64_t attached_visual = 0; /* Watch-owned worker on a pre-opened camera */
@@ -1386,16 +1445,6 @@ static void *shell_watch_worker(void *unused)
             r2_ears_status_desktop() > 0;
         int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
-        int vlc_available = desktop_playing && r2_vision_vlc_available();
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-        unsigned long media_window = atomic_load(&tv_live_video_window);
-        int window_available = media_window &&
-            r2_vision_window_available(media_window);
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-        long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
-        unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
         int eyes_permitted = r2_sense_auto_allowed(1);
@@ -1418,39 +1467,10 @@ static void *shell_watch_worker(void *unused)
             !r2_vision_watch_active() && r2_vision_available())
             attached_visual = r2_vision_watch_start_for_watch();
 
-        /* Watch finds accessible media; R2 decides whether to watch it.
-           Media capture is independent, and no semantic inference is triggered. */
-        int wanted_media = window_available ? 3 :
-            (playback_window ? 4 : (vlc_available ? 2 : 0));
-        unsigned long wanted_window = wanted_media == 3 ? media_window :
-                                      wanted_media == 4 ? playback_window : 0;
-        if (managed_media &&
-            (!r2_vision_media_watch_owns(managed_media_token) ||
-             !eyes_permitted || r2_vision_media_status() <= 0 ||
-             ((audio_known || window_available) &&
-              (wanted_media != managed_media ||
-               managed_window_id != wanted_window)))) {
-            (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
-            managed_media = 0;
-            managed_media_token = 0;
-            managed_window_id = 0;
-        }
-        if (eyes_permitted && !managed_media && wanted_media &&
-            !r2_vision_media_status() && r2_vision_available()) {
-            uint64_t opened_token = wanted_media == 2 ?
-                r2_vision_media_open_vlc_for_watch() :
-                r2_vision_media_open_window_for_watch(wanted_window);
-            if (opened_token) {
-                managed_media = wanted_media;
-                managed_media_token = opened_token;
-                managed_window_id = wanted_window;
-                r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
-                             "R2 can observe an independent real media display.",
-                             "The display does not replace physical Eyes or demand attention.",
-                             wanted_media == 3 ? "CRT video renderer" :
-                             wanted_media == 4 ? "visible X11 audio producer" : "VLC");
-            }
-        }
+        long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
+        shell_watch_media_poll(&managed_media, eyes_permitted, audio_known,
+                               desktop_playing, playback_pid);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
         /* Both audio sources operate independently; the decision to close one
            must not be overridden by mere availability of that source. */
@@ -1514,8 +1534,8 @@ snapshot_finished:
         (void)r2_eyes_release_if_watch_owned(managed_camera);
     if (attached_visual)
         (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
-    if (managed_media)
-        (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
+    if (managed_media.token)
+        (void)r2_vision_media_stop_if_watch_owned(managed_media.token);
     if (managed_microphone)
         (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)

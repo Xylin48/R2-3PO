@@ -326,6 +326,7 @@ char *r2_vision_search(const char *query, int limit);
 int r2_vision_set_model(const char *model);
 int r2_vision_camera_available(void);
 int r2_vision_vlc_available(void);
+unsigned long r2_vision_vlc_window(void);
 /* Generic X11 rendering window published by an active media source. */
 int r2_vision_window_available(unsigned long window_id);
 unsigned long r2_vision_window_for_pid(long pid);
@@ -341,6 +342,7 @@ int r2_vision_media_stop(void);
  * Explicit media replacement takes ownership away from Watch. */
 uint64_t r2_vision_media_open_window_for_watch(unsigned long window_id);
 uint64_t r2_vision_media_open_vlc_for_watch(void);
+uint64_t r2_vision_media_open_vlc_window_for_watch(unsigned long window_id);
 int r2_vision_media_stop_if_watch_owned(uint64_t token);
 int r2_vision_media_watch_owns(uint64_t token);
 char *r2_vision_media_see(const char *question);

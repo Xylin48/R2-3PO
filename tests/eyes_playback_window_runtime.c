@@ -34,10 +34,14 @@ int main(void)
         "  if [ \"$4\" = \"3141\" ]; then printf '101\\n102\\n'; fi\n"
         "  if [ \"$4\" = \"3142\" ]; then printf '101\\n102\\n'; exit 7; fi\n"
         "  if [ \"$4\" = \"3143\" ]; then printf '101\\nnot-a-window\\n'; fi\n"
+        "  if [ \"$4\" = \"3146\" ]; then printf '101\\n-2\\n'; fi\n"
+        "  if [ \"$4\" = \"3147\" ]; then printf '101\\n4294967296\\n'; fi\n"
         "  if [ \"$4\" = \"3144\" ]; then\n"
         "    exec python3 -c 'import os, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(os.environ[\"R2_EYES_QUERY_PID\"], \"w\").write(str(os.getpid())); signal.pause()'\n"
         "  fi\n"
         "  if [ \"$4\" = \"3145\" ]; then sleep 3; printf '101\\n205\\n'; fi\n"
+        "elif [ \"$1\" = \"search\" ] && [ \"$3\" = \"--class\" ]; then\n"
+        "  printf '101\\n102\\n'\n"
         "elif [ \"$1\" = \"getwindowgeometry\" ] && [ \"$2\" = \"--shell\" ]; then\n"
         "  if [ \"$3\" = \"101\" ]; then printf 'WIDTH=640\\nHEIGHT=480\\n'; fi\n"
         "  if [ \"$3\" = \"102\" ]; then printf 'WIDTH=1280\\nHEIGHT=720\\n'; fi\n"
@@ -72,6 +76,9 @@ int main(void)
     assert(!r2_eyes_window_available(204));
     assert(r2_eyes_window_for_pid(3142) == 0);
     assert(r2_eyes_window_for_pid(3143) == 0);
+    assert(r2_eyes_window_for_pid(3146) == 0);
+    assert(r2_eyes_window_for_pid(3147) == 0);
+    assert(r2_eyes_vlc_window() == 102);
     struct timespec before, after;
     assert(clock_gettime(CLOCK_MONOTONIC, &before) == 0);
     assert(r2_eyes_window_for_pid(3144) == 0);

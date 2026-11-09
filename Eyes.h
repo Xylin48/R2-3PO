@@ -112,6 +112,7 @@ uint64_t r2_eyes_preview_session(void);
 int r2_eyes_camera_available(void);
 /* Check for a visible existing VLC window without opening it. */
 int r2_eyes_vlc_available(void);
+unsigned long r2_eyes_vlc_window(void);
 
 /* Input sources */
 int r2_eyes_open_file(R2Eyes *eyes, const char *path);
@@ -128,6 +129,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
 
 /* VLC window input */
 int r2_eyes_open_vlc(R2Eyes *eyes);
+int r2_eyes_open_vlc_window(R2Eyes *eyes, unsigned long window_id);
 
 void r2_eyes_close(R2Eyes *eyes);
 

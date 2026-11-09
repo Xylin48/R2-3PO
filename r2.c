@@ -10701,7 +10701,8 @@ static int r2_vision_media_open(int kind, unsigned long window,
     }
     r2_eyes_set_auxiliary(media_eyes, 1);
     int rc = kind == 1 ? r2_eyes_open_window(media_eyes, window) :
-             kind == 2 ? r2_eyes_open_vlc(media_eyes) :
+             kind == 2 ? (window ? r2_eyes_open_vlc_window(media_eyes, window) :
+                                    r2_eyes_open_vlc(media_eyes)) :
                          r2_eyes_open_file(media_eyes, path);
     pthread_mutex_unlock(&media_capture_lock);
     if (rc != 0) {
@@ -10747,6 +10748,13 @@ uint64_t r2_vision_media_open_vlc_for_watch(void)
 {
     uint64_t token = 0;
     return r2_vision_media_open(2, 0, NULL, &token) == 0 ? token : 0;
+}
+
+uint64_t r2_vision_media_open_vlc_window_for_watch(unsigned long window)
+{
+    if (!window) return 0;
+    uint64_t token = 0;
+    return r2_vision_media_open(2, window, NULL, &token) == 0 ? token : 0;
 }
 
 int r2_vision_media_stop_if_watch_owned(uint64_t token)
@@ -11277,6 +11285,7 @@ int r2_vision_set_model(const char *model)
 
 int r2_vision_camera_available(void) { return r2_eyes_camera_available(); }
 int r2_vision_vlc_available(void) { return r2_eyes_vlc_available(); }
+unsigned long r2_vision_vlc_window(void) { return r2_eyes_vlc_window(); }
 
 unsigned long r2_vision_window_for_pid(long pid)
 {

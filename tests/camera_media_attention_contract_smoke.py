@@ -41,13 +41,13 @@ current_frame = core[core.index("static char *r2_vision_current_frame_base64(voi
 assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in current_frame
 assert "r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled," not in current_frame
 
-worker = shell[shell.index("static void *shell_watch_worker("):
+worker = shell[shell.index("static void shell_watch_media_poll("):
                shell.index("static void shell_watch_start(void)")]
 assert "uint64_t managed_camera = 0;" in worker
-assert "int managed_media = 0;" in worker
+assert "ShellWatchMedia managed_media = {0};" in worker
 assert "r2_eyes_start_for_watch()" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
-assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in worker
 assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
 assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen closure"
 for channel in ("1", "2", "3"):

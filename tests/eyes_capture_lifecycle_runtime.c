@@ -107,6 +107,10 @@ int main(void)
         "#!/usr/bin/python3\n"
         "import os, signal, sys, time\n"
         "mode = sys.argv[sys.argv.index('-i') + 1]\n"
+        "if '-window_id' in sys.argv:\n"
+        "    assert sys.argv[sys.argv.index('-video_size') + 1] == '2x2'\n"
+        "    window = sys.argv[sys.argv.index('-window_id') + 1]\n"
+        "    assert window == os.getenv('R2_TEST_EXPECTED_WINDOW', '123')\n"
         "if mode == 'finite':\n"
         "    os.write(1, bytes(range(24)))\n"
         "elif mode == 'partial':\n"
@@ -304,7 +308,9 @@ int main(void)
 
     assert(setenv("DISPLAY", ":test-display", 1) == 0);
     assert(setenv("R2_TEST_VLC_TITLE", media_source, 1) == 0);
-    assert(r2_vision_open_vlc() == 0);
+    assert(setenv("R2_TEST_EXPECTED_WINDOW", "456", 1) == 0);
+    uint64_t vlc_token = r2_vision_media_open_vlc_window_for_watch(456);
+    assert(vlc_token && r2_vision_media_watch_owns(vlc_token));
     child = wait_for_child(ready);
     expected_source = media_source;
     observation = NULL;
@@ -321,6 +327,7 @@ int main(void)
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(unsetenv("DISPLAY") == 0);
+    assert(unsetenv("R2_TEST_EXPECTED_WINDOW") == 0);
 
     /* A manual file can end before Watch discovers a separate display.
      * Its ended worker must be joined and its old focus must expire. */

@@ -7,7 +7,7 @@ shell = (ROOT / "shell.c").read_text(encoding="utf-8")
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
 header = (ROOT / "r2.h").read_text(encoding="utf-8")
 
-worker_start = shell.index("static void *shell_watch_worker(void *unused)")
+worker_start = shell.index("static void shell_watch_media_poll(")
 worker_end = shell.index("static void shell_watch_start(void)", worker_start)
 worker = shell[worker_start:worker_end]
 start = shell.index("static void shell_watch_start(void)")
@@ -30,8 +30,8 @@ assert "r2_audio_discover_cancelable(" in worker
 assert "audio_known && audio.microphone_source" in worker
 assert "audio_known ? audio.desktop_playing" in worker
 assert "r2_vision_camera_available()" in worker
-assert "r2_vision_vlc_available()" in worker
-assert "r2_vision_window_available(media_window)" in worker
+assert "r2_vision_vlc_window()" in worker
+assert "r2_vision_window_available(published)" in worker
 assert "r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor," in worker
 assert "r2_ears_start_for_watch_cancelable(audio.microphone_source," in worker
 assert "if (managed_microphone)" in worker and "r2_ears_stop_if_watch_owned(managed_microphone)" in worker
@@ -53,10 +53,10 @@ assert "r2_vision_watch_start_for_watch()" in worker
 assert "r2_vision_watch_stop_if_watch_owned(attached_visual)" in worker
 assert "r2_vision_watch_owns(attached_visual)" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
-assert "r2_vision_media_open_vlc_for_watch()" in worker
-assert "r2_vision_media_watch_owns(managed_media_token)" in worker
-assert "managed_window_id != wanted_window" in worker
-assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
+assert "r2_vision_media_open_vlc_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_watch_owns(managed->token)" in worker
+assert "managed->window != wanted_window" in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in worker
 assert "(void)r2_vision_media_stop();" not in worker
 assert "r2_ears_listen_cancelable(" not in worker
 assert "shell_talk_watch(" not in worker
