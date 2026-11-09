@@ -177,6 +177,7 @@ static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
 static uint64_t vision_watch_owner_token = 0; /* protected by vision_watch_lock */
 static int query_requests_visual_context(const char *query);
+static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
 static char *r2_vision_media_current_frame_base64(void);
@@ -6219,16 +6220,7 @@ static char *chat_with_relevant_memories(
     if (visual_requested && atomic_load(&eyes_auto_allowed) &&
         (!eyes || !r2_eyes_is_open(eyes))) {
         /* An explicit request to see permits opening Eyes; ordinary turns do not. */
-        pthread_mutex_lock(&visual_capture_lock);
-        int open_rc = eyes ? r2_eyes_open_camera(eyes) : -1;
-        pthread_mutex_unlock(&visual_capture_lock);
-        if (open_rc == 0 && r2_vision_watch_start() != 0) {
-            pthread_mutex_lock(&visual_capture_lock);
-            if (eyes) r2_eyes_close(eyes);
-            pthread_mutex_unlock(&visual_capture_lock);
-            open_rc = -1;
-        }
-        if (open_rc != 0) {
+        if (r2_eyes_start_impl(NULL, 0) != 0) {
             r2_log_sensory("visual_input_unavailable",
                            "R2 could not open continuous Eyes input for an explicit visual request.",
                            "The camera could not be opened or the continuous raw-frame capture worker could not start.",
@@ -11330,21 +11322,24 @@ int r2_vision_close(void)
     return 0;
 }
 
-/* Only a newly opened camera can be claimed by Watch. Manual starts
- * revoke the Watch token, including when camera capture was already active. */
-static int r2_eyes_start_impl(uint64_t *watch_token_out)
+/* A visual request may reuse a source opened concurrently by Watch.
+ * Only an explicit manual start replaces a live source or enables Eyes. */
+static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
 {
     if (watch_token_out) *watch_token_out = 0;
     pthread_mutex_lock(&eyes_source_owner_lock);
-    if (watch_token_out &&
-        (!r2_sense_auto_allowed(1) || r2_eyes_status() > 0)) {
-        pthread_mutex_unlock(&eyes_source_owner_lock);
-        return -1;
+    if (!replace) {
+        if (!r2_sense_auto_allowed(1)) {
+            pthread_mutex_unlock(&eyes_source_owner_lock);
+            return -1;
+        }
+        if (r2_eyes_status() > 0) {
+            pthread_mutex_unlock(&eyes_source_owner_lock);
+            return watch_token_out ? -1 : 0;
+        }
     }
-    if (!watch_token_out) {
-        eyes_watch_token = 0;
-        r2_sense_set_auto_allowed(1, 1);
-    }
+    eyes_watch_token = 0;
+    if (replace) r2_sense_set_auto_allowed(1, 1);
     /* Reopening a source cannot reuse the previous worker's frame snapshot
      * or wait behind a stalled read while holding the source-owner mutex. */
     (void)r2_vision_watch_stop();
@@ -11371,13 +11366,13 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out)
 
 int r2_eyes_start(void)
 {
-    return r2_eyes_start_impl(NULL);
+    return r2_eyes_start_impl(NULL, 1);
 }
 
 uint64_t r2_eyes_start_for_watch(void)
 {
     uint64_t token = 0;
-    return r2_eyes_start_impl(&token) == 0 ? token : 0;
+    return r2_eyes_start_impl(&token, 0) == 0 ? token : 0;
 }
 
 /* Calling release_source explicitly revokes Watch. A Watch cleanup may only

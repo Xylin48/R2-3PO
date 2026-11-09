@@ -58,8 +58,16 @@ int main(void)
     eyes = (R2Eyes *)(uintptr_t)1;
     assert(r2_eyes_start_for_watch() == 0);
     assert(eyes_watch_token == 0); /* no takeover of an existing camera */
-    eyes = NULL;
+    /* The explicit question's stale outer check must neither replace a
+     * camera Watch just opened nor revoke its cleanup token. */
     eyes_watch_token = 105;
+    assert(r2_eyes_start_impl(NULL, 0) == 0);
+    assert(r2_eyes_watch_owns(105));
+    r2_sense_set_auto_allowed(1, 0);
+    assert(r2_eyes_start_impl(NULL, 0) == -1);
+    assert(!r2_sense_auto_allowed(1) && r2_eyes_watch_owns(105));
+    r2_sense_set_auto_allowed(1, 1);
+    eyes = NULL;
     assert(r2_eyes_watch_owns(105));
     assert(!r2_eyes_watch_owns(104));
     assert(r2_eyes_release_if_watch_owned(104) == 0);
