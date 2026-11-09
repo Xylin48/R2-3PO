@@ -186,6 +186,7 @@ class CRTDisplay:
         self._last_transport: str | None = None
         self._last_position_save = time.monotonic()
         self._vlc_error_shown = False
+        self._pending_vcr_seek: object | None = None
         self._last_logged_vlc_state: tuple[str, str] | None = None
         self._renderer_published = False
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -307,11 +308,13 @@ class CRTDisplay:
         self._player.audio_set_mute(not audible)
         self._loaded_path = path
         self._last_transport = None
+        seek_request = object()
+        self._pending_vcr_seek = seek_request
         self._player.play()
         self._player.set_pause(1)
 
         def seek_and_apply() -> None:
-            if self._player is None or self._loaded_path != path:
+            if self._player is None or self._pending_vcr_seek is not seek_request:
                 return
             # The transport may have changed while VLC initialized. Re-read
             # Reality at callback time instead of applying stale captured state.
@@ -321,14 +324,17 @@ class CRTDisplay:
             except (sqlite3.Error, OSError, RuntimeError, ValueError):
                 self._player.audio_set_mute(True)
                 self._player.set_pause(1)
+                self.root.after(500, seek_and_apply)
                 return
             if current_path != path:
+                self.root.after(500, seek_and_apply)
                 return
             audible_now = bool(power and kind == "input" and value == 1)
             self._player.audio_set_mute(not audible_now)
             self._player.set_time(int(current_position * 1000))
             self._player.set_pause(0 if current_transport == "play" else 1)
             self._last_transport = current_transport
+            self._pending_vcr_seek = None
 
         self.root.after(500, seek_and_apply)
 
@@ -351,13 +357,15 @@ class CRTDisplay:
         if path != self._loaded_path:
             self._save_vcr_position(force=True)
             if path is None:
+                self._pending_vcr_seek = None
                 if self._player:
                     self._player.stop()
                 self._loaded_path = None
                 self._last_transport = None
             else:
                 self._prepare_media(path, position, transport, audible)
-        elif path and self._player and transport != self._last_transport:
+        elif (path and self._player and self._pending_vcr_seek is None
+              and transport != self._last_transport):
             self._save_vcr_position(force=True)
             self._player.audio_set_mute(not audible)
             if transport == "play":
@@ -468,7 +476,10 @@ class CRTDisplay:
             if self._player:
                 self._player.audio_set_mute(not audible)
             self.sync_vcr_player(tape_path, transport, position, audible)
-            self._record_playback_state(tape_path)
+            if self._pending_vcr_seek is None:
+                self._record_playback_state(self._loaded_path)
+            elif self._last_logged_vlc_state and self._last_logged_vlc_state[0] != self._loaded_path:
+                self._record_playback_state(None)
 
             if not power:
                 headline = "TV OFF"

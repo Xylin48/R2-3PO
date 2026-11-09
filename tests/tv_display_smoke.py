@@ -292,6 +292,44 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertIn(("mute", True), events)
         self.assertEqual(events[-1], ("pause", 0))
 
+    def test_vcr_pending_seek_is_retried_and_superseded_by_exact_load(self) -> None:
+        events = []
+        callbacks = []
+
+        class Player:
+            def set_media(self, media): pass
+            def audio_set_mute(self, muted): pass
+            def play(self): events.append(("play",)); return 0
+            def set_pause(self, paused): events.append(("pause", paused))
+            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Player()
+        display._vlc_instance = type("Instance", (), {"media_new": lambda self, path: path})()
+        display._loaded_path = None
+        display._last_transport = None
+        display.root = type("Root", (), {"after": lambda self, delay, callback: callbacks.append(callback)})()
+        first, second = "/tmp/first.mp4", "/tmp/second.mp4"
+        display.read_state = lambda: (1, "input", 1, None)
+
+        display._prepare_media(first, 0, "play", True)
+        stale = callbacks[-1]
+        display._prepare_media(second, 0, "stop", True)
+        display._prepare_media(first, 0, "play", True)
+        active = callbacks[-1]
+        events.clear()
+        with patch.object(display, "read_vcr_state",
+                          side_effect=[sqlite3.OperationalError("busy"), (first, "play", 70.5)]):
+            stale()
+            self.assertEqual(events, [])
+            active()
+            self.assertEqual(events, [("pause", 1)])
+            display.sync_vcr_player(first, "play", 0, True)
+            self.assertEqual(events, [("pause", 1)])
+            callbacks[-1]()
+        self.assertEqual(events, [("pause", 1), ("seek", 70500), ("pause", 0)])
+        self.assertIsNone(display._pending_vcr_seek)
+
     def test_media_playback_transitions_are_logged_once(self) -> None:
         class FakeState:
             Playing, Paused, Stopped, Ended, Error = range(1, 6)
