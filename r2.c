@@ -128,7 +128,7 @@ static int media_capture_thread_started = 0;
 static unsigned char *media_latest_data = NULL;
 static size_t media_latest_capacity = 0;
 static R2VisionFrame media_latest_frame;
-static R2VisionEvent media_latest_event;
+static char *media_latest_source;
 /* Chosen display attention never changes camera capture or playback. */
 static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
@@ -181,7 +181,7 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
 static char *r2_vision_current_frame_base64(void);
 static char *r2_vision_media_current_frame_base64(void);
 static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
-                                        R2VisionEvent *event,
+                                        char **source_out,
                                         unsigned char **owned_data);
 
 static pthread_mutex_t db_lock =
@@ -10466,14 +10466,14 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         return NULL;
 
     R2VisionFrame frame = {0};
-    R2VisionEvent event = {0};
+    char *source = NULL;
     unsigned char *frame_copy = NULL;
 
     /* A running camera already has a dedicated continuous frame reader.
        Explicit attention must observe that reader's latest snapshot rather
        than consume an extra frame behind its back. */
     if (atomic_load(&vision_watch_running)) {
-        if (r2_vision_copy_watched_frame(&frame, &event, &frame_copy) != 0) {
+        if (r2_vision_copy_watched_frame(&frame, &source, &frame_copy) != 0) {
             r2_log_sensory("vision_frame_unavailable",
                            "R2 could not obtain a current camera frame for deliberate attention.",
                            "The continuous Eyes worker has not published a valid frame.",
@@ -10508,8 +10508,8 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
             return NULL;
         }
         if (r2_eyes_get_frame(eyes, &frame) != 0 ||
-            r2_eyes_get_event(eyes, &event) != 0 ||
-            !frame.data || frame.size == 0) {
+            !frame.data || frame.size == 0 ||
+            !(source = r2_eyes_copy_source(eyes))) {
             pthread_mutex_unlock(&visual_capture_lock);
             return NULL;
         }
@@ -10518,7 +10518,8 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
             pthread_mutex_unlock(&visual_capture_lock);
             r2_log_sensory("vision_frame_copy_failed",
                            "R2 could not copy a frame for independent visual analysis.",
-                           "The frame snapshot allocation failed.", event.source_name);
+                           "The frame snapshot allocation failed.", source);
+            free(source);
             return NULL;
         }
         memcpy(frame_copy, frame.data, frame.size);
@@ -10526,9 +10527,8 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         pthread_mutex_unlock(&visual_capture_lock);
     }
 
-    char source_name[sizeof(event.source_name)];
-    snprintf(source_name, sizeof(source_name), "%s", event.source_name);
-    char *description = r2_visual_analyze_frame(&frame, source_name, question);
+    char *description = r2_visual_analyze_frame(&frame, source, question);
+    free(source);
     free(frame_copy);
     return description;
 }
@@ -10567,14 +10567,14 @@ static void *r2_media_capture_worker(void *unused)
     while (!shutting_down && atomic_load(&media_capture_running)) {
         pthread_mutex_lock(&media_capture_lock);
         R2VisionFrame frame = {0};
-        R2VisionEvent event = {0};
+        char *source = NULL;
         int captured = media_eyes && r2_eyes_is_open(media_eyes)
             ? r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled,
                                           &media_capture_running) : -1;
         int available = captured == 1 &&
             r2_eyes_get_frame(media_eyes, &frame) == 0 &&
-            r2_eyes_get_event(media_eyes, &event) == 0 &&
-            frame.data && frame.size > 0;
+            frame.data && frame.size > 0 &&
+            (source = r2_eyes_copy_source(media_eyes));
         if (available) {
             pthread_mutex_lock(&media_frame_lock);
             if (frame.size > media_latest_capacity) {
@@ -10590,12 +10590,14 @@ static void *r2_media_capture_worker(void *unused)
                 memcpy(media_latest_data, frame.data, frame.size);
                 media_latest_frame = frame;
                 media_latest_frame.data = media_latest_data;
-                media_latest_event = event;
+                free(media_latest_source);
+                media_latest_source = source;
             }
             pthread_mutex_unlock(&media_frame_lock);
         }
         pthread_mutex_unlock(&media_capture_lock);
         if (!available) {
+            free(source);
             if (!shutting_down && atomic_load(&media_capture_running))
                 r2_log_sensory("media_capture_ended",
                               "The separate media display stopped supplying frames.",
@@ -10620,7 +10622,7 @@ static void *r2_media_capture_worker(void *unused)
                      changed, (unsigned long long)frame.timestamp);
             r2_log_sensory("media_visual_change_notice",
                            "Raw visual variation was detected in an available media display.",
-                           detail, event.source_name);
+                           detail, source);
             last_change_event = frame.timestamp;
         }
         have_previous = 1;
@@ -10653,7 +10655,8 @@ static int r2_vision_media_stop_locked(void)
     media_latest_data = NULL;
     media_latest_capacity = 0;
     memset(&media_latest_frame, 0, sizeof(media_latest_frame));
-    memset(&media_latest_event, 0, sizeof(media_latest_event));
+    free(media_latest_source);
+    media_latest_source = NULL;
     pthread_mutex_unlock(&media_frame_lock);
     return 0;
 }
@@ -10772,15 +10775,18 @@ char *r2_vision_media_see(const char *question)
         !atomic_load(&eyes_auto_allowed)) return NULL;
     pthread_mutex_lock(&media_frame_lock);
     R2VisionFrame frame = media_latest_frame;
-    R2VisionEvent event = media_latest_event;
-    unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
+    char *source = NULL;
+    if (atomic_load(&media_capture_running) && frame.data && frame.size &&
+        media_latest_source)
+        source = strdup(media_latest_source);
+    unsigned char *copy = source ? malloc(frame.size) : NULL;
     if (copy) {
         memcpy(copy, frame.data, frame.size);
         frame.data = copy;
     }
     pthread_mutex_unlock(&media_frame_lock);
-    if (!copy) return NULL;
-    char *description = r2_visual_analyze_frame(&frame, event.source_name, question);
+    char *description = copy ? r2_visual_analyze_frame(&frame, source, question) : NULL;
+    free(source);
     free(copy);
     return description;
 }
@@ -10845,7 +10851,8 @@ static pthread_cond_t vision_watch_frame_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t vision_watch_frame_generation = 0;
 static int vision_watch_capture_done = 0;
 static R2VisionFrame vision_watch_latest_frame;
-static R2VisionEvent vision_watch_latest_event;
+static char *vision_watch_latest_source;
+static R2VisionOrigin vision_watch_latest_origin;
 static unsigned char *vision_watch_latest_frame_data = NULL;
 static size_t vision_watch_latest_frame_capacity = 0;
 
@@ -10853,11 +10860,12 @@ static size_t vision_watch_latest_frame_capacity = 0;
    observation copy the same current, complete frame. Wait for the first
    published frame; a stopped/end-of-stream worker cannot supply stale sight. */
 static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
-                                        R2VisionEvent *event,
+                                        char **source_out,
                                         unsigned char **owned_data)
 {
-    if (!frame || !event || !owned_data) return -1;
+    if (!frame || !source_out || !owned_data) return -1;
     *owned_data = NULL;
+    *source_out = NULL;
     pthread_mutex_lock(&vision_watch_frame_lock);
     while (!shutting_down && atomic_load(&vision_watch_running) &&
            vision_watch_frame_generation == 0 && !vision_watch_capture_done)
@@ -10865,15 +10873,18 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
     if (!shutting_down && atomic_load(&vision_watch_running) &&
         !vision_watch_capture_done && vision_watch_frame_generation > 0 &&
         vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
-        vision_watch_latest_frame.size > 0) {
-        unsigned char *copy = malloc(vision_watch_latest_frame.size);
+        vision_watch_latest_frame.size > 0 && vision_watch_latest_source) {
+        char *source = strdup(vision_watch_latest_source);
+        unsigned char *copy = source ? malloc(vision_watch_latest_frame.size) : NULL;
         if (copy) {
             memcpy(copy, vision_watch_latest_frame_data,
                    vision_watch_latest_frame.size);
             *frame = vision_watch_latest_frame;
             frame->data = copy;
-            *event = vision_watch_latest_event;
+            *source_out = source;
             *owned_data = copy;
+        } else {
+            free(source);
         }
     }
     pthread_mutex_unlock(&vision_watch_frame_lock);
@@ -10888,9 +10899,8 @@ static void *vision_watch_capture_worker(void *unused)
     uint64_t last_notice_ms = 0;
     while (!shutting_down && atomic_load(&vision_watch_running)) {
         R2VisionFrame frame;
-        R2VisionEvent event;
+        char *source = NULL;
         memset(&frame, 0, sizeof(frame));
-        memset(&event, 0, sizeof(event));
 
         pthread_mutex_lock(&visual_capture_lock);
         int captured = (eyes && r2_eyes_is_open(eyes))
@@ -10898,8 +10908,8 @@ static void *vision_watch_capture_worker(void *unused)
                                           &vision_watch_running) : -1;
         int frame_ready = captured == 1 && eyes &&
             r2_eyes_get_frame(eyes, &frame) == 0 &&
-            r2_eyes_get_event(eyes, &event) == 0 &&
-            frame.data && frame.size > 0;
+            frame.data && frame.size > 0 &&
+            (source = r2_eyes_copy_source(eyes));
         /* Raw temporal difference belongs to pre-attentive awareness. A
            changed pixel is not a recognized object, command or meaning. */
         unsigned changed_samples = 0;
@@ -10936,7 +10946,9 @@ static void *vision_watch_capture_worker(void *unused)
                 memcpy(vision_watch_latest_frame_data, frame.data, frame.size);
                 vision_watch_latest_frame = frame;
                 vision_watch_latest_frame.data = vision_watch_latest_frame_data;
-                vision_watch_latest_event = event;
+                free(vision_watch_latest_source);
+                vision_watch_latest_source = source;
+                vision_watch_latest_origin = r2_eyes_get_origin(eyes);
                 ++vision_watch_frame_generation;
                 pthread_cond_broadcast(&vision_watch_frame_cond);
             }
@@ -10950,10 +10962,11 @@ static void *vision_watch_capture_worker(void *unused)
                      changed_samples, (unsigned long long)frame.timestamp);
             r2_log_sensory("camera_visual_change_notice",
                            "R2's visual field varied; attention may be directed there.",
-                           details, event.source_name);
+                           details, source);
         }
 
         if (captured == 1 && !frame_ready) {
+            free(source);
             r2_log_sensory("vision_watch_frame_snapshot_failed",
                            "R2 captured a frame but could not publish it for visual analysis.",
                            "Eyes frame metadata or the latest-frame buffer could not be copied.",
@@ -10984,17 +10997,17 @@ static void *vision_watch_capture_worker(void *unused)
 static char *r2_vision_current_frame_base64(void)
 {
     R2VisionFrame frame = {0};
-    R2VisionEvent event = {0};
+    char *source = NULL;
     unsigned char *frame_copy = NULL;
 
     if (atomic_load(&vision_watch_running)) {
-        (void)r2_vision_copy_watched_frame(&frame, &event, &frame_copy);
+        (void)r2_vision_copy_watched_frame(&frame, &source, &frame_copy);
     } else {
         pthread_mutex_lock(&visual_capture_lock);
         int captured = (eyes && r2_eyes_is_open(eyes))
             ? r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL) : -1;
         if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
-            r2_eyes_get_event(eyes, &event) == 0 && frame.data && frame.size > 0) {
+            frame.data && frame.size > 0 && (source = r2_eyes_copy_source(eyes))) {
             frame_copy = malloc(frame.size);
             if (frame_copy) {
                 memcpy(frame_copy, frame.data, frame.size);
@@ -11008,7 +11021,8 @@ static char *r2_vision_current_frame_base64(void)
         r2_log_sensory("visual_input_unavailable",
                        "R2's active conversation could not obtain a current image from Eyes.",
                        "No valid live frame snapshot was available for direct multimodal input.",
-                       event.source_name[0] ? event.source_name : "Eyes");
+                       source ? source : "Eyes");
+        free(source);
         return NULL;
     }
 
@@ -11018,7 +11032,8 @@ static char *r2_vision_current_frame_base64(void)
         r2_log_sensory("visual_input_encoding_failed",
                        "R2's current visual frame could not be encoded for the conversation brain.",
                        "Frame-to-JPEG/base64 encoding failed; no visual interpretation was substituted.",
-                       event.source_name[0] ? event.source_name : "Eyes");
+                       source ? source : "Eyes");
+    free(source);
     return encoded;
 }
 
@@ -11026,13 +11041,10 @@ static void *vision_watch_worker(void *unused)
 {
     (void)unused;
     vision_watch_worker_context = 1;
-    char source_name[512] = "Eyes";
     pthread_mutex_lock(&visual_capture_lock);
-    R2VisionEvent initial_event;
-    if (eyes && r2_eyes_get_event(eyes, &initial_event) == 0 &&
-        initial_event.source_name[0])
-        snprintf(source_name, sizeof(source_name), "%s", initial_event.source_name);
+    char *source = r2_eyes_copy_source(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
+    const char *source_name = source ? source : "Eyes";
 
     r2_log_event(R2_LOG_LIFECYCLE, "vision_watch_started",
                  "R2 continuous visual input started.",
@@ -11071,6 +11083,7 @@ static void *vision_watch_worker(void *unused)
                  "R2 continuous visual input stopped.",
                  "The raw-frame capture worker exited because observation stopped or the source ended.",
                  source_name);
+    free(source);
     atomic_store(&vision_watch_running, 0);
     vision_watch_worker_context = 0;
     return NULL;
@@ -11115,7 +11128,9 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
     vision_watch_frame_generation = 0;
     vision_watch_capture_done = 0;
     memset(&vision_watch_latest_frame, 0, sizeof(vision_watch_latest_frame));
-    memset(&vision_watch_latest_event, 0, sizeof(vision_watch_latest_event));
+    free(vision_watch_latest_source);
+    vision_watch_latest_source = NULL;
+    vision_watch_latest_origin = R2_VISION_NONE;
     free(vision_watch_latest_frame_data);
     vision_watch_latest_frame_data = NULL;
     vision_watch_latest_frame_capacity = 0;
@@ -11190,7 +11205,9 @@ static int r2_vision_watch_stop_locked(void)
     vision_watch_latest_frame_data = NULL;
     vision_watch_latest_frame_capacity = 0;
     memset(&vision_watch_latest_frame, 0, sizeof(vision_watch_latest_frame));
-    memset(&vision_watch_latest_event, 0, sizeof(vision_watch_latest_event));
+    free(vision_watch_latest_source);
+    vision_watch_latest_source = NULL;
+    vision_watch_latest_origin = R2_VISION_NONE;
     vision_watch_frame_generation = 0;
     vision_watch_capture_done = 0;
     pthread_mutex_unlock(&vision_watch_frame_lock);
@@ -13901,51 +13918,71 @@ finalize_reply:
      * not claims that Ears has transcribed or understood the audio.
      */
     if (turn_event_id > 0) {
-        R2VisionEvent visual_event;
-        if (eyes && r2_eyes_is_open(eyes) &&
-            r2_eyes_get_event(eyes, &visual_event) == 0 &&
-            (visual_event.origin == R2_VISION_FILE ||
-             visual_event.origin == R2_VISION_VLC ||
-             visual_event.origin == R2_VISION_WINDOW)) {
-            char details[1200];
-            snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\nvisual_source=%s\n"
-                     "visual_origin=%s\nThe media source was active during this conversation; "
-                     "this association does not assert that its contents were fully understood.",
-                     (long long)turn_event_id, visual_event.source_name,
-                     visual_event.origin == R2_VISION_VLC ? "VLC window" :
-                     visual_event.origin == R2_VISION_WINDOW ? "active video window" : "file");
+        char *visual_source = NULL;
+        R2VisionOrigin visual_origin = R2_VISION_NONE;
+        if (atomic_load(&vision_watch_running)) {
+            pthread_mutex_lock(&vision_watch_frame_lock);
+            if (vision_watch_latest_source && !vision_watch_capture_done) {
+                visual_origin = vision_watch_latest_origin;
+                if (visual_origin != R2_VISION_WORLD)
+                    visual_source = strdup(vision_watch_latest_source);
+            }
+            pthread_mutex_unlock(&vision_watch_frame_lock);
+        } else if (pthread_mutex_trylock(&visual_capture_lock) == 0) {
+            if (eyes && r2_eyes_is_open(eyes)) {
+                visual_origin = r2_eyes_get_origin(eyes);
+                if (visual_origin != R2_VISION_WORLD)
+                    visual_source = r2_eyes_copy_source(eyes);
+            }
+            pthread_mutex_unlock(&visual_capture_lock);
+        }
+        if (visual_source &&
+            (visual_origin == R2_VISION_FILE || visual_origin == R2_VISION_VLC ||
+             visual_origin == R2_VISION_WINDOW)) {
+            char *details = NULL;
+            if (asprintf(&details,
+                         "conversation_event_id=%lld\nvisual_source=%s\n"
+                         "visual_origin=%s\nThe media source was active during this conversation; "
+                         "this association does not assert that its contents were fully understood.",
+                         (long long)turn_event_id, visual_source,
+                         visual_origin == R2_VISION_VLC ? "VLC window" :
+                         visual_origin == R2_VISION_WINDOW ? "active video window" : "file") < 0)
+                details = NULL;
             int64_t association_id = r2_log_event(
                 R2_LOG_CONVERSATION, "conversation_during_visual_media",
                 "A conversation turn occurred while R2 was observing media.",
-                details, visual_event.source_name);
+                details, visual_source);
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
-                            "conversation_occurred_during_media", visual_event.source_name);
+                            "conversation_occurred_during_media", visual_source);
+            free(details);
         }
+        free(visual_source);
 
         /* Media is a display present in R2's world, not another pair of eyes.
            Being available never proves he watched or understood its content. */
-        R2VisionEvent display_event = {0};
+        char *display_source = NULL;
         pthread_mutex_lock(&media_frame_lock);
-        int display_present = atomic_load(&media_capture_running) &&
-            media_latest_frame.data && media_latest_frame.size &&
-            media_latest_event.source_name[0];
-        if (display_present) display_event = media_latest_event;
+        if (atomic_load(&media_capture_running) && media_latest_frame.data &&
+            media_latest_frame.size && media_latest_source)
+            display_source = strdup(media_latest_source);
         pthread_mutex_unlock(&media_frame_lock);
-        if (display_present) {
-            char details[1200];
-            snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\\nmedia_display=%s\\n"
-                     "display_available=1; attended=not_established; interpreted=not_established",
-                     (long long)turn_event_id, display_event.source_name);
+        if (display_source) {
+            char *details = NULL;
+            if (asprintf(&details,
+                         "conversation_event_id=%lld\\nmedia_display=%s\\n"
+                         "display_available=1; attended=not_established; interpreted=not_established",
+                         (long long)turn_event_id, display_source) < 0)
+                details = NULL;
             int64_t association_id = r2_log_event(
                 R2_LOG_CONVERSATION, "conversation_with_media_display_available",
                 "A separate video display was available during this conversation.",
-                details, display_event.source_name);
+                details, display_source);
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
-                            "media_display_was_available", display_event.source_name);
+                            "media_display_was_available", display_source);
+            free(details);
+            free(display_source);
         }
 
         R2HearingEvent hearing_event = {0};

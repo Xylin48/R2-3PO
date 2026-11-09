@@ -151,10 +151,15 @@ ssize_t r2_eyes_copy_frame(
 );
 
 /* Event information */
+/* Legacy fixed-size event. Returns EOVERFLOW if the full source will not fit. */
 int r2_eyes_get_event(
     R2Eyes *eyes,
     R2VisionEvent *event
 );
+
+/* Caller owns the result. Hold the source lock across the frame and name copies
+   when sharing an Eyes receiver with another thread. */
+char *r2_eyes_copy_source(const R2Eyes *eyes);
 
 int r2_eyes_get_format(
     R2Eyes *eyes,

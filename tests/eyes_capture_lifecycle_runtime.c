@@ -6,6 +6,17 @@
 
 int __wrap_r2_visual_is_initialized(void) { return 1; }
 
+static const char *expected_source;
+
+char *__wrap_r2_visual_analyze_frame(const R2VisionFrame *frame, const char *source,
+                                    const char *question)
+{
+    (void)question;
+    assert(expected_source && source && strcmp(source, expected_source) == 0);
+    assert(frame->size == 12 && frame->data[11] == 11);
+    return strdup("visual fixture result");
+}
+
 static double monotonic_seconds(void)
 {
     struct timespec now;
@@ -68,11 +79,20 @@ int main(void)
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
     assert(mkdtemp(root));
     char probe[PATH_MAX], decoder[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
-    char path[PATH_MAX * 2];
+    char xdotool[PATH_MAX], path[PATH_MAX * 2];
     assert(snprintf(probe, sizeof(probe), "%s/ffprobe", root) < (int)sizeof(probe));
     assert(snprintf(decoder, sizeof(decoder), "%s/ffmpeg", root) < (int)sizeof(decoder));
     assert(snprintf(ready, sizeof(ready), "%s/ready", root) < (int)sizeof(ready));
     assert(snprintf(release, sizeof(release), "%s/release", root) < (int)sizeof(release));
+    assert(snprintf(xdotool, sizeof(xdotool), "%s/xdotool", root) < (int)sizeof(xdotool));
+    write_executable(xdotool,
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  search) echo 123 ;;\n"
+        "  getwindowgeometry) printf 'WIDTH=2\\nHEIGHT=2\\n' ;;\n"
+        "  getwindowname) printf '%s\\n' \"$R2_TEST_VLC_TITLE\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n");
     write_executable(probe,
         "#!/usr/bin/python3\n"
         "import os, signal, sys\n"
@@ -104,6 +124,7 @@ int main(void)
         "else:\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "    if mode == 'stalled-partial': os.write(1, b'12345')\n"
+        "    if mode.startswith('long-frame:') or mode == ':test-display': os.write(1, bytes(range(12)))\n"
         "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
         "        f.write(str(os.getpid()))\n"
         "    while True: signal.pause()\n");
@@ -246,12 +267,67 @@ int main(void)
     assert(r2_eyes_open_file(eyes, "failed") == 0);
     assert(r2_eyes_capture(eyes) == -1 && !r2_eyes_is_open(eyes));
 
+    /* Use the public capture and attention paths with names sharing a long
+     * prefix. The matching source must accompany the actual copied pixels. */
+    char camera_source[1700], media_source[1700];
+    memset(camera_source, 's', sizeof(camera_source));
+    memcpy(camera_source, "long-frame:", 11);
+    memcpy(camera_source + sizeof(camera_source) - sizeof(" camera"), " camera", sizeof(" camera"));
+    memcpy(media_source, camera_source, sizeof(media_source));
+    memcpy(media_source + sizeof(media_source) - sizeof(" media\n"), " media\n", sizeof(" media\n"));
+
+    assert(r2_eyes_open_file(eyes, camera_source) == 0);
+    R2VisionEvent legacy = {0};
+    assert(r2_eyes_get_event(eyes, &legacy) == -1 && errno == EOVERFLOW);
+    char *saved_source = r2_eyes_copy_source(eyes);
+    assert(saved_source && strcmp(saved_source, camera_source) == 0);
+    expected_source = camera_source;
+    char *observation = r2_vision_see("direct source");
+    assert(observation);
+    free(observation);
+    child = wait_for_child(ready);
+    assert(r2_eyes_release_source() == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+    assert(strcmp(saved_source, camera_source) == 0);
+    free(saved_source);
+
+    assert(r2_eyes_open_file(eyes, camera_source) == 0);
+    assert(r2_vision_watch_start() == 0);
+    child = wait_for_child(ready);
+    observation = r2_vision_see("watched source");
+    assert(observation);
+    free(observation);
+    assert(r2_eyes_release_source() == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    assert(setenv("DISPLAY", ":test-display", 1) == 0);
+    assert(setenv("R2_TEST_VLC_TITLE", media_source, 1) == 0);
+    assert(r2_vision_open_vlc() == 0);
+    child = wait_for_child(ready);
+    expected_source = media_source;
+    observation = NULL;
+    for (int i = 0; i < 2000 && !observation; ++i) {
+        observation = r2_vision_media_see("long VLC source");
+        if (!observation) {
+            struct timespec pause = {0, 1000000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    assert(observation);
+    free(observation);
+    assert(r2_vision_media_stop() == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+    assert(unsetenv("DISPLAY") == 0);
+
     r2_eyes_shutdown(media_eyes);
     media_eyes = NULL;
     r2_eyes_shutdown(eyes);
     eyes = NULL;
     core_initialized = 0;
-    assert(unlink(probe) == 0 && unlink(decoder) == 0 && rmdir(root) == 0);
-    puts("Stalled camera/media stop, exact worker ownership, partial-frame rejection, decoder exit failure, restart and child reaping passed.");
+    assert(unlink(probe) == 0 && unlink(decoder) == 0 && unlink(xdotool) == 0 && rmdir(root) == 0);
+    puts("Stalled camera/media stop, exact worker ownership, partial-frame rejection, decoder exit failure, restart, child reaping and full capture source identity passed.");
     return 0;
 }

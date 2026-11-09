@@ -1849,8 +1849,7 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
                 const char *relationship, const char *notes)
 {
     if (from_event_id <= 0 || to_event_id <= 0 ||
-        !valid_text(relationship) || strlen(relationship) > 128 ||
-        (notes && strlen(notes) > R2_LOG_MAX_TEXT))
+        !valid_text(relationship) || strlen(relationship) > 128)
         return -1;
 
     char utc[40];
@@ -1870,7 +1869,10 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
         rc = sqlite3_bind_int64(st, 1, from_event_id);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, to_event_id);
         if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, relationship, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, notes);
+        if (rc == SQLITE_OK)
+            rc = notes ? sqlite3_bind_text64(st, 4, notes, strlen(notes),
+                                             SQLITE_TRANSIENT, SQLITE_UTF8)
+                       : sqlite3_bind_null(st, 4);
         if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 5, utc, -1, SQLITE_TRANSIENT);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }

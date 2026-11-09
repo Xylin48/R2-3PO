@@ -17,7 +17,7 @@ assert "static void *r2_media_capture_worker(void *unused)" in core
 media = core[core.index("static void *r2_media_capture_worker("):
              core.index("/* Capture and inference are separate workers.")]
 assert "r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled," in media
-assert "media_latest_frame" in media and "media_latest_event" in media
+assert "media_latest_frame" in media and "media_latest_source" in media
 assert "r2_visual_analyze_frame" in media[media.index("char *r2_vision_media_see("):]
 assert "r2_visual_analyze_frame" not in media[:media.index("char *r2_vision_media_see(")]
 assert "media_visual_change_notice" in media
@@ -66,7 +66,7 @@ assert "r2_eyes_open_file(eyes," not in core
 explicit_look = core[core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\n{"):
                      core.index("char *r2_vision_see(const char *question)")]
 assert "if (atomic_load(&vision_watch_running))" in explicit_look
-assert "r2_vision_copy_watched_frame(&frame, &event, &frame_copy)" in explicit_look
+assert "r2_vision_copy_watched_frame(&frame, &source, &frame_copy)" in explicit_look
 assert explicit_look.index("r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled,") > explicit_look.index("} else {")  # direct fallback only
 snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\n"):
                 core.index("static void *vision_watch_capture_worker(void *unused)")]

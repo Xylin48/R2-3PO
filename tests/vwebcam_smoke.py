@@ -41,6 +41,10 @@ def verify_session_matching() -> None:
         pixels = b"1 1\n255\n\x00\x80\xff"
         label = "complete " * 100
         region = {"x": 0, "y": 0, "width": 1, "height": 1, "label": label.strip()}
+        source = "  " + "é" * 700 + "\r\nlong exact title\n "
+        status.write_text("1\nlegacy label\n1\n1\n1\n123\n10\nsource_hex=" +
+                          source.encode().hex() + "\n")
+        assert viewer.status()["source"] == source
         status.write_text("1\nSame name\n1\n1\n1\n123\n10\n")
         frame.write_bytes(b"P6\n# r2-preview 10\n" + pixels)
         focus.write_text(json.dumps(dict(region, preview_session=10)))

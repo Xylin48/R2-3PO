@@ -113,7 +113,7 @@ struct R2Eyes
     R2VisionEvent event;
     R2VisionFrame frame;
 
-    char source_name[512];
+    char *source_name;
 };
 
 /* Display-only mirror for V-Webcam. It reads the same Eyes frames but never
@@ -163,27 +163,31 @@ static void r2_vwebcam_write_status(const R2Eyes *eyes, int active)
         return;
     if (active && now_ms)
         r2_vwebcam_last_status_ms = now_ms;
-    char tmp[PATH_MAX], path[PATH_MAX], source[sizeof(eyes->source_name)];
+    char tmp[PATH_MAX], path[PATH_MAX];
     int tn = snprintf(tmp, sizeof(tmp), "%s/status.tmp", R2_VWEBCAM_DIR);
     int pn = snprintf(path, sizeof(path), "%s/status.txt", R2_VWEBCAM_DIR);
     if (tn < 0 || (size_t)tn >= sizeof(tmp) || pn < 0 || (size_t)pn >= sizeof(path))
         return;
 
-    size_t j = 0;
-    const char *raw = eyes && eyes->source_name[0] ? eyes->source_name : "No visual source";
-    for (size_t i = 0; raw[i] && j + 1 < sizeof(source); ++i)
-        source[j++] = (raw[i] == '\n' || raw[i] == '\r') ? ' ' : raw[i];
-    source[j] = '\0';
-
+    const char *raw = eyes && eyes->source_name ? eyes->source_name : "No visual source";
     FILE *fp = fopen(tmp, "w");
     if (!fp)
         return;
-    int failed = fprintf(fp, "%d\n%s\n%u\n%u\n%llu\n%llu\n%llu\n",
-        active ? 1 : 0, source,
-        eyes ? eyes->format.width : 0, eyes ? eyes->format.height : 0,
-        (unsigned long long)(eyes ? eyes->frame_count : 0),
-        (unsigned long long)(eyes ? eyes->timestamp : 0),
-        (unsigned long long)(eyes ? eyes->preview_session : 0)) < 0;
+    int failed = fprintf(fp, "%d\n", active ? 1 : 0) < 0;
+    /* Retain the legacy one-line display label and append the exact bytes
+       after the existing fields. Both forms travel in the same atomic file. */
+    for (const unsigned char *c = (const unsigned char *)raw; *c && !failed; ++c)
+        failed = fputc(*c == '\n' || *c == '\r' ? ' ' : *c, fp) == EOF;
+    if (!failed)
+        failed = fprintf(fp, "\n%u\n%u\n%llu\n%llu\n%llu\nsource_hex=",
+            eyes ? eyes->format.width : 0, eyes ? eyes->format.height : 0,
+            (unsigned long long)(eyes ? eyes->frame_count : 0),
+            (unsigned long long)(eyes ? eyes->timestamp : 0),
+            (unsigned long long)(eyes ? eyes->preview_session : 0)) < 0;
+    for (const unsigned char *c = (const unsigned char *)raw; *c && !failed; ++c)
+        failed = fprintf(fp, "%02x", (unsigned)*c) < 0;
+    if (!failed)
+        failed = fputc('\n', fp) == EOF;
     if (fclose(fp) != 0)
         failed = 1;
     if (!failed) {
@@ -739,13 +743,6 @@ static void r2_eyes_reset_event(R2Eyes *eyes)
     eyes->event.type =
         R2_VISUAL_UNKNOWN;
 
-    snprintf(
-        eyes->event.source_name,
-        sizeof(eyes->event.source_name),
-        "%s",
-        eyes->source_name
-    );
-
     eyes->event.format =
         eyes->format;
 
@@ -964,15 +961,16 @@ void r2_eyes_close(R2Eyes *eyes)
     }
 
     if (eyes->open) {
-        char details[768];
-        snprintf(details, sizeof(details),
-                 "source=%s; frames_captured=%llu; resolution=%ux%u",
-                 eyes->source_name[0] ? eyes->source_name : "(unknown)",
+        char *details = NULL;
+        if (asprintf(&details, "source=%s; frames_captured=%llu; resolution=%ux%u",
+                 eyes->source_name ? eyes->source_name : "(unknown)",
                  (unsigned long long)eyes->frame_count,
-                 eyes->format.width, eyes->format.height);
+                 eyes->format.width, eyes->format.height) < 0)
+            details = NULL;
         r2_log_sensory("vision_source_closed",
                        "R2 Eyes stopped receiving visual frames.",
-                       details, "Eyes.c");
+                       details, eyes->source_name);
+        free(details);
     }
 
     eyes->open = 0;
@@ -984,11 +982,8 @@ void r2_eyes_close(R2Eyes *eyes)
     eyes->timestamp = 0;
     eyes->last_log_timestamp = 0;
 
-    memset(
-        eyes->source_name,
-        0,
-        sizeof(eyes->source_name)
-    );
+    free(eyes->source_name);
+    eyes->source_name = NULL;
 
     memset(
         &eyes->event,
@@ -1080,6 +1075,9 @@ static int r2_eyes_open_internal(
         return -1;
     }
 
+    char *source_copy = strdup(source);
+    if (!source_copy) return -1;
+
     FILE *stream =
         r2_eyes_start_ffmpeg(
             source,
@@ -1091,25 +1089,17 @@ static int r2_eyes_open_internal(
                        "R2 Eyes could not start the FFmpeg capture stream.",
                        "FFmpeg did not provide a readable visual stream.",
                        source);
+        free(source_copy);
         return -1;
     }
 
+    eyes->source_name = source_copy;
     eyes->stream = stream;
     eyes->open = 1;
     eyes->source_is_live = live_device;
     eyes->origin = origin;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
-
-    strncpy(
-        eyes->source_name,
-        source,
-        sizeof(eyes->source_name) - 1
-    );
-
-    eyes->source_name[
-        sizeof(eyes->source_name) - 1
-    ] = '\0';
 
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
@@ -1150,15 +1140,13 @@ int r2_eyes_open_file(
 /* Find actual video-capture devices, rather than assuming /dev/video0.
  * A single camera can expose multiple V4L2 nodes (e.g. capture + metadata).
  * Query capabilities to avoid treating a metadata-only node as an eye. */
-static int r2_eyes_camera_path(char *out, size_t capacity)
+static char *r2_eyes_camera_path(void)
 {
     const char *configured = getenv("R2_CAMERA_DEVICE");
     glob_t candidates = {0};
-    if (!out || capacity == 0) return -1;
-    out[0] = '\0';
     if (!configured || !*configured) {
         if (glob("/dev/video*", 0, NULL, &candidates) != 0)
-            return -1;
+            return NULL;
     }
     size_t count = (configured && *configured) ? 1 : candidates.gl_pathc;
     for (size_t i = 0; i < count; ++i) {
@@ -1178,27 +1166,29 @@ static int r2_eyes_camera_path(char *out, size_t capacity)
         if (!(effective & (V4L2_CAP_VIDEO_CAPTURE |
                            V4L2_CAP_VIDEO_CAPTURE_MPLANE)))
             continue;
-        if (snprintf(out, capacity, "%s", path) >= (int)capacity)
-            break;
+        char *selected = strdup(path);
         globfree(&candidates);
-        return 0;
+        return selected;
     }
     globfree(&candidates);
-    return -1;
+    return NULL;
 }
 
 int r2_eyes_camera_available(void)
 {
-    char camera[512];
-    return r2_eyes_camera_path(camera, sizeof(camera)) == 0;
+    char *camera = r2_eyes_camera_path();
+    int available = camera != NULL;
+    free(camera);
+    return available;
 }
 
 int r2_eyes_open_camera(R2Eyes *eyes)
 {
-    char camera[512];
-    if (r2_eyes_camera_path(camera, sizeof(camera)) != 0)
-        return -1;
-    return r2_eyes_open_device(eyes, camera);
+    char *camera = r2_eyes_camera_path();
+    if (!camera) return -1;
+    int rc = r2_eyes_open_device(eyes, camera);
+    free(camera);
+    return rc;
 }
 
 int r2_eyes_open_device(
@@ -1272,16 +1262,21 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
         r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
         r2_eyes_allocate_record_buffer(eyes) != 0)
         return -1;
+    char *source = NULL;
+    if (asprintf(&source, "video rendering window %lu", window_id) < 0)
+        return -1;
     FILE *stream = r2_eyes_start_vlc(window_id, &eyes->stream_child);
-    if (!stream) return -1;
+    if (!stream) {
+        free(source);
+        return -1;
+    }
+    eyes->source_name = source;
     eyes->stream = stream;
     eyes->open = 1;
     eyes->source_is_live = 0;
     eyes->origin = R2_VISION_WINDOW;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
-    snprintf(eyes->source_name, sizeof(eyes->source_name),
-             "video rendering window %lu", window_id);
     r2_eyes_reset_event(eyes);
     r2_eyes_reset_frame(eyes);
     if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
@@ -1339,26 +1334,6 @@ int r2_eyes_open_vlc(
         return -1;
     }
 
-    FILE *stream =
-        r2_eyes_start_vlc(
-            window_id, &eyes->stream_child
-        );
-
-    if (!stream)
-        return -1;
-
-    eyes->stream = stream;
-    eyes->open = 1;
-
-    /*
-     * VLC is visually live, but the capture should close
-     * when the VLC window disappears.
-     */
-    eyes->source_is_live = 0;
-
-    eyes->origin =
-        R2_VISION_VLC;
-
     /*
      * Preserve the visible VLC window title as source metadata. This is
      * useful for later history searches, but is not treated as proof of
@@ -1368,28 +1343,31 @@ int r2_eyes_open_vlc(
     snprintf(window, sizeof(window), "%lu", window_id);
     char *title_argv[] = {"xdotool", "getwindowname", window, NULL};
     char *window_title = r2_eyes_query(title_argv, deadline);
-    if (!window_title && errno == ETIMEDOUT) {
-        r2_eyes_close(eyes);
-        errno = ETIMEDOUT;
+    if (!window_title && (errno == ETIMEDOUT || errno == ENOMEM ||
+                          errno == EOVERFLOW || errno == EPROTO))
         return -1;
-    }
     if (window_title) {
         size_t length = strlen(window_title);
-        while (length && (window_title[length - 1] == '\n' || window_title[length - 1] == '\r'))
-            window_title[--length] = '\0';
-        /* The current public event representation still has a fixed source
-         * field. Do not silently present a partial title as the full identity. */
-        if (length >= sizeof(eyes->source_name)) {
-            free(window_title);
-            r2_eyes_close(eyes);
-            errno = EOVERFLOW;
-            return -1;
-        }
+        /* xdotool appends one newline to the title. */
+        if (length && window_title[length - 1] == '\n')
+            window_title[length - 1] = '\0';
     }
-    snprintf(eyes->source_name, sizeof(eyes->source_name), "%s",
-             window_title && *window_title ? window_title : "VLC");
-    free(window_title);
+    if (!window_title || !*window_title) {
+        free(window_title);
+        window_title = strdup("VLC");
+        if (!window_title) return -1;
+    }
 
+    FILE *stream = r2_eyes_start_vlc(window_id, &eyes->stream_child);
+    if (!stream) {
+        free(window_title);
+        return -1;
+    }
+    eyes->source_name = window_title;
+    eyes->stream = stream;
+    eyes->open = 1;
+    eyes->source_is_live = 0;
+    eyes->origin = R2_VISION_VLC;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
 
@@ -1469,16 +1447,6 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
     eyes->event.type =
         R2_VISUAL_UNKNOWN;
 
-    strncpy(
-        eyes->event.source_name,
-        eyes->source_name,
-        sizeof(eyes->event.source_name) - 1
-    );
-
-    eyes->event.source_name[
-        sizeof(eyes->event.source_name) - 1
-    ] = '\0';
-
     eyes->event.format =
         eyes->format;
 
@@ -1519,18 +1487,19 @@ int r2_eyes_capture_cancelable(R2Eyes *eyes,
      */
     if (eyes->last_log_timestamp == 0 ||
         eyes->timestamp - eyes->last_log_timestamp >= 5000) {
-        char details[768];
-        snprintf(details, sizeof(details),
-                 "source=%s; frame=%llu; resolution=%ux%u; bytes=%zu; "
+        char *details = NULL;
+        if (asprintf(&details, "source=%s; frame=%llu; resolution=%ux%u; bytes=%zu; "
                  "timestamp_ms=%llu; interpretation=not_performed_by_Eyes",
                  eyes->source_name,
                  (unsigned long long)eyes->frame_count,
                  eyes->format.width, eyes->format.height,
                  eyes->frame_size,
-                 (unsigned long long)eyes->timestamp);
+                 (unsigned long long)eyes->timestamp) < 0)
+            details = NULL;
         r2_log_sensory("visual_frame_received",
                        "R2 Eyes received a real visual frame.",
                        details, eyes->source_name);
+        free(details);
         eyes->last_log_timestamp = eyes->timestamp;
     }
 
@@ -1597,9 +1566,20 @@ int r2_eyes_get_event(
     if (!eyes || !event)
         return -1;
 
+    const char *source = eyes->source_name ? eyes->source_name : "";
+    size_t length = strlen(source);
+    if (length >= sizeof(event->source_name)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     *event = eyes->event;
-
+    memcpy(event->source_name, source, length + 1);
     return 0;
+}
+
+char *r2_eyes_copy_source(const R2Eyes *eyes)
+{
+    return eyes && eyes->source_name ? strdup(eyes->source_name) : NULL;
 }
 
 int r2_eyes_get_format(
