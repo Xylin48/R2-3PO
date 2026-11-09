@@ -89,8 +89,84 @@ static pthread_t tv_control_thread;
 static int tv_control_started = 0;
 static int tv_control_fd = -1;
 static atomic_int tv_control_stop = ATOMIC_VAR_INIT(0);
-static atomic_ulong tv_live_video_window = ATOMIC_VAR_INIT(0);
+/* One snapshot carries both the XID and its playback publication. The same
+ * Tk surface can host multiple tapes between two Watch polls. */
+static atomic_uint_fast64_t tv_live_renderer = ATOMIC_VAR_INIT(0);
+static char tv_renderer_path[1100]; /* control-thread-only exact publication key */
 static char tv_control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+static void tv_publish_video_window(uint32_t window, const char *path)
+{
+    /* Only the control thread publishes while it runs. */
+    uint64_t previous = atomic_load(&tv_live_renderer);
+    if ((uint32_t)previous == window &&
+        (!window || (path && !strcmp(tv_renderer_path, path))))
+        return;
+    if (path) memcpy(tv_renderer_path, path, strlen(path) + 1);
+    else tv_renderer_path[0] = '\0';
+    uint64_t generation = (previous >> 32) + 1;
+    atomic_store(&tv_live_renderer, (generation << 32) | window);
+}
+
+static int tv_parse_window_id(const char *value, uint32_t *window)
+{
+    if (!*value || strlen(value) > 10 || value[strspn(value, "0123456789")]) return -1;
+    char *end;
+    errno = 0;
+    unsigned long id = strtoul(value, &end, 10);
+    if (errno || *end || id > UINT32_MAX) return -1;
+    *window = (uint32_t)id;
+    return 0;
+}
+
+static int tv_renderer_path_valid(const char *path)
+{
+    return path[0] == '/' && !strpbrk(path, "\n\r") &&
+        strlen(path) < sizeof(tv_renderer_path);
+}
+
+static const char *tv_control_renderer(char *payload)
+{
+    char *path = strchr(payload, '|');
+    if (path) *path++ = '\0';
+    uint32_t window;
+    if (tv_parse_window_id(payload, &window) != 0 ||
+        (window ? !path || !tv_renderer_path_valid(path) : path != NULL))
+        return "ERROR invalid renderer";
+    tv_publish_video_window(window, path);
+    return "OK renderer publication received";
+}
+
+static const char *tv_control_media_event(char *payload, int legacy_locator)
+{
+    const char *invalid = "ERROR invalid media event";
+    uint32_t window = 0;
+    char *separator = strchr(payload, '|');
+    if (!separator) return invalid;
+    *separator = '\0';
+    char *path = separator + 1;
+    if (legacy_locator) {
+        /* Legacy clients append an optional locator to the path. */
+        char *locator = NULL;
+        for (char *next = path; (next = strstr(next, "|x11=")); ++next)
+            locator = next;
+        if (locator) {
+            if (tv_parse_window_id(locator + 5, &window) != 0 || !window)
+                return invalid;
+            *locator = '\0';
+        }
+    }
+    if (!tv_renderer_path_valid(path)) return invalid;
+    int playing = !strcmp(payload, "vcr_playback_started");
+    if (!playing && strcmp(payload, "vcr_playback_paused") &&
+        strcmp(payload, "vcr_playback_stopped") && strcmp(payload, "vcr_playback_ended") &&
+        strcmp(payload, "vcr_playback_error"))
+        return invalid;
+    if (legacy_locator) tv_publish_video_window(playing ? window : 0, NULL);
+    return r2_log_media_event(payload, "media", path,
+        "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
+        ? "OK media event recorded" : "ERROR could not record media event";
+}
 
 static void *tv_control_server(void *unused)
 {
@@ -160,7 +236,7 @@ static void *tv_control_server(void *unused)
 
         /* A partial or oversized command is never dispatched. This also lets
            shutdown abandon a client that connected but never sent a full line. */
-        if (!complete_line || atomic_load(&tv_control_stop)) {
+        if (!complete_line || atomic_load(&tv_control_stop) || memchr(command, '\0', used)) {
             close(client);
             if (atomic_load(&tv_control_stop)) break;
             continue;
@@ -179,12 +255,12 @@ static void *tv_control_server(void *unused)
         } else if (!strcmp(command, "display opened")) {
             reply = r2_reality_tv_display_event(1) == 0 ? "OK TV display-open event recorded" : "ERROR could not record TV display-open event";
         } else if (!strcmp(command, "display closed")) {
-            atomic_store(&tv_live_video_window, 0);
+            tv_publish_video_window(0, NULL);
             reply = r2_reality_tv_display_event(0) == 0 ? "OK TV display-close event recorded" : "ERROR could not record TV display-close event";
         } else if (!strcmp(command, "power on")) {
             reply = r2_reality_tv_power(1) == 0 ? "OK powered on" : "ERROR power-on failed";
         } else if (!strcmp(command, "power off")) {
-            atomic_store(&tv_live_video_window, 0);
+            tv_publish_video_window(0, NULL);
             reply = r2_reality_tv_power(0) == 0 ? "OK powered off" : "ERROR power-off failed";
         } else if (!strncmp(command, "input ", 6)) {
             char *end = NULL;
@@ -199,47 +275,11 @@ static void *tv_control_server(void *unused)
                 reply = r2_reality_tv_tune_rf((int)n) == 0 ? "OK RF channel tuned" : "ERROR RF tuning failed";
             else reply = "ERROR RF channel must be 2..13";
         } else if (!strncmp(command, "media ", 6)) {
-            char *payload = command + 6;
-            char *separator = strchr(payload, '|');
-            if (separator) {
-                *separator = '\0';
-                char *path = separator + 1;
-                unsigned long published_window = 0;
-                int valid_locator = 1;
-                char *locator = strstr(path, "|x11=");
-                if (locator) {
-                    char *end = NULL;
-                    errno = 0;
-                    unsigned long value = strtoul(locator + 5, &end, 10);
-                    if (errno || end == locator + 5 || !end || *end || !value)
-                        valid_locator = 0;
-                    else {
-                        published_window = value;
-                        *locator = '\0';
-                    }
-                }
-                const char *allowed_actions[] = {
-                    "vcr_playback_started", "vcr_playback_paused",
-                    "vcr_playback_stopped", "vcr_playback_ended",
-                    "vcr_playback_error"
-                };
-                int allowed = 0;
-                for (size_t i = 0; i < sizeof(allowed_actions) / sizeof(allowed_actions[0]); ++i)
-                    if (!strcmp(payload, allowed_actions[i])) { allowed = 1; break; }
-                if (allowed && valid_locator && path[0] == '/' && *path &&
-                    !strchr(path, '\n') && !strchr(path, '\r') &&
-                    strlen(path) < 1100) {
-                    atomic_store(&tv_live_video_window,
-                        !strcmp(payload, "vcr_playback_started") ? published_window : 0);
-                    reply = r2_log_media_event(payload, "media", path,
-                        "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
-                        ? "OK media event recorded" : "ERROR could not record media event";
-                } else {
-                    reply = "ERROR invalid media event";
-                }
-            } else {
-                reply = "ERROR invalid media event";
-            }
+            reply = tv_control_media_event(command + 6, 1);
+        } else if (!strncmp(command, "media-path ", 11)) {
+            reply = tv_control_media_event(command + 11, 0);
+        } else if (!strncmp(command, "renderer ", 9)) {
+            reply = tv_control_renderer(command + 9);
         } else if (!strncmp(command, "vcr insert ", 11)) {
             const char *path = command + 11;
             reply = *path && r2_reality_tv_vcr_insert(path) == 0
@@ -331,6 +371,7 @@ static void tv_control_stop_server(void)
     /* The server uses bounded poll() waits and must finish before its listener
        descriptor is closed, avoiding close/accept races and an unbounded join. */
     pthread_join(tv_control_thread, NULL);
+    tv_publish_video_window(0, NULL);
     close(tv_control_fd);
     tv_control_fd = -1;
     unlink(tv_control_path);
@@ -1359,12 +1400,14 @@ typedef struct {
     int kind; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
     uint64_t token;
     unsigned long window;
+    uint64_t publication; /* CRT playback generation, including its XID */
 } ShellWatchMedia;
 
 static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
                                    int audio_known, int desktop_playing, long playback_pid)
 {
-    unsigned long published = atomic_load(&tv_live_video_window);
+    uint64_t publication = atomic_load(&tv_live_renderer);
+    unsigned long published = (uint32_t)publication;
     unsigned long wanted_window = 0;
     int wanted_kind = 0;
     if (eyes_permitted) {
@@ -1381,7 +1424,7 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
             if (wanted_window) wanted_kind = 2;
         }
     }
-    if (shell_watch_cancelled(NULL) || published != atomic_load(&tv_live_video_window))
+    if (shell_watch_cancelled(NULL) || publication != atomic_load(&tv_live_renderer))
         return; /* Reconcile against the next complete publication snapshot. */
 
     /* The CRT publisher can withdraw its own window independently of Pulse.
@@ -1389,7 +1432,7 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
     if (managed->token &&
         (!r2_vision_media_watch_owns(managed->token) ||
          !r2_sense_auto_allowed(1) || r2_vision_media_status() <= 0 ||
-         (managed->kind == 3 && managed->window != published) ||
+         (managed->kind == 3 && managed->publication != publication) ||
          ((audio_known || wanted_kind == 3) &&
           (managed->kind != wanted_kind || managed->window != wanted_window)))) {
         (void)r2_vision_media_stop_if_watch_owned(managed->token);
@@ -1397,18 +1440,21 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
     }
     if (!wanted_window || managed->token || shell_watch_cancelled(NULL) ||
         r2_vision_media_status() || !r2_vision_available() ||
-        published != atomic_load(&tv_live_video_window))
+        publication != atomic_load(&tv_live_renderer))
         return;
 
     uint64_t token = wanted_kind == 2 ?
         r2_vision_media_open_vlc_window_for_watch(wanted_window) :
         r2_vision_media_open_window_for_watch(wanted_window);
     if (!token) return;
-    if (shell_watch_cancelled(NULL) || published != atomic_load(&tv_live_video_window)) {
+    if (shell_watch_cancelled(NULL) || publication != atomic_load(&tv_live_renderer)) {
         (void)r2_vision_media_stop_if_watch_owned(token);
         return;
     }
-    *managed = (ShellWatchMedia){.kind = wanted_kind, .token = token, .window = wanted_window};
+    *managed = (ShellWatchMedia){
+        .kind = wanted_kind, .token = token, .window = wanted_window,
+        .publication = wanted_kind == 3 ? publication : 0
+    };
     r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
                  "R2 can observe an independent real media display.",
                  "The display does not replace physical Eyes or demand attention.",

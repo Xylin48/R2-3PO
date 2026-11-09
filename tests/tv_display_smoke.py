@@ -171,7 +171,9 @@ class TVDisplaySmoke(unittest.TestCase):
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",
                         "vcr insert /tmp/example-film.mp4", "vcr position 42.750",
                         "media vcr_playback_started|/tmp/example-film.mp4",
-                        "media vcr_playback_started|/tmp/example-film.mp4|x11=8412"):
+                        "media vcr_playback_started|/tmp/example-film.mp4|x11=8412",
+                        "media-path vcr_playback_started|/tmp/example|x11=film.mp4",
+                        "renderer 8412|/tmp/example|x11=film.mp4", "renderer 0"):
             received = []
             TV.SOCKET_PATH.unlink(missing_ok=True)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -313,8 +315,27 @@ class TVDisplaySmoke(unittest.TestCase):
             display._record_playback_state("/tmp/movie.mp4")
 
         self.assertEqual(commands, [
-            "media vcr_playback_started|/tmp/movie.mp4|x11=8412",
-            "media vcr_playback_paused|/tmp/movie.mp4",
+            "media-path vcr_playback_started|/tmp/movie.mp4",
+            "media-path vcr_playback_paused|/tmp/movie.mp4",
+        ])
+
+    def test_renderer_publication_tracks_visible_playback_separately(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._loaded_path = "/tmp/movie|x11=literal.mp4"
+        display._last_transport = "play"
+        display._renderer_published = False
+        display._vlc = type("FakeVLC", (), {"State": type("State", (), {"Playing": 2})})
+        display._player = type("Player", (), {"get_state": lambda self: 2})()
+        display.video_surface = type("Surface", (), {"winfo_id": lambda self: 8412})()
+        with patch.object(TV, "send_control_command", return_value="OK") as send:
+            display._publish_renderer(display._loaded_path)
+            display._publish_renderer(None)
+            display._publish_renderer(None)
+            display._publish_renderer(display._loaded_path)
+        self.assertEqual([call.args[0] for call in send.call_args_list], [
+            "renderer 8412|/tmp/movie|x11=literal.mp4",
+            "renderer 0",
+            "renderer 8412|/tmp/movie|x11=literal.mp4",
         ])
 
     def test_vcr_client_rejects_invalid_media_and_position(self) -> None:

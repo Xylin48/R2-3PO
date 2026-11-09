@@ -23,7 +23,7 @@ static uint64_t open_window(unsigned long window, int vlc)
     active_window = window;
     active_vlc = vlc;
     ++opens;
-    if (publish_on_open) atomic_store(&tv_live_video_window, publish_on_open);
+    if (publish_on_open) tv_publish_video_window(publish_on_open, NULL);
     return active_token = next_token++;
 }
 
@@ -55,6 +55,15 @@ int64_t r2_log_event(R2LogCategory category, const char *type, const char *summa
     return 1;
 }
 
+static const char *expected_media_path;
+int64_t r2_log_media_event(const char *action, const char *media_type,
+                           const char *path, const char *details)
+{
+    assert(action && media_type && details);
+    assert(expected_media_path && !strcmp(path, expected_media_path));
+    return 1;
+}
+
 int main(void)
 {
     ShellWatchMedia managed = {0};
@@ -72,15 +81,15 @@ int main(void)
 
     /* Higher priority CRT publication and its explicit withdrawal do not
      * depend on the success of PulseAudio discovery. */
-    atomic_store(&tv_live_video_window, 201);
+    tv_publish_video_window(201, NULL);
     shell_watch_media_poll(&managed, 1, 0, 0, -1);
     assert(managed.token && !active_vlc && active_window == 201);
-    atomic_store(&tv_live_video_window, 0);
+    tv_publish_video_window(0, NULL);
     shell_watch_media_poll(&managed, 1, 0, 0, -1);
     assert(!managed.token && !active_token && stops == 3);
 
     /* If the publication changes while FFmpeg opens, abandon our old token. */
-    atomic_store(&tv_live_video_window, 202);
+    tv_publish_video_window(202, NULL);
     publish_on_open = 203;
     shell_watch_media_poll(&managed, 1, 0, 0, -1);
     assert(!managed.token && !active_token && stops == 4);
@@ -91,13 +100,13 @@ int main(void)
     /* A manual takeover revokes Watch's token and survives a new candidate. */
     active_token = 0;
     manual_active = 1;
-    atomic_store(&tv_live_video_window, 204);
+    tv_publish_video_window(204, NULL);
     shell_watch_media_poll(&managed, 1, 1, 1, -1);
     assert(!managed.token && manual_active && opens == 5 && stops == 4);
     manual_active = 0;
 
     /* Producer window priority and a transient audio discovery failure. */
-    atomic_store(&tv_live_video_window, 0);
+    tv_publish_video_window(0, NULL);
     pid_window = 301;
     shell_watch_media_poll(&managed, 1, 1, 1, 4321);
     assert(managed.token && !active_vlc && active_window == 301);
@@ -105,6 +114,39 @@ int main(void)
     assert(managed.token && active_window == 301);
     eyes_allowed = 0;
     shell_watch_media_poll(&managed, 0, 1, 1, 4321);
+    assert(!managed.token && !active_token);
+    eyes_allowed = 1;
+    char legacy[] = "vcr_playback_started|/tmp/old.mp4|x11=401";
+    expected_media_path = "/tmp/old.mp4";
+    assert(!strncmp(tv_control_media_event(legacy, 1), "OK", 2));
+    assert((uint32_t)atomic_load(&tv_live_renderer) == 401);
+    char render[] = "401|/tmp/tape|x11=literal.mp4";
+    assert(!strncmp(tv_control_renderer(render), "OK", 2));
+    uint64_t publication = atomic_load(&tv_live_renderer);
+    char repeat[] = "401|/tmp/tape|x11=literal.mp4";
+    assert(!strncmp(tv_control_renderer(repeat), "OK", 2));
+    assert(atomic_load(&tv_live_renderer) == publication);
+    shell_watch_media_poll(&managed, 1, 1, 0, -1);
+    assert(active_window == 401 && managed.token);
+    previous = managed.token;
+    char next_tape[] = "401|/tmp/next.mp4";
+    assert(!strncmp(tv_control_renderer(next_tape), "OK", 2));
+    assert(atomic_load(&tv_live_renderer) != publication);
+    shell_watch_media_poll(&managed, 1, 1, 0, -1);
+    assert(active_window == 401 && managed.token && managed.token != previous);
+
+    /* Exact-path events can contain legacy-looking text and do not claim a window. */
+    publication = atomic_load(&tv_live_renderer);
+    char exact[] = "vcr_playback_stopped|/tmp/tape|x11=literal.mp4";
+    expected_media_path = "/tmp/tape|x11=literal.mp4";
+    assert(!strncmp(tv_control_media_event(exact, 0), "OK", 2));
+    assert(atomic_load(&tv_live_renderer) == publication);
+    char invalid[] = "4294967296|/tmp/tape.mp4";
+    assert(!strncmp(tv_control_renderer(invalid), "ERROR", 5));
+    assert(atomic_load(&tv_live_renderer) == publication);
+    char withdraw[] = "0";
+    assert(!strncmp(tv_control_renderer(withdraw), "OK", 2));
+    shell_watch_media_poll(&managed, 1, 0, 0, -1);
     assert(!managed.token && !active_token);
     puts("Watch switches exact renderers, respects CRT withdrawal and preserves manual custody.");
     return 0;
