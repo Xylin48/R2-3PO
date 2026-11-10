@@ -10539,6 +10539,7 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         int captured = r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled, &revision);
         if (captured != 1) {
             pthread_mutex_unlock(&visual_capture_lock);
+            if (r2_vision_direct_cancelled(&revision)) return NULL;
             r2_log_sensory("vision_frame_unavailable",
                            "R2 could not obtain a new frame for visual analysis.",
                            captured == 0 ? "The visual stream reached its end." :
@@ -11150,7 +11151,7 @@ static char *r2_vision_current_frame_base64(void)
     char *encoded = r2_vision_direct_cancelled(&revision) ? NULL
         : r2_vision_encode_snapshot(&frame, &origin);
     free(frame_copy);
-    if (!encoded)
+    if (!encoded && !r2_vision_direct_cancelled(&revision))
         r2_log_sensory("visual_input_encoding_failed",
                        "R2's current visual frame could not be encoded for the conversation brain.",
                        "Frame-to-JPEG/base64 encoding failed; no visual interpretation was substituted.",

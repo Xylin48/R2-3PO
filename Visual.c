@@ -439,8 +439,13 @@ static unsigned char *encode_jpeg(const R2VisionFrame *frame, size_t *jpeg_lengt
     }
 
     int encoded = pid > 0 ? visual_wait_encoder(pid) : -1;
+    int encoder_error = errno;
     unlink(ppm_template);
-    if (encoded != 0) { unlink(jpg_template); return NULL; }
+    if (encoded != 0) {
+        unlink(jpg_template);
+        errno = encoder_error;
+        return NULL;
+    }
 
     unsigned char *jpeg = read_file(jpg_template, jpeg_length);
     unlink(jpg_template);
@@ -637,9 +642,15 @@ payload_ready:
         goto request_cleanup;
     }
     gate_active = 1;
+    if (r2_ollama_vision_request_should_abort()) goto request_cleanup;
     CURLcode cc = curl_easy_perform(curl);
-    int yielded_to_foreground = cc == CURLE_ABORTED_BY_CALLBACK && r2_ollama_vision_request_should_abort();
+    int interrupted = cc == CURLE_ABORTED_BY_CALLBACK || r2_ollama_vision_request_should_abort();
     r2_ollama_vision_request_end(); gate_active = 0;
+    if (interrupted) {
+        r2_log_sensory("vision_request_yielded", "R2's visual inference was cancelled.",
+                       "The response was discarded before any observation was published.", model);
+        goto request_cleanup;
+    }
     long http_status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);
     if (cc == CURLE_OK && http_status >= 200 && http_status < 300 && response.data) {
@@ -673,9 +684,6 @@ payload_ready:
                            "Expected complete JSON, message.role=assistant, string content and boolean done=true.", model);
         }
         if (parsed) json_object_put(parsed);
-    } else if (yielded_to_foreground) {
-        r2_log_sensory("vision_request_yielded", "R2's visual inference yielded to an ordinary conversation request.",
-                       "The incomplete visual result will not be used as an observation.", model);
     } else {
         char failure[1200];
         snprintf(failure, sizeof(failure), "curl=%s; HTTP=%ld; response_bytes=%zu; model=%s",
@@ -1008,6 +1016,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     size_t jpeg_length = 0;
     unsigned char *jpeg = encode_jpeg(frame, &jpeg_length);
     if (!jpeg) {
+        if (r2_ollama_vision_request_should_abort()) return NULL;
         r2_log_sensory("visual_encoding_failed",
                        "R2 could not encode a captured frame for vision inference.",
                        "FFmpeg conversion from RGB24 to JPEG failed.", source);

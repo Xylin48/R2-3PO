@@ -9,7 +9,7 @@
 static const pid_t encoder_pid = 727272;
 static char ppm_path[PATH_MAX], jpeg_path[PATH_MAX];
 static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, reaped_encoder;
-static int cancel_request, cancel_on_archive_write, timeout_clock, clock_calls, read_mode, read_fd = -1;
+static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_during_http, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
 static uint64_t fixture_preview_session = 1;
@@ -114,7 +114,9 @@ int __wrap_r2_ollama_vision_request_begin(void)
     ++gate_begin_count;
     if (defer_gate) return 0;
     int rc = __real_r2_ollama_vision_request_begin();
-    assert(rc && !gate_active); gate_active = 1; return rc;
+    assert(rc && !gate_active); gate_active = 1;
+    if (cancel_after_gate) cancel_request = 1;
+    return rc;
 }
 void __real_r2_ollama_vision_request_end(void);
 void __wrap_r2_ollama_vision_request_end(void)
@@ -167,6 +169,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     size_t n = strlen(body), split = n / 2;
     assert(write_response(body, 1, split, write_data) == split);
     assert(write_response(body + split, 1, n - split, write_data) == n - split);
+    if (cancel_during_http) cancel_request = 1;
     return transport_code;
 }
 CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
@@ -287,9 +290,26 @@ int main(void)
     response("valid prefix", "stop"); size_t body_n = strlen(body); body = realloc(body, body_n+10); assert(body); memcpy(body+body_n, " trailing", 10); rejected_frame(&frame);
     response("private server failure", "stop"); transport_code = CURLE_COULDNT_CONNECT; rejected_frame(&frame); transport_code = CURLE_OK;
     history = r2_log_search("vision_model_request_failed",10); assert(history && !strstr(history,"PRIVATE-VISION-REASONING") && !strstr(history,"private server failure")); free(history);
-    transport_code = CURLE_ABORTED_BY_CALLBACK; cancel_request=1;
-    assert(!call_vision_model("fixture-image", "deliberate question", R2_OLLAMA_MODEL)); assert(!gate_active);
-    transport_code = CURLE_OK; cancel_request=0;
+    int before_cancelled_send = perform_count;
+    cancel_after_gate = 1;
+    rejected_frame(&frame);
+    assert(perform_count == before_cancelled_send && cancel_request);
+    cancel_after_gate = cancel_request = 0;
+
+    response("{\"description\":\"late successful response after cancellation\",\"focus\":null}", "stop");
+    cancel_during_http = 1;
+    rejected_frame(&frame);
+    assert(perform_count == before_cancelled_send + 1 && cancel_request);
+    history = r2_log_search("vision_request_yielded", 10);
+    assert(history && strstr(history, "visual inference was cancelled") &&
+           !strstr(history, "ordinary conversation request") &&
+           !strstr(history, "late successful response after cancellation"));
+    free(history);
+    transport_code = CURLE_ABORTED_BY_CALLBACK;
+    cancel_during_http = cancel_request = 0;
+    rejected_frame(&frame);
+    transport_code = CURLE_OK;
+    cancel_during_http = cancel_request = 0;
 
     char fenced[] = "```json\n \n{\"description\":\"text with ``` inside\",\"focus\":null}\n```\n";
     json_object *extracted_focus = NULL;
@@ -389,7 +409,7 @@ int main(void)
     assert(r2_diary_init()==0 && r2_log_init()==0 && r2_sj_init()==0 && r2_visual_init(database,library)==0);
     history=r2_visual_search("VISUAL-SOURCE-END",10); assert(history && strstr(history,description) && strstr(history,source)); free(history);
     verify_event_link(source, description);
-    assert(!gate_active && gate_end_count==perform_count && init_count==cleanup_count);
+    assert(!gate_active && gate_end_count==perform_count+1 && init_count==cleanup_count);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
