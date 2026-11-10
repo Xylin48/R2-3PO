@@ -84,6 +84,9 @@ int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
                                 const char *summary, const char *details, const char *source,
                                 int (*save)(struct sqlite3 *, int64_t, void *), void *context);
 
+/* Resolve or publish a detached Visual observation by its persisted archive key. */
+int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source);
+
 /* Idempotency check for replayable event outboxes such as verified virtual
  * game events. The source identifier must be stable across retries. */
 int r2_log_event_exists(const char *event_type, const char *source);

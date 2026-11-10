@@ -425,6 +425,10 @@ static int ensure_tables(void)
         " FOREIGN KEY(session_id) REFERENCES r2_log_sessions(id),"
         " FOREIGN KEY(related_event_id) REFERENCES r2_log_events(id)"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_visual_keys ("
+        " archive_key TEXT PRIMARY KEY NOT NULL,"
+        " event_id INTEGER NOT NULL UNIQUE REFERENCES r2_log_events(id)"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_activity_sessions ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " activity_key TEXT NOT NULL,"
@@ -1004,6 +1008,59 @@ int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char
     /* Journal indexing runs after commit. Journal startup can rebuild it. */
     r2_sj_index_event(event_id, "sensory", event_type, source);
     return 0;
+}
+
+int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source)
+{
+    const char *type = "visual_experience";
+    const char *summary = "R2's vision model interpreted a real captured frame.";
+    if (!valid_text(archive_key) || !valid_text(description) || !valid_text(source))
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db ||
+        sqlite3_exec(log_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT e.id FROM r2_log_visual_keys k JOIN r2_log_events e ON e.id=k.event_id "
+        "WHERE k.archive_key=? AND e.category='sensory' AND e.event_type='visual_experience' "
+        "AND e.details COLLATE BINARY=? AND e.source COLLATE BINARY=?",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, archive_key);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 2, description);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 3, source);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int64_t id = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+    sqlite3_finalize(st);
+
+    if (rc == SQLITE_DONE) {
+        id = log_insert_event_locked(R2_LOG_SENSORY, type, summary, description, source);
+        if (id > 0) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(log_db,
+                "INSERT INTO r2_log_visual_keys(archive_key,event_id) VALUES(?,?)",
+                -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, archive_key);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, id);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            if (rc == SQLITE_DONE && sqlite3_changes(log_db) != 1) rc = SQLITE_CONSTRAINT;
+            sqlite3_finalize(st);
+        }
+    }
+
+    if (id <= 0 || (rc != SQLITE_DONE && rc != SQLITE_ROW) ||
+        sqlite3_exec(log_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        if (!sqlite3_get_autocommit(log_db))
+            (void)sqlite3_exec(log_db, "ROLLBACK", NULL, NULL, NULL);
+        id = -1;
+    }
+    pthread_mutex_unlock(&log_lock);
+    if (id > 0) r2_sj_index_event(id, "sensory", type, source);
+    return id;
 }
 
 /* Check a stable source identifier before replaying an outbox event. */

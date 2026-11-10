@@ -812,7 +812,8 @@ static int visual_migrate_schema(void)
         {"height", "INTEGER NOT NULL DEFAULT 0"},
         {"frame_number", "INTEGER NOT NULL DEFAULT 0"},
         {"frame_timestamp", "INTEGER NOT NULL DEFAULT 0"},
-        {"life_log_event_id", "INTEGER"}
+        {"life_log_event_id", "INTEGER"},
+        {"life_log_archive_key", "TEXT"}
     };
     for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); ++i) {
         if (visual_ensure_column(columns[i][0], columns[i][1]) != SQLITE_OK)
@@ -833,7 +834,9 @@ static int visual_migrate_schema(void)
         return SQLITE_ERROR;
     return sqlite3_exec(visual_db,
         "CREATE INDEX IF NOT EXISTS r2_visual_experiences_created_idx "
-        "ON r2_visual_experiences(created_utc);",
+        "ON r2_visual_experiences(created_utc);"
+        "CREATE INDEX IF NOT EXISTS r2_visual_pending_log_idx ON r2_visual_experiences(id) "
+        "WHERE life_log_archive_key IS NOT NULL AND life_log_event_id IS NULL;",
         NULL, NULL, NULL);
 }
 
@@ -845,7 +848,8 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
                                 const char *image_path, const char *model,
                                 const char *prompt, const char *description,
                                 int width, int height, sqlite3_int64 frame_number,
-                                sqlite3_int64 frame_timestamp, int64_t event_id)
+                                sqlite3_int64 frame_timestamp, int64_t event_id,
+                                const char *archive_key)
 {
     enum { VISUAL_TEXT = 1, VISUAL_INTEGER = 2, VISUAL_NULL = 3 };
     struct visual_value {
@@ -878,6 +882,7 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
     ADD_INTEGER("frame_timestamp", frame_timestamp);
     if (event_id > 0) ADD_INTEGER("life_log_event_id", event_id);
     else ADD_NULL("life_log_event_id");
+    if (archive_key) ADD_TEXT("life_log_archive_key", archive_key);
 
     if (visual_column_exists(db, "created_at")) ADD_TEXT("created_at", created);
     if (visual_column_exists(db, "timestamp")) ADD_TEXT("timestamp", created);
@@ -949,19 +954,40 @@ static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
                                 experience->question, experience->description,
                                 (int)frame->format.width, (int)frame->format.height,
                                 (sqlite3_int64)frame->frame_number,
-                                (sqlite3_int64)frame->timestamp, event_id);
-    if (event_id > 0 && rc == SQLITE_DONE && r2_ollama_vision_request_should_abort())
+                                (sqlite3_int64)frame->timestamp, event_id,
+                                event_id > 0 ? NULL : experience->image_path);
+    if (rc == SQLITE_DONE && r2_ollama_vision_request_should_abort())
         return SQLITE_ABORT;
     return rc;
 }
 
-/* Separate library files are supported. Record the authoritative image row
- * first so a failed Visual insert cannot publish a Life Log experience. */
-static int visual_save_separate(VisualExperience *experience, const char *summary)
+static int visual_link_detached(sqlite3_int64 row_id, const char *key,
+                                const char *description, const char *source)
+{
+    int64_t event_id = r2_log_save_visual_once(key, description, source);
+    if (event_id <= 0) return -1;
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(visual_db,
+        "UPDATE r2_visual_experiences SET life_log_event_id=? WHERE id=? "
+        "AND life_log_archive_key=? AND life_log_event_id IS NULL",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, row_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int linked = rc == SQLITE_DONE && sqlite3_changes(visual_db) == 1;
+    sqlite3_finalize(st);
+    return linked ? 0 : -1;
+}
+
+/* Save the replay identity in the same transaction as the authoritative row. */
+static int visual_save_separate(VisualExperience *experience)
 {
     int rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
     rc = visual_save_experience(visual_db, 0, experience);
+    sqlite3_int64 row_id = sqlite3_last_insert_rowid(visual_db);
     if (rc == SQLITE_DONE) {
         int commit = sqlite3_exec(visual_db, "COMMIT", NULL, NULL, NULL);
         if (commit != SQLITE_OK) rc = commit;
@@ -972,23 +998,47 @@ static int visual_save_separate(VisualExperience *experience, const char *summar
         return rc;
     }
 
-    sqlite3_int64 row_id = sqlite3_last_insert_rowid(visual_db);
-    int64_t event_id = r2_log_sensory("visual_experience", summary,
-                                     experience->description, experience->source);
-    if (event_id <= 0) return SQLITE_DONE;
-
-    sqlite3_stmt *statement = NULL;
-    rc = sqlite3_prepare_v2(visual_db,
-        "UPDATE r2_visual_experiences SET life_log_event_id=? WHERE id=?",
-        -1, &statement, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 2, row_id);
-    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc != SQLITE_DONE || sqlite3_changes(visual_db) != 1)
-        fprintf(stderr, "[R2 Visual] Separate library row %lld could not link Life Log event %lld.\n",
-                (long long)row_id, (long long)event_id);
-    sqlite3_finalize(statement);
+    if (visual_link_detached(row_id, experience->image_path, experience->description,
+                             experience->source) != 0)
+        fprintf(stderr, "[R2 Visual] Life Log link for row %lld is pending.\n", (long long)row_id);
     return SQLITE_DONE;
+}
+
+static void visual_retry_detached_links(void)
+{
+    if (!r2_log_is_initialized()) return;
+    sqlite3_int64 after = 0;
+    int pending = 0;
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(visual_db,
+            "SELECT id,life_log_archive_key,description,source FROM r2_visual_experiences "
+            "WHERE id>? AND life_log_archive_key IS NOT NULL AND life_log_event_id IS NULL "
+            "ORDER BY id LIMIT 1", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc != SQLITE_ROW) {
+            if (rc != SQLITE_DONE) pending = 1;
+            sqlite3_finalize(st);
+            break;
+        }
+
+        after = sqlite3_column_int64(st, 0);
+        char *fields[3] = {0};
+        for (int i = 0; i < 3; ++i) {
+            const char *value = (const char *)sqlite3_column_text(st, i + 1);
+            if (value && strlen(value) == (size_t)sqlite3_column_bytes(st, i + 1))
+                fields[i] = strdup(value);
+        }
+        /* End the read before Life Log or Visual opens a write transaction. */
+        sqlite3_finalize(st);
+        if (!fields[0] || !fields[1] || !fields[2] ||
+            visual_link_detached(after, fields[0], fields[1], fields[2]) != 0)
+            pending = 1;
+        for (int i = 0; i < 3; ++i) free(fields[i]);
+    }
+    if (pending)
+        fprintf(stderr, "[R2 Visual] Some detached Life Log links remain pending.\n");
 }
 
 int r2_visual_init(const char *database_path, const char *library_directory)
@@ -1048,6 +1098,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
+    visual_retry_detached_links();
     ++visual_generation;
     visual_initialized = 1;
     pthread_mutex_unlock(&visual_lock);
@@ -1236,7 +1287,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                                    image_path, model_snapshot, question, description};
     int shared = r2_log_save_shared_sensory(visual_db, "visual_experience", summary,
                      description, experience.source, visual_save_experience, &experience);
-    int rc = shared == 1 ? visual_save_separate(&experience, summary)
+    int rc = shared == 1 ? visual_save_separate(&experience)
            : shared == 0 ? SQLITE_DONE : SQLITE_ERROR;
     char db_error[512] = "The shared Visual and Life Log transaction failed.";
     if (shared == 1 && rc != SQLITE_DONE) {

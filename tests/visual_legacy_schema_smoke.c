@@ -25,6 +25,13 @@ int64_t r2_log_sensory(const char *sense, const char *observation,
     return 1;
 }
 
+int r2_log_is_initialized(void) { return 0; }
+int64_t r2_log_save_visual_once(const char *key, const char *description, const char *source)
+{
+    (void)key; (void)description; (void)source;
+    return -1;
+}
+
 static int visit_legacy_visual(void *context, int64_t id, const char *row, size_t length)
 {
     int *count = context;
@@ -96,7 +103,7 @@ int main(void)
 
     assert(visual_insert_compat(visual_db, "2026-10-16T07:00:00Z", "Eyes",
         "/new/frame.jpg", "qwen3.5:9b", NULL, "new frame",
-        640, 480, 7, 123456, 0) == SQLITE_DONE);
+        640, 480, 7, 123456, 0, NULL) == SQLITE_DONE);
 
     assert(sqlite3_prepare_v2(visual_db,
         "SELECT created_utc,image_path,created_at,timestamp,file_path,path "

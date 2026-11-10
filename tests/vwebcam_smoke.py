@@ -144,7 +144,7 @@ def main() -> None:
     commit_end = visual.index("pthread_mutex_unlock(&visual_lock);", commit_start)
     assert "if (rc == SQLITE_DONE)\n        publish_committed_focus(request_sequence, frame->preview_session, focus);" in visual[commit_start:commit_end]
     assert "static int visual_insert_compat(" in visual
-    assert "visual_save_separate(&experience, summary)" in visual[commit_start:commit_end]
+    assert "visual_save_separate(&experience)" in visual[commit_start:commit_end]
     assert "visual_insert_compat(db, experience->created, experience->source," in visual
     for legacy_column in ("created_at", "timestamp", "file_path", "path"):
         assert f'visual_column_exists(db, "{legacy_column}")' in visual

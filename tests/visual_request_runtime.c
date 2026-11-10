@@ -10,7 +10,7 @@
 static const pid_t encoder_pid = 727272;
 static char ppm_path[PATH_MAX], jpeg_path[PATH_MAX];
 static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, reaped_encoder;
-static int fail_file_sync, fail_directory_sync;
+static int fail_file_sync, fail_directory_sync, stop_after_archive_sync;
 static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_during_http, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
@@ -72,7 +72,9 @@ int __wrap_fsync(int fd)
         errno = EIO;
         return -1;
     }
-    return __real_fsync(fd);
+    int rc = __real_fsync(fd);
+    if (rc == 0 && stop_after_archive_sync && S_ISDIR(metadata.st_mode)) _exit(73);
+    return rc;
 }
 int __real_close(int);
 int __wrap_close(int fd)
@@ -94,6 +96,8 @@ ssize_t __wrap_read(int fd, void *p, size_t n)
     }
     return __real_read(fd, p, n);
 }
+pid_t __real_fork(void);
+pid_t __real_waitpid(pid_t, int *, int);
 pid_t __wrap_fork(void) { killed_encoder = 0; return encoder_pid; }
 pid_t __wrap_waitpid(pid_t pid, int *status, int options)
 {
@@ -480,6 +484,49 @@ int main(void)
     assert(scalar(event_db, "SELECT id FROM r2_log_events WHERE event_type='visual_experience' "
                             "AND source='detached camera source'") == detached_event);
     assert(sqlite3_close(event_db) == SQLITE_OK);
+
+    /* Interruption before the Life Log transaction, and after it commits but
+     * before the detached Visual row can attach the event ID. */
+    assert(sqlite3_open(database, &event_db) == SQLITE_OK);
+    assert(sqlite3_exec(event_db, "CREATE TRIGGER deny_detached_event "
+        "BEFORE INSERT ON r2_log_events WHEN NEW.source='detached camera source' "
+        "BEGIN SELECT RAISE(ABORT, 'fixture'); END", NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"saved in a separate Visual library\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "detached camera source", "same captured evidence");
+    assert(actual);
+    free(actual);
+    assert(sqlite3_exec(event_db, "DROP TRIGGER deny_detached_event", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_detached_link "
+        "BEFORE UPDATE OF life_log_event_id ON r2_visual_experiences "
+        "BEGIN SELECT RAISE(IGNORE); END", NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"saved in a separate Visual library\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "detached camera source", "same captured evidence");
+    assert(actual);
+    free(actual);
+    assert(archive_count() == 3);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences "
+                            "WHERE life_log_event_id IS NULL") == 2);
+    assert(scalar(event_db, "SELECT count(*) FROM r2_log_events "
+                            "WHERE source='detached camera source'") == 2);
+    sqlite3_int64 published_event = scalar(event_db,
+        "SELECT max(id) FROM r2_log_events WHERE source='detached camera source'");
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_detached_link", NULL, NULL, NULL) == SQLITE_OK);
+
+    for (int i = 0; i < 2; ++i) {
+        r2_visual_shutdown();
+        r2_sj_shutdown();
+        r2_log_shutdown();
+        assert(r2_log_init() == 0 && r2_sj_init() == 0);
+        assert(r2_visual_init(next_db, next_library) == 0);
+        assert(scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences "
+                                "ORDER BY id DESC LIMIT 1") == published_event);
+        assert(scalar(visual_db, "SELECT count(DISTINCT life_log_event_id) "
+                                "FROM r2_visual_experiences") == 3);
+        assert(scalar(event_db, "SELECT count(*) FROM r2_log_events e "
+                                "JOIN r2_sensory_journal j ON j.event_id=e.id "
+                                "WHERE e.source='detached camera source'") == 3);
+    }
+    assert(sqlite3_close(event_db) == SQLITE_OK);
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
     assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==7);
     assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);
@@ -489,6 +536,25 @@ int main(void)
     history=r2_visual_search("VISUAL-SOURCE-END",10); assert(history && strstr(history,description) && strstr(history,source)); free(history);
     verify_event_link(source, description);
     assert(!gate_active && gate_end_count==perform_count+1 && init_count==cleanup_count);
+    r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    pid_t interrupted = __real_fork();
+    assert(interrupted >= 0);
+    if (interrupted == 0) {
+        assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+        assert(r2_visual_init(database, library) == 0);
+        response("{\"description\":\"archive interrupted before publication\",\"focus\":null}", "stop");
+        stop_after_archive_sync = 1;
+        (void)r2_visual_analyze_frame(&frame, "interrupted camera", "crash boundary");
+        _exit(74);
+    }
+    int status = 0;
+    assert(__real_waitpid(interrupted, &status, 0) == interrupted);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 73);
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 7);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='interrupted camera'") == 0);
+    assert(archive_count() == 8);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
