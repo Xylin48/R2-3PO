@@ -64,6 +64,30 @@ int main(void)
         return 1;
     }
 
+    sqlite3 *edges = NULL;
+    int edge_ok = sqlite3_open(R2_DIARY_DATABASE, &edges) == SQLITE_OK &&
+        sqlite3_exec(edges,
+            "CREATE TRIGGER smoke_skip_edge BEFORE INSERT ON r2_log_links "
+            "WHEN NEW.relationship='skipped_edge' BEGIN SELECT RAISE(IGNORE); END; "
+            "CREATE TRIGGER smoke_remove_edge AFTER INSERT ON r2_log_links "
+            "WHEN NEW.relationship='removed_edge' BEGIN DELETE FROM r2_log_links WHERE id=NEW.id; END;",
+            NULL, NULL, NULL) == SQLITE_OK &&
+        r2_log_link(seed, linked, "identity_evidence", "duplicate retry") == 0 &&
+        r2_log_link(seed, linked, "skipped_edge", NULL) != 0 &&
+        r2_log_link(seed, linked, "removed_edge", NULL) != 0 &&
+        r2_log_link(seed, INT64_MAX, "missing_endpoint", NULL) != 0;
+    sqlite3_stmt *edge_count = NULL;
+    if (edge_ok)
+        edge_ok = sqlite3_prepare_v2(edges,
+            "SELECT COUNT(*) FROM r2_log_links WHERE relationship IN "
+            "('identity_evidence','skipped_edge','removed_edge','missing_endpoint');",
+            -1, &edge_count, NULL) == SQLITE_OK &&
+            sqlite3_step(edge_count) == SQLITE_ROW && sqlite3_column_int(edge_count, 0) == 1;
+    sqlite3_finalize(edge_count);
+    sqlite3_close(edges);
+    if (!edge_ok)
+        fprintf(stderr, "Stored relationship verification failed.\n");
+
     char *from_seed = r2_log_search("identity", 10);
     char *from_relation = r2_log_search("explicit current-user identity relationship", 10);
     int ok = from_seed && from_relation &&
@@ -138,7 +162,7 @@ int main(void)
     }
 
     r2_log_shutdown();
-    if (!ok || !memory_update_ok) return 1;
+    if (!ok || !memory_update_ok || !edge_ok) return 1;
     puts("Life Log linked retrieval and failed memory_saved bookkeeping are handled correctly.");
     return 0;
 }

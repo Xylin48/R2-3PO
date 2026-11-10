@@ -46,6 +46,14 @@ int main(void)
     assert(!r2_vision_media_status());
     assert(media_watch_token == 0);
 
+    /* A manual lifecycle operation must not delay stale cleanup or a
+     * Watch attempt on the same receiver. */
+    pthread_mutex_lock(&media_lifecycle_lock);
+    assert(!r2_vision_media_watch_owns(57));
+    assert(r2_vision_media_stop_if_watch_owned(57) == 0);
+    assert(r2_vision_media_open_window_for_watch(701) == 0 && errno == EBUSY);
+    pthread_mutex_unlock(&media_lifecycle_lock);
+
     /* A matching Watch token closes its own generation, not future ones. */
     media_watch_token = 81;
     atomic_store(&media_capture_running, 1);
@@ -56,10 +64,26 @@ int main(void)
      * The synthetic test has no camera; it checks that stale cleanup
      * never calls release and that an explicit release revokes ownership. */
     eyes = (R2Eyes *)(uintptr_t)1;
+    pthread_mutex_lock(&eyes_source_owner_lock);
+    assert(r2_eyes_start_for_watch() == 0 && errno == EBUSY);
+    assert(!r2_eyes_watch_owns(104) && r2_eyes_release_if_watch_owned(104) == 0);
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    pthread_mutex_lock(&vision_watch_lock);
+    assert(r2_vision_watch_start_for_watch() == 0 && errno == EBUSY);
+    assert(!r2_vision_watch_owns(104) && r2_vision_watch_stop_if_watch_owned(104) == 0);
+    pthread_mutex_unlock(&vision_watch_lock);
     assert(r2_eyes_start_for_watch() == 0);
     assert(eyes_watch_token == 0); /* no takeover of an existing camera */
-    eyes = NULL;
+    /* The explicit question's stale outer check must neither replace a
+     * camera Watch just opened nor revoke its cleanup token. */
     eyes_watch_token = 105;
+    assert(r2_eyes_start_impl(NULL, 0) == 0);
+    assert(r2_eyes_watch_owns(105));
+    r2_sense_set_auto_allowed(1, 0);
+    assert(r2_eyes_start_impl(NULL, 0) == -1);
+    assert(!r2_sense_auto_allowed(1) && r2_eyes_watch_owns(105));
+    r2_sense_set_auto_allowed(1, 1);
+    eyes = NULL;
     assert(r2_eyes_watch_owns(105));
     assert(!r2_eyes_watch_owns(104));
     assert(r2_eyes_release_if_watch_owned(104) == 0);

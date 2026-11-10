@@ -46,23 +46,23 @@ for name in ("r2_ears_start_desktop", "r2_ears_stop_desktop",
 assert "r2_ears_stop_desktop();" in core[core.index("void r2_shutdown(void)"):], (
     "core teardown must stop the independent desktop worker"
 )
-watch = shell[shell.index("static void *shell_watch_worker(void *unused)"):
+watch = shell[shell.index("static void shell_watch_media_poll("):
               shell.index("static void shell_watch_start(void)")]
 assert "managed_microphone" in watch and "managed_desktop" in watch
 assert "wanted_audio" not in watch
 # Watch must claim only newly opened capture generations and only stop its own.
-assert "r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor," in watch
-assert "r2_ears_start_for_watch_cancelable(audio.microphone_source," in watch
+assert "r2_ears_start_desktop_for_watch_cancelable(wanted," in watch
+assert "r2_ears_start_for_watch_cancelable(wanted," in watch
 assert "r2_ears_stop_desktop_if_watch_owned(managed_desktop)" in watch
 assert "r2_ears_stop_if_watch_owned(managed_microphone)" in watch
 assert "r2_ears_start_desktop()" not in watch and "r2_ears_start()" not in watch
-assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in watch
+assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in watch
 assert "r2_ears_stop_desktop()" not in watch and "r2_ears_stop()" not in watch
 for api in ("r2_ears_start_for_watch", "r2_ears_start_desktop_for_watch",
             "r2_ears_stop_if_watch_owned", "r2_ears_stop_desktop_if_watch_owned"):
     assert api in header and api in core, api
-assert "r2_ears_status_desktop()" in watch and "r2_ears_status()" in watch
-assert "r2_ears_status_desktop_source(audio.desktop_monitor)" in watch
+assert "r2_ears_watch_input_snapshot(desktop, input)" in watch
+assert "known && (!wanted || strcmp(input->source, wanted))" in watch
 assert "audio_known &&" in watch and "r2_audio_discovery_free(&audio)" in watch
 assert "audio_origin=desktop_playback" in core
 assert "No automatic transcription or semantic interpretation." in core

@@ -21,24 +21,24 @@ probe = audio[audio.index("static void r2_discovery_sink_input("):
 assert "PA_PROP_APPLICATION_PROCESS_ID" in probe
 assert "info->corked" in probe
 assert "info->sink" in probe
-assert "r2_discovery_pid(pid)" in probe
+assert "r2_discovery_add_producer(scan, producer)" in probe
 assert "r2_audio_discover(&sources)" in ears
-vision = eyes[eyes.index("unsigned long r2_eyes_window_for_pid(long pid)"):
+vision = eyes[eyes.index("static int r2_eyes_find_window("):
               eyes.index("static FILE *r2_eyes_start_vlc(")]
 assert '"xdotool", "search", "--onlyvisible", "--pid"' in vision
 assert 'r2_eyes_probe_vlc_dimensions(candidate' in vision
 assert 'r2_eyes_start_vlc(' not in vision
-worker = shell[shell.index("static void *shell_watch_worker(void *unused)"):
+worker = shell[shell.index("static void shell_watch_media_poll("):
                shell.index("static void shell_watch_start(void)")]
-assert "audio.playback_pid" in worker
+assert "audio->playback_producers, audio->playback_producer_count" in worker
 assert "r2_audio_discover_cancelable(" in worker
-assert "r2_vision_window_for_pid(playback_pid)" in worker
-assert "wanted_media == 3 ? media_window" in worker
-assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
-assert "managed_window_id != wanted_window" in worker
+assert "r2_vision_select_playback_window(" in worker
+assert "wanted_window = published" in worker
+assert "r2_vision_media_open_x11_for_watch_cancelable(" in worker
+assert "managed->window != wanted_window" in worker
 assert "r2_vision_watch_active()" in worker
 assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
-assert "r2_vision_media_stop_if_watch_owned(managed_media_token)" in worker
+assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in worker
 assert "r2_visual_analyze_frame(" not in worker
 assert "r2_ears_listen_cancelable(" not in worker
 print("Application-independent X11 visual-source discovery and raw frame handoff passed.")

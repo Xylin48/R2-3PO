@@ -170,8 +170,11 @@ class TVDisplaySmoke(unittest.TestCase):
     def test_vcr_client_accepts_transport_and_media_commands(self) -> None:
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",
                         "vcr insert /tmp/example-film.mp4", "vcr position 42.750",
+                        "vcr tape-position 42.750|/tmp/example|x11=film.mp4",
                         "media vcr_playback_started|/tmp/example-film.mp4",
-                        "media vcr_playback_started|/tmp/example-film.mp4|x11=8412"):
+                        "media vcr_playback_started|/tmp/example-film.mp4|x11=8412",
+                        "media-path vcr_playback_started|/tmp/example|x11=film.mp4",
+                        "renderer 8412|/tmp/example|x11=film.mp4", "renderer 0"):
             received = []
             TV.SOCKET_PATH.unlink(missing_ok=True)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -289,6 +292,44 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertIn(("mute", True), events)
         self.assertEqual(events[-1], ("pause", 0))
 
+    def test_vcr_pending_seek_is_retried_and_superseded_by_exact_load(self) -> None:
+        events = []
+        callbacks = []
+
+        class Player:
+            def set_media(self, media): pass
+            def audio_set_mute(self, muted): pass
+            def play(self): events.append(("play",)); return 0
+            def set_pause(self, paused): events.append(("pause", paused))
+            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Player()
+        display._vlc_instance = type("Instance", (), {"media_new": lambda self, path: path})()
+        display._loaded_path = None
+        display._last_transport = None
+        display.root = type("Root", (), {"after": lambda self, delay, callback: callbacks.append(callback)})()
+        first, second = "/tmp/first.mp4", "/tmp/second.mp4"
+        display.read_state = lambda: (1, "input", 1, None)
+
+        display._prepare_media(first, 0, "play", True)
+        stale = callbacks[-1]
+        display._prepare_media(second, 0, "stop", True)
+        display._prepare_media(first, 0, "play", True)
+        active = callbacks[-1]
+        events.clear()
+        with patch.object(display, "read_vcr_state",
+                          side_effect=[sqlite3.OperationalError("busy"), (first, "play", 70.5)]):
+            stale()
+            self.assertEqual(events, [])
+            active()
+            self.assertEqual(events, [("pause", 1)])
+            display.sync_vcr_player(first, "play", 0, True)
+            self.assertEqual(events, [("pause", 1)])
+            callbacks[-1]()
+        self.assertEqual(events, [("pause", 1), ("seek", 70500), ("pause", 0)])
+        self.assertIsNone(display._pending_vcr_seek)
+
     def test_media_playback_transitions_are_logged_once(self) -> None:
         class FakeState:
             Playing, Paused, Stopped, Ended, Error = range(1, 6)
@@ -313,9 +354,44 @@ class TVDisplaySmoke(unittest.TestCase):
             display._record_playback_state("/tmp/movie.mp4")
 
         self.assertEqual(commands, [
-            "media vcr_playback_started|/tmp/movie.mp4|x11=8412",
-            "media vcr_playback_paused|/tmp/movie.mp4",
+            "media-path vcr_playback_started|/tmp/movie.mp4",
+            "media-path vcr_playback_paused|/tmp/movie.mp4",
         ])
+
+    def test_renderer_publication_tracks_visible_playback_separately(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._loaded_path = "/tmp/movie|x11=literal.mp4"
+        display._last_transport = "play"
+        display._renderer_published = False
+        display._vlc = type("FakeVLC", (), {"State": type("State", (), {"Playing": 2})})
+        display._player = type("Player", (), {"get_state": lambda self: 2})()
+        display.video_surface = type("Surface", (), {"winfo_id": lambda self: 8412})()
+        with patch.object(TV, "send_control_command", return_value="OK") as send:
+            display._publish_renderer(display._loaded_path)
+            display._publish_renderer(None)
+            display._publish_renderer(None)
+            display._publish_renderer(display._loaded_path)
+        self.assertEqual([call.args[0] for call in send.call_args_list], [
+            "renderer 8412|/tmp/movie|x11=literal.mp4",
+            "renderer 0",
+            "renderer 8412|/tmp/movie|x11=literal.mp4",
+        ])
+
+    def test_tape_switch_saves_outgoing_position_with_exact_path(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._loaded_path = "/tmp/outgoing|x11=tape.mp4"
+        display._last_transport = "play"
+        display._last_position_save = 0
+        display._player = type("Player", (), {"get_time": lambda self: 63125})()
+        with patch.object(TV, "send_control_command", return_value="OK") as send:
+            def replace(path, position, transport, audible):
+                send.assert_called_once_with("vcr tape-position 63.125|/tmp/outgoing|x11=tape.mp4")
+                display._loaded_path = path
+                display._last_transport = None
+
+            display._prepare_media = replace
+            display.sync_vcr_player("/tmp/next.mp4", "stop", 0, False)
+        self.assertEqual(display._loaded_path, "/tmp/next.mp4")
 
     def test_vcr_client_rejects_invalid_media_and_position(self) -> None:
         with self.assertRaises(ValueError):

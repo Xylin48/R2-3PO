@@ -7,7 +7,7 @@
 /*
  * One coherent read of the current PulseAudio/PipeWire server.
  * Query failures are different from a successful query with no sources.
- * All returned strings are owned by the caller and must be freed.
+ * The caller releases a successful snapshot with r2_audio_discovery_free.
  */
 /* Every distinct active playback sink, not one entry per application. A sink
  * monitor already mixes the applications routed to that physical output;
@@ -27,6 +27,8 @@ typedef struct {
     int desktop_playing;     /* Uncorked sink input exists. */
     R2AudioPlaybackOutput *playback_outputs; /* distinct active outputs */
     size_t playback_output_count; /* no arbitrary device count quota */
+    long *playback_producers; /* unique uncorked PIDs across all outputs */
+    size_t playback_producer_count;
 } R2AudioDiscovery;
 
 int r2_audio_discover(R2AudioDiscovery *result);

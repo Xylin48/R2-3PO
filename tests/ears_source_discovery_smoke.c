@@ -114,16 +114,23 @@ int main(void)
     playback.sink = 88;
     playback.proplist = properties;
     r2_discovery_sink_input(NULL, &playback, 0, &scan);
-    /* Same sink, separate producer: one monitor capture, not duplicates. */
+    /* Same sink, separate producer: keep both PIDs with one monitor capture. */
+    assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3142") == 0);
     r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3143") == 0);
     pa_sink_input_info secondary = {.sink = 99, .proplist = properties};
     r2_discovery_sink_input(NULL, &secondary, 0, &scan);
+    r2_discovery_sink_input(NULL, &playback, 0, &scan);
+    assert(pa_proplist_sets(properties, PA_PROP_APPLICATION_PROCESS_ID, "3144") == 0);
     r2_discovery_sink_input(NULL, &paused, 0, &scan);
     r2_discovery_sink_input(NULL, NULL, 1, &scan);
     assert(scan.done && !scan.failed);
     assert(scan.data.desktop_playing);
     assert(scan.data.playback_sink == 88);
     assert(scan.data.playback_pid == 3141);
+    assert(scan.data.playback_producer_count == 3);
+    for (size_t i = 0; i < 3; ++i) assert(scan.data.playback_producers[i] == 3141 + (long)i);
     assert(scan.data.playback_output_count == 2);
     assert(scan.data.playback_outputs[0].sink_index == 88);
     assert(scan.data.playback_outputs[1].sink_index == 99);
@@ -180,6 +187,7 @@ int main(void)
     r2_discovery_sink_input(NULL, &playback, 0, &invalid_pid);
     assert(invalid_pid.data.desktop_playing && invalid_pid.data.playback_pid == -1);
     assert(invalid_pid.data.playback_output_count == 1);
+    assert(!invalid_pid.data.playback_producers && !invalid_pid.data.playback_producer_count);
     r2_audio_discovery_free(&invalid_pid.data);
     assert(scan.data.playback_output_count == 2);
 
@@ -187,6 +195,7 @@ int main(void)
     free(scan.default_source);
     free(scan.fallback_microphone);
     r2_audio_discovery_free(&scan.data);
+    assert(!scan.data.playback_producers && !scan.data.playback_producer_count);
     puts("Native discovery keeps untruncated microphones and every distinct routed playback sink, with failure propagation.");
     return 0;
 }

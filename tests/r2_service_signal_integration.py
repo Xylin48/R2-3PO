@@ -99,33 +99,41 @@ def main() -> int:
                         + current_log[-12000:]
                     )
 
-                # Exercise the real Unix-socket -> C shell -> Life Log media bridge.
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                    client.settimeout(3.0)
-                    client.connect(str(socket_path))
-                    client.sendall(b"media vcr_playback_started|/tmp/audit-film.mp4\n")
-                    response_chunks = []
-                    while True:
-                        chunk = client.recv(4096)
-                        if not chunk:
-                            break
-                        response_chunks.append(chunk)
-                response = b"".join(response_chunks).decode("utf-8", errors="replace")
-                if not response.startswith("OK media event recorded"):
-                    raise AssertionError(f"Media event socket command failed: {response!r}")
+                # Exercise the real socket, both event grammars, and exact tape saves.
+                def control(command: str, expected: str) -> None:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.settimeout(3.0)
+                        client.connect(str(socket_path))
+                        client.sendall((command + "\n").encode("utf-8"))
+                        with client.makefile("r", encoding="utf-8") as stream:
+                            response = stream.read()
+                    if not response.startswith(expected):
+                        raise AssertionError(f"Control command {command!r} failed: {response!r}")
 
-                with sqlite3.connect(
-                    f"file:{memory_db}?mode=ro", uri=True, timeout=5.0
-                ) as db:
-                    row = db.execute(
-                        "SELECT summary FROM r2_log_events "
-                        "WHERE event_type=? AND summary LIKE ? ORDER BY id DESC LIMIT 1",
-                        ("vcr_playback_started", "%/tmp/audit-film.mp4%"),
-                    ).fetchone()
-                if row is None:
-                    raise AssertionError(
-                        "VCR playback event was not persisted to the Life Log."
-                    )
+                first = base / "audit|x11=film.mp4"
+                second = base / "second.mp4"
+                first.touch()
+                second.touch()
+                control("media vcr_playback_started|/tmp/audit-film.mp4", "OK media event recorded")
+                control(f"media-path vcr_playback_started|{first}", "OK media event recorded")
+                control("renderer 0", "OK renderer publication received")
+                control(f"vcr insert {first}", "OK VCR tape inserted")
+                control(f"vcr insert {second}", "OK VCR tape inserted")
+                control(f"vcr tape-position 62.125|{first}", "OK VCR tape position saved")
+
+                with sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True, timeout=5.0) as db:
+                    summaries = db.execute(
+                        "SELECT summary FROM r2_log_events WHERE event_type=? AND summary IN (?,?)",
+                        ("vcr_playback_started", "vcr_playback_started media: /tmp/audit-film.mp4",
+                         f"vcr_playback_started media: {first}"),
+                    ).fetchall()
+                if len(summaries) != 2:
+                    raise AssertionError("Legacy and exact-path playback events did not persist.")
+                with sqlite3.connect(f"file:{home / 'r2_reality.db'}?mode=ro", uri=True, timeout=5.0) as db:
+                    positions = dict(db.execute("SELECT media_path,position_seconds FROM r2_tv_vcr_tapes"))
+                    cassette = db.execute("SELECT cassette_path FROM r2_tv_vcr_state WHERE id=1").fetchone()
+                if positions != {str(first): 62.125, str(second): 0.0} or cassette != (str(second),):
+                    raise AssertionError("An exact outgoing tape save changed another VCR record.")
             finally:
                 if process.poll() is None:
                     try:

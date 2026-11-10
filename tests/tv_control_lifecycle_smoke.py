@@ -30,7 +30,7 @@ require("poll(&input, 1, 250)" in server
         "connected clients have a bounded idle-read timeout")
 require("int complete_line = 0;" in server
         and "complete_line = 1;" in server
-        and "if (!complete_line || atomic_load(&tv_control_stop))" in server,
+        and "if (!complete_line || atomic_load(&tv_control_stop) || memchr(command," in server,
         "partial or oversized socket commands cannot trigger TV actions")
 require("int client = accept(server_fd, NULL, NULL);" in server
         and "POLLIN" in server,

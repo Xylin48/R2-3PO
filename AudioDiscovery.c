@@ -34,6 +34,7 @@ typedef struct {
     char *default_source;
     char *fallback_microphone;
     R2AudioDiscovery data;
+    size_t producer_capacity;
     size_t resolving_output_slot; /* SIZE_MAX for default-only monitor */
 } R2PulseScan;
 
@@ -59,6 +60,7 @@ void r2_audio_discovery_free(R2AudioDiscovery *result)
     for (size_t i = 0; i < result->playback_output_count; ++i)
         free(result->playback_outputs[i].monitor);
     free(result->playback_outputs);
+    free(result->playback_producers);
     memset(result, 0, sizeof(*result));
     result->playback_pid = -1;
     result->playback_sink = PA_INVALID_INDEX;
@@ -114,6 +116,26 @@ static long r2_discovery_pid(const char *source)
         ? value : -1;
 }
 
+static int r2_discovery_add_producer(R2PulseScan *scan, long pid)
+{
+    if (pid <= 1) return 0;
+    R2AudioDiscovery *data = &scan->data;
+    for (size_t i = 0; i < data->playback_producer_count; ++i)
+        if (data->playback_producers[i] == pid) return 0;
+    if (data->playback_producer_count == scan->producer_capacity) {
+        const size_t limit = SIZE_MAX / sizeof(*data->playback_producers);
+        if (scan->producer_capacity == limit) { errno = EOVERFLOW; return -1; }
+        size_t capacity = scan->producer_capacity;
+        capacity = !capacity ? 8 : capacity > limit / 2 ? limit : capacity * 2;
+        long *grown = realloc(data->playback_producers, capacity * sizeof(*grown));
+        if (!grown) return -1;
+        data->playback_producers = grown;
+        scan->producer_capacity = capacity;
+    }
+    data->playback_producers[data->playback_producer_count++] = pid;
+    return 0;
+}
+
 /* Snapshot every distinct output sink with live, uncorked playback.
  * Multiple applications on the same sink share its monitor; different
  * sinks never collapse into one audio stream. */
@@ -128,8 +150,15 @@ static void r2_discovery_sink_input(pa_context *ctx,
         scan->done = 1;
         return;
     }
-    if (!info || info->corked || info->sink == PA_INVALID_INDEX)
+    if (scan->failed || !info || info->corked || info->sink == PA_INVALID_INDEX)
         return;
+    const char *pid = info->proplist ?
+        pa_proplist_gets(info->proplist, PA_PROP_APPLICATION_PROCESS_ID) : NULL;
+    long producer = r2_discovery_pid(pid);
+    if (r2_discovery_add_producer(scan, producer) != 0) {
+        scan->failed = 1;
+        return;
+    }
     for (size_t i = 0; i < scan->data.playback_output_count; ++i)
         if (scan->data.playback_outputs[i].sink_index == info->sink)
             return;
@@ -143,13 +172,11 @@ static void r2_discovery_sink_input(pa_context *ctx,
         scan->data.playback_outputs, next * sizeof(*grown));
     if (!grown) { scan->failed = 1; return; }
     scan->data.playback_outputs = grown;
-    const char *pid = info->proplist ?
-        pa_proplist_gets(info->proplist, PA_PROP_APPLICATION_PROCESS_ID) : NULL;
     R2AudioPlaybackOutput *output = &grown[scan->data.playback_output_count];
     *output = (R2AudioPlaybackOutput){
         .monitor = NULL,
         .sink_index = info->sink,
-        .playback_pid = r2_discovery_pid(pid)
+        .playback_pid = producer
     };
     scan->data.playback_output_count = next;
     if (!scan->data.desktop_playing) {

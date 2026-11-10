@@ -16,14 +16,14 @@ focus = core[core.index("int r2_vision_media_attention_status(void)"):
              core.index("/* Capture and inference are separate workers.")]
 assert "atomic_exchange(&media_attention_selected, 1)" in focus
 assert "atomic_exchange(&media_attention_selected, 0)" in focus
-assert "!atomic_load(&eyes_auto_allowed) || !r2_vision_media_status()" in focus
+assert "!atomic_load(&eyes_auto_allowed)" in focus
 assert "r2_log_sensory(\"media_attention_selected\"" in focus
 assert "r2_log_sensory(\"media_attention_released\"" in focus
 assert "r2_vision_media_status() ? 1 : 0;" in focus
 media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
                   core.index("int r2_vision_media_stop(void)")]
-assert "atomic_exchange(&media_attention_selected, 0)" in media_stop
-assert "media_attention_source_lost" in media_stop
+assert "r2_vision_media_end_capture();" in media_stop
+assert "media_attention_source_lost" in core
 assert "r2_eyes_close(media_eyes)" in media_stop
 assert "r2_eyes_close(eyes)" not in media_stop
 

@@ -27,6 +27,11 @@ MEDIA_EXTENSIONS = (
 )
 
 
+def _valid_x11_id(value: str) -> bool:
+    return (value.isascii() and value.isdecimal() and len(value) <= 10
+            and 1 <= int(value) <= 0xFFFFFFFF)
+
+
 def send_control_command(command: str) -> str:
     """Send a bounded request to R2; C routes it through Reality APIs."""
     allowed = {"display opened", "display closed", "power on", "power off", "vcr play", "vcr pause", "vcr stop", "vcr eject"}
@@ -42,14 +47,16 @@ def send_control_command(command: str) -> str:
     if command.startswith("vcr insert "):
         path = command[11:]
         valid = Path(path).is_absolute() and "\n" not in path and "\r" not in path and len(command) <= 1199
-    if command.startswith("media "):
-        action, separator, path_and_window = command[6:].partition("|")
-        path, marker, window_id = path_and_window.rpartition("|x11=")
-        # The window locator is optional for older renderers; a supplied
-        # locator is numeric X11 metadata, not part of the media filename.
-        valid_window = not marker or (window_id.isdecimal() and int(window_id) > 0)
-        if not marker:
-            path = path_and_window
+    if command.startswith(("media ", "media-path ")):
+        if command.startswith("media-path "):
+            action, separator, path = command[11:].partition("|")
+            valid_window = True
+        else:
+            action, separator, path_and_window = command[6:].partition("|")
+            path, marker, window_id = path_and_window.rpartition("|x11=")
+            valid_window = not marker or _valid_x11_id(window_id)
+            if not marker:
+                path = path_and_window
         valid = (
             separator != ""
             and valid_window
@@ -59,9 +66,25 @@ def send_control_command(command: str) -> str:
                 "vcr_playback_error",
             }
             and Path(path).is_absolute()
-            and "\n" not in path and "\r" not in path
-            and len(command) <= 1199
+            and "\n" not in path and "\r" not in path and "\0" not in path
+            and len(path.encode("utf-8")) < 1100
+            and len(command.encode("utf-8")) <= 1198
         )
+    if command.startswith("renderer "):
+        window_id, marker, path = command[9:].partition("|")
+        valid = (command == "renderer 0"
+                 or bool(marker) and _valid_x11_id(window_id)
+                 and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
+                 and len(path.encode("utf-8")) < 1100)
+    if command.startswith("vcr tape-position "):
+        seconds, marker, path = command[18:].partition("|")
+        try:
+            valid = (bool(marker) and 0 <= float(seconds) <= 604800
+                     and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
+                     and len(path.encode("utf-8")) <= 1024
+                     and len(command.encode("utf-8")) <= 1198)
+        except ValueError:
+            valid = False
     if command.startswith("vcr position "):
         try:
             seconds = float(command[13:])
@@ -163,7 +186,9 @@ class CRTDisplay:
         self._last_transport: str | None = None
         self._last_position_save = time.monotonic()
         self._vlc_error_shown = False
+        self._pending_vcr_seek: object | None = None
         self._last_logged_vlc_state: tuple[str, str] | None = None
+        self._renderer_published = False
         root.protocol("WM_DELETE_WINDOW", self.close)
         # Record the GUI opening through Reality, even while the modeled TV is off.
         # The event also represents the requested forced-attention cue.
@@ -283,11 +308,13 @@ class CRTDisplay:
         self._player.audio_set_mute(not audible)
         self._loaded_path = path
         self._last_transport = None
+        seek_request = object()
+        self._pending_vcr_seek = seek_request
         self._player.play()
         self._player.set_pause(1)
 
         def seek_and_apply() -> None:
-            if self._player is None or self._loaded_path != path:
+            if self._player is None or self._pending_vcr_seek is not seek_request:
                 return
             # The transport may have changed while VLC initialized. Re-read
             # Reality at callback time instead of applying stale captured state.
@@ -297,14 +324,17 @@ class CRTDisplay:
             except (sqlite3.Error, OSError, RuntimeError, ValueError):
                 self._player.audio_set_mute(True)
                 self._player.set_pause(1)
+                self.root.after(500, seek_and_apply)
                 return
             if current_path != path:
+                self.root.after(500, seek_and_apply)
                 return
             audible_now = bool(power and kind == "input" and value == 1)
             self._player.audio_set_mute(not audible_now)
             self._player.set_time(int(current_position * 1000))
             self._player.set_pause(0 if current_transport == "play" else 1)
             self._last_transport = current_transport
+            self._pending_vcr_seek = None
 
         self.root.after(500, seek_and_apply)
 
@@ -317,7 +347,7 @@ class CRTDisplay:
         milliseconds = self._player.get_time()
         if milliseconds >= 0:
             try:
-                send_control_command(f"vcr position {milliseconds / 1000:.3f}")
+                send_control_command(f"vcr tape-position {milliseconds / 1000:.3f}|{self._loaded_path}")
                 self._last_position_save = now
             except (OSError, RuntimeError, ValueError):
                 pass
@@ -325,14 +355,18 @@ class CRTDisplay:
     def sync_vcr_player(self, path: str | None, transport: str, position: float,
                         audible: bool) -> None:
         if path != self._loaded_path:
+            self._save_vcr_position(force=True)
             if path is None:
+                self._pending_vcr_seek = None
                 if self._player:
                     self._player.stop()
                 self._loaded_path = None
                 self._last_transport = None
             else:
                 self._prepare_media(path, position, transport, audible)
-        elif path and self._player and transport != self._last_transport:
+        elif (path and self._player and self._pending_vcr_seek is None
+              and transport != self._last_transport):
+            self._save_vcr_position(force=True)
             self._player.audio_set_mute(not audible)
             if transport == "play":
                 if self._player.play() < 0:
@@ -344,17 +378,26 @@ class CRTDisplay:
 
     def _send_media_event(self, action: str, path: str) -> bool:
         try:
-            # Report the actual video-surface window only when libVLC has
-            # entered playback. Watch can then observe the real rendered
-            # frames without inferring a movie from a filename or window title.
-            window = (self.video_surface.winfo_id()
-                      if action == "vcr_playback_started" else 0)
-            suffix = f"|x11={window}" if window > 0 else ""
-            send_control_command(f"media {action}|{path}{suffix}")
+            send_control_command(f"media-path {action}|{path}")
             return True
         except (OSError, RuntimeError, ValueError):
             # The player must remain usable if the Life Log socket is unavailable.
             return False
+
+    def _publish_renderer(self, path: str | None) -> None:
+        try:
+            if path and self._loaded_path == path and self._last_transport == "play" \
+                    and self._player.get_state() == self._vlc.State.Playing:
+                window = self.video_surface.winfo_id()
+                if window > 0:
+                    self._renderer_published = True
+                    send_control_command(f"renderer {window}|{path}")
+                    return
+            if self._renderer_published:
+                send_control_command("renderer 0")
+                self._renderer_published = False
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            pass
 
     def _record_playback_state(self, path: str | None) -> None:
         previous = self._last_logged_vlc_state
@@ -433,7 +476,10 @@ class CRTDisplay:
             if self._player:
                 self._player.audio_set_mute(not audible)
             self.sync_vcr_player(tape_path, transport, position, audible)
-            self._record_playback_state(tape_path)
+            if self._pending_vcr_seek is None:
+                self._record_playback_state(self._loaded_path)
+            elif self._last_logged_vlc_state and self._last_logged_vlc_state[0] != self._loaded_path:
+                self._record_playback_state(None)
 
             if not power:
                 headline = "TV OFF"
@@ -469,6 +515,7 @@ class CRTDisplay:
                     bg="#080b08" if power else "#050605",
                 )
 
+            self._publish_renderer(tape_path if showing_vcr else None)
             tape_name = Path(tape_path).name if tape_path else "no tape"
             self.status.configure(
                 text=f"{'POWER ON' if power else 'POWER OFF'}   |   {source}"
@@ -477,6 +524,7 @@ class CRTDisplay:
                      + "   |   Reality-linked controls"
             )
         except (sqlite3.Error, OSError, RuntimeError) as exc:
+            self._publish_renderer(None)
             self.picture.lift()
             self.picture.configure(text="TV STATE UNAVAILABLE", fg="#b8c0b2")
             self.status.configure(text=f"Database: {DB_PATH}   |   {exc}")

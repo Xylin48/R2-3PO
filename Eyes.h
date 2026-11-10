@@ -112,6 +112,7 @@ uint64_t r2_eyes_preview_session(void);
 int r2_eyes_camera_available(void);
 /* Check for a visible existing VLC window without opening it. */
 int r2_eyes_vlc_available(void);
+unsigned long r2_eyes_vlc_window(void);
 
 /* Input sources */
 int r2_eyes_open_file(R2Eyes *eyes, const char *path);
@@ -123,11 +124,22 @@ int r2_eyes_open_source(R2Eyes *eyes,
 
 /* Live video-rendering window supplied by a playback source. */
 int r2_eyes_window_available(unsigned long window_id);
+int r2_eyes_window_available_cancelable(unsigned long window_id,
+                                        int (*cancelled)(void *), void *userdata);
 unsigned long r2_eyes_window_for_pid(long pid);
+/* In/out preference and result. A zero window means a complete empty
+ * search; a negative result means discovery is unknown or cancelled.
+ * A positive returned PID identifies a producer; -1 marks VLC fallback. */
+int r2_eyes_select_playback_window(const long *producers, size_t count,
+                                  long *pid, unsigned long *window,
+                                  int (*cancelled)(void *), void *userdata);
 int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
+int r2_eyes_open_x11_cancelable(R2Eyes *eyes, unsigned long window_id, int vlc,
+                               int (*cancelled)(void *), void *userdata);
 
 /* VLC window input */
 int r2_eyes_open_vlc(R2Eyes *eyes);
+int r2_eyes_open_vlc_window(R2Eyes *eyes, unsigned long window_id);
 
 void r2_eyes_close(R2Eyes *eyes);
 

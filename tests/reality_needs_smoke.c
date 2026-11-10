@@ -26,6 +26,63 @@ static void fail(const char *message)
     exit(1);
 }
 
+static void verify_vcr_tape_identity(void)
+{
+    const char *first = R2_ROOT "/first|x11=tape.mp4";
+    const char *second = R2_ROOT "/second.mp4";
+    const char *blocked = R2_ROOT "/blocked.mp4";
+    const char *fixtures[] = {first, second, blocked};
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); ++i) {
+        FILE *fp = fopen(fixtures[i], "wb");
+        if (!fp || fclose(fp) != 0) fail("could not create tape fixture");
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &db) != SQLITE_OK)
+        fail("could not query VCR state");
+    if (r2_reality_tv_vcr_insert(first) != 0 ||
+        r2_reality_tv_vcr_set_position(12.5) != 0 ||
+        r2_reality_tv_vcr_insert(second) != 0 ||
+        r2_reality_tv_vcr_set_tape_position(first, 63.25) != 0 ||
+        r2_reality_tv_vcr_set_tape_position(blocked, 90) == 0)
+        fail("could not save an exact outgoing tape position");
+
+    if (sqlite3_exec(db, "CREATE TRIGGER ignore_tape_insert BEFORE UPDATE OF cassette_path "
+                         "ON r2_tv_vcr_state WHEN NEW.cassette_path LIKE '%/blocked.mp4' "
+                         "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not install VCR rollback fixture");
+    if (r2_reality_tv_vcr_insert(blocked) == 0)
+        fail("an ignored cassette update reported successful insertion");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "SELECT (SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=?1),"
+            "(SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=?2),"
+            "(SELECT COUNT(*) FROM r2_tv_vcr_tapes WHERE media_path=?3),"
+            "cassette_path FROM r2_tv_vcr_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(st, 1, first, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, second, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_text(st, 3, blocked, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW || sqlite3_column_double(st, 0) != 63.25 ||
+        sqlite3_column_type(st, 1) == SQLITE_NULL || sqlite3_column_double(st, 1) != 0 ||
+        sqlite3_column_int(st, 2) != 0 || !sqlite3_column_text(st, 3) ||
+        strcmp((const char *)sqlite3_column_text(st, 3), second))
+        fail("tape save or failed insertion changed the wrong VCR record");
+    sqlite3_finalize(st);
+    if (r2_reality_tv_vcr_insert(first) != 0)
+        fail("could not reinsert tape after an aborted insertion");
+    char *status = r2_reality_tv_status();
+    if (!status || !strstr(status, "63.2 seconds") || !strstr(status, first))
+        fail("reinserted tape lost its own saved position");
+    free(status);
+    if (sqlite3_exec(db, "DROP TRIGGER ignore_tape_insert;"
+                         "UPDATE r2_tv_vcr_state SET cassette_path='legacy_tape.mkv',"
+                         "transport='pause' WHERE id=1;", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not restore the migrated cassette fixture");
+    sqlite3_close(db);
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); ++i)
+        if (unlink(fixtures[i]) != 0) fail("could not remove tape fixture");
+}
+
 static void read_needs(double *hunger, double *sleepiness, double *energy,
                        double *satisfaction, double *since_meal)
 {
@@ -482,6 +539,7 @@ int main(void)
     free(initial_tv_status);
     verify_legacy_fridge_migration();
     verify_legacy_shared_reality_migration();
+    verify_vcr_tape_identity();
     double initial_hunger, initial_sleepiness, initial_energy;
     double initial_satisfaction, initial_since_meal;
     read_needs(&initial_hunger, &initial_sleepiness, &initial_energy,

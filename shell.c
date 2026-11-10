@@ -89,8 +89,84 @@ static pthread_t tv_control_thread;
 static int tv_control_started = 0;
 static int tv_control_fd = -1;
 static atomic_int tv_control_stop = ATOMIC_VAR_INIT(0);
-static atomic_ulong tv_live_video_window = ATOMIC_VAR_INIT(0);
+/* One snapshot carries both the XID and its playback publication. The same
+ * Tk surface can host multiple tapes between two Watch polls. */
+static atomic_uint_fast64_t tv_live_renderer = ATOMIC_VAR_INIT(0);
+static char tv_renderer_path[1100]; /* control-thread-only exact publication key */
 static char tv_control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+static void tv_publish_video_window(uint32_t window, const char *path)
+{
+    /* Only the control thread publishes while it runs. */
+    uint64_t previous = atomic_load(&tv_live_renderer);
+    if ((uint32_t)previous == window &&
+        (!window || (path && !strcmp(tv_renderer_path, path))))
+        return;
+    if (path) memcpy(tv_renderer_path, path, strlen(path) + 1);
+    else tv_renderer_path[0] = '\0';
+    uint64_t generation = (previous >> 32) + 1;
+    atomic_store(&tv_live_renderer, (generation << 32) | window);
+}
+
+static int tv_parse_window_id(const char *value, uint32_t *window)
+{
+    if (!*value || strlen(value) > 10 || value[strspn(value, "0123456789")]) return -1;
+    char *end;
+    errno = 0;
+    unsigned long id = strtoul(value, &end, 10);
+    if (errno || *end || id > UINT32_MAX) return -1;
+    *window = (uint32_t)id;
+    return 0;
+}
+
+static int tv_renderer_path_valid(const char *path)
+{
+    return path[0] == '/' && !strpbrk(path, "\n\r") &&
+        strlen(path) < sizeof(tv_renderer_path);
+}
+
+static const char *tv_control_renderer(char *payload)
+{
+    char *path = strchr(payload, '|');
+    if (path) *path++ = '\0';
+    uint32_t window;
+    if (tv_parse_window_id(payload, &window) != 0 ||
+        (window ? !path || !tv_renderer_path_valid(path) : path != NULL))
+        return "ERROR invalid renderer";
+    tv_publish_video_window(window, path);
+    return "OK renderer publication received";
+}
+
+static const char *tv_control_media_event(char *payload, int legacy_locator)
+{
+    const char *invalid = "ERROR invalid media event";
+    uint32_t window = 0;
+    char *separator = strchr(payload, '|');
+    if (!separator) return invalid;
+    *separator = '\0';
+    char *path = separator + 1;
+    if (legacy_locator) {
+        /* Legacy clients append an optional locator to the path. */
+        char *locator = NULL;
+        for (char *next = path; (next = strstr(next, "|x11=")); ++next)
+            locator = next;
+        if (locator) {
+            if (tv_parse_window_id(locator + 5, &window) != 0 || !window)
+                return invalid;
+            *locator = '\0';
+        }
+    }
+    if (!tv_renderer_path_valid(path)) return invalid;
+    int playing = !strcmp(payload, "vcr_playback_started");
+    if (!playing && strcmp(payload, "vcr_playback_paused") &&
+        strcmp(payload, "vcr_playback_stopped") && strcmp(payload, "vcr_playback_ended") &&
+        strcmp(payload, "vcr_playback_error"))
+        return invalid;
+    if (legacy_locator) tv_publish_video_window(playing ? window : 0, NULL);
+    return r2_log_media_event(payload, "media", path,
+        "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
+        ? "OK media event recorded" : "ERROR could not record media event";
+}
 
 static void *tv_control_server(void *unused)
 {
@@ -160,7 +236,7 @@ static void *tv_control_server(void *unused)
 
         /* A partial or oversized command is never dispatched. This also lets
            shutdown abandon a client that connected but never sent a full line. */
-        if (!complete_line || atomic_load(&tv_control_stop)) {
+        if (!complete_line || atomic_load(&tv_control_stop) || memchr(command, '\0', used)) {
             close(client);
             if (atomic_load(&tv_control_stop)) break;
             continue;
@@ -179,12 +255,12 @@ static void *tv_control_server(void *unused)
         } else if (!strcmp(command, "display opened")) {
             reply = r2_reality_tv_display_event(1) == 0 ? "OK TV display-open event recorded" : "ERROR could not record TV display-open event";
         } else if (!strcmp(command, "display closed")) {
-            atomic_store(&tv_live_video_window, 0);
+            tv_publish_video_window(0, NULL);
             reply = r2_reality_tv_display_event(0) == 0 ? "OK TV display-close event recorded" : "ERROR could not record TV display-close event";
         } else if (!strcmp(command, "power on")) {
             reply = r2_reality_tv_power(1) == 0 ? "OK powered on" : "ERROR power-on failed";
         } else if (!strcmp(command, "power off")) {
-            atomic_store(&tv_live_video_window, 0);
+            tv_publish_video_window(0, NULL);
             reply = r2_reality_tv_power(0) == 0 ? "OK powered off" : "ERROR power-off failed";
         } else if (!strncmp(command, "input ", 6)) {
             char *end = NULL;
@@ -199,47 +275,11 @@ static void *tv_control_server(void *unused)
                 reply = r2_reality_tv_tune_rf((int)n) == 0 ? "OK RF channel tuned" : "ERROR RF tuning failed";
             else reply = "ERROR RF channel must be 2..13";
         } else if (!strncmp(command, "media ", 6)) {
-            char *payload = command + 6;
-            char *separator = strchr(payload, '|');
-            if (separator) {
-                *separator = '\0';
-                char *path = separator + 1;
-                unsigned long published_window = 0;
-                int valid_locator = 1;
-                char *locator = strstr(path, "|x11=");
-                if (locator) {
-                    char *end = NULL;
-                    errno = 0;
-                    unsigned long value = strtoul(locator + 5, &end, 10);
-                    if (errno || end == locator + 5 || !end || *end || !value)
-                        valid_locator = 0;
-                    else {
-                        published_window = value;
-                        *locator = '\0';
-                    }
-                }
-                const char *allowed_actions[] = {
-                    "vcr_playback_started", "vcr_playback_paused",
-                    "vcr_playback_stopped", "vcr_playback_ended",
-                    "vcr_playback_error"
-                };
-                int allowed = 0;
-                for (size_t i = 0; i < sizeof(allowed_actions) / sizeof(allowed_actions[0]); ++i)
-                    if (!strcmp(payload, allowed_actions[i])) { allowed = 1; break; }
-                if (allowed && valid_locator && path[0] == '/' && *path &&
-                    !strchr(path, '\n') && !strchr(path, '\r') &&
-                    strlen(path) < 1100) {
-                    atomic_store(&tv_live_video_window,
-                        !strcmp(payload, "vcr_playback_started") ? published_window : 0);
-                    reply = r2_log_media_event(payload, "media", path,
-                        "Observed from the CRT built-in VCR's VLC player; this records renderer state, not proof of what a person watched.") >= 0
-                        ? "OK media event recorded" : "ERROR could not record media event";
-                } else {
-                    reply = "ERROR invalid media event";
-                }
-            } else {
-                reply = "ERROR invalid media event";
-            }
+            reply = tv_control_media_event(command + 6, 1);
+        } else if (!strncmp(command, "media-path ", 11)) {
+            reply = tv_control_media_event(command + 11, 0);
+        } else if (!strncmp(command, "renderer ", 9)) {
+            reply = tv_control_renderer(command + 9);
         } else if (!strncmp(command, "vcr insert ", 11)) {
             const char *path = command + 11;
             reply = *path && r2_reality_tv_vcr_insert(path) == 0
@@ -252,6 +292,17 @@ static void *tv_control_server(void *unused)
             reply = r2_reality_tv_vcr_transport("stop") == 0 ? "OK VCR stopped" : "ERROR no tape inserted";
         } else if (!strcmp(command, "vcr eject")) {
             reply = r2_reality_tv_vcr_transport("eject") == 0 ? "OK VCR tape ejected" : "ERROR no tape inserted";
+        } else if (!strncmp(command, "vcr tape-position ", 18)) {
+            char *value = command + 18;
+            char *path = strchr(value, '|');
+            if (path) {
+                *path++ = '\0';
+                char *end = NULL;
+                double seconds = strtod(value, &end);
+                if (end != value && *end == '\0' && isfinite(seconds) && seconds >= 0.0)
+                    reply = r2_reality_tv_vcr_set_tape_position(path, seconds) == 0
+                        ? "OK VCR tape position saved" : "ERROR could not save tape position";
+            }
         } else if (!strncmp(command, "vcr position ", 13)) {
             char *end = NULL;
             double seconds = strtod(command + 13, &end);
@@ -331,6 +382,7 @@ static void tv_control_stop_server(void)
     /* The server uses bounded poll() waits and must finish before its listener
        descriptor is closed, avoiding close/accept races and an unbounded join. */
     pthread_join(tv_control_thread, NULL);
+    tv_publish_video_window(0, NULL);
     close(tv_control_fd);
     tv_control_fd = -1;
     unlink(tv_control_path);
@@ -1326,6 +1378,9 @@ static void shell_ears(const char *argument)
 
 static void shell_watch_status(void)
 {
+    R2EarsWatchInput microphone = {0}, desktop = {0};
+    int mic_known = watch_running && r2_ears_watch_input_snapshot(0, &microphone) == 0;
+    int desktop_known = watch_running && r2_ears_watch_input_snapshot(1, &desktop) == 0;
     printf(
         "\n"
         "================ WATCH STATUS =============================\n"
@@ -1342,17 +1397,123 @@ static void shell_watch_status(void)
         "============================================================\n"
         "\n",
         shell_watch_thread_started ? "MONITORING" : "STOPPED",
-        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "WAITING"),
-        !watch_running ? "STOPPED" : (r2_ears_status_desktop() > 0 ? "ACTIVE" : "WAITING"),
+        !watch_running ? "STOPPED" : !mic_known ? "UPDATING" : microphone.active ? "ACTIVE" : "WAITING",
+        !watch_running ? "STOPPED" : !desktop_known ? "UPDATING" : desktop.active ? "ACTIVE" : "WAITING",
         r2_vision_watch_active() ? "ACTIVE" : "WAITING",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
+    free(microphone.source);
+    free(desktop.source);
 }
 
 static int shell_watch_cancelled(void *unused)
 {
     (void)unused;
     return atomic_load(&shell_watch_stop_requested) || r2_is_shutting_down();
+}
+
+typedef struct {
+    int kind; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
+    uint64_t token;
+    unsigned long window;
+    long producer;
+    uint64_t publication; /* CRT playback generation, including its XID */
+} ShellWatchMedia;
+
+static int shell_watch_media_stale(void *userdata)
+{
+    return shell_watch_cancelled(NULL) ||
+        *(const uint64_t *)userdata != atomic_load(&tv_live_renderer);
+}
+
+static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
+                                   const R2AudioDiscovery *audio)
+{
+    uint64_t publication = atomic_load(&tv_live_renderer);
+    unsigned long published = (uint32_t)publication;
+    unsigned long wanted_window = 0;
+    long producer = -1;
+    int wanted_kind = 0;
+    int selection_known = audio != NULL;
+    if (eyes_permitted && !shell_watch_cancelled(NULL)) {
+        if (published && ((managed->kind == 3 && managed->publication == publication &&
+                           r2_vision_media_watch_owns(managed->token) && r2_vision_media_status()) ||
+                          r2_vision_window_available_cancelable(published, shell_watch_media_stale,
+                                                               &publication))) {
+            wanted_window = published;
+            wanted_kind = 3;
+        } else if (audio && audio->desktop_playing) {
+            if (managed->kind == 4) {
+                producer = managed->producer;
+                wanted_window = managed->window;
+            }
+            selection_known = r2_vision_select_playback_window(
+                audio->playback_producers, audio->playback_producer_count,
+                &producer, &wanted_window, shell_watch_media_stale, &publication) == 0;
+            if (!selection_known) wanted_window = 0;
+            if (wanted_window) wanted_kind = producer > 1 ? 4 : 2;
+        }
+    }
+    if (shell_watch_media_stale(&publication))
+        return; /* Reconcile against the next complete publication snapshot. */
+
+    /* The CRT publisher can withdraw its own window independently of Pulse.
+       Failed Pulse discovery alone cannot withdraw a desktop source. */
+    if (managed->token &&
+        (!r2_vision_media_watch_owns(managed->token) ||
+         !r2_sense_auto_allowed(1) || r2_vision_media_status() <= 0 ||
+         (managed->kind == 3 && managed->publication != publication) ||
+         ((selection_known || wanted_kind == 3) &&
+          (managed->kind != wanted_kind || managed->window != wanted_window ||
+           (wanted_kind == 4 && managed->producer != producer))))) {
+        (void)r2_vision_media_stop_if_watch_owned(managed->token);
+        *managed = (ShellWatchMedia){0};
+    }
+    if (!wanted_window || managed->token || shell_watch_cancelled(NULL) ||
+        r2_vision_media_status() || !r2_vision_available() ||
+        publication != atomic_load(&tv_live_renderer))
+        return;
+
+    uint64_t token = r2_vision_media_open_x11_for_watch_cancelable(
+        wanted_window, wanted_kind == 2, shell_watch_media_stale, &publication);
+    if (!token) return;
+    if (shell_watch_media_stale(&publication)) {
+        (void)r2_vision_media_stop_if_watch_owned(token);
+        return;
+    }
+    *managed = (ShellWatchMedia){
+        .kind = wanted_kind, .token = token, .window = wanted_window, .producer = producer,
+        .publication = wanted_kind == 3 ? publication : 0
+    };
+    r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
+                 "R2 can observe an independent real media display.",
+                 "The display does not replace physical Eyes or demand attention.",
+                 wanted_kind == 3 ? "CRT video renderer" :
+                 wanted_kind == 4 ? "visible X11 audio producer" : "VLC");
+}
+
+static int shell_watch_audio_input(uint64_t *managed, int desktop, int known,
+                                   const char *wanted, R2EarsWatchInput *input)
+{
+    if (r2_ears_watch_input_snapshot(desktop, input) != 0) return -1;
+    int permitted = r2_sense_auto_allowed(desktop ? 3 : 2);
+    if (*managed && *managed != input->owner) *managed = 0;
+    if (*managed && (!permitted || !input->active ||
+                     (known && (!wanted || strcmp(input->source, wanted))))) {
+        if (desktop) (void)r2_ears_stop_desktop_if_watch_owned(*managed);
+        else (void)r2_ears_stop_if_watch_owned(*managed);
+        *managed = 0;
+        free(input->source);
+        if (r2_ears_watch_input_snapshot(desktop, input) != 0) return -1;
+    }
+    if (!input->active && permitted && known && wanted && !shell_watch_cancelled(NULL)) {
+        *managed = desktop
+            ? r2_ears_start_desktop_for_watch_cancelable(wanted, shell_watch_cancelled, NULL)
+            : r2_ears_start_for_watch_cancelable(wanted, shell_watch_cancelled, NULL);
+        free(input->source);
+        return r2_ears_watch_input_snapshot(desktop, input);
+    }
+    return 0;
 }
 
 /*
@@ -1365,9 +1526,7 @@ static void *shell_watch_worker(void *unused)
 {
     (void)unused;
     uint64_t managed_camera = 0; /* exact Watch-owned camera generation */
-    int managed_media = 0; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
-    uint64_t managed_media_token = 0; /* only a Watch-opened generation */
-    unsigned long managed_window_id = 0;
+    ShellWatchMedia managed_media = {0};
     uint64_t managed_microphone = 0; /* ownership token, not just a boolean */
     uint64_t managed_desktop = 0;
     uint64_t attached_visual = 0; /* Watch-owned worker on a pre-opened camera */
@@ -1380,22 +1539,7 @@ static void *shell_watch_worker(void *unused)
             if (audio_known) r2_audio_discovery_free(&audio);
             break;
         }
-        /* On a server query error, existing capture is not evidence of
-         * unplugging. Use status only to preserve established attention. */
-        int desktop_playing = audio_known ? audio.desktop_playing :
-            r2_ears_status_desktop() > 0;
-        int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
-        int vlc_available = desktop_playing && r2_vision_vlc_available();
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-        unsigned long media_window = atomic_load(&tv_live_video_window);
-        int window_available = media_window &&
-            r2_vision_window_available(media_window);
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-        long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
-        unsigned long playback_window = r2_vision_window_for_pid(playback_pid);
-        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
-
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
         int eyes_permitted = r2_sense_auto_allowed(1);
@@ -1418,88 +1562,25 @@ static void *shell_watch_worker(void *unused)
             !r2_vision_watch_active() && r2_vision_available())
             attached_visual = r2_vision_watch_start_for_watch();
 
-        /* Watch finds accessible media; R2 decides whether to watch it.
-           Media capture is independent, and no semantic inference is triggered. */
-        int wanted_media = window_available ? 3 :
-            (playback_window ? 4 : (vlc_available ? 2 : 0));
-        unsigned long wanted_window = wanted_media == 3 ? media_window :
-                                      wanted_media == 4 ? playback_window : 0;
-        if (managed_media &&
-            (!r2_vision_media_watch_owns(managed_media_token) ||
-             !eyes_permitted || r2_vision_media_status() <= 0 ||
-             ((audio_known || window_available) &&
-              (wanted_media != managed_media ||
-               managed_window_id != wanted_window)))) {
-            (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
-            managed_media = 0;
-            managed_media_token = 0;
-            managed_window_id = 0;
-        }
-        if (eyes_permitted && !managed_media && wanted_media &&
-            !r2_vision_media_status() && r2_vision_available()) {
-            uint64_t opened_token = wanted_media == 2 ?
-                r2_vision_media_open_vlc_for_watch() :
-                r2_vision_media_open_window_for_watch(wanted_window);
-            if (opened_token) {
-                managed_media = wanted_media;
-                managed_media_token = opened_token;
-                managed_window_id = wanted_window;
-                r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
-                             "R2 can observe an independent real media display.",
-                             "The display does not replace physical Eyes or demand attention.",
-                             wanted_media == 3 ? "CRT video renderer" :
-                             wanted_media == 4 ? "visible X11 audio producer" : "VLC");
-            }
-        }
+        shell_watch_media_poll(&managed_media, eyes_permitted, audio_known ? &audio : NULL);
+        if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
-        /* Both audio sources operate independently; the decision to close one
-           must not be overridden by mere availability of that source. */
-        int microphone_changed = audio_known && microphone_available &&
-            !r2_ears_status_microphone_source(audio.microphone_source);
-        if (managed_microphone &&
-            (!r2_sense_auto_allowed(2) ||
-             (audio_known && (!microphone_available || microphone_changed)) ||
-             r2_ears_status() <= 0)) {
-            (void)r2_ears_stop_if_watch_owned(managed_microphone);
-            managed_microphone = 0;
-        }
-        if (!managed_microphone && r2_sense_auto_allowed(2) &&
-            microphone_available && r2_ears_status() <= 0)
-            managed_microphone =
-                r2_ears_start_for_watch_cancelable(audio.microphone_source,
-                                                    shell_watch_cancelled, NULL);
+        /* Unknown or busy source state preserves custody until a later poll.
+         * A manual open on one input must not block checks of the others. */
+        R2EarsWatchInput microphone, desktop;
+        (void)shell_watch_audio_input(&managed_microphone, 0, audio_known,
+                                       audio_known ? audio.microphone_source : NULL, &microphone);
+        free(microphone.source);
+        int desktop_known = shell_watch_audio_input(
+            &managed_desktop, 1, audio_known,
+            audio_known && audio.desktop_playing ? audio.desktop_monitor : NULL, &desktop) == 0;
 
-        int monitor_changed = audio_known && desktop_playing &&
-            audio.desktop_monitor &&
-            !r2_ears_status_desktop_source(audio.desktop_monitor);
-        if (managed_desktop &&
-            (!r2_sense_auto_allowed(3) ||
-             (audio_known && (!desktop_playing || monitor_changed)) ||
-             r2_ears_status_desktop() <= 0)) {
-            (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
-            managed_desktop = 0;
-        }
-        if (!managed_desktop && r2_sense_auto_allowed(3) &&
-            audio_known && desktop_playing && audio.desktop_monitor &&
-            r2_ears_status_desktop() <= 0)
-            managed_desktop =
-                r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor,
-                                                            shell_watch_cancelled, NULL);
-
-        /* Every other active output gets its own continuously buffered
-         * listener, without replacing the primary or the physical mic.
-         * Failed discovery cannot be treated as evidence of unplugging. */
         if (!r2_sense_auto_allowed(3))
             r2_ears_extra_stop_all();
-        else if (audio_known) {
-            /* Exclude the receiver's ACTUAL selected monitor, which may
-             * differ from the first detected output after manual takeover.
-             * If there is no active primary receiver, capture every sink. */
-            char *primary_source = r2_ears_current_desktop_source();
-            (void)r2_ears_extra_reconcile_cancelable(&audio, primary_source,
+        else if (audio_known && desktop_known)
+            (void)r2_ears_extra_reconcile_cancelable(&audio, desktop.source,
                                                    shell_watch_cancelled, NULL);
-            free(primary_source);
-        }
+        free(desktop.source);
 
 snapshot_finished:
         if (audio_known) r2_audio_discovery_free(&audio);
@@ -1514,8 +1595,8 @@ snapshot_finished:
         (void)r2_eyes_release_if_watch_owned(managed_camera);
     if (attached_visual)
         (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
-    if (managed_media)
-        (void)r2_vision_media_stop_if_watch_owned(managed_media_token);
+    if (managed_media.token)
+        (void)r2_vision_media_stop_if_watch_owned(managed_media.token);
     if (managed_microphone)
         (void)r2_ears_stop_if_watch_owned(managed_microphone);
     if (managed_desktop)
