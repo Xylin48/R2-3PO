@@ -1073,3 +1073,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - In the shared file, write both rows using one SQLite transaction on the Life Log connection, with the exact event ID and a final source cancellation check. Index the event in Sensory Journal only after commit. The scoped lock order is Visual, then Life Log during the shared transaction, with Life Log released before Journal indexing.
 - A separate Visual database still works. In that configuration, commit the Visual row before publishing its Life Log event and then attach the exact event ID. A failed Visual insert rolls back even if SQLite's trigger retained provisional changes. Separate files retain independent durability and can still be left without a link by an interruption between commits.
 - The native fixture passed failed and ignored Visual inserts, a rejected Life Log insert, exact event and Journal counts, cancellation cleanup, detached-file rollback and linkage, and restart recall. This completes the scoped SQLite publication and linkage trace.
+
+### R2-AUD-2026-11-10-088 — Synchronize JPEG archives before committing their index
+
+- Traced the archive descriptor through exclusive creation, full writes, close, cancellation, and publication. Closing a JPEG alone does not synchronize its bytes or its directory entry before the separate SQLite commit.
+- Synchronize both the JPEG and its directory before database publication. Reject and clean up the new file on a sync failure. Archive names use a random suffix and an exclusive create, with the pre-audit `0640` creation mode subject to the process umask, superseding the intermediate permissions in 086.
+- The native fixture passed both file and directory sync failures, with no Visual row, Life Log experience, or extra JPEG left by either failure. This completes the scoped archive write and sync trace. An abrupt stop between file synchronization and database commit can still leave an unindexed JPEG.

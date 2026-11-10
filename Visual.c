@@ -287,6 +287,43 @@ static int mkdir_one(const char *path)
     return -1;
 }
 
+static int visual_sync(int fd)
+{
+    int rc;
+    do { rc = fsync(fd); } while (rc != 0 && errno == EINTR);
+    return rc;
+}
+
+static int visual_sync_directory(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = visual_sync(fd);
+    int error = errno;
+    if (close(fd) != 0 && rc == 0) return -1;
+    errno = error;
+    return rc;
+}
+
+static int visual_create_archive(const char *directory, const R2VisionFrame *frame,
+                                 char *path, size_t capacity)
+{
+    const char *separator = directory[strlen(directory) - 1] == '/' ? "" : "/";
+    for (;;) {
+        uint64_t nonce;
+        if (getentropy(&nonce, sizeof(nonce)) != 0) return -1;
+        int length = snprintf(path, capacity, "%s%svisual_%llu_%llu_%016llx.jpg",
+                              directory, separator, (unsigned long long)frame->timestamp,
+                              (unsigned long long)frame->frame_number, (unsigned long long)nonce);
+        if (length < 0 || (size_t)length >= capacity) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+}
+
 static int write_all(int fd, const void *buffer, size_t length)
 {
     const unsigned char *p = buffer;
@@ -1109,42 +1146,25 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     if (!description) { free(jpeg); return NULL; }
 
     char image_path[PATH_MAX];
-    size_t directory_length = strlen(directory_snapshot);
-    const char *separator = directory_snapshot[directory_length - 1] == '/' ? "" : "/";
-    int path_length = snprintf(image_path, sizeof(image_path), "%s%svisual_%llu_%llu_XXXXXX.jpg",
-                               directory_snapshot, separator,
-                               (unsigned long long)frame->timestamp,
-                               (unsigned long long)frame->frame_number);
-    if (path_length < 0 || (size_t)path_length >= sizeof(image_path)) {
-        r2_log_sensory("visual_image_archive_failed",
-                       "R2 analyzed a frame but its archive path was too long.",
-                       directory_snapshot, source ? source : "Eyes");
-        free(jpeg);
-        json_object_put(focus);
-        free(description);
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-
-    /* Frame counters belong to receivers and repeated looks can reuse one
-     * snapshot. Claim a fresh path for each observation, including after restart. */
-    int image_fd = mkstemps(image_path, 4);
+    /* Each interpretation owns an archive even when capture coordinates match. */
+    int image_fd = visual_create_archive(directory_snapshot, frame, image_path, sizeof(image_path));
     if (image_fd < 0) {
         int saved_errno = errno;
         r2_log_sensory("visual_image_archive_failed",
                        "R2 analyzed an image but could not create its JPEG archive.",
-                       strerror(saved_errno), image_path);
+                       strerror(saved_errno), source ? source : "Eyes");
         free(jpeg);
         json_object_put(focus);
         free(description);
+        errno = saved_errno;
         return NULL; /* Never unlink a path that this call did not create. */
     }
-    if (write_all(image_fd, jpeg, jpeg_length) != 0) {
+    if (write_all(image_fd, jpeg, jpeg_length) != 0 || visual_sync(image_fd) != 0) {
         int saved_errno = errno;
         close(image_fd);
         unlink(image_path); /* This call created the file. */
         r2_log_sensory("visual_image_archive_failed",
-                       "R2 analyzed an image but could not write its JPEG archive.",
+                       "R2 analyzed an image but could not write or synchronize its JPEG archive.",
                        strerror(saved_errno), image_path);
         free(jpeg);
         json_object_put(focus);
@@ -1163,6 +1183,18 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
         return NULL;
     }
     free(jpeg);
+
+    /* The JPEG and its directory entry must be durable before the row commits. */
+    if (visual_sync_directory(directory_snapshot) != 0) {
+        int saved_errno = errno;
+        unlink(image_path);
+        r2_log_sensory("visual_image_archive_failed",
+                       "R2 could not synchronize the visual archive directory.",
+                       strerror(saved_errno), directory_snapshot);
+        json_object_put(focus);
+        free(description);
+        return NULL;
+    }
 
     time_t now = time(NULL);
     struct tm utc;

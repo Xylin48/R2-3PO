@@ -10,6 +10,7 @@
 static const pid_t encoder_pid = 727272;
 static char ppm_path[PATH_MAX], jpeg_path[PATH_MAX];
 static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, reaped_encoder;
+static int fail_file_sync, fail_directory_sync;
 static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_during_http, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
@@ -39,8 +40,7 @@ int __wrap_mkstemps(char *path, int suffix)
 {
     int fd = __real_mkstemps(path, suffix);
     if (fd >= 0 && strstr(path, ".ppm")) { snprintf(ppm_path, sizeof(ppm_path), "%s", path); ppm_fd = fd; }
-    if (fd >= 0 && !strchr(path + sizeof("/tmp/") - 1, '/') && strstr(path, ".jpg"))
-        snprintf(jpeg_path, sizeof(jpeg_path), "%s", path);
+    if (fd >= 0 && strstr(path, ".jpg")) snprintf(jpeg_path, sizeof(jpeg_path), "%s", path);
     return fd;
 }
 ssize_t __real_write(int, const void *, size_t);
@@ -60,6 +60,19 @@ ssize_t __wrap_write(int fd, const void *p, size_t n)
         free(result);
     }
     return __real_write(fd, p, n);
+}
+int __real_fsync(int);
+int __wrap_fsync(int fd)
+{
+    struct stat metadata;
+    assert(fstat(fd, &metadata) == 0);
+    if ((S_ISDIR(metadata.st_mode) && fail_directory_sync) ||
+        (S_ISREG(metadata.st_mode) && fail_file_sync)) {
+        fail_file_sync = fail_directory_sync = 0;
+        errno = EIO;
+        return -1;
+    }
+    return __real_fsync(fd);
 }
 int __real_close(int);
 int __wrap_close(int fd)
@@ -383,6 +396,16 @@ int main(void)
     assert(scalar(visual_db, "SELECT count(*) FROM r2_sensory_journal j "
                              "JOIN r2_log_events e ON e.id=j.event_id "
                              "WHERE e.event_type='visual_experience'") == journal_before);
+
+    response("{\"description\":\"archive sync failure fixture\",\"focus\":null}", "stop");
+    fail_file_sync = 1;
+    rejected_frame(&frame);
+    assert(!fail_file_sync);
+    fail_directory_sync = 1;
+    rejected_frame(&frame);
+    assert(!fail_directory_sync);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience'")
+           == events_before);
 
     response("{\"description\":\"cancelled before publication\",\"focus\":null}", "stop");
     cancel_on_archive_write = 1;
