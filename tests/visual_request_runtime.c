@@ -4,6 +4,7 @@
 #include "r2_diary.h"
 #include "SensoryJournal.h"
 #include <assert.h>
+#include <dirent.h>
 #include <stdarg.h>
 
 static const pid_t encoder_pid = 727272;
@@ -38,7 +39,8 @@ int __wrap_mkstemps(char *path, int suffix)
 {
     int fd = __real_mkstemps(path, suffix);
     if (fd >= 0 && strstr(path, ".ppm")) { snprintf(ppm_path, sizeof(ppm_path), "%s", path); ppm_fd = fd; }
-    if (fd >= 0 && strstr(path, ".jpg")) snprintf(jpeg_path, sizeof(jpeg_path), "%s", path);
+    if (fd >= 0 && !strchr(path + sizeof("/tmp/") - 1, '/') && strstr(path, ".jpg"))
+        snprintf(jpeg_path, sizeof(jpeg_path), "%s", path);
     return fd;
 }
 ssize_t __real_write(int, const void *, size_t);
@@ -209,13 +211,28 @@ static void temporary_files_gone(void)
 {
     assert(*ppm_path && *jpeg_path && access(ppm_path, F_OK) != 0 && access(jpeg_path, F_OK) != 0);
 }
+static int archive_count(void)
+{
+    DIR *directory = opendir(visual_directory);
+    assert(directory);
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory))) {
+        if (strncmp(entry->d_name, "visual_", 7) == 0) ++count;
+    }
+    assert(closedir(directory) == 0);
+    return count;
+}
+
 static void rejected_frame(R2VisionFrame *frame)
 {
     sqlite3_int64 before = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+    int images = archive_count();
     frame->frame_number++;
     char *result = r2_visual_analyze_frame(frame, "camera fixture", "observe real frame");
     assert(!result && scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before);
-    assert(!gate_active); temporary_files_gone();
+    assert(!gate_active && archive_count() == images);
+    temporary_files_gone();
 }
 int main(void)
 {
@@ -331,9 +348,7 @@ int main(void)
     free(actual);
     json_object_put(observation);
 
-    /* Reuse the archived frame name to force O_EXCL failure after analysis. */
-    response("{\"description\":\"archive conflict\",\"focus\":null}", "stop");
-    assert(!r2_visual_analyze_frame(&frame, "camera fixture", "archive conflict"));
+    R2VisionFrame repeated_frame = frame;
     frame.frame_number = newer_frame.frame_number;
     response("failed request", "length");
     rejected_frame(&frame);
@@ -349,12 +364,6 @@ int main(void)
     response("{\"description\":\"skipped insert\",\"focus\":null}", "stop");
     rejected_frame(&frame);
     assert(visual_focus_sequence == prior_focus);
-    char skipped_path[PATH_MAX];
-    int skipped_length = snprintf(skipped_path, sizeof(skipped_path),
-        "%s/visual_%llu_%llu.jpg", library, (unsigned long long)frame.timestamp,
-        (unsigned long long)frame.frame_number);
-    assert(skipped_length > 0 && (size_t)skipped_length < sizeof(skipped_path));
-    assert(access(skipped_path, F_OK) == -1 && errno == ENOENT);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER skip_visual_insert", NULL, NULL, NULL) == SQLITE_OK);
 
     response("{\"description\":\"cancelled before publication\",\"focus\":null}", "stop");
@@ -362,12 +371,6 @@ int main(void)
     rejected_frame(&frame);
     assert(cancel_request && !cancel_on_archive_write);
     cancel_request = 0;
-    char cancelled_path[PATH_MAX];
-    int cancelled_length = snprintf(cancelled_path, sizeof(cancelled_path),
-        "%s/visual_%llu_%llu.jpg", library, (unsigned long long)frame.timestamp,
-        (unsigned long long)frame.frame_number);
-    assert(cancelled_length > 0 && (size_t)cancelled_length < sizeof(cancelled_path));
-    assert(access(cancelled_path, F_OK) == -1 && errno == ENOENT);
     char *cancelled_history = r2_log_search("cancelled before publication", 10);
     assert(!cancelled_history || !strstr(cancelled_history, "cancelled before publication"));
     free(cancelled_history);
@@ -399,10 +402,26 @@ int main(void)
     assert(json_object_get_uint64(focus) == fixture_preview_session - 1);
     json_object_put(observation);
 
+    /* The same capture can be deliberately inspected with a different question.
+     * An auxiliary source can also have the same timestamp and frame number. */
+    response("{\"description\":\"second look at the same camera frame\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&repeated_frame, "camera fixture", "different camera question");
+    assert(actual && !strcmp(actual, "second look at the same camera frame"));
+    free(actual);
+    R2VisionFrame same_coordinates = repeated_frame;
+    same_coordinates.preview_session = 0;
+    response("{\"description\":\"media with the same frame coordinates\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&same_coordinates, "media fixture", "separate media question");
+    assert(actual && !strcmp(actual, "media with the same frame coordinates"));
+    free(actual);
+    assert(scalar(visual_db, "SELECT count(DISTINCT image_path) FROM r2_visual_experiences "
+                            "WHERE description IN ('older result','second look at the same camera frame',"
+                            "'media with the same frame coordinates')") == 3);
+
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
-    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==5);
+    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==7);
     assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);
     assert(unsetenv("DISPLAY")==0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
