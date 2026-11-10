@@ -1126,3 +1126,10 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced both SQLite archive record sets through the filesystem comparison in `tools/audit_r2_databases.py`. A JPEG with a durable pending record is distinct from a file with no retained interpretation.
 - Report pending records and file presence separately from unindexed candidates. Read published and pending records from one SQLite snapshot. File presence is metadata only, with content verification owned by Visual startup.
 - The database audit fixture passed staged-file, missing staged-file, older aliases, and unindexed file classification. This completes the scoped audit comparison.
+
+### Verification checkpoint for R2-AUD-2026-11-10-092 through 093
+
+- Continued [draft #183](https://github.com/Xylin48/R2-3PO/pull/183) from `37c2a2c`. Published `190b79edda186ddcbdf7e4b084e9b6a47d268726` and `cccf36d6f727cd37eceb08bc37185ab01ede26dc` with matching local and published trees.
+- [GitHub Actions run 42877021490](https://github.com/Xylin48/R2-3PO/actions/runs/42877021490) passed all 119 steps at `cccf36d6f727cd37eceb08bc37185ab01ede26dc`. Local strict compilation, 63 applicable Python checks, the native Visual and legacy-schema fixtures, and the native fixture under address and undefined-behavior sanitizers passed. Leak detection was disabled for the sanitizer run.
+- A disposable local fixture used real FFmpeg and a controlled model reply. Its subprocess exited after the JPEG directory synchronization. The complete JPEG matched the staged bytes, and two restarts produced one linked Visual, Life Log, and Sensory Journal record with the original source, question, and interpretation. Manual review also traced Visual recall and verified it reads the published table only.
+- Next trace how failed, withdrawn, or abandoned archive claims are surfaced across Visual session changes and how copied backup pairs preserve their index-to-file paths. Missing, incomplete, or mismatched JPEGs remain pending for review. Older orphan files remain separate from recorded observations. This checkpoint changes documentation only.
