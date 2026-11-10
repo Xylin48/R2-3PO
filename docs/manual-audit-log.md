@@ -1079,3 +1079,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced the archive descriptor through exclusive creation, full writes, close, cancellation, and publication. Closing a JPEG alone does not synchronize its bytes or its directory entry before the separate SQLite commit.
 - Synchronize both the JPEG and its directory before database publication. Reject and clean up the new file on a sync failure. Archive names use a random suffix and an exclusive create, with the pre-audit `0640` creation mode subject to the process umask, superseding the intermediate permissions in 086.
 - The native fixture passed both file and directory sync failures, with no Visual row, Life Log experience, or extra JPEG left by either failure. This completes the scoped archive write and sync trace. An abrupt stop between file synchronization and database commit can still leave an unindexed JPEG.
+
+### R2-AUD-2026-11-10-089 — Roll back incomplete Visual schema upgrades
+
+- Traced `r2_visual_init`, additive schema migration, timestamp and path alias backfills, and legacy reads and writes after startup. The inherited code reported a failed backfill but left its earlier added columns committed. The revised startup fixture reproduced that partial migration.
+- Create and upgrade the schema in one transaction. Validate that an existing archive path is a directory and synchronize a newly created directory's parent before startup publishes availability. Startup logging uses the caller's path and the established model value after unlocking.
+- The legacy fixture passed rollback of added columns, retry, rejection of a regular file as the archive directory, recall of the original rows, and a new write that fills every required legacy alias. This completes the scoped startup and legacy migration trace.

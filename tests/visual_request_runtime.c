@@ -214,7 +214,9 @@ static void verify_event_link(const char *source, const char *description)
     assert(id > 0);
     sqlite3 *connection = NULL; sqlite3_stmt *st = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
-    assert(sqlite3_prepare_v2(connection, "SELECT source,details FROM r2_log_events WHERE id=? AND event_type='visual_experience'", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(connection, "SELECT e.source,e.details FROM r2_log_events e "
+                              "JOIN r2_sensory_journal j ON j.event_id=e.id AND j.journal_kind='sensory' "
+                              "WHERE e.id=? AND e.event_type='visual_experience'", -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_bind_int64(st, 1, id) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(!strcmp((const char *)sqlite3_column_text(st, 0), source));
     assert(!strcmp((const char *)sqlite3_column_text(st, 1), description));

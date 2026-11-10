@@ -38,13 +38,16 @@ static int visit_legacy_visual(void *context, int64_t id, const char *row, size_
 
 int main(void)
 {
-    char path[] = "/tmp/r2-visual-legacy-smoke-XXXXXX";
-    int fd = mkstemp(path);
-    assert(fd >= 0);
-    assert(close(fd) == 0);
-    assert(sqlite3_open(path, &visual_db) == SQLITE_OK);
+    char root[] = "/tmp/r2-visual-legacy-smoke-XXXXXX";
+    assert(mkdtemp(root));
+    char path[PATH_MAX], library[PATH_MAX];
+    assert(snprintf(path, sizeof(path), "%s/legacy.db", root) < (int)sizeof(path));
+    assert(snprintf(library, sizeof(library), "%s/archive", root) < (int)sizeof(library));
+    assert(unsetenv("DISPLAY") == 0);
+    sqlite3 *legacy_db = NULL;
+    assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
 
-    assert(sqlite3_exec(visual_db,
+    assert(sqlite3_exec(legacy_db,
         "CREATE TABLE r2_visual_experiences ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "created_at TEXT,"
@@ -59,8 +62,18 @@ int main(void)
         "(NULL,'2020-02-03T04:05:06Z','','/legacy/alternate.jpg','another camera','alternate aliases');",
         NULL, NULL, NULL) == SQLITE_OK);
 
-    assert(visual_migrate_schema() == SQLITE_OK);
-    visual_initialized = 1;
+    assert(sqlite3_exec(legacy_db, "CREATE TRIGGER deny_backfill "
+        "BEFORE UPDATE ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy_db) == SQLITE_OK);
+    assert(r2_visual_init(path, library) == -1 && !r2_visual_is_initialized());
+    assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
+    assert(!visual_column_exists(legacy_db, "created_utc"));
+    assert(!visual_column_exists(legacy_db, "life_log_event_id"));
+    assert(sqlite3_exec(legacy_db, "DROP TRIGGER deny_backfill", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy_db) == SQLITE_OK);
+    assert(r2_visual_init(path, path) == -1 && !r2_visual_is_initialized());
+    assert(r2_visual_init(path, library) == 0);
     int legacy_rows = 0;
     assert(r2_visual_visit_search("legacy-camera", 2, visit_legacy_visual, &legacy_rows) == 0);
     assert(legacy_rows == 1);
@@ -96,9 +109,10 @@ int main(void)
         assert(strcmp((const char *)sqlite3_column_text(st, i), expected) == 0);
     }
     sqlite3_finalize(st);
-    assert(sqlite3_close(visual_db) == SQLITE_OK);
-    visual_db = NULL;
+    r2_visual_shutdown();
     assert(unlink(path) == 0);
+    assert(rmdir(library) == 0);
+    assert(rmdir(root) == 0);
     puts("Legacy visual schema migration preserves old rows and supports new writes.");
     return 0;
 }

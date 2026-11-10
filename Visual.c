@@ -281,12 +281,6 @@ static size_t response_write(char *ptr, size_t size, size_t nmemb, void *userdat
     return amount;
 }
 
-static int mkdir_one(const char *path)
-{
-    if (mkdir(path, 0750) == 0 || errno == EEXIST) return 0;
-    return -1;
-}
-
 static int visual_sync(int fd)
 {
     int rc;
@@ -303,6 +297,33 @@ static int visual_sync_directory(const char *path)
     if (close(fd) != 0 && rc == 0) return -1;
     errno = error;
     return rc;
+}
+
+static int visual_prepare_directory(const char *path)
+{
+    if (mkdir(path, 0750) != 0) {
+        if (errno != EEXIST) return -1;
+        struct stat metadata;
+        if (stat(path, &metadata) != 0) return -1;
+        if (S_ISDIR(metadata.st_mode)) return 0;
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    /* A newly created directory also needs a durable entry in its parent. */
+    char parent[PATH_MAX];
+    size_t length = strlen(path);
+    memcpy(parent, path, length + 1);
+    while (length > 1 && parent[length - 1] == '/')
+        parent[--length] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (slash == parent) slash[1] = '\0';
+    else if (slash) *slash = '\0';
+    if (visual_sync_directory(slash ? parent : ".") == 0) return 0;
+    int error = errno;
+    (void)rmdir(path);
+    errno = error;
+    return -1;
 }
 
 static int visual_create_archive(const char *directory, const R2VisionFrame *frame,
@@ -987,7 +1008,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
                 configured, R2_VISION_DEFAULT_MODEL);
     }
     snprintf(visual_model, sizeof(visual_model), "%s", R2_VISION_DEFAULT_MODEL);
-    if (mkdir_one(visual_directory) != 0) {
+    if (visual_prepare_directory(visual_directory) != 0) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
@@ -997,7 +1018,6 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
-    sqlite3_busy_timeout(visual_db, 5000);
     const char *schema =
         "CREATE TABLE IF NOT EXISTS r2_visual_experiences ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -1013,17 +1033,16 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         "frame_timestamp INTEGER NOT NULL,"
         "life_log_event_id INTEGER,"
         "UNIQUE(image_path));";
-    char *err = NULL;
-    if (sqlite3_exec(visual_db, schema, NULL, NULL, &err) != SQLITE_OK) {
-        sqlite3_free(err);
-        sqlite3_close(visual_db);
-        visual_db = NULL;
-        pthread_mutex_unlock(&visual_lock);
-        return -1;
-    }
-    if (visual_migrate_schema() != SQLITE_OK) {
-        fprintf(stderr, "[R2 Visual] Could not migrate legacy visual database schema: %s\n",
+    int rc = sqlite3_busy_timeout(visual_db, 5000);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = visual_migrate_schema();
+    if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[R2 Visual] Could not initialize the visual database schema: %s\n",
                 sqlite3_errmsg(visual_db));
+        if (!sqlite3_get_autocommit(visual_db))
+            (void)sqlite3_exec(visual_db, "ROLLBACK", NULL, NULL, NULL);
         sqlite3_close(visual_db);
         visual_db = NULL;
         pthread_mutex_unlock(&visual_lock);
@@ -1034,7 +1053,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     pthread_mutex_unlock(&visual_lock);
     r2_log_sensory("visual_library_initialized",
                    "R2 Visual Experience Library initialized.",
-                   visual_directory, visual_model);
+                   library_directory, R2_VISION_DEFAULT_MODEL);
     return 0;
 }
 
