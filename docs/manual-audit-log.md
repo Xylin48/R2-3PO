@@ -1027,3 +1027,10 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Local strict build and 63 workflow checks passed. The old visual ownership code timed out in the new manual-lock fixture. Current Watch ownership, audio cancellation, exact source and decoder lifecycle checks passed. The combined synthetic fixture passed under address and undefined-behavior sanitizers with leak detection disabled. A separate local variant also verified real FFmpeg JPEG encoding on those production frame snapshots.
 - The combined fixture used synthetic input and ASR. It ran deliberate named audio capture while both visual inputs were active, then replaced the renderer, verified camera-first image construction and explicit reselection, and recovered exact audio transcript and visual source events after the writable stores restarted.
 - Next trace the release-candidate shutdown and recovery boundary between a first-frame wait in `r2_vision_copy_watched_frame`, explicit visual close/reopen and active model-request cancellation. Keep audio availability and previously persisted provenance independent of those transitions. This checkpoint changes documentation only.
+
+### R2-AUD-2026-11-10-082 — Bound first-frame waits to one Watch session
+
+- Created `audit/r2-visual-recovery-2026-11-10` from verified draft #182 at `3e0600b`. Its starting Git tree and all 182 tracked files matched the previous branch.
+- Traced the first-frame condition variable through capture, start, stop, shutdown, and its two model-facing readers. A waiter could wait indefinitely on a silent source or consume a replacement session's frame after a rapid restart.
+- Use a monotonic five-second first-frame budget, matching the live decoder read budget. Invalidate old waiters with a session identity before a frame slot is reused, and wake them when shutdown is requested. Waiting for raw pixels does not activate inference or change focus.
+- The regression exercises a replacement published before the old waiter wakes, shutdown notification, and the timeout return. This completes the scoped first-frame condition wait trace.

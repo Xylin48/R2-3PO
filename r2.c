@@ -10897,6 +10897,8 @@ static pthread_t vision_watch_capture_thread;
 static int vision_watch_capture_thread_started = 0;
 static pthread_mutex_t vision_watch_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t vision_watch_frame_cond = PTHREAD_COND_INITIALIZER;
+/* Changes across worker replacement, independent of the per-session frame count. */
+static uint64_t vision_watch_session = 1;
 static uint64_t vision_watch_frame_generation = 0;
 static int vision_watch_capture_done = 0;
 static R2VisionFrame vision_watch_latest_frame;
@@ -10915,11 +10917,21 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
     if (!frame || !source_out || !owned_data) return -1;
     *owned_data = NULL;
     *source_out = NULL;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return -1;
+    deadline.tv_sec += 5; /* Same first-frame budget as a live Eyes decoder. */
     pthread_mutex_lock(&vision_watch_frame_lock);
-    while (!shutting_down && atomic_load(&vision_watch_running) &&
-           vision_watch_frame_generation == 0 && !vision_watch_capture_done)
-        pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
-    if (!shutting_down && atomic_load(&vision_watch_running) &&
+    uint64_t session = vision_watch_session;
+    int wait_result = 0;
+    while (!shutting_down && atomic_load(&eyes_auto_allowed) &&
+           atomic_load(&vision_watch_running) && session == vision_watch_session &&
+           vision_watch_frame_generation == 0 && !vision_watch_capture_done) {
+        wait_result = pthread_cond_clockwait(&vision_watch_frame_cond, &vision_watch_frame_lock,
+                                              CLOCK_MONOTONIC, &deadline);
+        if (wait_result != 0) break;
+    }
+    if (wait_result == 0 && !shutting_down && atomic_load(&eyes_auto_allowed) &&
+        atomic_load(&vision_watch_running) && session == vision_watch_session &&
         !vision_watch_capture_done && vision_watch_frame_generation > 0 &&
         vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
         vision_watch_latest_frame.size > 0 && vision_watch_latest_source) {
@@ -10937,6 +10949,7 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
         }
     }
     pthread_mutex_unlock(&vision_watch_frame_lock);
+    if (wait_result) errno = wait_result;
     return *owned_data ? 0 : -1;
 }
 
@@ -11161,6 +11174,7 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
     /* Reap both completed workers before reusing their lifecycle state. */
     atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
@@ -11247,6 +11261,7 @@ static int r2_vision_watch_stop_locked(void)
     vision_watch_owner_token = 0;
     atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
@@ -13253,6 +13268,9 @@ void r2_request_shutdown(void)
     shutting_down = 1;
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
     r2_ears_extra_cancel_pending();
     r2_ears_cancel_pending_inputs(0);
 }

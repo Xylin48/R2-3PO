@@ -60,7 +60,8 @@ snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFram
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "vision_watch_latest_frame_data" in snapshot
 assert "vision_watch_frame_generation == 0 && !vision_watch_capture_done" in snapshot
-assert "pthread_cond_wait(&vision_watch_frame_cond" in snapshot
+assert "pthread_cond_clockwait(&vision_watch_frame_cond" in snapshot
+assert "session == vision_watch_session" in snapshot
 assert "!vision_watch_capture_done && vision_watch_frame_generation > 0" in snapshot
 assert "memcpy(copy, vision_watch_latest_frame_data," in snapshot
 assert "r2_visual_frame_base64(&frame)" in helper

@@ -79,8 +79,67 @@ static int cancel_when_probe_started(void *path)
     return access(path, F_OK) == 0;
 }
 
+static atomic_int frame_waiting = ATOMIC_VAR_INIT(0);
+static atomic_int force_frame_timeout = ATOMIC_VAR_INIT(0);
+int __real_pthread_cond_clockwait(pthread_cond_t *, pthread_mutex_t *, clockid_t,
+                                  const struct timespec *);
+int __wrap_pthread_cond_clockwait(pthread_cond_t *cond, pthread_mutex_t *lock,
+                                 clockid_t clock_id, const struct timespec *deadline)
+{
+    assert(cond == &vision_watch_frame_cond && clock_id == CLOCK_MONOTONIC);
+    atomic_store(&frame_waiting, 1);
+    if (atomic_load(&force_frame_timeout)) return ETIMEDOUT;
+    return __real_pthread_cond_clockwait(cond, lock, clock_id, deadline);
+}
+
+static void *wait_for_first_frame(void *unused)
+{
+    (void)unused;
+    R2VisionFrame frame;
+    char *source = NULL;
+    unsigned char *pixels = NULL;
+    assert(r2_vision_copy_watched_frame(&frame, &source, &pixels) == -1);
+    assert(!source && !pixels);
+    return NULL;
+}
+
+static void check_first_frame_lifecycle(void)
+{
+    atomic_store(&vision_watch_running, 1);
+    pthread_t waiter;
+    assert(pthread_create(&waiter, NULL, wait_for_first_frame, NULL) == 0);
+    while (!atomic_load(&frame_waiting)) sched_yield();
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session; /* replacement publishes before the old waiter runs */
+    vision_watch_frame_generation = 1;
+    unsigned char data = 42;
+    vision_watch_latest_frame = (R2VisionFrame){.data = &data, .size = 1};
+    vision_watch_latest_frame_data = &data;
+    vision_watch_latest_source = "replacement";
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
+    assert(pthread_join(waiter, NULL) == 0);
+    vision_watch_frame_generation = 0;
+    vision_watch_latest_frame = (R2VisionFrame){0};
+    vision_watch_latest_frame_data = NULL;
+    vision_watch_latest_source = NULL;
+
+    atomic_store(&frame_waiting, 0);
+    assert(pthread_create(&waiter, NULL, wait_for_first_frame, NULL) == 0);
+    while (!atomic_load(&frame_waiting)) sched_yield();
+    r2_request_shutdown();
+    assert(pthread_join(waiter, NULL) == 0);
+    shutting_down = 0;
+    atomic_store(&force_frame_timeout, 1);
+    wait_for_first_frame(NULL);
+    assert(errno == ETIMEDOUT);
+    atomic_store(&force_frame_timeout, 0);
+    atomic_store(&vision_watch_running, 0);
+}
+
 int main(void)
 {
+    check_first_frame_lifecycle();
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
     assert(mkdtemp(root));
     char probe[PATH_MAX], decoder[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
