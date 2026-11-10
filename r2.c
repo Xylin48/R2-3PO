@@ -123,7 +123,7 @@ static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
 /* Watch owns a particular media receiver generation, not "the media slot".
  * Protected by media_lifecycle_lock, which already serializes replacement. */
 static atomic_uint_fast64_t visual_watch_next_token = ATOMIC_VAR_INIT(1);
-static uint64_t media_watch_token = 0;
+static atomic_uint_fast64_t media_watch_token = ATOMIC_VAR_INIT(0);
 static int media_capture_thread_started = 0;
 static unsigned char *media_latest_data = NULL;
 static size_t media_latest_capacity = 0;
@@ -142,7 +142,7 @@ static pthread_mutex_t visual_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Camera Watch token is separate from the media display's generation.
  * Explicit camera operations always supersede Watch's stale claim. */
 static pthread_mutex_t eyes_source_owner_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t eyes_watch_token = 0;
+static atomic_uint_fast64_t eyes_watch_token = ATOMIC_VAR_INIT(0);
 /* Keep this process from flooding the local text model with concurrent requests. */
 static pthread_mutex_t ollama_request_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Foreground conversations can interrupt background Ollama bookkeeping. */
@@ -175,7 +175,7 @@ static pthread_mutex_t vision_watch_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int vision_watch_running = ATOMIC_VAR_INIT(0);
 static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
-static uint64_t vision_watch_owner_token = 0; /* protected by vision_watch_lock */
+static atomic_uint_fast64_t vision_watch_owner_token = ATOMIC_VAR_INIT(0); /* protected by vision_watch_lock */
 static int query_requests_visual_context(const char *query);
 static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
@@ -10660,6 +10660,25 @@ static int r2_vision_media_stop_locked(void)
     return 0;
 }
 
+/* A stale Watch token must never join a manual operation. The current
+ * owner rechecks the token under the lifecycle lock before closing. */
+static int r2_lock_watch_owner(pthread_mutex_t *lock,
+                                    const atomic_uint_fast64_t *owner, uint64_t token)
+{
+    while (token && atomic_load(owner) == token) {
+        int rc = pthread_mutex_trylock(lock);
+        if (rc == 0) {
+            if (atomic_load(owner) == token) return 1;
+            pthread_mutex_unlock(lock);
+            break;
+        }
+        if (rc != EBUSY) break;
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
 int r2_vision_media_stop(void)
 {
     pthread_mutex_lock(&media_lifecycle_lock);
@@ -10682,7 +10701,9 @@ static int r2_vision_media_open(int kind, unsigned long window,
     if (watch_token_out) *watch_token_out = 0;
     if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
         !atomic_load(&eyes_auto_allowed)) return -1;
-    pthread_mutex_lock(&media_lifecycle_lock);
+    int lock_result = watch_token_out ? pthread_mutex_trylock(&media_lifecycle_lock)
+                                      : pthread_mutex_lock(&media_lifecycle_lock);
+    if (lock_result != 0) { errno = lock_result; return -1; }
     if (shutting_down || !atomic_load(&eyes_auto_allowed) ||
         (cancelled && cancelled(userdata)) ||
         (watch_token_out && atomic_load(&media_capture_running))) {
@@ -10693,8 +10714,8 @@ static int r2_vision_media_open(int kind, unsigned long window,
     }
     /* A worker at EOF still has a joinable handle. Reap it before opening
      * the newly discovered source even when its original owner was manual. */
+    media_watch_token = 0; /* revoke before waiting for the old decoder */
     (void)r2_vision_media_stop_locked();
-    media_watch_token = 0; /* a new source supersedes the old token */
     pthread_mutex_lock(&media_capture_lock);
     if (!media_eyes && r2_eyes_init(&media_eyes) != 0) {
         pthread_mutex_unlock(&media_capture_lock);
@@ -10775,22 +10796,16 @@ uint64_t r2_vision_media_open_x11_for_watch_cancelable(unsigned long window, int
 
 int r2_vision_media_stop_if_watch_owned(uint64_t token)
 {
-    pthread_mutex_lock(&media_lifecycle_lock);
-    int rc = 0;
-    if (token && media_watch_token == token) {
-        media_watch_token = 0;
-        rc = r2_vision_media_stop_locked();
-    }
+    if (!r2_lock_watch_owner(&media_lifecycle_lock, &media_watch_token, token)) return 0;
+    atomic_store(&media_watch_token, 0);
+    int rc = r2_vision_media_stop_locked();
     pthread_mutex_unlock(&media_lifecycle_lock);
     return rc;
 }
 
 int r2_vision_media_watch_owns(uint64_t token)
 {
-    pthread_mutex_lock(&media_lifecycle_lock);
-    int owns = token && media_watch_token == token;
-    pthread_mutex_unlock(&media_lifecycle_lock);
-    return owns;
+    return token && atomic_load(&media_watch_token) == token;
 }
 
 char *r2_vision_media_see(const char *question)
@@ -11126,7 +11141,9 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
         r2_eyes_status() <= 0)
         return -1;
 
-    pthread_mutex_lock(&vision_watch_lock);
+    int lock_result = watch_token_out ? pthread_mutex_trylock(&vision_watch_lock)
+                                      : pthread_mutex_lock(&vision_watch_lock);
+    if (lock_result != 0) { errno = lock_result; return -1; }
     if (!core_initialized || shutting_down || !r2_visual_is_initialized() ||
         r2_eyes_status() <= 0) {
         pthread_mutex_unlock(&vision_watch_lock);
@@ -11264,19 +11281,15 @@ int r2_vision_watch_stop(void)
 
 int r2_vision_watch_stop_if_watch_owned(uint64_t token)
 {
-    pthread_mutex_lock(&vision_watch_lock);
-    int rc = token && token == vision_watch_owner_token
-        ? r2_vision_watch_stop_locked() : 0;
+    if (!r2_lock_watch_owner(&vision_watch_lock, &vision_watch_owner_token, token)) return 0;
+    int rc = r2_vision_watch_stop_locked();
     pthread_mutex_unlock(&vision_watch_lock);
     return rc;
 }
 
 int r2_vision_watch_owns(uint64_t token)
 {
-    pthread_mutex_lock(&vision_watch_lock);
-    int owns = token && token == vision_watch_owner_token;
-    pthread_mutex_unlock(&vision_watch_lock);
-    return owns;
+    return token && atomic_load(&vision_watch_owner_token) == token;
 }
 
 int r2_vision_watch_active(void)
@@ -11365,7 +11378,9 @@ int r2_vision_close(void)
 static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
 {
     if (watch_token_out) *watch_token_out = 0;
-    pthread_mutex_lock(&eyes_source_owner_lock);
+    int lock_result = watch_token_out ? pthread_mutex_trylock(&eyes_source_owner_lock)
+                                      : pthread_mutex_lock(&eyes_source_owner_lock);
+    if (lock_result != 0) { errno = lock_result; return -1; }
     if (!replace) {
         if (!r2_sense_auto_allowed(1)) {
             pthread_mutex_unlock(&eyes_source_owner_lock);
@@ -11436,22 +11451,16 @@ int r2_eyes_release_source(void)
 
 int r2_eyes_release_if_watch_owned(uint64_t token)
 {
-    pthread_mutex_lock(&eyes_source_owner_lock);
-    int rc = 0;
-    if (token && eyes_watch_token == token) {
-        eyes_watch_token = 0;
-        rc = r2_eyes_release_source_locked();
-    }
+    if (!r2_lock_watch_owner(&eyes_source_owner_lock, &eyes_watch_token, token)) return 0;
+    atomic_store(&eyes_watch_token, 0);
+    int rc = r2_eyes_release_source_locked();
     pthread_mutex_unlock(&eyes_source_owner_lock);
     return rc;
 }
 
 int r2_eyes_watch_owns(uint64_t token)
 {
-    pthread_mutex_lock(&eyes_source_owner_lock);
-    int owns = token && eyes_watch_token == token;
-    pthread_mutex_unlock(&eyes_source_owner_lock);
-    return owns;
+    return token && atomic_load(&eyes_watch_token) == token;
 }
 
 int r2_eyes_stop(void)
@@ -13013,25 +13022,6 @@ uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
     return r2_ears_start_desktop_impl(&token, monitor, cancelled, userdata) == 0 ? token : 0;
 }
 
-/* A stale Watch token must never join a manual operation. The current
- * owner rechecks the token under the lifecycle lock before closing. */
-static int r2_ears_lock_watch_owner(pthread_mutex_t *lock,
-                                    const atomic_uint_fast64_t *owner, uint64_t token)
-{
-    while (token && atomic_load(owner) == token) {
-        int rc = pthread_mutex_trylock(lock);
-        if (rc == 0) {
-            if (atomic_load(owner) == token) return 1;
-            pthread_mutex_unlock(lock);
-            break;
-        }
-        if (rc != EBUSY) break;
-        struct timespec pause = {0, 1000000L};
-        nanosleep(&pause, NULL);
-    }
-    return 0;
-}
-
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
     if (!watch_only) {
@@ -13048,7 +13038,7 @@ static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
         pthread_mutex_unlock(&ears_desktop_pointer_lock);
     }
     if (watch_only) {
-        if (!r2_ears_lock_watch_owner(&ears_desktop_capture_lock, &ears_desktop_watch_token, watch_token))
+        if (!r2_lock_watch_owner(&ears_desktop_capture_lock, &ears_desktop_watch_token, watch_token))
             return 0;
     } else {
         pthread_mutex_lock(&ears_desktop_capture_lock);
@@ -13179,7 +13169,7 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
         r2_ears_cancel(ears); /* wake a direct listen BEFORE waiting for its mutex */
     }
     if (watch_only) {
-        if (!r2_ears_lock_watch_owner(&ears_capture_lock, &ears_microphone_watch_token, watch_token))
+        if (!r2_lock_watch_owner(&ears_capture_lock, &ears_microphone_watch_token, watch_token))
             return 0;
     } else {
         pthread_mutex_lock(&ears_capture_lock);

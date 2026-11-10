@@ -241,7 +241,7 @@ jobs:
       - name: Check live Watch ownership tokens against external capture takeover
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_ears_open_desktop_cancelable
-          /tmp/r2-ears-watch-ownership
+          timeout -k 2s 30s /tmp/r2-ears-watch-ownership
 
       - name: Require source-specific raw hearing, deliberate attention, and shutdown
         run: python3 tests/ears_dual_attention_wiring_smoke.py
@@ -262,7 +262,7 @@ jobs:
       - name: Protect camera and media from stale Watch ownership and manual takeover races
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/watch_visual_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-watch-visual-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_visual_is_initialized -Wl,--wrap=r2_eyes_is_open
-          /tmp/r2-watch-visual-ownership
+          timeout -k 2s 30s /tmp/r2-watch-visual-ownership
 
       - name: Check Watch coordinator worker lifecycle
         run: python3 tests/watch_coordinator_lifecycle_smoke.py

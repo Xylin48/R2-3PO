@@ -1014,3 +1014,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Extended the source provenance fixture to run the production Eyes and media capture workers during a deliberate independent Ears listen. Used synthetic RGB pipes, PCM, frame encoding and ASR at the external boundaries. Capture worker lifecycle, source identities, attention choices, multimodal message construction and persistence are the production paths.
 - Verified camera-first input, media images only after deliberate selection, continued camera availability through renderer replacement and stop, and explicit selection of the replacement. The exact independent audio transcript and visual source events were verified in the writable stores before and after restart.
 - The combined fixture passed locally. Existing Visual archive and local model request checks remain in the full suite as separate coverage. This completes the scoped combined integration fixture and leaves the actual runtime deployment path outside this check.
+
+### R2-AUD-2026-11-09-081 — Keep visual Watch ownership queries independent of manual setup
+
+- Followed Watch media/camera ownership probes, automatic open and stale cleanup through manual reconfiguration. Ownership queries previously took the same lock as manual setup; even a stale token could make Watch wait on the newer owner's decoder.
+- Publish camera, camera-worker and media owner tokens atomically. Automatic opens defer when the corresponding lock is busy. Cleanup checks the live token before and after locking, while the matching owner retains normal serialized teardown. Revoke a replaced media token before joining its prior decoder.
+- Native ownership checks passed with each visual lifecycle mutex held, including stale cleanup and automatic-open deferral. The combined camera/media/audio fixture also passed. This completes the scoped automatic ownership trace. Manual source operations still serialize their actual transitions.
