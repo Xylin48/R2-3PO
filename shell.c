@@ -1378,6 +1378,9 @@ static void shell_ears(const char *argument)
 
 static void shell_watch_status(void)
 {
+    R2EarsWatchInput microphone = {0}, desktop = {0};
+    int mic_known = watch_running && r2_ears_watch_input_snapshot(0, &microphone) == 0;
+    int desktop_known = watch_running && r2_ears_watch_input_snapshot(1, &desktop) == 0;
     printf(
         "\n"
         "================ WATCH STATUS =============================\n"
@@ -1394,11 +1397,13 @@ static void shell_watch_status(void)
         "============================================================\n"
         "\n",
         shell_watch_thread_started ? "MONITORING" : "STOPPED",
-        !watch_running ? "STOPPED" : (r2_ears_status() > 0 ? "ACTIVE" : "WAITING"),
-        !watch_running ? "STOPPED" : (r2_ears_status_desktop() > 0 ? "ACTIVE" : "WAITING"),
+        !watch_running ? "STOPPED" : !mic_known ? "UPDATING" : microphone.active ? "ACTIVE" : "WAITING",
+        !watch_running ? "STOPPED" : !desktop_known ? "UPDATING" : desktop.active ? "ACTIVE" : "WAITING",
         r2_vision_watch_active() ? "ACTIVE" : "WAITING",
         r2_watch_active() ? "ACTIVE" : "INACTIVE"
     );
+    free(microphone.source);
+    free(desktop.source);
 }
 
 static int shell_watch_cancelled(void *unused)
@@ -1487,6 +1492,30 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
                  wanted_kind == 4 ? "visible X11 audio producer" : "VLC");
 }
 
+static int shell_watch_audio_input(uint64_t *managed, int desktop, int known,
+                                   const char *wanted, R2EarsWatchInput *input)
+{
+    if (r2_ears_watch_input_snapshot(desktop, input) != 0) return -1;
+    int permitted = r2_sense_auto_allowed(desktop ? 3 : 2);
+    if (*managed && *managed != input->owner) *managed = 0;
+    if (*managed && (!permitted || !input->active ||
+                     (known && (!wanted || strcmp(input->source, wanted))))) {
+        if (desktop) (void)r2_ears_stop_desktop_if_watch_owned(*managed);
+        else (void)r2_ears_stop_if_watch_owned(*managed);
+        *managed = 0;
+        free(input->source);
+        if (r2_ears_watch_input_snapshot(desktop, input) != 0) return -1;
+    }
+    if (!input->active && permitted && known && wanted && !shell_watch_cancelled(NULL)) {
+        *managed = desktop
+            ? r2_ears_start_desktop_for_watch_cancelable(wanted, shell_watch_cancelled, NULL)
+            : r2_ears_start_for_watch_cancelable(wanted, shell_watch_cancelled, NULL);
+        free(input->source);
+        return r2_ears_watch_input_snapshot(desktop, input);
+    }
+    return 0;
+}
+
 /*
  * Source discovery is inexpensive polling, not a continuous audio/video feed.
  * A source that actually becomes available owns its continuous capture until
@@ -1510,11 +1539,6 @@ static void *shell_watch_worker(void *unused)
             if (audio_known) r2_audio_discovery_free(&audio);
             break;
         }
-        /* On a server query error, existing capture is not evidence of
-         * unplugging. Use status only to preserve established attention. */
-        int desktop_playing = audio_known ? audio.desktop_playing :
-            r2_ears_status_desktop() > 0;
-        int microphone_available = audio_known && audio.microphone_source;
         int camera_available = r2_vision_camera_available();
         /* The physical camera is the Eyes organ. Movies are separate displays.
            Neither a playing media window nor its disappearance changes eyesight. */
@@ -1541,54 +1565,22 @@ static void *shell_watch_worker(void *unused)
         shell_watch_media_poll(&managed_media, eyes_permitted, audio_known ? &audio : NULL);
         if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
-        /* Both audio sources operate independently; the decision to close one
-           must not be overridden by mere availability of that source. */
-        int microphone_changed = audio_known && microphone_available &&
-            !r2_ears_status_microphone_source(audio.microphone_source);
-        if (managed_microphone &&
-            (!r2_sense_auto_allowed(2) ||
-             (audio_known && (!microphone_available || microphone_changed)) ||
-             r2_ears_status() <= 0)) {
-            (void)r2_ears_stop_if_watch_owned(managed_microphone);
-            managed_microphone = 0;
-        }
-        if (!managed_microphone && r2_sense_auto_allowed(2) &&
-            microphone_available && r2_ears_status() <= 0)
-            managed_microphone =
-                r2_ears_start_for_watch_cancelable(audio.microphone_source,
-                                                    shell_watch_cancelled, NULL);
+        /* Unknown or busy source state preserves custody until a later poll.
+         * A manual open on one input must not block checks of the others. */
+        R2EarsWatchInput microphone, desktop;
+        (void)shell_watch_audio_input(&managed_microphone, 0, audio_known,
+                                       audio_known ? audio.microphone_source : NULL, &microphone);
+        free(microphone.source);
+        int desktop_known = shell_watch_audio_input(
+            &managed_desktop, 1, audio_known,
+            audio_known && audio.desktop_playing ? audio.desktop_monitor : NULL, &desktop) == 0;
 
-        int monitor_changed = audio_known && desktop_playing &&
-            audio.desktop_monitor &&
-            !r2_ears_status_desktop_source(audio.desktop_monitor);
-        if (managed_desktop &&
-            (!r2_sense_auto_allowed(3) ||
-             (audio_known && (!desktop_playing || monitor_changed)) ||
-             r2_ears_status_desktop() <= 0)) {
-            (void)r2_ears_stop_desktop_if_watch_owned(managed_desktop);
-            managed_desktop = 0;
-        }
-        if (!managed_desktop && r2_sense_auto_allowed(3) &&
-            audio_known && desktop_playing && audio.desktop_monitor &&
-            r2_ears_status_desktop() <= 0)
-            managed_desktop =
-                r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor,
-                                                            shell_watch_cancelled, NULL);
-
-        /* Every other active output gets its own continuously buffered
-         * listener, without replacing the primary or the physical mic.
-         * Failed discovery cannot be treated as evidence of unplugging. */
         if (!r2_sense_auto_allowed(3))
             r2_ears_extra_stop_all();
-        else if (audio_known) {
-            /* Exclude the receiver's ACTUAL selected monitor, which may
-             * differ from the first detected output after manual takeover.
-             * If there is no active primary receiver, capture every sink. */
-            char *primary_source = r2_ears_current_desktop_source();
-            (void)r2_ears_extra_reconcile_cancelable(&audio, primary_source,
+        else if (audio_known && desktop_known)
+            (void)r2_ears_extra_reconcile_cancelable(&audio, desktop.source,
                                                    shell_watch_cancelled, NULL);
-            free(primary_source);
-        }
+        free(desktop.source);
 
 snapshot_finished:
         if (audio_known) r2_audio_discovery_free(&audio);

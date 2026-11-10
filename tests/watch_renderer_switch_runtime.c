@@ -10,7 +10,7 @@ static int active_vlc, eyes_allowed = 1, manual_active;
 static unsigned long publish_on_open;
 
 int r2_is_shutting_down(void) { return 0; }
-int r2_sense_auto_allowed(int which) { assert(which == 1); return eyes_allowed; }
+int r2_sense_auto_allowed(int which) { return which == 1 ? eyes_allowed : 1; }
 int r2_vision_available(void) { return 1; }
 int r2_vision_media_status(void) { return active_token || manual_active; }
 int r2_vision_window_available_cancelable(unsigned long window,
@@ -69,6 +69,52 @@ int64_t r2_log_event(R2LogCategory category, const char *type, const char *summa
     assert(type && summary && details && source);
     return 1;
 }
+
+static int input_busy[2];
+static uint64_t input_owner[2];
+static const char *input_source[2];
+
+int r2_ears_watch_input_snapshot(int desktop, R2EarsWatchInput *input)
+{
+    *input = (R2EarsWatchInput){0};
+    if (input_busy[desktop]) { errno = EBUSY; return -1; }
+    input->owner = input_owner[desktop];
+    input->active = input_source[desktop] != NULL;
+    input->source = input->active ? strdup(input_source[desktop]) : NULL;
+    assert(!input->active || input->source);
+    return 0;
+}
+
+static uint64_t open_input(int desktop, const char *source,
+                           int (*cancelled)(void *), void *userdata)
+{
+    assert(!input_busy[desktop] && !input_source[desktop] && !cancelled(userdata));
+    input_source[desktop] = source;
+    return input_owner[desktop] = next_token++;
+}
+
+uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
+                                                   int (*cancelled)(void *), void *userdata)
+{
+    return open_input(1, monitor, cancelled, userdata);
+}
+
+uint64_t r2_ears_start_for_watch_cancelable(const char *source,
+                                           int (*cancelled)(void *), void *userdata)
+{
+    return open_input(0, source, cancelled, userdata);
+}
+
+static int stop_input(int desktop, uint64_t token)
+{
+    assert(!input_busy[desktop] && token && token == input_owner[desktop]);
+    input_owner[desktop] = 0;
+    input_source[desktop] = NULL;
+    return 0;
+}
+
+int r2_ears_stop_desktop_if_watch_owned(uint64_t token) { return stop_input(1, token); }
+int r2_ears_stop_if_watch_owned(uint64_t token) { return stop_input(0, token); }
 
 static const char *expected_media_path;
 int64_t r2_log_media_event(const char *action, const char *media_type,
@@ -175,6 +221,38 @@ int main(void)
     assert(!strncmp(tv_control_renderer(withdraw), "OK", 2));
     shell_watch_media_poll(&managed, 1, NULL);
     assert(!managed.token && !active_token);
+    /* A changing renderer and desktop monitor must proceed with a busy mic.
+     * Uncertain discovery preserves the established exact desktop receiver. */
+    uint64_t mic = 0, desktop = 0;
+    R2EarsWatchInput input;
+    input_busy[0] = 1;
+    assert(shell_watch_audio_input(&mic, 0, 1, "mic", &input) == -1);
+    assert(!mic && !input.source);
+    vlc_window = 501;
+    playback.playback_producer_count = 0;
+    shell_watch_media_poll(&managed, 1, &playback);
+    assert(active_window == 501);
+    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.a", &input) == 0);
+    assert(input.active && desktop && !strcmp(input.source, "monitor.a"));
+    free(input.source);
+    previous = desktop;
+    assert(shell_watch_audio_input(&desktop, 1, 0, NULL, &input) == 0);
+    assert(desktop == previous && !strcmp(input.source, "monitor.a"));
+    free(input.source);
+    vlc_window = 502;
+    shell_watch_media_poll(&managed, 1, &playback);
+    assert(active_window == 502);
+    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.b", &input) == 0);
+    assert(desktop != previous && !strcmp(input.source, "monitor.b"));
+    free(input.source);
+    input_owner[1] = 0; /* manual takeover */
+    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.c", &input) == 0);
+    assert(!desktop && !strcmp(input.source, "monitor.b"));
+    free(input.source);
+    input_busy[0] = 0;
+    assert(shell_watch_audio_input(&mic, 0, 1, "mic", &input) == 0);
+    assert(mic && !strcmp(input.source, "mic"));
+    free(input.source);
     puts("Watch switches exact renderers, respects CRT withdrawal and preserves manual custody.");
     return 0;
 }

@@ -376,6 +376,13 @@ uint64_t r2_ears_start_for_watch_cancelable(const char *source,
 uint64_t r2_ears_start_desktop_for_watch(const char *monitor);
 uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
                                                     int (*cancelled)(void *), void *userdata);
+typedef struct {
+    int active;
+    uint64_t owner;
+    char *source; /* caller frees the exact active source name */
+} R2EarsWatchInput;
+/* An unknown snapshot (-1) must not trigger a source replacement. */
+int r2_ears_watch_input_snapshot(int desktop, R2EarsWatchInput *input);
 /* Stop only the precise stream generation started by Watch; safe after replacement. */
 int r2_ears_stop_if_watch_owned(uint64_t token);
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token);

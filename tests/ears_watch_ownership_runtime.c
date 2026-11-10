@@ -15,6 +15,7 @@
 static atomic_int mic_closes = ATOMIC_VAR_INIT(0);
 static atomic_int desktop_closes = ATOMIC_VAR_INIT(0);
 static atomic_int synthetic_reads = ATOMIC_VAR_INIT(0);
+static atomic_int microphone_eof = ATOMIC_VAR_INIT(0);
 static char current_microphone[256] = {0}, current_desktop[256] = {0};
 static void remember_source(char *destination, size_t capacity, const char *source)
 {
@@ -106,6 +107,7 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *samples, size_t bytes)
 {
     assert(receiver == ears || receiver == ears_desktop);
     assert(bytes == 1920U);
+    if (receiver == ears && atomic_load(&microphone_eof)) return 0;
     memset(samples, 0, bytes);
     atomic_fetch_add(&synthetic_reads, 1);
     struct timespec short_sample = {.tv_sec = 0, .tv_nsec = 2000000L};
@@ -161,6 +163,23 @@ int main(void)
 
     uint64_t desktop_first = r2_ears_start_desktop_for_watch("alsa_output.test.monitor");
     assert(desktop_first != 0 && r2_ears_status_desktop() == 1);
+    R2EarsWatchInput snapshot;
+    assert(r2_ears_watch_input_snapshot(1, &snapshot) == 0 && snapshot.active &&
+           snapshot.owner == desktop_first && !strcmp(snapshot.source, current_desktop));
+    free(snapshot.source);
+    pthread_mutex_lock(&ears_capture_lock);
+    assert(r2_ears_watch_input_snapshot(0, &snapshot) == -1 && errno == EBUSY && !snapshot.source);
+    assert(r2_ears_start_for_watch("alsa_input.test_mic") == 0 && errno == EBUSY);
+    assert(r2_ears_stop_if_watch_owned(mic_first) == 0);
+    assert(r2_ears_watch_input_snapshot(1, &snapshot) == 0 && snapshot.owner == desktop_first);
+    free(snapshot.source);
+    pthread_mutex_unlock(&ears_capture_lock);
+
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    assert(r2_ears_watch_input_snapshot(1, &snapshot) == -1 && errno == EBUSY && !snapshot.source);
+    assert(r2_ears_start_desktop_for_watch("alsa_output.other.monitor") == 0 && errno == EBUSY);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+
     assert(r2_ears_start_desktop_for_watch("alsa_output.test.monitor") == 0);
     assert(r2_ears_start_desktop() == 0); /* manual takeover */
     assert(r2_ears_stop_desktop_if_watch_owned(desktop_first) == 0);
@@ -189,6 +208,17 @@ int main(void)
     assert(model_fd >= 0);
     assert(close(model_fd) == 0);
     assert(setenv("R2_WHISPER_MODEL", model_path, 1) == 0);
+    uint64_t ended = r2_ears_start_for_watch("alsa_input.ended");
+    assert(ended);
+    atomic_store(&microphone_eof, 1);
+    for (int attempts = 0; atomic_load(&ears_capture_running); ++attempts) {
+        assert(attempts < 2000);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    atomic_store(&microphone_eof, 0);
+    assert(ears_capture_thread_started); /* the one-shot path must reap it */
+    assert(atomic_load(&ears_microphone_watch_token) == ended);
     atomic_store(&synthetic_reads, 0);
     pthread_t listener;
     assert(pthread_create(&listener, NULL, direct_listen_worker, NULL) == 0);
@@ -197,6 +227,8 @@ int main(void)
         (void)nanosleep(&tick, NULL);
     }
     assert(atomic_load(&synthetic_reads) > 0);
+    assert(atomic_load(&ears_microphone_watch_token) == 0);
+    assert(r2_ears_stop_if_watch_owned(ended) == 0);
     struct timespec before_stop, after_stop;
     assert(clock_gettime(CLOCK_MONOTONIC, &before_stop) == 0);
     assert(r2_ears_stop() == 0);

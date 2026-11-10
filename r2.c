@@ -11496,8 +11496,8 @@ void r2_sense_set_auto_allowed(int which, int allowed)
 static pthread_mutex_t ears_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 /* A Watch claim belongs to exactly one successful capture generation. */
 static atomic_uint_fast64_t ears_watch_next_token = ATOMIC_VAR_INIT(1);
-static uint64_t ears_microphone_watch_token = 0;
-static uint64_t ears_desktop_watch_token = 0;
+static atomic_uint_fast64_t ears_microphone_watch_token = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t ears_desktop_watch_token = ATOMIC_VAR_INIT(0);
 static uint64_t r2_ears_new_watch_token(void)
 {
     return (uint64_t)atomic_fetch_add(&ears_watch_next_token, 1);
@@ -12648,6 +12648,11 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No continuously buffered audio is available to inspect.\n");
             goto cleanup;
         }
+        ears_microphone_watch_token = 0;
+        if (ears_capture_thread_started) {
+            pthread_join(ears_capture_thread, NULL);
+            ears_capture_thread_started = 0;
+        }
         if (!ears || r2_ears_open_input(ears, NULL, &request) != 0) {
             pthread_mutex_unlock(&ears_capture_lock);
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
@@ -12848,7 +12853,9 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
 {
     if (watch_token_out) *watch_token_out = 0;
     R2EarsOpenRequest request = r2_ears_open_request(0, watch_token_out != NULL, cancelled, userdata);
-    pthread_mutex_lock(&ears_capture_lock);
+    int lock_result = watch_token_out ? pthread_mutex_trylock(&ears_capture_lock)
+                                      : pthread_mutex_lock(&ears_capture_lock);
+    if (lock_result != 0) { errno = lock_result; return -1; }
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
         /* An explicit start takes over an existing Watch-owned stream. */
         if (!watch_token_out) ears_microphone_watch_token = 0;
@@ -12918,7 +12925,9 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
 {
     if (watch_token_out) *watch_token_out = 0;
     R2EarsOpenRequest request = r2_ears_open_request(1, watch_token_out != NULL, cancelled, userdata);
-    pthread_mutex_lock(&ears_desktop_capture_lock);
+    int lock_result = watch_token_out ? pthread_mutex_trylock(&ears_desktop_capture_lock)
+                                      : pthread_mutex_lock(&ears_desktop_capture_lock);
+    if (lock_result != 0) { errno = lock_result; return -1; }
     if (atomic_load(&ears_desktop_capture_running) &&
         ears_desktop_capture_thread_started) {
         if (!watch_token_out) ears_desktop_watch_token = 0;
@@ -12988,6 +12997,25 @@ uint64_t r2_ears_start_desktop_for_watch_cancelable(const char *monitor,
     return r2_ears_start_desktop_impl(&token, monitor, cancelled, userdata) == 0 ? token : 0;
 }
 
+/* A stale Watch token must never join a manual operation. The current
+ * owner rechecks the token under the lifecycle lock before closing. */
+static int r2_ears_lock_watch_owner(pthread_mutex_t *lock,
+                                    const atomic_uint_fast64_t *owner, uint64_t token)
+{
+    while (token && atomic_load(owner) == token) {
+        int rc = pthread_mutex_trylock(lock);
+        if (rc == 0) {
+            if (atomic_load(owner) == token) return 1;
+            pthread_mutex_unlock(lock);
+            break;
+        }
+        if (rc != EBUSY) break;
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
 static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
 {
     if (!watch_only) {
@@ -13003,10 +13031,11 @@ static int r2_ears_stop_desktop_impl(uint64_t watch_token, int watch_only)
         if (ears_desktop) r2_ears_cancel(ears_desktop);
         pthread_mutex_unlock(&ears_desktop_pointer_lock);
     }
-    pthread_mutex_lock(&ears_desktop_capture_lock);
-    if (watch_only && (!watch_token || ears_desktop_watch_token != watch_token)) {
-        pthread_mutex_unlock(&ears_desktop_capture_lock);
-        return 0;
+    if (watch_only) {
+        if (!r2_ears_lock_watch_owner(&ears_desktop_capture_lock, &ears_desktop_watch_token, watch_token))
+            return 0;
+    } else {
+        pthread_mutex_lock(&ears_desktop_capture_lock);
     }
     ears_desktop_watch_token = 0;
     if (ears_desktop) r2_ears_cancel(ears_desktop);
@@ -13035,6 +13064,31 @@ int r2_ears_stop_desktop(void)
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token)
 {
     return r2_ears_stop_desktop_impl(token, 1);
+}
+
+int r2_ears_watch_input_snapshot(int desktop, R2EarsWatchInput *input)
+{
+    if (!input) { errno = EINVAL; return -1; }
+    *input = (R2EarsWatchInput){0};
+    pthread_mutex_t *lock = desktop ? &ears_desktop_capture_lock : &ears_capture_lock;
+    int rc = pthread_mutex_trylock(lock);
+    if (rc != 0) { errno = rc; return -1; }
+    R2Ears *receiver = desktop ? ears_desktop : ears;
+    int worker = desktop ? ears_desktop_capture_thread_started : ears_capture_thread_started;
+    int running = atomic_load(desktop ? &ears_desktop_capture_running : &ears_capture_running);
+    int active = receiver && (worker ? running : !desktop && r2_ears_is_open(receiver));
+    R2HearingEvent event = {0};
+    if (active && (r2_ears_get_event(receiver, &event) != 0 ||
+                   !event.source_name || !*event.source_name)) {
+        r2_ears_release_event(&event);
+        pthread_mutex_unlock(lock);
+        return -1;
+    }
+    input->active = active;
+    input->owner = atomic_load(desktop ? &ears_desktop_watch_token : &ears_microphone_watch_token);
+    input->source = event.source_name;
+    pthread_mutex_unlock(lock);
+    return 0;
 }
 
 int r2_ears_status_desktop(void)
@@ -13108,10 +13162,11 @@ static int r2_ears_stop_impl(uint64_t watch_token, int watch_only)
         r2_ears_cancel_pending_source(0);
         r2_ears_cancel(ears); /* wake a direct listen BEFORE waiting for its mutex */
     }
-    pthread_mutex_lock(&ears_capture_lock);
-    if (watch_only && (!watch_token || ears_microphone_watch_token != watch_token)) {
-        pthread_mutex_unlock(&ears_capture_lock);
-        return 0;
+    if (watch_only) {
+        if (!r2_ears_lock_watch_owner(&ears_capture_lock, &ears_microphone_watch_token, watch_token))
+            return 0;
+    } else {
+        pthread_mutex_lock(&ears_capture_lock);
     }
     ears_microphone_watch_token = 0;
     r2_ears_cancel(ears); /* release Watch-owned reader before join */
