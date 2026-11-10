@@ -10676,13 +10676,15 @@ int r2_vision_media_status(void)
 
 /* kind=window, vlc or file; only a separate receiver is changed. */
 static int r2_vision_media_open(int kind, unsigned long window,
-                                const char *path, uint64_t *watch_token_out)
+                                const char *path, uint64_t *watch_token_out,
+                                int (*cancelled)(void *), void *userdata)
 {
     if (watch_token_out) *watch_token_out = 0;
     if (!r2_visual_is_initialized() || shutting_down || !core_initialized ||
         !atomic_load(&eyes_auto_allowed)) return -1;
     pthread_mutex_lock(&media_lifecycle_lock);
     if (shutting_down || !atomic_load(&eyes_auto_allowed) ||
+        (cancelled && cancelled(userdata)) ||
         (watch_token_out && atomic_load(&media_capture_running))) {
         /* A manual/other caller may have opened a display between Watch's
          * status check and this lock. Watch must not replace that source. */
@@ -10700,10 +10702,15 @@ static int r2_vision_media_open(int kind, unsigned long window,
         return -1;
     }
     r2_eyes_set_auxiliary(media_eyes, 1);
-    int rc = kind == 1 ? r2_eyes_open_window(media_eyes, window) :
-             kind == 2 ? (window ? r2_eyes_open_vlc_window(media_eyes, window) :
-                                    r2_eyes_open_vlc(media_eyes)) :
+    int rc = window ? r2_eyes_open_x11_cancelable(media_eyes, window, kind == 2,
+                                                   cancelled, userdata) :
+             kind == 2 ? r2_eyes_open_vlc(media_eyes) :
                          r2_eyes_open_file(media_eyes, path);
+    if (rc == 0 && (shutting_down || !atomic_load(&eyes_auto_allowed) ||
+                    (cancelled && cancelled(userdata)))) {
+        r2_eyes_close(media_eyes);
+        rc = -1;
+    }
     pthread_mutex_unlock(&media_capture_lock);
     if (rc != 0) {
         pthread_mutex_unlock(&media_lifecycle_lock);
@@ -10734,27 +10741,36 @@ static int r2_vision_media_open(int kind, unsigned long window,
 }
 int r2_vision_media_open_window(unsigned long window)
 {
-    return window ? r2_vision_media_open(1, window, NULL, NULL) : -1;
+    return window ? r2_vision_media_open(1, window, NULL, NULL, NULL, NULL) : -1;
 }
 
 uint64_t r2_vision_media_open_window_for_watch(unsigned long window)
 {
     if (!window) return 0;
     uint64_t token = 0;
-    return r2_vision_media_open(1, window, NULL, &token) == 0 ? token : 0;
+    return r2_vision_media_open(1, window, NULL, &token, NULL, NULL) == 0 ? token : 0;
 }
 
 uint64_t r2_vision_media_open_vlc_for_watch(void)
 {
     uint64_t token = 0;
-    return r2_vision_media_open(2, 0, NULL, &token) == 0 ? token : 0;
+    return r2_vision_media_open(2, 0, NULL, &token, NULL, NULL) == 0 ? token : 0;
 }
 
 uint64_t r2_vision_media_open_vlc_window_for_watch(unsigned long window)
 {
     if (!window) return 0;
     uint64_t token = 0;
-    return r2_vision_media_open(2, window, NULL, &token) == 0 ? token : 0;
+    return r2_vision_media_open(2, window, NULL, &token, NULL, NULL) == 0 ? token : 0;
+}
+
+uint64_t r2_vision_media_open_x11_for_watch_cancelable(unsigned long window, int vlc,
+                                                       int (*cancelled)(void *), void *userdata)
+{
+    if (!window) return 0;
+    uint64_t token = 0;
+    return r2_vision_media_open(vlc ? 2 : 1, window, NULL, &token,
+                                cancelled, userdata) == 0 ? token : 0;
 }
 
 int r2_vision_media_stop_if_watch_owned(uint64_t token)
@@ -11299,6 +11315,12 @@ int r2_vision_select_playback_window(const long *producers, size_t count,
     return r2_eyes_select_playback_window(producers, count, pid, window, cancelled, userdata);
 }
 
+int r2_vision_window_available_cancelable(unsigned long window_id,
+                                          int (*cancelled)(void *), void *userdata)
+{
+    return r2_eyes_window_available_cancelable(window_id, cancelled, userdata);
+}
+
 int r2_vision_window_available(unsigned long window_id)
 {
     return r2_eyes_window_available(window_id);
@@ -11311,12 +11333,12 @@ int r2_vision_open_window(unsigned long window_id)
 
 int r2_vision_open_vlc(void)
 {
-    return r2_vision_media_open(2, 0, NULL, NULL);
+    return r2_vision_media_open(2, 0, NULL, NULL, NULL, NULL);
 }
 
 int r2_vision_open_file(const char *path)
 {
-    return path && *path ? r2_vision_media_open(3, 0, path, NULL) : -1;
+    return path && *path ? r2_vision_media_open(3, 0, path, NULL, NULL, NULL) : -1;
 }
 
 int r2_vision_close(void)

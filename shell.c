@@ -1415,6 +1415,12 @@ typedef struct {
     uint64_t publication; /* CRT playback generation, including its XID */
 } ShellWatchMedia;
 
+static int shell_watch_media_stale(void *userdata)
+{
+    return shell_watch_cancelled(NULL) ||
+        *(const uint64_t *)userdata != atomic_load(&tv_live_renderer);
+}
+
 static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
                                    const R2AudioDiscovery *audio)
 {
@@ -1425,7 +1431,10 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
     int wanted_kind = 0;
     int selection_known = audio != NULL;
     if (eyes_permitted && !shell_watch_cancelled(NULL)) {
-        if (published && r2_vision_window_available(published)) {
+        if (published && ((managed->kind == 3 && managed->publication == publication &&
+                           r2_vision_media_watch_owns(managed->token) && r2_vision_media_status()) ||
+                          r2_vision_window_available_cancelable(published, shell_watch_media_stale,
+                                                               &publication))) {
             wanted_window = published;
             wanted_kind = 3;
         } else if (audio && audio->desktop_playing) {
@@ -1435,12 +1444,12 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
             }
             selection_known = r2_vision_select_playback_window(
                 audio->playback_producers, audio->playback_producer_count,
-                &producer, &wanted_window, shell_watch_cancelled, NULL) == 0;
+                &producer, &wanted_window, shell_watch_media_stale, &publication) == 0;
             if (!selection_known) wanted_window = 0;
             if (wanted_window) wanted_kind = producer > 1 ? 4 : 2;
         }
     }
-    if (shell_watch_cancelled(NULL) || publication != atomic_load(&tv_live_renderer))
+    if (shell_watch_media_stale(&publication))
         return; /* Reconcile against the next complete publication snapshot. */
 
     /* The CRT publisher can withdraw its own window independently of Pulse.
@@ -1460,11 +1469,10 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
         publication != atomic_load(&tv_live_renderer))
         return;
 
-    uint64_t token = wanted_kind == 2 ?
-        r2_vision_media_open_vlc_window_for_watch(wanted_window) :
-        r2_vision_media_open_window_for_watch(wanted_window);
+    uint64_t token = r2_vision_media_open_x11_for_watch_cancelable(
+        wanted_window, wanted_kind == 2, shell_watch_media_stale, &publication);
     if (!token) return;
-    if (shell_watch_cancelled(NULL) || publication != atomic_load(&tv_live_renderer)) {
+    if (shell_watch_media_stale(&publication)) {
         (void)r2_vision_media_stop_if_watch_owned(token);
         return;
     }

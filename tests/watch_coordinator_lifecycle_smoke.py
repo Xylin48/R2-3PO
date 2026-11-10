@@ -31,7 +31,7 @@ assert "audio_known && audio.microphone_source" in worker
 assert "audio_known ? audio.desktop_playing" in worker
 assert "r2_vision_camera_available()" in worker
 assert "r2_vision_select_playback_window(" in worker
-assert "r2_vision_window_available(published)" in worker
+assert "r2_vision_window_available_cancelable(published, shell_watch_media_stale" in worker
 assert "r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor," in worker
 assert "r2_ears_start_for_watch_cancelable(audio.microphone_source," in worker
 assert "if (managed_microphone)" in worker and "r2_ears_stop_if_watch_owned(managed_microphone)" in worker
@@ -52,8 +52,8 @@ assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_vision_watch_start_for_watch()" in worker
 assert "r2_vision_watch_stop_if_watch_owned(attached_visual)" in worker
 assert "r2_vision_watch_owns(attached_visual)" in worker
-assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
-assert "r2_vision_media_open_vlc_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_open_x11_for_watch_cancelable(" in worker
+assert "wanted_window, wanted_kind == 2, shell_watch_media_stale" in worker
 assert "r2_vision_media_watch_owns(managed->token)" in worker
 assert "managed->window != wanted_window" in worker
 assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in worker

@@ -1363,37 +1363,71 @@ int r2_eyes_open_source(
 /* A video producer can publish its real X11 rendering window, regardless
  * of which UI framework hosts the player. Capture the window's pixels, never
  * a speculative description derived from its filename or player identity. */
-int r2_eyes_window_available(unsigned long window_id)
+int r2_eyes_window_available_cancelable(unsigned long window_id,
+                                        int (*cancelled)(void *), void *userdata)
 {
     uint32_t width = 0, height = 0;
     return window_id != 0 &&
         r2_eyes_probe_vlc_dimensions(window_id, &width, &height,
-                                    (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}) == 0;
+                                    (R2EyesProbe){r2_eyes_probe_deadline(), cancelled, userdata}) == 0;
 }
 
-int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
+int r2_eyes_window_available(unsigned long window_id)
 {
-    if (!eyes || window_id == 0) return -1;
+    return r2_eyes_window_available_cancelable(window_id, NULL, NULL);
+}
+
+static char *r2_eyes_window_source(unsigned long window_id, int vlc, R2EyesProbe probe)
+{
+    char window[32];
+    snprintf(window, sizeof(window), "%lu", window_id);
+    if (!vlc) {
+        char *source = NULL;
+        return asprintf(&source, "video rendering window %s", window) < 0 ? NULL : source;
+    }
+
+    /* Keep the exact title as metadata; a title does not establish content. */
+    char *argv[] = {"xdotool", "getwindowname", window, NULL};
+    char *title = r2_eyes_query(argv, probe, 0);
+    if (!title && (errno == ECANCELED || errno == ETIMEDOUT || errno == ENOMEM ||
+                   errno == EOVERFLOW || errno == EPROTO))
+        return NULL;
+    if (title) {
+        size_t length = strlen(title);
+        if (length && title[length - 1] == '\n') title[length - 1] = '\0';
+        if (*title) return title;
+        free(title);
+    }
+    return strdup("VLC");
+}
+
+static int r2_eyes_open_x11(R2Eyes *eyes, unsigned long window_id, int vlc, R2EyesProbe probe)
+{
+    if (!eyes || !window_id || r2_eyes_probe_check(probe) != 0) return -1;
     r2_eyes_close(eyes);
     uint32_t width = 0, height = 0;
-    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height,
-                                    (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}) != 0 ||
+    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height, probe) != 0 ||
         r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
         r2_eyes_allocate_record_buffer(eyes) != 0)
         return -1;
-    char *source = NULL;
-    if (asprintf(&source, "video rendering window %lu", window_id) < 0)
-        return -1;
+    char *source = r2_eyes_window_source(window_id, vlc, probe);
+    if (!source) return -1;
+    if (r2_eyes_probe_check(probe) != 0) { free(source); return -1; }
+
     FILE *stream = r2_eyes_start_vlc(window_id, width, height, &eyes->stream_child);
-    if (!stream) {
+    if (!stream) { free(source); return -1; }
+    if (r2_eyes_probe_check(probe) != 0) {
+        int saved = errno;
+        r2_eyes_close_stream(stream, &eyes->stream_child);
         free(source);
+        errno = saved;
         return -1;
     }
     eyes->source_name = source;
     eyes->stream = stream;
     eyes->open = 1;
     eyes->source_is_live = 1;
-    eyes->origin = R2_VISION_WINDOW;
+    eyes->origin = vlc ? R2_VISION_VLC : R2_VISION_WINDOW;
     eyes->frame_count = 0;
     eyes->timestamp = 0;
     r2_eyes_reset_event(eyes);
@@ -1401,97 +1435,29 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
     if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
     r2_log_sensory("vision_source_opened",
-                   "R2 Eyes connected to an active rendered video window.",
-                   "The source supplied a live window ID; frames are raw pixels.",
+                   vlc ? "R2 Eyes began capturing the visible VLC window."
+                       : "R2 Eyes connected to an active rendered video window.",
+                   vlc ? "origin=VLC; frames are raw pixels until a vision model interprets them."
+                       : "The source supplied a live window ID; frames are raw pixels.",
                    eyes->source_name);
     return 0;
 }
 
-static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
-                                        R2EyesProbe probe)
+int r2_eyes_open_x11_cancelable(R2Eyes *eyes, unsigned long window_id, int vlc,
+                               int (*cancelled)(void *), void *userdata)
 {
-    if (!eyes || !window_id) return -1;
-    r2_eyes_close(eyes);
+    return r2_eyes_open_x11(eyes, window_id, vlc,
+                           (R2EyesProbe){r2_eyes_probe_deadline(), cancelled, userdata});
+}
 
-    uint32_t width = 0;
-    uint32_t height = 0;
-
-    if (r2_eyes_probe_vlc_dimensions(
-            window_id,
-            &width,
-            &height, probe) != 0)
-    {
-        return -1;
-    }
-
-    if (r2_eyes_allocate_native_buffer(
-            eyes,
-            width,
-            height) != 0)
-    {
-        return -1;
-    }
-
-    if (r2_eyes_allocate_record_buffer(
-            eyes) != 0)
-    {
-        return -1;
-    }
-
-    /*
-     * Preserve the visible VLC window title as source metadata. This is
-     * useful for later history searches, but is not treated as proof of
-     * the actual media contents.
-     */
-    char window[32];
-    snprintf(window, sizeof(window), "%lu", window_id);
-    char *title_argv[] = {"xdotool", "getwindowname", window, NULL};
-    char *window_title = r2_eyes_query(title_argv, probe, 0);
-    if (!window_title && (errno == ETIMEDOUT || errno == ENOMEM ||
-                          errno == EOVERFLOW || errno == EPROTO))
-        return -1;
-    if (window_title) {
-        size_t length = strlen(window_title);
-        /* xdotool appends one newline to the title. */
-        if (length && window_title[length - 1] == '\n')
-            window_title[length - 1] = '\0';
-    }
-    if (!window_title || !*window_title) {
-        free(window_title);
-        window_title = strdup("VLC");
-        if (!window_title) return -1;
-    }
-
-    FILE *stream = r2_eyes_start_vlc(window_id, width, height, &eyes->stream_child);
-    if (!stream) {
-        free(window_title);
-        return -1;
-    }
-    eyes->source_name = window_title;
-    eyes->stream = stream;
-    eyes->open = 1;
-    eyes->source_is_live = 1;
-    eyes->origin = R2_VISION_VLC;
-    eyes->frame_count = 0;
-    eyes->timestamp = 0;
-
-    /* source_name was populated from the visible VLC window title above. */
-    r2_eyes_reset_event(eyes);
-    r2_eyes_reset_frame(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_begin_session(eyes);
-    if (!eyes->auxiliary_display) r2_vwebcam_start_viewer();
-
-    r2_log_sensory("vision_source_opened",
-                   "R2 Eyes began capturing the visible VLC window.",
-                   "origin=VLC; frames are raw pixels until a vision model interprets them.",
-                   eyes->source_name);
-
-    return 0;
+int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
+{
+    return r2_eyes_open_x11_cancelable(eyes, window_id, 0, NULL, NULL);
 }
 
 int r2_eyes_open_vlc_window(R2Eyes *eyes, unsigned long window_id)
 {
-    return r2_eyes_open_vlc_window_impl(eyes, window_id, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()});
+    return r2_eyes_open_x11_cancelable(eyes, window_id, 1, NULL, NULL);
 }
 
 int r2_eyes_open_vlc(R2Eyes *eyes)
@@ -1507,7 +1473,7 @@ int r2_eyes_open_vlc(R2Eyes *eyes)
                        "VLC");
         return -1;
     }
-    return r2_eyes_open_vlc_window_impl(eyes, window_id, probe);
+    return r2_eyes_open_x11(eyes, window_id, 1, probe);
 }
 
 /* ============================================================

@@ -46,7 +46,7 @@ worker = shell[shell.index("static void shell_watch_media_poll("):
 assert "uint64_t managed_camera = 0;" in worker
 assert "ShellWatchMedia managed_media = {0};" in worker
 assert "r2_eyes_start_for_watch()" in worker
-assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_open_x11_for_watch_cancelable(" in worker
 assert "r2_vision_media_stop_if_watch_owned(managed_media.token)" in worker
 assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker
 assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen closure"
@@ -72,7 +72,7 @@ snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFram
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "pthread_mutex_lock(&vision_watch_frame_lock)" in snapshot
 assert "memcpy(copy, vision_watch_latest_frame_data," in snapshot
-assert "r2_eyes_open_window(media_eyes," in media
+assert "r2_eyes_open_x11_cancelable(media_eyes, window, kind == 2," in media
 
 tool = core[core.index("/* Decisions to open/close sensors override Watch discovery. */"):
             core.index("/* Deliberate hearing is an action")]

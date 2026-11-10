@@ -34,7 +34,7 @@ assert "audio->playback_producers, audio->playback_producer_count" in worker
 assert "r2_audio_discover_cancelable(" in worker
 assert "r2_vision_select_playback_window(" in worker
 assert "wanted_window = published" in worker
-assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
+assert "r2_vision_media_open_x11_for_watch_cancelable(" in worker
 assert "managed->window != wanted_window" in worker
 assert "r2_vision_watch_active()" in worker
 assert "r2_eyes_release_if_watch_owned(managed_camera)" in worker

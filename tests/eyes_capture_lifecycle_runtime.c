@@ -74,6 +74,11 @@ static void assert_no_complete_frame(R2Eyes *receiver)
     for (size_t i = 0; i < sizeof(output); ++i) assert(output[i] == 0xE7);
 }
 
+static int cancel_when_probe_started(void *path)
+{
+    return access(path, F_OK) == 0;
+}
+
 int main(void)
 {
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
@@ -90,7 +95,8 @@ int main(void)
         "case \"$1\" in\n"
         "  search) echo 123 ;;\n"
         "  getwindowgeometry) printf 'WIDTH=2\\nHEIGHT=2\\n' ;;\n"
-        "  getwindowname) printf '%s\\n' \"$R2_TEST_VLC_TITLE\" ;;\n"
+        "  getwindowname) if [ \"$2\" = 999 ]; then exec ffprobe probe-stalled; fi;\n"
+        "    printf '%s\\n' \"$R2_TEST_VLC_TITLE\" ;;\n"
         "  *) exit 1 ;;\n"
         "esac\n");
     write_executable(probe,
@@ -309,6 +315,12 @@ int main(void)
     assert(setenv("DISPLAY", ":test-display", 1) == 0);
     assert(setenv("R2_TEST_VLC_TITLE", media_source, 1) == 0);
     assert(setenv("R2_TEST_EXPECTED_WINDOW", "456", 1) == 0);
+    assert(r2_vision_media_open_x11_for_watch_cancelable(999, 1,
+                                                        cancel_when_probe_started, ready) == 0);
+    assert(!r2_vision_media_status() && !r2_vision_media_attention_status());
+    child = wait_for_child(ready);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
     uint64_t vlc_token = r2_vision_media_open_vlc_window_for_watch(456);
     assert(vlc_token && r2_vision_media_watch_owns(vlc_token));
     child = wait_for_child(ready);

@@ -13,7 +13,11 @@ int r2_is_shutting_down(void) { return 0; }
 int r2_sense_auto_allowed(int which) { assert(which == 1); return eyes_allowed; }
 int r2_vision_available(void) { return 1; }
 int r2_vision_media_status(void) { return active_token || manual_active; }
-int r2_vision_window_available(unsigned long window) { return window != 0; }
+int r2_vision_window_available_cancelable(unsigned long window,
+                                          int (*cancelled)(void *), void *userdata)
+{
+    return !cancelled(userdata) && window != 0;
+}
 int r2_vision_select_playback_window(const long *producers, size_t count,
                                     long *pid, unsigned long *window,
                                     int (*cancelled)(void *), void *userdata)
@@ -42,14 +46,10 @@ static uint64_t open_window(unsigned long window, int vlc)
     return active_token = next_token++;
 }
 
-uint64_t r2_vision_media_open_window_for_watch(unsigned long window)
+uint64_t r2_vision_media_open_x11_for_watch_cancelable(unsigned long window, int vlc,
+                                                       int (*cancelled)(void *), void *userdata)
 {
-    return open_window(window, 0);
-}
-
-uint64_t r2_vision_media_open_vlc_window_for_watch(unsigned long window)
-{
-    return open_window(window, 1);
+    return cancelled(userdata) ? 0 : open_window(window, vlc);
 }
 
 int r2_vision_media_stop_if_watch_owned(uint64_t token)
