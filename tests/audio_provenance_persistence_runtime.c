@@ -148,6 +148,42 @@ int main(void)
         verify_event(connection, speech_ids[mode], source, expected);
         free(transcript); free(source); free(wanted);
     }
+    /* A primary lifecycle update can stall independently. An already
+     * published extra source must still reach ASR and persist its exact ID. */
+    const char extra_name[] = "fixture.secondary|exact.monitor";
+    R2ExtraDesktop extra = {
+        .monitor = (char *)extra_name,
+        .running = ATOMIC_VAR_INIT(1),
+        .history_lock = PTHREAD_MUTEX_INITIALIZER,
+        .length = 192000,
+        .position = 192000,
+        .total_bytes = 192000,
+        .generation = 1
+    };
+    extra.recent = calloc(1, R2_EARS_RECENT_CAPACITY);
+    assert(extra.recent);
+    extra_desktop_head = &extra;
+    r2_ears_extra_requested = extra_name;
+    int64_t independent_id;
+    char *independent_source = NULL;
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    char *available = r2_ears_desktop_available_sources();
+    assert(available && strstr(available, "capture lifecycle update in progress") &&
+           strstr(available, extra_name));
+    free(available);
+    char *independent_transcript = r2_ears_listen_source_cancelable(
+        1, NULL, NULL, &independent_source, &independent_id);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    assert(independent_transcript && !strcmp(independent_transcript, expected));
+    assert(independent_source && !strcmp(independent_source, extra_name) && independent_id > 0);
+    verify_event(connection, independent_id, independent_source, expected);
+    free(independent_transcript);
+    free(independent_source);
+    extra_desktop_head = NULL;
+    r2_ears_extra_requested = NULL;
+    pthread_mutex_destroy(&extra.history_lock);
+    free(extra.recent);
+
     /* Tool result must include captured identity, with no 8/16/32/64 KiB cut. */
     memset(names[1], 'z', 900); names[1][900] = '\0';
     char *request = NULL;
@@ -220,6 +256,7 @@ int main(void)
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
     verify_turn(connection, turn, expected, reply);
     for (int i = 0; i < 3; ++i) verify_event(connection, speech_ids[i], original_sources[i], expected);
+    verify_event(connection, independent_id, extra_name, expected);
     assert(sqlite3_prepare_v2(connection, "SELECT count(*) FROM r2_log_links WHERE from_event_id=? AND relationship='speech_was_transcribed_for_turn'", -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_bind_int64(st, 1, turn) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(sqlite3_column_int(st, 0) == 2);

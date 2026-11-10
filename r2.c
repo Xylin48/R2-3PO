@@ -12073,6 +12073,20 @@ int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output)
     return -1;
 }
 
+static int r2_ears_extra_source_active(const char *monitor)
+{
+    pthread_mutex_lock(&extra_desktop_lock);
+    int active = 0;
+    for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
+        if (!strcmp(entry->monitor, monitor)) {
+            active = atomic_load(&entry->running);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    return active;
+}
+
 /* A deliberate query of actually available monitor identities. Capture
  * is independent; listing a source does not mean R2 chose to attend to it.
  * An open_memstream grows with the actual names (no 512-byte or 20K cut). */
@@ -12083,14 +12097,19 @@ static char *r2_ears_desktop_available_sources(void)
     FILE *stream = open_memstream(&report, &report_size);
     if (!stream) return NULL;
     R2HearingEvent primary = {0};
-    pthread_mutex_lock(&ears_desktop_capture_lock);
-    int have_primary = ears_desktop &&
-        atomic_load(&ears_desktop_capture_running) &&
-        r2_ears_get_event(ears_desktop, &primary) == 0;
-    pthread_mutex_unlock(&ears_desktop_capture_lock);
-    if (fprintf(stream, "PRIMARY DESKTOP AUDIO SOURCE: %s\n",
-                have_primary && primary.source_name ? primary.source_name :
-                "(not active)") < 0) goto fail;
+    const char *primary_status = "(capture lifecycle update in progress)";
+    if (pthread_mutex_trylock(&ears_desktop_capture_lock) == 0) {
+        if (ears_desktop && atomic_load(&ears_desktop_capture_running)) {
+            primary_status = "(source identity unavailable)";
+            if (r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name)
+                primary_status = primary.source_name;
+        } else {
+            primary_status = "(not active)";
+        }
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+    }
+    if (fprintf(stream, "PRIMARY DESKTOP AUDIO SOURCE: %s\n", primary_status) < 0)
+        goto fail;
     r2_ears_release_event(&primary);
     pthread_mutex_lock(&extra_desktop_lock);
     size_t active = 0;
@@ -12530,13 +12549,20 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
 
     int named_primary = 0;
     if (r2_ears_extra_requested) {
-        pthread_mutex_lock(&ears_desktop_capture_lock);
-        R2HearingEvent primary = {0};
-        named_primary = ears_desktop && atomic_load(&ears_desktop_capture_running) &&
-            r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name &&
-            !strcmp(primary.source_name, r2_ears_extra_requested);
-        r2_ears_release_event(&primary);
-        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        /* A published exact extra stream can be used while the primary is
+         * connecting. When the primary is accessible, preserve its priority
+         * for a matching name during a short handoff overlap. */
+        int primary_locked = r2_ears_extra_source_active(r2_ears_extra_requested)
+            ? pthread_mutex_trylock(&ears_desktop_capture_lock) == 0
+            : pthread_mutex_lock(&ears_desktop_capture_lock) == 0;
+        if (primary_locked) {
+            R2HearingEvent primary = {0};
+            named_primary = ears_desktop && atomic_load(&ears_desktop_capture_running) &&
+                r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name &&
+                !strcmp(primary.source_name, r2_ears_extra_requested);
+            r2_ears_release_event(&primary);
+            pthread_mutex_unlock(&ears_desktop_capture_lock);
+        }
     }
     if (r2_ears_extra_requested && !named_primary) {
         captured_event.source_name = strdup(r2_ears_extra_requested);
