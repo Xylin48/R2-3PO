@@ -30,7 +30,7 @@ assert "r2_audio_discover_cancelable(" in worker
 assert "audio_known && audio.microphone_source" in worker
 assert "audio_known ? audio.desktop_playing" in worker
 assert "r2_vision_camera_available()" in worker
-assert "r2_vision_vlc_window()" in worker
+assert "r2_vision_select_playback_window(" in worker
 assert "r2_vision_window_available(published)" in worker
 assert "r2_ears_start_desktop_for_watch_cancelable(audio.desktop_monitor," in worker
 assert "r2_ears_start_for_watch_cancelable(audio.microphone_source," in worker

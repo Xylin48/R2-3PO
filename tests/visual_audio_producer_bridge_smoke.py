@@ -21,18 +21,18 @@ probe = audio[audio.index("static void r2_discovery_sink_input("):
 assert "PA_PROP_APPLICATION_PROCESS_ID" in probe
 assert "info->corked" in probe
 assert "info->sink" in probe
-assert "r2_discovery_pid(pid)" in probe
+assert "r2_discovery_add_producer(scan, producer)" in probe
 assert "r2_audio_discover(&sources)" in ears
-vision = eyes[eyes.index("static unsigned long r2_eyes_find_window("):
+vision = eyes[eyes.index("static int r2_eyes_find_window("):
               eyes.index("static FILE *r2_eyes_start_vlc(")]
 assert '"xdotool", "search", "--onlyvisible", "--pid"' in vision
 assert 'r2_eyes_probe_vlc_dimensions(candidate' in vision
 assert 'r2_eyes_start_vlc(' not in vision
 worker = shell[shell.index("static void shell_watch_media_poll("):
                shell.index("static void shell_watch_start(void)")]
-assert "audio.playback_pid" in worker
+assert "audio->playback_producers, audio->playback_producer_count" in worker
 assert "r2_audio_discover_cancelable(" in worker
-assert "r2_vision_window_for_pid(playback_pid)" in worker
+assert "r2_vision_select_playback_window(" in worker
 assert "wanted_window = published" in worker
 assert "r2_vision_media_open_window_for_watch(wanted_window)" in worker
 assert "managed->window != wanted_window" in worker

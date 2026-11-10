@@ -330,6 +330,9 @@ unsigned long r2_vision_vlc_window(void);
 /* Generic X11 rendering window published by an active media source. */
 int r2_vision_window_available(unsigned long window_id);
 unsigned long r2_vision_window_for_pid(long pid);
+int r2_vision_select_playback_window(const long *producers, size_t count,
+                                    long *pid, unsigned long *window,
+                                    int (*cancelled)(void *), void *userdata);
 int r2_vision_open_window(unsigned long window_id);
 /* Media is a separately observed display, not a replacement for Eyes. */
 int r2_vision_media_open_window(unsigned long window_id);

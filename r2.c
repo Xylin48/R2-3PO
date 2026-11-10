@@ -11292,6 +11292,13 @@ unsigned long r2_vision_window_for_pid(long pid)
     return r2_eyes_window_for_pid(pid);
 }
 
+int r2_vision_select_playback_window(const long *producers, size_t count,
+                                    long *pid, unsigned long *window,
+                                    int (*cancelled)(void *), void *userdata)
+{
+    return r2_eyes_select_playback_window(producers, count, pid, window, cancelled, userdata);
+}
+
 int r2_vision_window_available(unsigned long window_id)
 {
     return r2_eyes_window_available(window_id);

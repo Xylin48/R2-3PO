@@ -125,6 +125,12 @@ int r2_eyes_open_source(R2Eyes *eyes,
 /* Live video-rendering window supplied by a playback source. */
 int r2_eyes_window_available(unsigned long window_id);
 unsigned long r2_eyes_window_for_pid(long pid);
+/* In/out preference and result. A zero window means a complete empty
+ * search; a negative result means discovery is unknown or cancelled.
+ * A positive returned PID identifies a producer; -1 marks VLC fallback. */
+int r2_eyes_select_playback_window(const long *producers, size_t count,
+                                  long *pid, unsigned long *window,
+                                  int (*cancelled)(void *), void *userdata);
 int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id);
 
 /* VLC window input */

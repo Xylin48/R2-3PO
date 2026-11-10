@@ -383,7 +383,13 @@ static uint64_t r2_eyes_timestamp(void)
  * File playback retains its cancellable wait without a live-frame deadline. */
 #define R2_EYES_LIVE_FRAME_MS 5000U
 static uint64_t r2_eyes_monotonic_ms(void);
-static char *r2_eyes_query(char *const argv[], uint64_t deadline);
+typedef struct {
+    uint64_t deadline;
+    int (*cancelled)(void *);
+    void *userdata;
+} R2EyesProbe;
+
+static char *r2_eyes_query(char *const argv[], R2EyesProbe probe, int search);
 static uint64_t r2_eyes_probe_deadline(void)
 {
     uint64_t now = r2_eyes_monotonic_ms();
@@ -393,6 +399,19 @@ static int r2_eyes_probe_expired(uint64_t deadline)
 {
     uint64_t now = r2_eyes_monotonic_ms();
     return !deadline || now == UINT64_MAX || now >= deadline;
+}
+
+static int r2_eyes_probe_check(R2EyesProbe probe)
+{
+    if (probe.cancelled && probe.cancelled(probe.userdata)) {
+        errno = ECANCELED;
+        return -1;
+    }
+    if (r2_eyes_probe_expired(probe.deadline)) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    return 0;
 }
 
 static int r2_eyes_probe_dimensions(
@@ -415,7 +434,7 @@ static int r2_eyes_probe_dimensions(
     char *argv[] = {"ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
         (char *)source, NULL};
-    char *dimensions = r2_eyes_query(argv, r2_eyes_probe_deadline());
+    char *dimensions = r2_eyes_query(argv, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}, 0);
     if (!dimensions) return -1;
 
     char *separator = strchr(dimensions, 'x');
@@ -518,7 +537,9 @@ static uint64_t r2_eyes_monotonic_ms(void)
 
 /* Only the reader is nonblocking: the writer retains normal backpressure.
  * A private process group also permits cleanup of a decoder's helper children. */
-static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out, int quiet)
+typedef enum { R2_EYES_STDERR_INHERIT, R2_EYES_STDERR_DISCARD, R2_EYES_STDERR_CAPTURE } R2EyesStderr;
+
+static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out, R2EyesStderr diagnostics)
 {
     extern char **environ;
     int pipes[2];
@@ -544,8 +565,10 @@ static FILE *r2_eyes_spawn_stream(char *const argv[], pid_t *child_out, int quie
     if (rc == 0) rc = posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
     if (rc == 0 && pipes[1] != STDOUT_FILENO)
         rc = posix_spawn_file_actions_addclose(&actions, pipes[1]);
-    if (rc == 0 && quiet)
+    if (rc == 0 && diagnostics == R2_EYES_STDERR_DISCARD)
         rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    if (rc == 0 && diagnostics == R2_EYES_STDERR_CAPTURE)
+        rc = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
     if (rc == 0)
         rc = posix_spawnp(child_out, argv[0], &actions, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
@@ -596,7 +619,7 @@ static void r2_eyes_close_stream(FILE *stream, pid_t *child)
 }
 
 static int r2_eyes_stream_eof(R2Eyes *eyes,
-                             int (*cancelled)(void *), void *userdata)
+                             int (*cancelled)(void *), void *userdata, int *exit_code)
 {
     /* Pipe EOF alone does not establish a successful decoder exit. */
     if (eyes->stream_child <= 0) { errno = EIO; return -1; }
@@ -609,7 +632,13 @@ static int r2_eyes_stream_eof(R2Eyes *eyes,
         while (result < 0 && errno == EINTR);
         if (result == eyes->stream_child) {
             eyes->stream_child = -1;
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+            if (WIFEXITED(status)) {
+                if (exit_code) {
+                    *exit_code = WEXITSTATUS(status);
+                    return 0;
+                }
+                if (WEXITSTATUS(status) == 0) return 0;
+            }
             errno = EIO; return -1;
         }
         if (result < 0) return -1;
@@ -657,7 +686,7 @@ static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
         }
         if (got == 0) {
             if (total) { errno = EPROTO; return -1; }
-            return r2_eyes_stream_eof(eyes, cancelled, userdata);
+            return r2_eyes_stream_eof(eyes, cancelled, userdata, NULL);
         }
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
     }
@@ -667,16 +696,17 @@ static int r2_eyes_read_exact(R2Eyes *eyes, unsigned char *buffer, size_t size,
 
 /* Retain the complete query output, require a successful child exit, and
  * discard the whole snapshot on timeout/read/allocation failure. */
-static char *r2_eyes_query(char *const argv[], uint64_t deadline)
+static char *r2_eyes_query(char *const argv[], R2EyesProbe probe, int search)
 {
-    if (r2_eyes_probe_expired(deadline)) { errno = ETIMEDOUT; return NULL; }
+    if (r2_eyes_probe_check(probe) != 0) return NULL;
     R2Eyes process = {0};
-    process.stream = r2_eyes_spawn_stream(argv, &process.stream_child, 1);
+    process.stream = r2_eyes_spawn_stream(argv, &process.stream_child,
+        search ? R2_EYES_STDERR_CAPTURE : R2_EYES_STDERR_DISCARD);
     if (!process.stream) return NULL;
     char *output = NULL;
     size_t length = 0, capacity = 0;
     for (;;) {
-        if (r2_eyes_probe_expired(deadline)) { errno = ETIMEDOUT; break; }
+        if (r2_eyes_probe_check(probe) != 0) break;
         struct pollfd input = {.fd = fileno(process.stream), .events = POLLIN};
         int ready = poll(&input, 1, 50);
         if (ready < 0) { if (errno == EINTR) continue; break; }
@@ -689,7 +719,16 @@ static char *r2_eyes_query(char *const argv[], uint64_t deadline)
             break;
         }
         if (got == 0) {
-            if (r2_eyes_stream_eof(&process, NULL, NULL) < 0) break;
+            int exit_code;
+            if (r2_eyes_stream_eof(&process, probe.cancelled, probe.userdata, &exit_code) < 0 ||
+                r2_eyes_probe_check(probe) != 0)
+                break;
+            /* xdotool search returns 1 for no match. Accept it only if
+               both stdout and captured stderr are empty. */
+            if (exit_code && !(search && exit_code == 1 && !length)) {
+                errno = EIO;
+                break;
+            }
             if (!output) output = strdup("");
             r2_eyes_close_stream(process.stream, &process.stream_child);
             return output;
@@ -786,7 +825,7 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
     char *file[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-re", "-i", (char *)input, "-vf", filter, "-f", "rawvideo", "-pix_fmt",
         "rgb24", "pipe:1", NULL};
-    return r2_eyes_spawn_stream(live_device ? camera : file, child_out, 0);
+    return r2_eyes_spawn_stream(live_device ? camera : file, child_out, R2_EYES_STDERR_INHERIT);
 }
 
 /* ============================================================
@@ -811,13 +850,13 @@ static int r2_eyes_parse_window_id(const char *cursor, char **end, unsigned long
 
 static int r2_eyes_probe_vlc_dimensions(unsigned long window_id,
                                         uint32_t *width, uint32_t *height,
-                                        uint64_t deadline)
+                                        R2EyesProbe probe)
 {
     if (!width || !height || !window_id || window_id > UINT32_MAX) return -1;
     char window[32];
     snprintf(window, sizeof(window), "%lu", window_id);
     char *argv[] = {"xdotool", "getwindowgeometry", "--shell", window, NULL};
-    char *output = r2_eyes_query(argv, deadline);
+    char *output = r2_eyes_query(argv, probe, 0);
     if (!output) return -1;
     uint32_t w = 0, h = 0;
     int valid = 1;
@@ -845,13 +884,16 @@ static int r2_eyes_probe_vlc_dimensions(unsigned long window_id,
     return 0;
 }
 
-/* Select a render-sized visible candidate for either producer lookup. */
-static unsigned long r2_eyes_find_window(char *const argv[], uint64_t deadline)
+/* A failed or incomplete search must never be interpreted as a withdrawal. */
+static int r2_eyes_find_window(char *const argv[], R2EyesProbe probe,
+                               unsigned long preferred, unsigned long *window)
 {
-    char *output = r2_eyes_query(argv, deadline);
-    if (!output) return 0;
+    *window = 0;
+    char *output = r2_eyes_query(argv, probe, 1);
+    if (!output) return -1;
     unsigned long best = 0;
     uint64_t best_area = 0;
+    int result = 0;
     char *cursor = output;
     while (*cursor) {
         while (*cursor && isspace((unsigned char)*cursor)) ++cursor;
@@ -859,39 +901,88 @@ static unsigned long r2_eyes_find_window(char *const argv[], uint64_t deadline)
         char *end;
         unsigned long candidate;
         if (r2_eyes_parse_window_id(cursor, &end, &candidate) != 0) {
-            best = 0; break;
+            errno = EPROTO;
+            result = -1;
+            break;
         }
         cursor = end;
         uint32_t width = 0, height = 0;
-        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height, deadline) == 0) {
+        if (r2_eyes_probe_vlc_dimensions(candidate, &width, &height, probe) == 0) {
             uint64_t area = (uint64_t)width * height;
-            if (area > best_area) { best = candidate; best_area = area; }
+            if (candidate == preferred ||
+                ((!best || best != preferred) &&
+                 (area > best_area || (area == best_area && candidate < best)))) {
+                best = candidate;
+                best_area = area;
+            }
+        } else if (errno != EINVAL) {
+            result = -1;
+            break;
         }
-        if (r2_eyes_probe_expired(deadline)) { best = 0; break; }
     }
     free(output);
-    return best;
+    if (result == 0 && r2_eyes_probe_check(probe) != 0) result = -1;
+    if (result == 0) *window = best;
+    return result;
 }
 
-/* Match a visible rendering window to the process supplying desktop audio. */
-unsigned long r2_eyes_window_for_pid(long pid)
+static int r2_eyes_find_pid_window(long pid, R2EyesProbe probe,
+                                  unsigned long preferred, unsigned long *window)
 {
+    *window = 0;
     if (pid <= 1 || pid > INT_MAX) return 0;
     char process_id[32];
     snprintf(process_id, sizeof(process_id), "%ld", pid);
     char *argv[] = {"xdotool", "search", "--onlyvisible", "--pid", process_id, NULL};
-    return r2_eyes_find_window(argv, r2_eyes_probe_deadline());
+    return r2_eyes_find_window(argv, probe, preferred, window);
 }
 
-static unsigned long r2_eyes_find_vlc_window(uint64_t deadline)
+static int r2_eyes_find_vlc_window(R2EyesProbe probe, unsigned long *window)
 {
     char *argv[] = {"xdotool", "search", "--onlyvisible", "--class", "^vlc$", NULL};
-    return r2_eyes_find_window(argv, deadline);
+    return r2_eyes_find_window(argv, probe, 0, window);
+}
+
+/* Prefer the current producer and window while they remain valid. All
+ * lookups, including VLC fallback, share a single cancellable deadline. */
+int r2_eyes_select_playback_window(const long *producers, size_t count,
+                                  long *pid, unsigned long *window,
+                                  int (*cancelled)(void *), void *userdata)
+{
+    if (!pid || !window || (count && !producers)) { errno = EINVAL; return -1; }
+    const long preferred_pid = *pid;
+    const unsigned long preferred_window = *window;
+    *pid = -1;
+    *window = 0;
+    R2EyesProbe probe = {r2_eyes_probe_deadline(), cancelled, userdata};
+    for (size_t i = 0; preferred_pid > 1 && i < count; ++i) {
+        if (producers[i] != preferred_pid) continue;
+        if (r2_eyes_find_pid_window(preferred_pid, probe, preferred_window, window) != 0)
+            return -1;
+        if (*window) { *pid = preferred_pid; return 0; }
+        break;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (producers[i] == preferred_pid) continue;
+        if (r2_eyes_find_pid_window(producers[i], probe, 0, window) != 0)
+            return -1;
+        if (*window) { *pid = producers[i]; return 0; }
+    }
+    return r2_eyes_find_vlc_window(probe, window);
+}
+
+unsigned long r2_eyes_window_for_pid(long pid)
+{
+    unsigned long window = 0;
+    (void)r2_eyes_find_pid_window(pid, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}, 0, &window);
+    return window;
 }
 
 unsigned long r2_eyes_vlc_window(void)
 {
-    return r2_eyes_find_vlc_window(r2_eyes_probe_deadline());
+    unsigned long window = 0;
+    (void)r2_eyes_find_vlc_window((R2EyesProbe){.deadline = r2_eyes_probe_deadline()}, &window);
+    return window;
 }
 
 int r2_eyes_vlc_available(void)
@@ -913,7 +1004,7 @@ static FILE *r2_eyes_start_vlc(unsigned long window_id, uint32_t width,
         "-draw_mouse", "0",
         "-i", (char *)display, "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt",
         "rgb24", "-r", fps, "pipe:1", NULL};
-    return r2_eyes_spawn_stream(argv, child_out, 0);
+    return r2_eyes_spawn_stream(argv, child_out, R2_EYES_STDERR_INHERIT);
 }
 
 /* ============================================================
@@ -1276,7 +1367,8 @@ int r2_eyes_window_available(unsigned long window_id)
 {
     uint32_t width = 0, height = 0;
     return window_id != 0 &&
-        r2_eyes_probe_vlc_dimensions(window_id, &width, &height, r2_eyes_probe_deadline()) == 0;
+        r2_eyes_probe_vlc_dimensions(window_id, &width, &height,
+                                    (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}) == 0;
 }
 
 int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
@@ -1284,7 +1376,8 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
     if (!eyes || window_id == 0) return -1;
     r2_eyes_close(eyes);
     uint32_t width = 0, height = 0;
-    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height, r2_eyes_probe_deadline()) != 0 ||
+    if (r2_eyes_probe_vlc_dimensions(window_id, &width, &height,
+                                    (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}) != 0 ||
         r2_eyes_allocate_native_buffer(eyes, width, height) != 0 ||
         r2_eyes_allocate_record_buffer(eyes) != 0)
         return -1;
@@ -1315,7 +1408,7 @@ int r2_eyes_open_window(R2Eyes *eyes, unsigned long window_id)
 }
 
 static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
-                                        uint64_t deadline)
+                                        R2EyesProbe probe)
 {
     if (!eyes || !window_id) return -1;
     r2_eyes_close(eyes);
@@ -1326,7 +1419,7 @@ static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
     if (r2_eyes_probe_vlc_dimensions(
             window_id,
             &width,
-            &height, deadline) != 0)
+            &height, probe) != 0)
     {
         return -1;
     }
@@ -1353,7 +1446,7 @@ static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
     char window[32];
     snprintf(window, sizeof(window), "%lu", window_id);
     char *title_argv[] = {"xdotool", "getwindowname", window, NULL};
-    char *window_title = r2_eyes_query(title_argv, deadline);
+    char *window_title = r2_eyes_query(title_argv, probe, 0);
     if (!window_title && (errno == ETIMEDOUT || errno == ENOMEM ||
                           errno == EOVERFLOW || errno == EPROTO))
         return -1;
@@ -1398,15 +1491,15 @@ static int r2_eyes_open_vlc_window_impl(R2Eyes *eyes, unsigned long window_id,
 
 int r2_eyes_open_vlc_window(R2Eyes *eyes, unsigned long window_id)
 {
-    return r2_eyes_open_vlc_window_impl(eyes, window_id, r2_eyes_probe_deadline());
+    return r2_eyes_open_vlc_window_impl(eyes, window_id, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()});
 }
 
 int r2_eyes_open_vlc(R2Eyes *eyes)
 {
     if (!eyes) return -1;
-    uint64_t deadline = r2_eyes_probe_deadline();
-    unsigned long window_id = r2_eyes_find_vlc_window(deadline);
-    if (!window_id) {
+    R2EyesProbe probe = {.deadline = r2_eyes_probe_deadline()};
+    unsigned long window_id;
+    if (r2_eyes_find_vlc_window(probe, &window_id) != 0 || !window_id) {
         r2_eyes_close(eyes);
         r2_log_sensory("vlc_window_not_found",
                        "R2 Eyes could not find a visible VLC window.",
@@ -1414,7 +1507,7 @@ int r2_eyes_open_vlc(R2Eyes *eyes)
                        "VLC");
         return -1;
     }
-    return r2_eyes_open_vlc_window_impl(eyes, window_id, deadline);
+    return r2_eyes_open_vlc_window_impl(eyes, window_id, probe);
 }
 
 /* ============================================================

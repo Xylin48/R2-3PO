@@ -1411,28 +1411,33 @@ typedef struct {
     int kind; /* 0=none, 2=VLC, 3=CRT, 4=other X11 */
     uint64_t token;
     unsigned long window;
+    long producer;
     uint64_t publication; /* CRT playback generation, including its XID */
 } ShellWatchMedia;
 
 static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
-                                   int audio_known, int desktop_playing, long playback_pid)
+                                   const R2AudioDiscovery *audio)
 {
     uint64_t publication = atomic_load(&tv_live_renderer);
     unsigned long published = (uint32_t)publication;
     unsigned long wanted_window = 0;
+    long producer = -1;
     int wanted_kind = 0;
-    if (eyes_permitted) {
+    int selection_known = audio != NULL;
+    if (eyes_permitted && !shell_watch_cancelled(NULL)) {
         if (published && r2_vision_window_available(published)) {
             wanted_window = published;
             wanted_kind = 3;
-        }
-        if (!wanted_window && !shell_watch_cancelled(NULL)) {
-            wanted_window = r2_vision_window_for_pid(playback_pid);
-            if (wanted_window) wanted_kind = 4;
-        }
-        if (!wanted_window && desktop_playing && !shell_watch_cancelled(NULL)) {
-            wanted_window = r2_vision_vlc_window();
-            if (wanted_window) wanted_kind = 2;
+        } else if (audio && audio->desktop_playing) {
+            if (managed->kind == 4) {
+                producer = managed->producer;
+                wanted_window = managed->window;
+            }
+            selection_known = r2_vision_select_playback_window(
+                audio->playback_producers, audio->playback_producer_count,
+                &producer, &wanted_window, shell_watch_cancelled, NULL) == 0;
+            if (!selection_known) wanted_window = 0;
+            if (wanted_window) wanted_kind = producer > 1 ? 4 : 2;
         }
     }
     if (shell_watch_cancelled(NULL) || publication != atomic_load(&tv_live_renderer))
@@ -1444,8 +1449,9 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
         (!r2_vision_media_watch_owns(managed->token) ||
          !r2_sense_auto_allowed(1) || r2_vision_media_status() <= 0 ||
          (managed->kind == 3 && managed->publication != publication) ||
-         ((audio_known || wanted_kind == 3) &&
-          (managed->kind != wanted_kind || managed->window != wanted_window)))) {
+         ((selection_known || wanted_kind == 3) &&
+          (managed->kind != wanted_kind || managed->window != wanted_window ||
+           (wanted_kind == 4 && managed->producer != producer))))) {
         (void)r2_vision_media_stop_if_watch_owned(managed->token);
         *managed = (ShellWatchMedia){0};
     }
@@ -1463,7 +1469,7 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
         return;
     }
     *managed = (ShellWatchMedia){
-        .kind = wanted_kind, .token = token, .window = wanted_window,
+        .kind = wanted_kind, .token = token, .window = wanted_window, .producer = producer,
         .publication = wanted_kind == 3 ? publication : 0
     };
     r2_log_event(R2_LOG_SENSORY, "watch_media_display_available",
@@ -1524,9 +1530,7 @@ static void *shell_watch_worker(void *unused)
             !r2_vision_watch_active() && r2_vision_available())
             attached_visual = r2_vision_watch_start_for_watch();
 
-        long playback_pid = audio_known && desktop_playing ? audio.playback_pid : -1;
-        shell_watch_media_poll(&managed_media, eyes_permitted, audio_known,
-                               desktop_playing, playback_pid);
+        shell_watch_media_poll(&managed_media, eyes_permitted, audio_known ? &audio : NULL);
         if (shell_watch_cancelled(NULL)) goto snapshot_finished;
 
         /* Both audio sources operate independently; the decision to close one
