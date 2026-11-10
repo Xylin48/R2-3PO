@@ -132,6 +132,8 @@ static char *media_latest_source;
 /* Chosen display attention never changes camera capture or playback. */
 static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
+static atomic_int eyes_source_changing = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t eyes_source_revision = ATOMIC_VAR_INIT(1);
 static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int desktop_auto_allowed = ATOMIC_VAR_INIT(1);
 
@@ -10451,12 +10453,23 @@ static int r2_vision_capture_cancelled(void *running)
     return shutting_down || (running && !atomic_load((atomic_int *)running));
 }
 
-/* Analyze the next real frame. Never starts a camera implicitly here. */
+static int r2_vision_direct_cancelled(void *userdata)
+{
+    return shutting_down || !atomic_load(&eyes_auto_allowed) ||
+        atomic_load(&eyes_source_changing) ||
+        atomic_load(&eyes_source_revision) != *(const uint_fast64_t *)userdata;
+}
+
+/* Deliberate visual analysis can request the normal Eyes startup path. */
 static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
     if (!r2_visual_is_initialized() || !atomic_load(&eyes_auto_allowed))
         return NULL;
 
+    if (open_camera && r2_eyes_status() <= 0 && r2_eyes_start_impl(NULL, 0) != 0)
+        return NULL;
+    uint_fast64_t revision = atomic_load(&eyes_source_revision);
+    if (r2_vision_direct_cancelled(&revision)) return NULL;
     R2VisionFrame frame = {0};
     char *source = NULL;
     unsigned char *frame_copy = NULL;
@@ -10475,21 +10488,12 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
     } else {
         /* Direct capture is only for an Eyes source without a running watcher. */
         pthread_mutex_lock(&visual_capture_lock);
-        if ((!eyes || !r2_eyes_is_open(eyes)) && open_camera) {
-            if (!eyes || r2_eyes_open_camera(eyes) != 0) {
-                pthread_mutex_unlock(&visual_capture_lock);
-                r2_log_sensory("vision_camera_start_failed",
-                               "R2 could not start a camera for visual analysis.",
-                               "The camera did not open successfully.", "r2_vision");
-                return NULL;
-            }
-        }
-        if (!eyes || !r2_eyes_is_open(eyes)) {
+        if (r2_vision_direct_cancelled(&revision) || !eyes || !r2_eyes_is_open(eyes)) {
             pthread_mutex_unlock(&visual_capture_lock);
             return NULL;
         }
 
-        int captured = r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL);
+        int captured = r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled, &revision);
         if (captured != 1) {
             pthread_mutex_unlock(&visual_capture_lock);
             r2_log_sensory("vision_frame_unavailable",
@@ -10519,7 +10523,8 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         pthread_mutex_unlock(&visual_capture_lock);
     }
 
-    char *description = r2_visual_analyze_frame(&frame, source, question);
+    char *description = r2_vision_direct_cancelled(&revision) ? NULL
+        : r2_visual_analyze_frame(&frame, source, question);
     free(source);
     free(frame_copy);
     return description;
@@ -11058,6 +11063,8 @@ static void *vision_watch_capture_worker(void *unused)
 }
 static char *r2_vision_current_frame_base64(void)
 {
+    uint_fast64_t revision = atomic_load(&eyes_source_revision);
+    if (r2_vision_direct_cancelled(&revision)) return NULL;
     R2VisionFrame frame = {0};
     char *source = NULL;
     unsigned char *frame_copy = NULL;
@@ -11066,8 +11073,8 @@ static char *r2_vision_current_frame_base64(void)
         (void)r2_vision_copy_watched_frame(&frame, &source, &frame_copy);
     } else {
         pthread_mutex_lock(&visual_capture_lock);
-        int captured = (eyes && r2_eyes_is_open(eyes))
-            ? r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL) : -1;
+        int captured = (!r2_vision_direct_cancelled(&revision) && eyes && r2_eyes_is_open(eyes))
+            ? r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled, &revision) : -1;
         if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
             frame.data && frame.size > 0 && (source = r2_eyes_copy_source(eyes))) {
             frame_copy = malloc(frame.size);
@@ -11088,7 +11095,11 @@ static char *r2_vision_current_frame_base64(void)
         return NULL;
     }
 
-    char *encoded = r2_visual_frame_base64(&frame);
+    char *encoded = r2_vision_direct_cancelled(&revision) ? NULL : r2_visual_frame_base64(&frame);
+    if (encoded && r2_vision_direct_cancelled(&revision)) {
+        free(encoded);
+        encoded = NULL;
+    }
     free(frame_copy);
     if (!encoded)
         r2_log_sensory("visual_input_encoding_failed",
@@ -11369,18 +11380,11 @@ int r2_vision_open_file(const char *path)
     return path && *path ? r2_vision_media_open(3, 0, path, NULL, NULL, NULL) : -1;
 }
 
+static int r2_eyes_stop_with_media(void);
+
 int r2_vision_close(void)
 {
-    pthread_mutex_lock(&eyes_source_owner_lock);
-    eyes_watch_token = 0;
-    pthread_mutex_unlock(&eyes_source_owner_lock);
-    r2_sense_set_auto_allowed(1, 0);
-    (void)r2_vision_media_set_attention(0);
-    (void)r2_vision_media_stop();
-    (void)r2_vision_watch_stop();
-    pthread_mutex_lock(&visual_capture_lock);
-    if (eyes) r2_eyes_close(eyes);
-    pthread_mutex_unlock(&visual_capture_lock);
+    (void)r2_eyes_stop_with_media();
     r2_log_sensory("vision_input_closed",
                    "R2 closed Eyes and media attention by choice.",
                    "Watch discovery will not reopen the eyes until that choice is reversed.",
@@ -11407,6 +11411,8 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
         }
     }
     eyes_watch_token = 0;
+    atomic_store(&eyes_source_changing, 1);
+    atomic_fetch_add(&eyes_source_revision, 1);
     if (replace) r2_sense_set_auto_allowed(1, 1);
     /* Reopening a source cannot reuse the previous worker's frame snapshot
      * or wait behind a stalled read while holding the source-owner mutex. */
@@ -11424,6 +11430,7 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
         eyes_watch_token = (uint64_t)atomic_fetch_add(&visual_watch_next_token, 1);
         *watch_token_out = eyes_watch_token;
     }
+    atomic_store(&eyes_source_changing, 0);
     pthread_mutex_unlock(&eyes_source_owner_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "eyes_started" : "eyes_start_failed",
                  rc == 0 ? "R2 Eyes camera and continuous raw-frame input are active."
@@ -11448,10 +11455,13 @@ uint64_t r2_eyes_start_for_watch(void)
 static int r2_eyes_release_source_locked(void)
 {
     if (!eyes) return -1;
+    atomic_store(&eyes_source_changing, 1);
+    atomic_fetch_add(&eyes_source_revision, 1);
     (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
+    atomic_store(&eyes_source_changing, 0);
     return 0;
 }
 
@@ -11478,12 +11488,21 @@ int r2_eyes_watch_owns(uint64_t token)
     return token && atomic_load(&eyes_watch_token) == token;
 }
 
-int r2_eyes_stop(void)
+static int r2_eyes_stop_with_media(void)
 {
+    pthread_mutex_lock(&eyes_source_owner_lock);
     r2_sense_set_auto_allowed(1, 0);
+    eyes_watch_token = 0;
+    int rc = r2_eyes_release_source_locked();
     (void)r2_vision_media_set_attention(0);
     (void)r2_vision_media_stop();
-    int rc = r2_eyes_release_source();
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    return rc;
+}
+
+int r2_eyes_stop(void)
+{
+    int rc = r2_eyes_stop_with_media();
     r2_log_event(R2_LOG_SENSORY, "eyes_stopped",
                  "R2 deliberately closed his eyes; Watch will respect the decision.",
                  NULL, "r2_eyes_stop");
@@ -11509,7 +11528,15 @@ int r2_sense_auto_allowed(int which)
 void r2_sense_set_auto_allowed(int which, int allowed)
 {
     switch (which) {
-        case 1: atomic_store(&eyes_auto_allowed, allowed != 0); break;
+        case 1:
+            atomic_store(&eyes_auto_allowed, allowed != 0);
+            if (!allowed) {
+                atomic_fetch_add(&eyes_source_revision, 1);
+                pthread_mutex_lock(&vision_watch_frame_lock);
+                pthread_cond_broadcast(&vision_watch_frame_cond);
+                pthread_mutex_unlock(&vision_watch_frame_lock);
+            }
+            break;
         case 2: atomic_store(&microphone_auto_allowed, allowed != 0); break;
         case 3: atomic_store(&desktop_auto_allowed, allowed != 0); break;
         default: break;

@@ -74,8 +74,11 @@ assert "r2_process_media_focus_request(trim(focus_request))" in diary
 assert "free(focus_request);" in diary
 
 assert core.count("[MEDIA_FOCUS]") >= 7
-assert "r2_vision_media_set_attention(0);" in core[core.index("int r2_vision_close(void)"):
-                                                     core.index("int r2_eyes_start(void)")]
-assert "r2_vision_media_set_attention(0);" in core[core.index("int r2_eyes_stop(void)"):
-                                                     core.index("int r2_eyes_status(void)")]
+close_eyes = core[core.index("int r2_vision_close(void)"):core.index("int r2_eyes_start(void)")]
+stop_eyes = core[core.index("int r2_eyes_stop(void)"):core.index("int r2_eyes_status(void)")]
+close_sources = core[core.index("static int r2_eyes_stop_with_media(void)\n{"):
+                     core.index("int r2_eyes_stop(void)")]
+assert "r2_eyes_stop_with_media();" in close_eyes
+assert "r2_eyes_stop_with_media();" in stop_eyes
+assert "r2_vision_media_set_attention(0);" in close_sources
 print("Autonomous media focus, primary camera priority, dual-image serialization and no forced interpretation passed.")

@@ -1034,3 +1034,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced the first-frame condition variable through capture, start, stop, shutdown, and its two model-facing readers. A waiter could wait indefinitely on a silent source or consume a replacement session's frame after a rapid restart.
 - Use a monotonic five-second first-frame budget, matching the live decoder read budget. Invalidate old waiters with a session identity before a frame slot is reused, and wake them when shutdown is requested. Waiting for raw pixels does not activate inference or change focus.
 - The regression exercises a replacement published before the old waiter wakes, shutdown notification, and the timeout return. This completes the scoped first-frame condition wait trace.
+
+### R2-AUD-2026-11-10-083 — Cancel direct camera reads before close and replacement
+
+- Traced `vision_analyze_current_frame`, `r2_vision_current_frame_base64`, `r2_eyes_start_impl`, both public close paths, and Eyes' partial-read and child-reaping branches. A direct read could hold the capture mutex indefinitely while a file decoder was silent. Deliberate close also revoked ownership before, instead of during, teardown.
+- Invalidate camera reads before acquiring their mutex, serialize deliberate close and reopen under the same owner lock, and use normal Eyes startup when an explicit look requests a camera that is closed and permitted. Preserve the return conventions of the two close commands and the independent audio permissions.
+- The native regression stalls an actual decoder pipe during a direct look and checks close latency, cancellation, child reaping, and the explicit closure gate on Watch discovery. This completes the scoped direct read and close trace.

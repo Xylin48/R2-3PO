@@ -48,6 +48,12 @@ static pid_t wait_for_child(const char *path)
     return -1;
 }
 
+static void *direct_look(void *unused)
+{
+    (void)unused;
+    return r2_vision_see("direct close");
+}
+
 static void assert_reaped(pid_t child)
 {
     int status;
@@ -217,6 +223,30 @@ int main(void)
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(r2_eyes_open_file(eyes, "probe-failed") == -1);
+
+    /* Closing Eyes also cancels a deliberate direct read with no Watch worker. */
+    assert(r2_eyes_open_file(eyes, "stalled") == 0);
+    child = wait_for_child(ready);
+    pthread_t look;
+    assert(pthread_create(&look, NULL, direct_look, NULL) == 0);
+    double lock_deadline = monotonic_seconds() + 2.0;
+    for (;;) {
+        int rc = pthread_mutex_trylock(&visual_capture_lock);
+        if (rc == EBUSY) break;
+        assert(rc == 0 && monotonic_seconds() < lock_deadline);
+        pthread_mutex_unlock(&visual_capture_lock);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    start = monotonic_seconds();
+    assert(r2_vision_close() == 0 && monotonic_seconds() - start < 2.0);
+    void *look_result = NULL;
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
+    assert_reaped(child);
+    assert(!r2_sense_auto_allowed(1) && !r2_eyes_status());
+    assert(r2_eyes_start_for_watch() == 0);
+    assert(unlink(ready) == 0);
+    r2_sense_set_auto_allowed(1, 1);
 
     /* Stop must wake a worker blocked before its first complete frame. */
     assert(r2_eyes_open_file(eyes, "stalled") == 0);
