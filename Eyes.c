@@ -962,11 +962,20 @@ int r2_eyes_select_playback_window(const long *producers, size_t count,
         if (*window) { *pid = preferred_pid; return 0; }
         break;
     }
+    int failed_search = 0;
     for (size_t i = 0; i < count; ++i) {
         if (producers[i] == preferred_pid) continue;
-        if (r2_eyes_find_pid_window(producers[i], probe, 0, window) != 0)
-            return -1;
+        if (r2_eyes_find_pid_window(producers[i], probe, 0, window) != 0) {
+            if (errno == ECANCELED || errno == ETIMEDOUT || errno == ENOMEM ||
+                errno == EOVERFLOW) return -1;
+            if (!failed_search) failed_search = errno;
+            continue;
+        }
         if (*window) { *pid = producers[i]; return 0; }
+    }
+    if (failed_search) {
+        errno = failed_search;
+        return -1; /* Incomplete producer evidence does not authorize a fallback. */
     }
     return r2_eyes_find_vlc_window(probe, window);
 }

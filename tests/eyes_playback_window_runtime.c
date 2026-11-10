@@ -105,7 +105,16 @@ int main(void)
     assert(r2_eyes_select_playback_window(&empty, 1, &pid, &window, NULL, NULL) == 0);
     assert(pid == -1 && window == 102);
     long failure[] = {9001, 3141};
-    assert(r2_eyes_select_playback_window(failure, 2, &pid, &window, NULL, NULL) == -1);
+    assert(r2_eyes_select_playback_window(failure, 1, &pid, &window, NULL, NULL) == -1);
+    assert(errno == EIO && !window);
+    assert(r2_eyes_select_playback_window(failure, 2, &pid, &window, NULL, NULL) == 0);
+    assert(pid == 3141 && window == 102);
+    /* A failed refresh of the preferred producer remains unknown, rather
+     * than choosing a different positive candidate and dropping focus. */
+    long preferred_failure[] = {9002, 9001};
+    pid = 9001;
+    window = 111;
+    assert(r2_eyes_select_playback_window(preferred_failure, 2, &pid, &window, NULL, NULL) == -1);
     assert(errno == EIO && !window);
 
     struct timespec before, after;
