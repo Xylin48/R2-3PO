@@ -182,6 +182,17 @@ static double seconds(void)
 
 int main(void)
 {
+    /* A stop between a completed handshake and worker publication must
+     * invalidate both primary routes before a worker or token can appear. */
+    for (int desktop = 0; desktop <= 1; ++desktop) {
+        R2EarsOpenRequest completed = r2_ears_open_request(desktop, 1, NULL, NULL);
+        r2_ears_cancel_pending_inputs(1);
+        uint64_t token = 0;
+        assert(r2_ears_publish_capture(&completed, &token) == -1 && errno == ECANCELED);
+        assert(!token && !ears_capture_thread_started && !ears_desktop_capture_thread_started);
+        assert(!atomic_load(&ears_capture_running) && !atomic_load(&ears_desktop_capture_running));
+    }
+
     /* Both an already-blocked connect and a stop before Ears resets its
      * reusable state must cancel the first open and skip the other outputs. */
     for (int before = 0; before <= 1; ++before) {

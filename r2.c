@@ -12848,6 +12848,36 @@ char *r2_ears_listen(unsigned seconds)
 
 /* Microphone retains the existing Ears bridge and its history, including
  * direct speech capture. It never takes over the separate desktop monitor. */
+/* The connection may have finished immediately before a stop changed
+ * its epoch. Publish a worker and its token under that same epoch lock. */
+static int r2_ears_publish_capture(R2EarsOpenRequest *request, uint64_t *token)
+{
+    int desktop = request->desktop;
+    atomic_int *running = desktop ? &ears_desktop_capture_running : &ears_capture_running;
+    pthread_t *thread = desktop ? &ears_desktop_capture_thread : &ears_capture_thread;
+    int *started = desktop ? &ears_desktop_capture_thread_started : &ears_capture_thread_started;
+    pthread_mutex_lock(&ears_open_pointer_lock);
+    int rc = ECANCELED;
+    if (!r2_ears_open_cancelled(request)) {
+        atomic_store(running, 1);
+        rc = pthread_create(thread, NULL, desktop ? r2_ears_desktop_capture_worker
+                                                  : r2_ears_capture_worker, NULL);
+        if (rc != 0) {
+            atomic_store(running, 0);
+        } else {
+            *started = 1;
+            if (token) {
+                *token = r2_ears_new_watch_token();
+                atomic_store(desktop ? &ears_desktop_watch_token
+                                     : &ears_microphone_watch_token, *token);
+            }
+        }
+    }
+    pthread_mutex_unlock(&ears_open_pointer_lock);
+    if (rc != 0) { errno = rc; return -1; }
+    return 0;
+}
+
 static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone_source,
                                 int (*cancelled)(void *), void *userdata)
 {
@@ -12875,18 +12905,11 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
         ears_recent_total_bytes = 0;
         ++ears_recent_generation;
         pthread_mutex_unlock(&ears_recent_lock);
-        atomic_store(&ears_capture_running, 1);
-        if (pthread_create(&ears_capture_thread, NULL,
-                           r2_ears_capture_worker, NULL) != 0) {
-            atomic_store(&ears_capture_running, 0);
+        rc = r2_ears_publish_capture(&request, watch_token_out);
+        if (rc != 0) {
+            int saved = errno;
             r2_ears_close(ears);
-            rc = -1;
-        } else {
-            ears_capture_thread_started = 1;
-            if (watch_token_out) {
-                ears_microphone_watch_token = r2_ears_new_watch_token();
-                *watch_token_out = ears_microphone_watch_token;
-            }
+            errno = saved;
         }
     }
     pthread_mutex_unlock(&ears_capture_lock);
@@ -12954,18 +12977,11 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
         ears_desktop_recent_total_bytes = 0;
         ++ears_desktop_recent_generation;
         pthread_mutex_unlock(&ears_desktop_recent_lock);
-        atomic_store(&ears_desktop_capture_running, 1);
-        if (pthread_create(&ears_desktop_capture_thread, NULL,
-                           r2_ears_desktop_capture_worker, NULL) != 0) {
-            atomic_store(&ears_desktop_capture_running, 0);
+        rc = r2_ears_publish_capture(&request, watch_token_out);
+        if (rc != 0) {
+            int saved = errno;
             r2_ears_close(ears_desktop);
-            rc = -1;
-        } else {
-            ears_desktop_capture_thread_started = 1;
-            if (watch_token_out) {
-                ears_desktop_watch_token = r2_ears_new_watch_token();
-                *watch_token_out = ears_desktop_watch_token;
-            }
+            errno = saved;
         }
     }
     pthread_mutex_unlock(&ears_desktop_capture_lock);
