@@ -1008,3 +1008,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Followed both primary Ears opens from transport connection through pending-pointer cleanup, history reset, thread creation and Watch token assignment. A stop after the connection check but before publication could otherwise leave a late worker with an obsolete request.
 - Recheck the request under the same lock used by cancellation epochs, and publish the worker and its token together under that lock. A rejected open closes the unclaimed transport. Existing microphone/desktop capture, history generations and ownership remain separate.
 - The native cancellation fixture verified a stale completed request cannot start either primary worker or assign a token, as well as the earlier blocked transport, direct listen and manual ownership cases. This completes the scoped publication trace.
+
+### R2-AUD-2026-11-09-080 — Exercise combined capture, deliberate focus and restart recall
+
+- Extended the source provenance fixture to run the production Eyes and media capture workers during a deliberate independent Ears listen. Used synthetic RGB pipes, PCM, frame encoding and ASR at the external boundaries. Capture worker lifecycle, source identities, attention choices, multimodal message construction and persistence are the production paths.
+- Verified camera-first input, media images only after deliberate selection, continued camera availability through renderer replacement and stop, and explicit selection of the replacement. The exact independent audio transcript and visual source events were verified in the writable stores before and after restart.
+- The combined fixture passed locally. Existing Visual archive and local model request checks remain in the full suite as separate coverage. This completes the scoped combined integration fixture and leaves the actual runtime deployment path outside this check.

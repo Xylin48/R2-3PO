@@ -4,6 +4,65 @@
 #undef main
 #include <assert.h>
 
+/* Synthetic frames have exact, distinct payload markers. The production
+ * Watch workers, focus checks and model-message assembly stay in the test. */
+char *__wrap_r2_visual_frame_base64(const R2VisionFrame *frame)
+{
+    assert(frame && frame->size == 16U * 16U * 3U);
+    for (size_t i = 1; i < frame->size; ++i) assert(frame->data[i] == frame->data[0]);
+    switch (frame->data[0]) {
+        case 17: return strdup("CAMERA");
+        case 29: return strdup("MEDIA_A");
+        case 41: return strdup("MEDIA_B");
+        default: assert(!"unexpected fixture pixels"); return NULL;
+    }
+}
+
+static void write_executable(const char *path, const char *contents)
+{
+    FILE *file = fopen(path, "wb");
+    assert(file && fputs(contents, file) >= 0 && fclose(file) == 0 && chmod(path, 0700) == 0);
+}
+
+static void verify_model_images(const char *media)
+{
+    char *camera = r2_vision_current_frame_base64();
+    assert(camera && !strcmp(camera, "CAMERA"));
+    char *display = NULL;
+    for (int i = 0; media && !display && i < 400; ++i) {
+        display = r2_vision_media_current_frame_base64();
+        if (!display) {
+            struct timespec pause = {0, 5000000L};
+            nanosleep(&pause, NULL);
+        }
+    }
+    if (media) assert(display && !strcmp(display, media));
+    else assert(!r2_vision_media_current_frame_base64());
+
+    struct json_object *messages = json_object_new_array(), *images = NULL;
+    assert(messages && ollama_json_append_message(messages, "user", "What is here?", 13,
+                                                  camera, display) == 0);
+    assert(json_object_object_get_ex(json_object_array_get_idx(messages, 0), "images", &images));
+    assert(json_object_array_length(images) == (media ? 2U : 1U));
+    assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 0)), "CAMERA"));
+    if (media)
+        assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 1)), media));
+    json_object_put(messages);
+    free(camera);
+    free(display);
+}
+
+static void verify_visual_sources(sqlite3 *connection)
+{
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(DISTINCT source) FROM r2_log_events WHERE event_type='vision_source_opened' "
+        "AND source IN ('fixture-camera','fixture-media-a','fixture-media-b')",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 3);
+    sqlite3_finalize(st);
+}
+
 static char names[2][1024];
 static int reroute_on_exit, read_fault;
 static const char *growing_file;
@@ -148,6 +207,33 @@ int main(void)
         verify_event(connection, speech_ids[mode], source, expected);
         free(transcript); free(source); free(wanted);
     }
+    /* Real separate capture workers consume deterministic RGB pipes while
+     * the exact independent audio route is being transcribed and stored. */
+    const char *prior_path = getenv("PATH");
+    char *fixture_path = NULL;
+    assert(asprintf(&fixture_path, "%s:%s", R2_ROOT, prior_path ? prior_path : "") > 0);
+    assert(setenv("PATH", fixture_path, 1) == 0);
+    free(fixture_path);
+    write_executable(R2_ROOT "/ffprobe", "#!/bin/sh\nprintf '16x16\\n'\n");
+    write_executable(R2_ROOT "/ffmpeg",
+        "#!/usr/bin/python3\n"
+        "import os, sys, time\n"
+        "source = sys.argv[sys.argv.index('-i') + 1]\n"
+        "value = {'fixture-camera': 17, 'fixture-media-a': 29, 'fixture-media-b': 41}[source]\n"
+        "while True:\n"
+        "    os.write(1, bytes([value]) * (16 * 16 * 3))\n"
+        "    time.sleep(.01)\n");
+    assert(r2_visual_init(R2_DIARY_DATABASE, R2_ROOT "/visual") == 0);
+    assert(r2_eyes_init(&eyes) == 0);
+    r2_eyes_set_auxiliary(eyes, 1);
+    core_initialized = 1;
+    assert(r2_eyes_open_file(eyes, "fixture-camera") == 0);
+    assert(r2_vision_watch_start() == 0);
+    assert(r2_vision_open_file("fixture-media-a") == 0);
+    verify_model_images(NULL);
+    assert(r2_vision_media_set_attention(1) == 0);
+    verify_model_images("MEDIA_A");
+
     /* A primary lifecycle update can stall independently. An already
      * published extra source must still reach ASR and persist its exact ID. */
     const char extra_name[] = "fixture.secondary|exact.monitor";
@@ -183,6 +269,22 @@ int main(void)
     r2_ears_extra_requested = NULL;
     pthread_mutex_destroy(&extra.history_lock);
     free(extra.recent);
+
+    assert(r2_vision_open_file("fixture-media-b") == 0);
+    assert(!r2_vision_media_attention_status());
+    verify_model_images(NULL);
+    assert(r2_vision_media_set_attention(1) == 0);
+    verify_model_images("MEDIA_B");
+    assert(r2_vision_media_stop() == 0);
+    verify_model_images(NULL);
+    assert(r2_vision_watch_stop() == 0);
+    r2_eyes_shutdown(eyes);
+    eyes = NULL;
+    r2_eyes_shutdown(media_eyes);
+    media_eyes = NULL;
+    r2_visual_shutdown();
+    core_initialized = 0;
+    verify_visual_sources(connection);
 
     /* Tool result must include captured identity, with no 8/16/32/64 KiB cut. */
     memset(names[1], 'z', 900); names[1][900] = '\0';
@@ -257,6 +359,7 @@ int main(void)
     verify_turn(connection, turn, expected, reply);
     for (int i = 0; i < 3; ++i) verify_event(connection, speech_ids[i], original_sources[i], expected);
     verify_event(connection, independent_id, extra_name, expected);
+    verify_visual_sources(connection);
     assert(sqlite3_prepare_v2(connection, "SELECT count(*) FROM r2_log_links WHERE from_event_id=? AND relationship='speech_was_transcribed_for_turn'", -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_bind_int64(st, 1, turn) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(sqlite3_column_int(st, 0) == 2);
