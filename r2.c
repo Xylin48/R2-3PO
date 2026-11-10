@@ -120,6 +120,7 @@ static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t media_source_revision = ATOMIC_VAR_INIT(1);
 /* Watch owns a particular media receiver generation, not "the media slot".
  * Protected by media_lifecycle_lock, which already serializes replacement. */
 static atomic_uint_fast64_t visual_watch_next_token = ATOMIC_VAR_INIT(1);
@@ -134,6 +135,12 @@ static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int eyes_source_changing = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t eyes_source_revision = ATOMIC_VAR_INIT(1);
+
+typedef struct {
+    const atomic_uint_fast64_t *revision;
+    uint_fast64_t expected;
+} R2VisionRequestSource;
+static _Thread_local const R2VisionRequestSource *vision_request_source;
 static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int desktop_auto_allowed = ATOMIC_VAR_INIT(1);
 
@@ -3018,9 +3025,16 @@ void r2_ollama_vision_request_end(void)
     pthread_mutex_unlock(&ollama_request_lock);
 }
 
+static int r2_vision_request_source_changed(void)
+{
+    return vision_request_source &&
+        (!atomic_load(&eyes_auto_allowed) ||
+         atomic_load(vision_request_source->revision) != vision_request_source->expected);
+}
+
 int r2_ollama_vision_request_should_abort(void)
 {
-    return shutting_down || atomic_load(&foreground_ollama_waiting) > 0 ||
+    return shutting_down || r2_vision_request_source_changed() || atomic_load(&foreground_ollama_waiting) > 0 ||
            (atomic_load(&foreground_conversation_waiting) > 0 &&
             !ollama_foreground_turn_mode) ||
            (vision_watch_worker_context && !atomic_load(&vision_watch_running));
@@ -10460,6 +10474,35 @@ static int r2_vision_direct_cancelled(void *userdata)
         atomic_load(&eyes_source_revision) != *(const uint_fast64_t *)userdata;
 }
 
+/* The request owns a copied frame. Carry its source generation through the
+ * encoder and model callbacks without holding capture or lifecycle locks. */
+static char *r2_vision_analyze_snapshot(const R2VisionFrame *frame,
+                                       const char *source, const char *question,
+                                       const R2VisionRequestSource *origin)
+{
+    const R2VisionRequestSource *saved = vision_request_source;
+    vision_request_source = origin;
+    char *result = r2_vision_request_source_changed() ? NULL
+        : r2_visual_analyze_frame(frame, source, question);
+    vision_request_source = saved;
+    return result;
+}
+
+static char *r2_vision_encode_snapshot(const R2VisionFrame *frame,
+                                      const R2VisionRequestSource *origin)
+{
+    const R2VisionRequestSource *saved = vision_request_source;
+    vision_request_source = origin;
+    char *encoded = r2_vision_request_source_changed() ? NULL
+        : r2_visual_frame_base64(frame);
+    if (encoded && r2_vision_request_source_changed()) {
+        free(encoded);
+        encoded = NULL;
+    }
+    vision_request_source = saved;
+    return encoded;
+}
+
 /* Deliberate visual analysis can request the normal Eyes startup path. */
 static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
@@ -10523,8 +10566,9 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         pthread_mutex_unlock(&visual_capture_lock);
     }
 
+    R2VisionRequestSource origin = {&eyes_source_revision, revision};
     char *description = r2_vision_direct_cancelled(&revision) ? NULL
-        : r2_visual_analyze_frame(&frame, source, question);
+        : r2_vision_analyze_snapshot(&frame, source, question, &origin);
     free(source);
     free(frame_copy);
     return description;
@@ -10554,9 +10598,10 @@ char *r2_vision_search(const char *query, int limit)
 
 /* Serialize the end of a media generation with attention and frame readers.
  * The worker can end on its own while a lifecycle caller is joining it. */
-static void r2_vision_media_end_capture(void)
+static void r2_vision_media_end_capture(int replaced)
 {
     pthread_mutex_lock(&media_frame_lock);
+    if (replaced) atomic_fetch_add(&media_source_revision, 1);
     atomic_store(&media_capture_running, 0);
     int had_attention = atomic_exchange(&media_attention_selected, 0);
     pthread_mutex_unlock(&media_frame_lock);
@@ -10639,14 +10684,14 @@ static void *r2_media_capture_worker(void *unused)
         }
         have_previous = 1;
     }
-    r2_vision_media_end_capture();
+    r2_vision_media_end_capture(0);
     return NULL;
 }
 
 /* Caller holds media_lifecycle_lock. Join before closing or replacing Eyes. */
 static int r2_vision_media_stop_locked(void)
 {
-    r2_vision_media_end_capture();
+    r2_vision_media_end_capture(1);
     if (media_capture_thread_started) {
         pthread_join(media_capture_thread, NULL);
         media_capture_thread_started = 0;
@@ -10745,7 +10790,7 @@ static int r2_vision_media_open(int kind, unsigned long window,
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
-        r2_vision_media_end_capture();
+        r2_vision_media_end_capture(1);
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
@@ -10819,6 +10864,7 @@ char *r2_vision_media_see(const char *question)
         !atomic_load(&eyes_auto_allowed)) return NULL;
     pthread_mutex_lock(&media_frame_lock);
     R2VisionFrame frame = media_latest_frame;
+    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
     char *source = NULL;
     if (atomic_load(&media_capture_running) && frame.data && frame.size &&
         media_latest_source)
@@ -10829,7 +10875,7 @@ char *r2_vision_media_see(const char *question)
         frame.data = copy;
     }
     pthread_mutex_unlock(&media_frame_lock);
-    char *description = copy ? r2_visual_analyze_frame(&frame, source, question) : NULL;
+    char *description = copy ? r2_vision_analyze_snapshot(&frame, source, question, &origin) : NULL;
     free(source);
     free(copy);
     return description;
@@ -10882,6 +10928,7 @@ static char *r2_vision_media_current_frame_base64(void)
         return NULL;
     }
     R2VisionFrame frame = media_latest_frame;
+    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
     unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
     if (copy) {
         memcpy(copy, frame.data, frame.size);
@@ -10889,7 +10936,11 @@ static char *r2_vision_media_current_frame_base64(void)
     }
     pthread_mutex_unlock(&media_frame_lock);
     if (!copy) return NULL;
-    char *encoded = r2_visual_frame_base64(&frame);
+    char *encoded = r2_vision_encode_snapshot(&frame, &origin);
+    if (encoded && !r2_vision_media_attention_status()) {
+        free(encoded);
+        encoded = NULL;
+    }
     free(copy);
     return encoded;
 }
@@ -11095,11 +11146,9 @@ static char *r2_vision_current_frame_base64(void)
         return NULL;
     }
 
-    char *encoded = r2_vision_direct_cancelled(&revision) ? NULL : r2_visual_frame_base64(&frame);
-    if (encoded && r2_vision_direct_cancelled(&revision)) {
-        free(encoded);
-        encoded = NULL;
-    }
+    R2VisionRequestSource origin = {&eyes_source_revision, revision};
+    char *encoded = r2_vision_direct_cancelled(&revision) ? NULL
+        : r2_vision_encode_snapshot(&frame, &origin);
     free(frame_copy);
     if (!encoded)
         r2_log_sensory("visual_input_encoding_failed",
@@ -11532,6 +11581,9 @@ void r2_sense_set_auto_allowed(int which, int allowed)
             atomic_store(&eyes_auto_allowed, allowed != 0);
             if (!allowed) {
                 atomic_fetch_add(&eyes_source_revision, 1);
+                pthread_mutex_lock(&media_frame_lock);
+                atomic_fetch_add(&media_source_revision, 1);
+                pthread_mutex_unlock(&media_frame_lock);
                 pthread_mutex_lock(&vision_watch_frame_lock);
                 pthread_cond_broadcast(&vision_watch_frame_cond);
                 pthread_mutex_unlock(&vision_watch_frame_lock);

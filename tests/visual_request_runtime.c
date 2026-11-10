@@ -9,7 +9,7 @@
 static const pid_t encoder_pid = 727272;
 static char ppm_path[PATH_MAX], jpeg_path[PATH_MAX];
 static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, reaped_encoder;
-static int cancel_request, timeout_clock, clock_calls, read_mode, read_fd = -1;
+static int cancel_request, cancel_on_archive_write, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
 static uint64_t fixture_preview_session = 1;
@@ -45,6 +45,10 @@ ssize_t __real_write(int, const void *, size_t);
 ssize_t __wrap_write(int fd, const void *p, size_t n)
 {
     if (fail_write && fd == ppm_fd) { errno = EIO; return -1; }
+    if (cancel_on_archive_write && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
+        cancel_on_archive_write = 0;
+        cancel_request = 1;
+    }
     if (overlapping_frame && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         const R2VisionFrame *newer = overlapping_frame;
         overlapping_frame = NULL;
@@ -332,6 +336,21 @@ int main(void)
     assert(skipped_length > 0 && (size_t)skipped_length < sizeof(skipped_path));
     assert(access(skipped_path, F_OK) == -1 && errno == ENOENT);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER skip_visual_insert", NULL, NULL, NULL) == SQLITE_OK);
+
+    response("{\"description\":\"cancelled before publication\",\"focus\":null}", "stop");
+    cancel_on_archive_write = 1;
+    rejected_frame(&frame);
+    assert(cancel_request && !cancel_on_archive_write);
+    cancel_request = 0;
+    char cancelled_path[PATH_MAX];
+    int cancelled_length = snprintf(cancelled_path, sizeof(cancelled_path),
+        "%s/visual_%llu_%llu.jpg", library, (unsigned long long)frame.timestamp,
+        (unsigned long long)frame.frame_number);
+    assert(cancelled_length > 0 && (size_t)cancelled_length < sizeof(cancelled_path));
+    assert(access(cancelled_path, F_OK) == -1 && errno == ENOENT);
+    char *cancelled_history = r2_log_search("cancelled before publication", 10);
+    assert(!cancelled_history || !strstr(cancelled_history, "cancelled before publication"));
+    free(cancelled_history);
 
     uint64_t focus_sequence = visual_focus_sequence;
     switch_preview_during_request = 1;

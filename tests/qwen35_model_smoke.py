@@ -123,7 +123,7 @@ require(
     "vision can yield to foreground conversation or shutdown",
 )
 require(
-    "r2_visual_frame_base64(&frame)" in core
+    "r2_vision_encode_snapshot(&frame, &origin)" in core
     and '"images"' in core
     and "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request." in core
     and "if (visual_requested && !r2_vision_watch_active())" not in core

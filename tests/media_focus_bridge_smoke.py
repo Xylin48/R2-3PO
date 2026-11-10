@@ -22,7 +22,7 @@ assert "r2_log_sensory(\"media_attention_released\"" in focus
 assert "r2_vision_media_status() ? 1 : 0;" in focus
 media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
                   core.index("int r2_vision_media_stop(void)")]
-assert "r2_vision_media_end_capture();" in media_stop
+assert "r2_vision_media_end_capture(1);" in media_stop
 assert "media_attention_source_lost" in core
 assert "r2_eyes_close(media_eyes)" in media_stop
 assert "r2_eyes_close(eyes)" not in media_stop
@@ -47,7 +47,7 @@ media = core[core.index("static char *r2_vision_media_current_frame_base64(void)
              core.index("/* Capture and inference are separate workers.")]
 assert "pthread_mutex_lock(&media_frame_lock)" in media
 assert "memcpy(copy, frame.data, frame.size)" in media
-assert "r2_visual_frame_base64(&frame)" in media
+assert "r2_vision_encode_snapshot(&frame, &origin)" in media
 assert "r2_visual_analyze_frame(" not in media
 assert "!r2_vision_media_attention_status()" in media
 

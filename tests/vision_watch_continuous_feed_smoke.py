@@ -64,7 +64,7 @@ assert "pthread_cond_clockwait(&vision_watch_frame_cond" in snapshot
 assert "session == vision_watch_session" in snapshot
 assert "!vision_watch_capture_done && vision_watch_frame_generation > 0" in snapshot
 assert "memcpy(copy, vision_watch_latest_frame_data," in snapshot
-assert "r2_visual_frame_base64(&frame)" in helper
+assert "r2_vision_encode_snapshot(&frame, &origin)" in helper
 assert "r2_visual_analyze_frame(" not in helper
 assert "r2_eyes_open_camera" not in helper
 

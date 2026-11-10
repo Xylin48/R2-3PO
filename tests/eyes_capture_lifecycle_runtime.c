@@ -7,13 +7,22 @@
 int __wrap_r2_visual_is_initialized(void) { return 1; }
 
 static const char *expected_source;
+static atomic_int analysis_waiting = ATOMIC_VAR_INIT(0);
+static atomic_int analysis_may_finish = ATOMIC_VAR_INIT(0);
 
 char *__wrap_r2_visual_analyze_frame(const R2VisionFrame *frame, const char *source,
                                     const char *question)
 {
-    (void)question;
     assert(expected_source && source && strcmp(source, expected_source) == 0);
     assert(frame->size == 12 && frame->data[11] == 11);
+    if (question && strcmp(question, "source lifetime during analysis") == 0) {
+        atomic_store(&analysis_waiting, 1);
+        while (!atomic_load(&analysis_may_finish)) {
+            struct timespec pause = {0, 1000000L};
+            nanosleep(&pause, NULL);
+        }
+        if (r2_ollama_vision_request_should_abort()) return NULL;
+    }
     return strdup("visual fixture result");
 }
 
@@ -52,6 +61,22 @@ static void *direct_look(void *unused)
 {
     (void)unused;
     return r2_vision_see("direct close");
+}
+
+static void *analyze_in_flight(void *use_media)
+{
+    const char *question = "source lifetime during analysis";
+    return use_media ? r2_vision_media_see(question) : r2_vision_see(question);
+}
+
+static void wait_for_analysis(void)
+{
+    double deadline = monotonic_seconds() + 2.0;
+    while (!atomic_load(&analysis_waiting)) {
+        assert(monotonic_seconds() < deadline);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
 }
 
 static void assert_reaped(pid_t child)
@@ -392,6 +417,16 @@ int main(void)
     free(saved_source);
 
     assert(r2_eyes_open_file(eyes, camera_source) == 0);
+    child = wait_for_child(ready);
+    assert(pthread_create(&look, NULL, analyze_in_flight, NULL) == 0);
+    wait_for_analysis();
+    assert(r2_eyes_release_source() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    assert(r2_eyes_open_file(eyes, camera_source) == 0);
     assert(r2_vision_watch_start() == 0);
     child = wait_for_child(ready);
     observation = r2_vision_see("watched source");
@@ -424,7 +459,22 @@ int main(void)
     }
     assert(observation);
     free(observation);
+    int media_flag = 1;
+    atomic_store(&analysis_waiting, 0);
+    atomic_store(&analysis_may_finish, 0);
+    assert(pthread_create(&look, NULL, analyze_in_flight, &media_flag) == 0);
+    wait_for_analysis();
+    assert(r2_eyes_release_source() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && look_result);
+    free(look_result);
+    atomic_store(&analysis_waiting, 0);
+    atomic_store(&analysis_may_finish, 0);
+    assert(pthread_create(&look, NULL, analyze_in_flight, &media_flag) == 0);
+    wait_for_analysis();
     assert(r2_vision_media_stop() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(unsetenv("DISPLAY") == 0);

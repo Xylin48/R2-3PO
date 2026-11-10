@@ -989,7 +989,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                               const char *source,
                               const char *question)
 {
-    if (!frame || !frame->data) return NULL;
+    if (!frame || !frame->data || r2_ollama_vision_request_should_abort()) return NULL;
 
     char model_snapshot[sizeof(visual_model)];
     char directory_snapshot[sizeof(visual_directory)];
@@ -1015,9 +1015,11 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     }
     char *base64 = base64_encode(jpeg, jpeg_length);
     if (!base64) { free(jpeg); return NULL; }
-    char *model_text = call_vision_model(base64, question, model_snapshot);
+    char *model_text = r2_ollama_vision_request_should_abort() ? NULL
+        : call_vision_model(base64, question, model_snapshot);
     free(base64);
-    if (!model_text) {
+    if (!model_text || r2_ollama_vision_request_should_abort()) {
+        free(model_text);
         free(jpeg);
         return NULL;
     }
@@ -1103,6 +1105,15 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     char created[40] = "unknown";
     if (gmtime_r(&now, &utc))
         strftime(created, sizeof(created), "%Y-%m-%dT%H:%M:%SZ", &utc);
+
+    /* This is the publication boundary for an already captured frame. A
+     * cancelled result owns only its temporary archive, never prior history. */
+    if (r2_ollama_vision_request_should_abort()) {
+        unlink(image_path);
+        json_object_put(focus);
+        free(description);
+        return NULL;
+    }
 
     int64_t event_id = r2_log_sensory(
         "visual_experience",
