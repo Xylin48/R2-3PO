@@ -92,4 +92,39 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     with sqlite3.connect(rewards) as db:
         assert db.execute("SELECT log_event_id FROM reward_events WHERE id=2").fetchone()[0] == 999
 
+    archive = root / "Visual_Library"
+    archive.mkdir()
+    owned = "visual_10_20_0123456789abcdef.jpg"
+    candidate = "visual_10_20_abcdef0123456789.jpg"
+    legacy = "visual_11_22.jpg"
+    relative = "visual_12_22_0123456789abcdef.jpg"
+    for name in (owned, candidate, legacy, relative, "family-photo.jpg"):
+        (archive / name).write_bytes(b"fixture")
+    (archive / "visual_13_22_0123456789abcdef.jpg").symlink_to(archive / owned)
+    visual_db = root / "detached.db"
+    with sqlite3.connect(visual_db) as db:
+        db.executescript("""
+            CREATE TABLE r2_visual_experiences(
+                id INTEGER PRIMARY KEY, image_path TEXT, file_path TEXT,
+                life_log_event_id INTEGER, life_log_archive_key TEXT
+            );
+        """)
+        missing = str(archive / "missing.jpg")
+        db.executemany("INSERT INTO r2_visual_experiences VALUES(?,?,?,?,?)", [
+            (1, "", str(archive / owned), 17, None),
+            (2, missing, None, None, "pending-key"),
+            (3, f"archive/{relative}", None, None, None),
+        ])
+    visual = audit.audit_visual_archive(visual_db, archive)
+    assert visual["error"] is None
+    assert visual["unindexed_candidates"] == [candidate]
+    assert visual["legacy_unindexed_candidates"] == [legacy]
+    assert visual["missing_indexed_files"] == [{"id": 2, "path": missing}]
+    assert visual["pending_life_log_ids"] == [2]
+    assert visual["legacy_unlinked_ids"] == [3]
+    assert visual["unresolved_relative_paths"] == [{"id": 3, "path": f"archive/{relative}"}]
+    assert (archive / candidate).read_bytes() == b"fixture"
+    with sqlite3.connect(visual_db) as db:
+        assert db.execute("SELECT life_log_event_id FROM r2_visual_experiences WHERE id=2").fetchone() == (None,)
+
 print("Read-only database audit detects SQLite FK violations and broken cross-organ references.")
