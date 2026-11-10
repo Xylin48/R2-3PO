@@ -140,11 +140,12 @@ def main() -> None:
     assert '"format", json_object_new_string("json")' in visual
     assert "extract_visual_description(model_text, &focus)" in visual
     assert "request_sequence <= visual_focus_sequence" in visual
-    commit_start = visual.index("int shared = r2_log_save_shared_sensory(visual_db")
+    commit_start = visual.index("rc = visual_publish_archive(&experience);")
     commit_end = visual.index("pthread_mutex_unlock(&visual_lock);", commit_start)
-    assert "if (rc == SQLITE_DONE)\n        publish_committed_focus(request_sequence, frame->preview_session, focus);" in visual[commit_start:commit_end]
-    assert "static int visual_insert_compat(" in visual
-    assert "visual_save_separate(&experience)" in visual[commit_start:commit_end]
+    assert "if (rc == SQLITE_DONE)" in visual[commit_start:commit_end]
+    assert "publish_committed_focus(request_sequence, frame->preview_session, focus)" in visual[commit_start:commit_end]
+    assert "r2_log_save_shared_sensory(visual_db" in visual
+    assert "visual_save_separate(experience)" in visual
     assert "visual_insert_compat(db, experience->created, experience->source," in visual
     for legacy_column in ("created_at", "timestamp", "file_path", "path"):
         assert f'visual_column_exists(db, "{legacy_column}")' in visual

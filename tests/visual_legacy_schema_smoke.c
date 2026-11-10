@@ -32,6 +32,15 @@ int64_t r2_log_save_visual_once(const char *key, const char *description, const 
     return -1;
 }
 
+int r2_log_save_shared_sensory(sqlite3 *peer, const char *type, const char *summary,
+                              const char *details, const char *source,
+                              int (*save)(sqlite3 *, int64_t, void *), void *context)
+{
+    (void)peer; (void)type; (void)summary; (void)details; (void)source;
+    (void)save; (void)context;
+    return 1;
+}
+
 static int visit_legacy_visual(void *context, int64_t id, const char *row, size_t length)
 {
     int *count = context;

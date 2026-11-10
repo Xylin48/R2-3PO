@@ -251,6 +251,7 @@ static void rejected_frame(R2VisionFrame *frame)
     char *result = r2_visual_analyze_frame(frame, "camera fixture", "observe real frame");
     assert(!result && scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before);
     assert(!gate_active && archive_count() == images);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
     temporary_files_gone();
 }
 int main(void)
@@ -403,6 +404,13 @@ int main(void)
                              "JOIN r2_log_events e ON e.id=j.event_id "
                              "WHERE e.event_type='visual_experience'") == journal_before);
 
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_pending_archive "
+        "AFTER INSERT ON r2_visual_pending_archives BEGIN SELECT RAISE(FAIL, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"pending interpretation rejected\",\"focus\":null}", "stop");
+    rejected_frame(&frame);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_pending_archive", NULL, NULL, NULL) == SQLITE_OK);
+
     response("{\"description\":\"archive sync failure fixture\",\"focus\":null}", "stop");
     fail_file_sync = 1;
     rejected_frame(&frame);
@@ -550,11 +558,107 @@ int main(void)
     int status = 0;
     assert(__real_waitpid(interrupted, &status, 0) == interrupted);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 73);
+    sqlite3 *interrupted_db = NULL;
+    sqlite3_stmt *pending = NULL;
+    assert(sqlite3_open(database, &interrupted_db) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(interrupted_db,
+        "SELECT image_path,source,prompt,description,length(jpeg) FROM r2_visual_pending_archives",
+        -1, &pending, NULL) == SQLITE_OK);
+    assert(sqlite3_step(pending) == SQLITE_ROW);
+    char *recovered_path = strdup((const char *)sqlite3_column_text(pending, 0));
+    assert(recovered_path);
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 1), "interrupted camera"));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 2), "crash boundary"));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 3), "archive interrupted before publication"));
+    assert(sqlite3_column_int(pending, 4) == 20);
+    assert(sqlite3_step(pending) == SQLITE_DONE);
+    sqlite3_finalize(pending);
+    assert(sqlite3_close(interrupted_db) == SQLITE_OK);
+
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    int claim = open(recovered_path, O_RDWR | O_CLOEXEC);
+    assert(claim >= 0 && flock(claim, LOCK_EX | LOCK_NB) == 0);
     assert(r2_visual_init(database, library) == 0);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 7);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='interrupted camera'") == 0);
-    assert(archive_count() == 8);
+    r2_visual_shutdown();
+
+    assert(pwrite(claim, "X", 1, 0) == 1);
+    assert(close(claim) == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 7);
+    r2_visual_shutdown();
+
+    claim = open(recovered_path, O_WRONLY | O_CLOEXEC);
+    assert(claim >= 0 && ftruncate(claim, 19) == 0 && close(claim) == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='interrupted camera'") == 0);
+    r2_visual_shutdown();
+
+    claim = open(recovered_path, O_WRONLY | O_CLOEXEC);
+    assert(claim >= 0 && pwrite(claim, "SYNTHETIC-JPEG-BYTES", 20, 0) == 20 && close(claim) == 0);
+    char older_orphan[PATH_MAX];
+    int orphan_length = snprintf(older_orphan, sizeof(older_orphan), "%s/visual_10_11.jpg", library);
+    assert(orphan_length > 0 && (size_t)orphan_length < sizeof(older_orphan));
+    int orphan = open(older_orphan, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(orphan >= 0 && close(orphan) == 0);
+    for (int i = 0; i < 2; ++i) {
+        assert(r2_visual_init(database, library) == 0);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 8);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v "
+            "JOIN r2_log_events e ON v.life_log_event_id=e.id "
+            "JOIN r2_sensory_journal j ON j.event_id=e.id "
+            "WHERE v.source='interrupted camera' AND e.source=v.source "
+            "AND v.description='archive interrupted before publication' "
+            "AND e.details=v.description AND v.prompt='crash boundary'") == 1);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='interrupted camera'") == 1);
+        assert(archive_count() == 9 && access(older_orphan, F_OK) == 0);
+        r2_visual_shutdown();
+    }
+    assert(r2_visual_init(database, library) == 0);
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_pending_withdrawal "
+        "BEFORE DELETE ON r2_visual_pending_archives BEGIN SELECT RAISE(IGNORE); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"archive retained after interrupted publication\",\"focus\":null}", "stop");
+    assert(!r2_visual_analyze_frame(&frame, "retained camera", "deferred publication"));
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience' AND source='retained camera'") == 0);
+    assert(archive_count() == 10);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_pending_withdrawal", NULL, NULL, NULL) == SQLITE_OK);
+    r2_visual_shutdown();
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences WHERE source='retained camera'") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience' AND source='retained camera'") == 1);
+    assert(archive_count() == 10);
+    r2_visual_shutdown();
+    free(recovered_path);
+    r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+
+    interrupted = __real_fork();
+    assert(interrupted >= 0);
+    if (interrupted == 0) {
+        assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+        assert(r2_visual_init(next_db, next_library) == 0);
+        response("{\"description\":\"detached archive interrupted\",\"focus\":null}", "stop");
+        stop_after_archive_sync = 1;
+        (void)r2_visual_analyze_frame(&frame, "detached interrupted camera", "detached crash boundary");
+        _exit(74);
+    }
+    assert(__real_waitpid(interrupted, &status, 0) == interrupted);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 73);
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(next_db, next_library) == 0);
+    assert(archive_count() == 4 && scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    sqlite3_int64 replay_id = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences "
+        "WHERE source='detached interrupted camera' AND prompt='detached crash boundary'");
+    assert(replay_id > 0 && sqlite3_open(database, &event_db) == SQLITE_OK);
+    assert(scalar(event_db, "SELECT e.id FROM r2_log_events e JOIN r2_sensory_journal j ON j.event_id=e.id "
+        "WHERE e.source='detached interrupted camera' AND e.details='detached archive interrupted'") == replay_id);
+    assert(sqlite3_close(event_db) == SQLITE_OK);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
