@@ -75,6 +75,15 @@ int64_t r2_log_event(
     const char *source
 );
 
+struct sqlite3;
+/* Commit a sensory event with a companion row in the same database.
+ * The callback uses the supplied connection, returns SQLITE_DONE on success,
+ * and must not reenter Life Log. Returns 0 on commit, 1 for an unavailable
+ * or separate log database, and -1 if the transaction failed. */
+int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
+                                const char *summary, const char *details, const char *source,
+                                int (*save)(struct sqlite3 *, int64_t, void *), void *context);
+
 /* Idempotency check for replayable event outboxes such as verified virtual
  * game events. The source identifier must be stable across retries. */
 int r2_log_event_exists(const char *event_type, const char *source);

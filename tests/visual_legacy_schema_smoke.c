@@ -81,7 +81,7 @@ int main(void)
     assert(strcmp((const char *)sqlite3_column_text(st, 1), "/legacy/old.jpg") == 0);
     sqlite3_finalize(st);
 
-    assert(visual_insert_compat("2026-10-16T07:00:00Z", "Eyes",
+    assert(visual_insert_compat(visual_db, "2026-10-16T07:00:00Z", "Eyes",
         "/new/frame.jpg", "qwen3.5:9b", NULL, "new frame",
         640, 480, 7, 123456, 0) == SQLITE_DONE);
 

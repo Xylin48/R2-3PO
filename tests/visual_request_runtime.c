@@ -239,7 +239,7 @@ int main(void)
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
-    snprintf(database, sizeof(database), "%s/visual.db", R2_HOME); snprintf(library, sizeof(library), "%s/library", R2_HOME);
+    snprintf(database, sizeof(database), "%s", R2_DIARY_DATABASE); snprintf(library, sizeof(library), "%s/library", R2_HOME);
     snprintf(next_db, sizeof(next_db), "%s/next.db", R2_HOME); snprintf(next_library, sizeof(next_library), "%s/next-library", R2_HOME);
     assert(r2_visual_init(database, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
@@ -352,19 +352,37 @@ int main(void)
     frame.frame_number = newer_frame.frame_number;
     response("failed request", "length");
     rejected_frame(&frame);
-    assert(sqlite3_exec(visual_db, "CREATE TEMP TRIGGER deny_overlay_insert BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_int64 events_before = scalar(visual_db,
+        "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience'");
+    sqlite3_int64 journal_before = scalar(visual_db,
+        "SELECT count(*) FROM r2_sensory_journal j JOIN r2_log_events e ON e.id=j.event_id "
+        "WHERE e.event_type='visual_experience'");
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_overlay_insert BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END", NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"rejected insert\",\"focus\":null}", "stop");
     rejected_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_overlay_insert", NULL, NULL, NULL) == SQLITE_OK);
 
     uint64_t prior_focus = visual_focus_sequence;
-    assert(sqlite3_exec(visual_db, "CREATE TEMP TRIGGER skip_visual_insert "
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER skip_visual_insert "
         "BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(IGNORE); END",
         NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"skipped insert\",\"focus\":null}", "stop");
     rejected_frame(&frame);
     assert(visual_focus_sequence == prior_focus);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER skip_visual_insert", NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_visual_event "
+        "BEFORE INSERT ON r2_log_events WHEN NEW.event_type='visual_experience' "
+        "BEGIN SELECT RAISE(FAIL, 'fixture Life Log failure'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"Life Log refused this observation\",\"focus\":null}", "stop");
+    rejected_frame(&frame);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_visual_event", NULL, NULL, NULL) == SQLITE_OK);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience'")
+           == events_before);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_sensory_journal j "
+                             "JOIN r2_log_events e ON e.id=j.event_id "
+                             "WHERE e.event_type='visual_experience'") == journal_before);
 
     response("{\"description\":\"cancelled before publication\",\"focus\":null}", "stop");
     cancel_on_archive_write = 1;
@@ -420,6 +438,23 @@ int main(void)
 
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER fail_after_detached_insert "
+        "AFTER INSERT ON r2_visual_experiences BEGIN SELECT RAISE(FAIL, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"rejected detached row\",\"focus\":null}", "stop");
+    rejected_frame(&frame);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER fail_after_detached_insert", NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"saved in a separate Visual library\",\"focus\":null}", "stop");
+    actual = r2_visual_analyze_frame(&frame, "detached camera source", "separate database");
+    assert(actual && !strcmp(actual, "saved in a separate Visual library"));
+    free(actual);
+    sqlite3_int64 detached_event = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences");
+    assert(detached_event > 0 && archive_count() == 1);
+    sqlite3 *event_db = NULL;
+    assert(sqlite3_open(database, &event_db) == SQLITE_OK);
+    assert(scalar(event_db, "SELECT id FROM r2_log_events WHERE event_type='visual_experience' "
+                            "AND source='detached camera source'") == detached_event);
+    assert(sqlite3_close(event_db) == SQLITE_OK);
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
     assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==7);
     assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);

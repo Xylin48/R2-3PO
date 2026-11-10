@@ -700,11 +700,11 @@ request_cleanup:
     return answer;
 }
 
-static int visual_column_exists(const char *column)
+static int visual_column_exists(sqlite3 *db, const char *column)
 {
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(visual_db, "PRAGMA table_info(r2_visual_experiences)",
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(r2_visual_experiences)",
                            -1, &st, NULL) == SQLITE_OK) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
@@ -720,7 +720,7 @@ static int visual_column_exists(const char *column)
 
 static int visual_ensure_column(const char *column, const char *definition)
 {
-    if (visual_column_exists(column)) return SQLITE_OK;
+    if (visual_column_exists(visual_db, column)) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
                      "ALTER TABLE r2_visual_experiences ADD COLUMN %s %s;",
@@ -731,7 +731,7 @@ static int visual_ensure_column(const char *column, const char *definition)
 
 static int visual_backfill(const char *target, const char *source)
 {
-    if (!visual_column_exists(source)) return SQLITE_OK;
+    if (!visual_column_exists(visual_db, source)) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
         "UPDATE r2_visual_experiences SET %s=%s WHERE (%s IS NULL OR %s='') "
@@ -783,7 +783,7 @@ static int visual_migrate_schema(void)
 /* Old visual-library schemas may retain required created_at/timestamp and
    file_path/path columns after the canonical columns are added. Populate
    those aliases on every insert so an upgrade remains writable for old DBs. */
-static int visual_insert_compat(const char *created, const char *source,
+static int visual_insert_compat(sqlite3 *db, const char *created, const char *source,
                                 const char *image_path, const char *model,
                                 const char *prompt, const char *description,
                                 int width, int height, sqlite3_int64 frame_number,
@@ -821,10 +821,10 @@ static int visual_insert_compat(const char *created, const char *source,
     if (event_id > 0) ADD_INTEGER("life_log_event_id", event_id);
     else ADD_NULL("life_log_event_id");
 
-    if (visual_column_exists("created_at")) ADD_TEXT("created_at", created);
-    if (visual_column_exists("timestamp")) ADD_TEXT("timestamp", created);
-    if (visual_column_exists("file_path")) ADD_TEXT("file_path", image_path);
-    if (visual_column_exists("path")) ADD_TEXT("path", image_path);
+    if (visual_column_exists(db, "created_at")) ADD_TEXT("created_at", created);
+    if (visual_column_exists(db, "timestamp")) ADD_TEXT("timestamp", created);
+    if (visual_column_exists(db, "file_path")) ADD_TEXT("file_path", image_path);
+    if (visual_column_exists(db, "path")) ADD_TEXT("path", image_path);
 #undef ADD_TEXT
 #undef ADD_INTEGER
 #undef ADD_NULL
@@ -853,7 +853,7 @@ static int visual_insert_compat(const char *created, const char *source,
     if (n < 0 || (size_t)n >= sizeof(sql) - used) return SQLITE_TOOBIG;
 
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(visual_db, sql, -1, &st, NULL);
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     if (rc != SQLITE_OK) return rc;
     for (size_t i = 0; i < count && rc == SQLITE_OK; ++i) {
         if (values[i].type == VISUAL_TEXT)
@@ -865,10 +865,72 @@ static int visual_insert_compat(const char *created, const char *source,
             rc = sqlite3_bind_null(st, (int)i + 1);
     }
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    if (rc == SQLITE_DONE && sqlite3_changes(visual_db) != 1)
+    if (rc == SQLITE_DONE && sqlite3_changes(db) != 1)
         rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
     return rc;
+}
+
+typedef struct {
+    const R2VisionFrame *frame;
+    const char *created;
+    const char *source;
+    const char *image_path;
+    const char *model;
+    const char *question;
+    const char *description;
+} VisualExperience;
+
+static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
+{
+    const VisualExperience *experience = context;
+    const R2VisionFrame *frame = experience->frame;
+    if (r2_ollama_vision_request_should_abort()) return SQLITE_ABORT;
+    int rc = visual_insert_compat(db, experience->created, experience->source,
+                                experience->image_path, experience->model,
+                                experience->question, experience->description,
+                                (int)frame->format.width, (int)frame->format.height,
+                                (sqlite3_int64)frame->frame_number,
+                                (sqlite3_int64)frame->timestamp, event_id);
+    if (event_id > 0 && rc == SQLITE_DONE && r2_ollama_vision_request_should_abort())
+        return SQLITE_ABORT;
+    return rc;
+}
+
+/* Separate library files are supported. Record the authoritative image row
+ * first so a failed Visual insert cannot publish a Life Log experience. */
+static int visual_save_separate(VisualExperience *experience, const char *summary)
+{
+    int rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+    rc = visual_save_experience(visual_db, 0, experience);
+    if (rc == SQLITE_DONE) {
+        int commit = sqlite3_exec(visual_db, "COMMIT", NULL, NULL, NULL);
+        if (commit != SQLITE_OK) rc = commit;
+    }
+    if (rc != SQLITE_DONE) {
+        if (!sqlite3_get_autocommit(visual_db))
+            (void)sqlite3_exec(visual_db, "ROLLBACK", NULL, NULL, NULL);
+        return rc;
+    }
+
+    sqlite3_int64 row_id = sqlite3_last_insert_rowid(visual_db);
+    int64_t event_id = r2_log_sensory("visual_experience", summary,
+                                     experience->description, experience->source);
+    if (event_id <= 0) return SQLITE_DONE;
+
+    sqlite3_stmt *statement = NULL;
+    rc = sqlite3_prepare_v2(visual_db,
+        "UPDATE r2_visual_experiences SET life_log_event_id=? WHERE id=?",
+        -1, &statement, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 2, row_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc != SQLITE_DONE || sqlite3_changes(visual_db) != 1)
+        fprintf(stderr, "[R2 Visual] Separate library row %lld could not link Life Log event %lld.\n",
+                (long long)row_id, (long long)event_id);
+    sqlite3_finalize(statement);
+    return SQLITE_DONE;
 }
 
 int r2_visual_init(const char *database_path, const char *library_directory)
@@ -1108,39 +1170,25 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     if (gmtime_r(&now, &utc))
         strftime(created, sizeof(created), "%Y-%m-%dT%H:%M:%SZ", &utc);
 
-    /* This is the publication boundary for an already captured frame. A
-     * cancelled result owns only its temporary archive, never prior history. */
-    if (r2_ollama_vision_request_should_abort()) {
-        unlink(image_path);
-        json_object_put(focus);
-        free(description);
-        return NULL;
-    }
-
-    int64_t event_id = r2_log_sensory(
-        "visual_experience",
-        "R2's vision model interpreted a real captured frame.",
-        description, source ? source : "Eyes");
     pthread_mutex_lock(&visual_lock);
-    if (!visual_initialized || !visual_db || visual_generation != generation_snapshot) {
+    if (!visual_initialized || !visual_db || visual_generation != generation_snapshot ||
+        r2_ollama_vision_request_should_abort()) {
         pthread_mutex_unlock(&visual_lock);
         unlink(image_path);
-        r2_log_sensory("visual_experience_store_failed",
-                       "R2 analyzed a frame, but the visual library shut down before it could be indexed.",
-                       "The JPEG archive was removed because no matching database record could be written.",
-                       image_path);
         json_object_put(focus);
         free(description);
         return NULL;
     }
 
-    int rc = visual_insert_compat(created, source, image_path, model_snapshot,
-                                  question, description, (int)frame->format.width,
-                                  (int)frame->format.height,
-                                  (sqlite3_int64)frame->frame_number,
-                                  (sqlite3_int64)frame->timestamp, event_id);
-    char db_error[512] = "unknown SQLite error";
-    if (rc != SQLITE_DONE) {
+    const char *summary = "R2's vision model interpreted a real captured frame.";
+    VisualExperience experience = {frame, created, source ? source : "Eyes",
+                                   image_path, model_snapshot, question, description};
+    int shared = r2_log_save_shared_sensory(visual_db, "visual_experience", summary,
+                     description, experience.source, visual_save_experience, &experience);
+    int rc = shared == 1 ? visual_save_separate(&experience, summary)
+           : shared == 0 ? SQLITE_DONE : SQLITE_ERROR;
+    char db_error[512] = "The shared Visual and Life Log transaction failed.";
+    if (shared == 1 && rc != SQLITE_DONE) {
         const char *message = sqlite3_errcode(visual_db) == SQLITE_OK
             ? "The insert did not create a visual experience row."
             : sqlite3_errmsg(visual_db);

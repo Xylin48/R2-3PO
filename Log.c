@@ -881,38 +881,17 @@ int r2_log_is_initialized(void)
  * EVENT RECORDING
  * ------------------------------------------------------------ */
 
-int64_t r2_log_event(
-    R2LogCategory category,
-    const char *event_type,
-    const char *summary,
-    const char *details,
-    const char *source
-)
+static int64_t log_insert_event_locked(R2LogCategory category,
+                                       const char *event_type, const char *summary,
+                                       const char *details, const char *source)
 {
     sqlite3_stmt *statement = NULL;
     char utc[40];
     char local[48];
     int64_t inserted_id = -1;
-    int rc;
-
-    if (!valid_text(event_type) || !valid_text(summary))
-        return -1;
-
-    if (strlen(event_type) > 128 || strlen(summary) > 8192) {
-        errno = E2BIG;
-        return -1;
-    }
-
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
 
-    pthread_mutex_lock(&log_lock);
-
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
-
-    rc = sqlite3_prepare_v2(
+    int rc = sqlite3_prepare_v2(
         log_db,
         "INSERT INTO r2_log_events "
         "(utc_time, local_time, monotonic_ms, session_id, category, "
@@ -953,6 +932,22 @@ int64_t r2_log_event(
     }
 
     sqlite3_finalize(statement);
+    return inserted_id;
+}
+
+int64_t r2_log_event(R2LogCategory category, const char *event_type,
+                     const char *summary, const char *details, const char *source)
+{
+    if (!valid_text(event_type) || !valid_text(summary))
+        return -1;
+    if (strlen(event_type) > 128 || strlen(summary) > 8192) {
+        errno = E2BIG;
+        return -1;
+    }
+
+    pthread_mutex_lock(&log_lock);
+    int64_t inserted_id = log_initialized && log_db
+        ? log_insert_event_locked(category, event_type, summary, details, source) : -1;
     pthread_mutex_unlock(&log_lock);
 
     /* Index original Life Log events without duplicating their text. */
@@ -967,10 +962,49 @@ int64_t r2_log_event(
         if (journal_category)
             r2_sj_index_event(inserted_id, journal_category, event_type, source);
     }
-
     return inserted_id;
 }
 
+int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char *summary,
+                                const char *details, const char *source,
+                                int (*save)(sqlite3 *, int64_t, void *), void *context)
+{
+    if (!peer || !save || !valid_text(event_type) || !valid_text(summary) ||
+        strlen(event_type) > 128 || strlen(summary) > 8192)
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    const char *life_path = log_initialized && log_db ? sqlite3_db_filename(log_db, "main") : NULL;
+    const char *peer_path = sqlite3_db_filename(peer, "main");
+    if (!life_path || !*life_path || !peer_path || strcmp(life_path, peer_path) != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return 1;
+    }
+
+    int rc = sqlite3_exec(log_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[R2 Life Log] Could not start shared sensory write: %s\n", sqlite3_errmsg(log_db));
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+    int64_t event_id = log_insert_event_locked(R2_LOG_SENSORY, event_type, summary, details, source);
+    int saved = event_id > 0 && save(log_db, event_id, context) == SQLITE_DONE;
+    if (saved)
+        saved = sqlite3_exec(log_db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    if (!saved) {
+        const char *reason = sqlite3_errcode(log_db) == SQLITE_OK
+            ? "a required row was rejected or cancelled" : sqlite3_errmsg(log_db);
+        fprintf(stderr, "[R2 Life Log] Shared sensory write failed: %s\n", reason);
+        if (!sqlite3_get_autocommit(log_db))
+            (void)sqlite3_exec(log_db, "ROLLBACK", NULL, NULL, NULL);
+    }
+    pthread_mutex_unlock(&log_lock);
+    if (!saved) return -1;
+
+    /* Journal indexing runs after commit. Journal startup can rebuild it. */
+    r2_sj_index_event(event_id, "sensory", event_type, source);
+    return 0;
+}
 
 /* Check a stable source identifier before replaying an outbox event. */
 int r2_log_event_exists(const char *event_type, const char *source)
