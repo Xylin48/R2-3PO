@@ -11755,9 +11755,9 @@ static void *r2_ears_desktop_capture_worker(void *unused)
  * contains only the other active output monitors. No fixed device-count
  * quota or shortened source-name allocation is imposed.
  *
- * Watch alone reconciles these captures. The lock serializes reconciliation,
- * snapshots and teardown; each worker only touches its own history lock, and
- * never acquires extra_desktop_lock, so cancellation + join are safe.
+ * Lifecycle updates serialize opens and retirement. The list mutex protects
+ * published entries and their readers, while workers use their history locks.
+ * Neither a connection nor a join holds the list mutex.
  */
 typedef struct R2ExtraDesktop {
     char *monitor;
@@ -11774,6 +11774,7 @@ typedef struct R2ExtraDesktop {
     struct R2ExtraDesktop *next;
 } R2ExtraDesktop;
 
+static pthread_mutex_t extra_desktop_update_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ExtraDesktop *extra_desktop_head = NULL;
 static atomic_uint_fast64_t extra_desktop_generation = ATOMIC_VAR_INIT(1);
@@ -11847,8 +11848,7 @@ static void *r2_extra_desktop_worker(void *arg)
     return NULL;
 }
 
-/* Caller owns extra_desktop_lock and must not remove an entry while another
- * caller is copying its rolling history. */
+/* Entry must be private or already detached under the list mutex. */
 static void r2_extra_desktop_destroy(R2ExtraDesktop *entry)
 {
     if (!entry) return;
@@ -11860,6 +11860,15 @@ static void r2_extra_desktop_destroy(R2ExtraDesktop *entry)
     free(entry->recent);
     free(entry->monitor);
     free(entry);
+}
+
+static void r2_extra_desktop_destroy_list(R2ExtraDesktop *entries)
+{
+    while (entries) {
+        R2ExtraDesktop *next = entries->next;
+        r2_extra_desktop_destroy(entries);
+        entries = next;
+    }
 }
 
 static int r2_extra_desktop_wanted(const R2AudioDiscovery *audio,
@@ -11878,13 +11887,13 @@ void r2_ears_extra_stop_all(void)
 {
     atomic_fetch_add(&extra_desktop_stoppers, 1);
     r2_ears_extra_cancel_pending();
+    pthread_mutex_lock(&extra_desktop_update_lock);
     pthread_mutex_lock(&extra_desktop_lock);
-    while (extra_desktop_head) {
-        R2ExtraDesktop *old = extra_desktop_head;
-        extra_desktop_head = old->next;
-        r2_extra_desktop_destroy(old);
-    }
+    R2ExtraDesktop *retired = extra_desktop_head;
+    extra_desktop_head = NULL;
     pthread_mutex_unlock(&extra_desktop_lock);
+    r2_extra_desktop_destroy_list(retired);
+    pthread_mutex_unlock(&extra_desktop_update_lock);
     atomic_fetch_sub(&extra_desktop_stoppers, 1);
 }
 
@@ -11897,14 +11906,16 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
     R2ExtraDesktopOpen request = {
         atomic_load(&extra_desktop_stop_epoch), cancelled, userdata
     };
-    pthread_mutex_lock(&extra_desktop_lock);
+    pthread_mutex_lock(&extra_desktop_update_lock);
     if (shutting_down || atomic_load(&extra_desktop_stoppers) ||
         atomic_load(&extra_desktop_stop_epoch) != request.epoch ||
         (cancelled && cancelled(userdata))) {
-        pthread_mutex_unlock(&extra_desktop_lock);
+        pthread_mutex_unlock(&extra_desktop_update_lock);
         errno = ECANCELED;
         return -1;
     }
+    R2ExtraDesktop *retired = NULL;
+    pthread_mutex_lock(&extra_desktop_lock);
     R2ExtraDesktop **slot = &extra_desktop_head;
     while (*slot) {
         R2ExtraDesktop *entry = *slot;
@@ -11912,10 +11923,14 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
             !atomic_load(&entry->running) ||
             !r2_extra_desktop_wanted(audio, primary, entry->monitor)) {
             *slot = entry->next;
-            r2_extra_desktop_destroy(entry);
+            entry->next = retired;
+            retired = entry;
         } else
             slot = &entry->next;
     }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    r2_extra_desktop_destroy_list(retired);
+
     int result = 0;
     if (r2_sense_auto_allowed(3)) {
         for (size_t i = 0; i < audio->playback_output_count; ++i) {
@@ -11927,6 +11942,7 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
             const char *monitor = audio->playback_outputs[i].monitor;
             if (!r2_extra_desktop_wanted(audio, primary, monitor))
                 continue;
+            /* Only the current update can change list membership. */
             int exists = 0;
             for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next)
                 if (!strcmp(p->monitor, monitor)) { exists = 1; break; }
@@ -11952,8 +11968,15 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
              * the worker exists. If the server refuses the monitor, leave
              * its identity available for retry at the next poll. */
             pthread_mutex_lock(&extra_desktop_pending_lock);
-            extra_desktop_pending = entry->receiver;
+            int stale = r2_extra_desktop_open_cancelled(&request);
+            if (!stale) extra_desktop_pending = entry->receiver;
             pthread_mutex_unlock(&extra_desktop_pending_lock);
+            if (stale) {
+                r2_extra_desktop_destroy(entry);
+                result = -1;
+                errno = ECANCELED;
+                break;
+            }
             int opened = r2_ears_open_desktop_source_cancelable(
                 entry->receiver, entry->monitor,
                 r2_extra_desktop_open_cancelled, &request);
@@ -11974,15 +11997,29 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
                 continue;
             }
             entry->thread_started = 1;
-            entry->next = extra_desktop_head;
-            extra_desktop_head = entry;
+            /* Serialize the final publication with cancellation's epoch. */
+            pthread_mutex_lock(&extra_desktop_lock);
+            pthread_mutex_lock(&extra_desktop_pending_lock);
+            stale = r2_extra_desktop_open_cancelled(&request);
+            if (!stale) {
+                entry->next = extra_desktop_head;
+                extra_desktop_head = entry;
+            }
+            pthread_mutex_unlock(&extra_desktop_pending_lock);
+            pthread_mutex_unlock(&extra_desktop_lock);
+            if (stale) {
+                r2_extra_desktop_destroy(entry);
+                result = -1;
+                errno = ECANCELED;
+                break;
+            }
             r2_log_sensory("audio_source_opened",
                            "An additional desktop output is supplying independent raw PCM.",
                            "This does not automatically transcribe audio or change R2's attention.",
                            entry->monitor);
         }
     }
-    pthread_mutex_unlock(&extra_desktop_lock);
+    pthread_mutex_unlock(&extra_desktop_update_lock);
     return result;
 }
 
