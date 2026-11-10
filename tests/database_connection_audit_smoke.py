@@ -98,7 +98,8 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     candidate = "visual_10_20_abcdef0123456789.jpg"
     legacy = "visual_11_22.jpg"
     relative = "visual_12_22_0123456789abcdef.jpg"
-    for name in (owned, candidate, legacy, relative, "family-photo.jpg"):
+    staged = "visual_14_23_0123456789abcdef.jpg"
+    for name in (owned, candidate, legacy, relative, staged, "family-photo.jpg"):
         (archive / name).write_bytes(b"fixture")
     (archive / "visual_13_22_0123456789abcdef.jpg").symlink_to(archive / owned)
     visual_db = root / "detached.db"
@@ -115,12 +116,20 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
             (2, missing, None, None, "pending-key"),
             (3, f"archive/{relative}", None, None, None),
         ])
+        db.execute("CREATE TABLE r2_visual_pending_archives(id INTEGER PRIMARY KEY, image_path TEXT)")
+        db.executemany("INSERT INTO r2_visual_pending_archives VALUES(?,?)", [
+            (21, str(archive / staged)), (22, str(archive / "missing-staged.jpg")),
+        ])
     visual = audit.audit_visual_archive(visual_db, archive)
     assert visual["error"] is None
     assert visual["unindexed_candidates"] == [candidate]
     assert visual["legacy_unindexed_candidates"] == [legacy]
     assert visual["missing_indexed_files"] == [{"id": 2, "path": missing}]
     assert visual["pending_life_log_ids"] == [2]
+    assert visual["pending_archives"] == [
+        {"id": 21, "path": str(archive / staged), "file_present": True},
+        {"id": 22, "path": str(archive / "missing-staged.jpg"), "file_present": False},
+    ]
     assert visual["legacy_unlinked_ids"] == [3]
     assert visual["unresolved_relative_paths"] == [{"id": 3, "path": f"archive/{relative}"}]
     assert (archive / candidate).read_bytes() == b"fixture"

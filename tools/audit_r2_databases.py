@@ -388,6 +388,7 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
         "missing_indexed_files": [],
         "unresolved_relative_paths": [],
         "pending_life_log_ids": [],
+        "pending_archives": [],
         "legacy_unlinked_ids": [],
         "error": None,
     }
@@ -399,6 +400,8 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
         with os.scandir(archive) as entries:
             files = {entry.name for entry in entries if entry.is_file(follow_symlinks=False)}
         db = _readonly_connection(database)
+        # Keep final and pending rows in the same SQLite snapshot.
+        db.execute("BEGIN")
         columns = {row[1].lower() for row in db.execute("PRAGMA table_info(r2_visual_experiences)")}
         path_columns = [name for name in ("image_path", "file_path", "path") if name in columns]
         if "id" not in columns or not path_columns:
@@ -425,6 +428,20 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
                 indexed.add(stored.name)
                 if stored.name not in files:
                     report["missing_indexed_files"].append({"id": row_id, "path": path})
+
+        pending_columns = {row[1].lower() for row in
+                           db.execute("PRAGMA table_info(r2_visual_pending_archives)")}
+        if {"id", "image_path"} <= pending_columns:
+            for row_id, path in db.execute(
+                    "SELECT id,image_path FROM r2_visual_pending_archives ORDER BY id"):
+                if not isinstance(path, str) or "\x00" in path:
+                    continue
+                stored = Path(path)
+                if stored.is_absolute() and stored.parent.resolve() == archive:
+                    indexed.add(stored.name)
+                    report["pending_archives"].append({
+                        "id": row_id, "path": path, "file_present": stored.name in files,
+                    })
 
         for name in sorted(files - indexed):
             if re.fullmatch(r"visual_[0-9]+_[0-9]+_[0-9a-f]{16}\.jpg", name):

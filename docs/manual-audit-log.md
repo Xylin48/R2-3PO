@@ -1120,3 +1120,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Hold an advisory claim on each owned JPEG through publication or withdrawal. Restart skips busy, missing, short, altered, and out-of-library files. It verifies complete bytes and synchronizes the file and directory before publishing. Older unmarked JPEGs remain available for audit. Pending interpretations stay out of recall, and replay does not apply a previous session's preview focus.
 - Normal errors or confirmed cancellation can withdraw a save. If publication may have occurred and withdrawal cannot be confirmed, retain the file so cleanup cannot erase evidence needed by a committed record. This trace distinguishes definite cancellation from uncertain storage outcomes.
 - The native fixture passed actual process exits after archive synchronization in shared and detached libraries, repeat startup without duplicate observations, locked and changed-byte checks, partial JPEG rejection, legacy orphan preservation, staging rejection, and retention when publication and withdrawal are both blocked. This completes the scoped archive publication and restart trace. Missing or incomplete images remain pending for review.
+
+### R2-AUD-2026-11-10-093 — Distinguish pending Visual archives in the read-only audit
+
+- Traced both SQLite archive record sets through the filesystem comparison in `tools/audit_r2_databases.py`. A JPEG with a durable pending record is distinct from a file with no retained interpretation.
+- Report pending records and file presence separately from unindexed candidates. Read published and pending records from one SQLite snapshot. File presence is metadata only, with content verification owned by Visual startup.
+- The database audit fixture passed staged-file, missing staged-file, older aliases, and unindexed file classification. This completes the scoped audit comparison.
