@@ -227,6 +227,8 @@ def _relationship_check(
             ("r2_sensory_journal", "event_id"),
             ("r2_sensory_journal_diary_links", "event_id"),
             ("r2_sensory_journal_diary_links", "diary_entry_id"),
+            ("r2_sensory_journal_reflection_links", "event_id"),
+            ("r2_sensory_journal_reflection_links", "diary_entry_id"),
             ("r2_log_activity_sessions", "start_event_id"),
             ("r2_log_milestones", "first_event_id"),
             ("r2_log_conversations", "event_id"),
@@ -300,6 +302,8 @@ def audit_relationships(
         ("r2_memory.db", "r2_sensory_journal", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_diary_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_diary_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
+        ("r2_memory.db", "r2_sensory_journal_reflection_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_sensory_journal_reflection_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
         ("r2_rewards.db", "reward_events", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
     ]
     output = []

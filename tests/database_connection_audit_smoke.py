@@ -76,6 +76,20 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert broken[0]["source_table"] == "reward_events"
     assert broken[0]["orphan_values"] == [999]
 
+    # Legacy copies may lack declared foreign keys on exact reflection links.
+    with sqlite3.connect(memory) as db:
+        db.executescript("""
+            CREATE TABLE r2_sensory_journal_reflection_links(event_id INTEGER, diary_entry_id INTEGER);
+            INSERT INTO r2_sensory_journal_reflection_links VALUES(2,10),(101,102),(NULL,NULL);
+        """)
+    reflection_links = {
+        item["source_column"]: item
+        for item in audit.audit_relationships(root, reports["databases"])
+        if item["source_table"] == "r2_sensory_journal_reflection_links"
+    }
+    assert reflection_links["event_id"]["orphan_values"] == [101, None]
+    assert reflection_links["diary_entry_id"]["orphan_values"] == [102, None]
+
     # Verify PRAGMA foreign_key_check detects broken in-file organ links even
     # when the source database was created with foreign-key enforcement off.
     with sqlite3.connect(memory) as db:
