@@ -24,6 +24,7 @@ struct R2AudioFile {
     int pcm_fd;             /* nonblocking read end, owned by this object */
     int cancel_fd;          /* eventfd wakes an indefinitely silent decoder */
     pid_t child;            /* direct FFmpeg child, NOT a shell PID */
+    size_t frame_bytes;     /* interleaved S16LE sample for each channel */
     atomic_int cancelled;
 };
 
@@ -47,7 +48,8 @@ static uint64_t r2_file_now_ms(void)
 R2AudioFile *r2_audio_file_open(const char *path, uint32_t sample_rate,
                                 unsigned channels)
 {
-    if (!path || !*path || !sample_rate || !channels) {
+    uint64_t frame_bytes = (uint64_t)channels * 2U;
+    if (!path || !*path || !sample_rate || !frame_bytes || frame_bytes > SSIZE_MAX) {
         errno = EINVAL;
         return NULL;
     }
@@ -55,6 +57,7 @@ R2AudioFile *r2_audio_file_open(const char *path, uint32_t sample_rate,
     if (!file) return NULL;
     file->pcm_fd = file->cancel_fd = -1;
     file->child = -1;
+    file->frame_bytes = (size_t)frame_bytes;
     atomic_init(&file->cancelled, 0);
 
     int pipes[2] = {-1, -1};
@@ -152,7 +155,7 @@ static int r2_file_check_eof(R2AudioFile *file)
 
 ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
 {
-    if (!file || !buffer || !bytes || bytes > SSIZE_MAX || (bytes % 4U) != 0U) {
+    if (!file || !buffer || !bytes || bytes > SSIZE_MAX || bytes % file->frame_bytes != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -162,9 +165,8 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
             errno = ECANCELED;
             return -1;
         }
-        /* Do not return a partial stereo 16-bit frame. The caller's ring
-         * history relies on complete four-byte frames. */
-        if (copied > 0 && copied % 4U == 0)
+        /* The caller's ring history relies on complete sample frames. */
+        if (copied > 0 && copied % file->frame_bytes == 0)
             return (ssize_t)copied;
         struct pollfd pfd[2] = {
             {.fd = file->cancel_fd, .events = POLLIN},
@@ -194,7 +196,7 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
             continue;
         }
         if (got == 0) {
-            if (copied % 4U != 0) { errno = EPROTO; return -1; }
+            if (copied % file->frame_bytes != 0) { errno = EPROTO; return -1; }
             if (copied == 0 && r2_file_check_eof(file) < 0) return -1;
             return (ssize_t)copied;
         }

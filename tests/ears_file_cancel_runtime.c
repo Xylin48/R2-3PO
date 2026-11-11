@@ -110,6 +110,14 @@ int main(void)
     assert(memcmp(out, "EFGH", 4) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 0);
     assert(!r2_ears_is_open(ears));
+
+    R2AudioFile *mono = r2_audio_file_open(unusual_filename, 44100, 1);
+    assert(mono);
+    assert(r2_audio_file_read(mono, out, 3) == -1 && errno == EINVAL);
+    assert(r2_audio_file_read(mono, out, 2) == 2);
+    assert(memcmp(out, "AB", 2) == 0);
+    r2_audio_file_close(mono);
+
     /* Reopening from the exact event string previously freed it before
      * passing it to FFmpeg. Recreate while the old event is still owned. */
     assert(r2_ears_open_file(ears, ears->event.source_name) == 0);

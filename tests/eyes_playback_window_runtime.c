@@ -1,6 +1,6 @@
-#define _POSIX_C_SOURCE 200809L
-#include "Eyes.h"
-#include "Log.h"
+/* Include Eyes to exercise its private viewer PID ownership with a child
+ * that ignores SIGTERM, without a real display or global preview directory. */
+#include "../Eyes.c"
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
@@ -24,8 +24,37 @@ static int cancel_when_child_ready(void *path)
     return access(path, F_OK) == 0;
 }
 
+static void verify_stalled_viewer_is_reaped(void)
+{
+    int ready[2];
+    assert(pipe(ready) == 0);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        alarm(5);
+        close(ready[0]);
+        if (setsid() < 0 || signal(SIGTERM, SIG_IGN) == SIG_ERR ||
+            write(ready[1], "1", 1) != 1) _exit(1);
+        close(ready[1]);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    char marker;
+    assert(read(ready[0], &marker, 1) == 1 && marker == '1');
+    close(ready[0]);
+    uint64_t start = r2_eyes_monotonic_ms();
+    assert(start != UINT64_MAX);
+    r2_vwebcam_pid = child;
+    r2_vwebcam_stop_viewer();
+    assert(r2_eyes_monotonic_ms() - start < 2000);
+    assert(r2_vwebcam_pid == -1);
+    assert(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+    assert(kill(child, 0) == -1 && errno == ESRCH);
+}
+
 int main(void)
 {
+    verify_stalled_viewer_is_reaped();
     char dir[] = "/tmp/r2-window-discovery-XXXXXX";
     assert(mkdtemp(dir) != NULL);
     char script[PATH_MAX], path[PATH_MAX * 2], ready[PATH_MAX];

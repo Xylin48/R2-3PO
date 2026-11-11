@@ -141,7 +141,7 @@ fi
 # so a partial manual copy is caught before the user is asked to continue.
 for file in \
   Makefile \
-  r2.c r2.h \
+  r2.c r2.h r2_input.h \
   r2_diary.c r2_diary.h \
   Log.c Log.h \
   Reality.c Reality.h \
@@ -152,6 +152,9 @@ for file in \
   SensoryJournal.c SensoryJournal.h \
   Visual.c Visual.h \
   Ears.c Ears.h \
+  AudioCapture.c AudioCapture.h \
+  AudioDiscovery.c AudioDiscovery.h \
+  AudioFile.c AudioFile.h \
   Eyes.c Eyes.h \
   V-Webcam.py \
   R2Sounds.c R2Sounds.h \

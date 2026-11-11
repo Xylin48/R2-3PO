@@ -251,7 +251,7 @@ jobs:
 
       - name: Exercise playback producer to live X11 window geometry lookup
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c Eyes.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_playback_window_runtime.c -o /tmp/r2-eyes-window-discovery-test -lpthread -lm
           timeout -k 2s 25s /tmp/r2-eyes-window-discovery-test
 
       - name: Reconcile exact Watch renderer transitions and CRT withdrawal
