@@ -1200,9 +1200,11 @@ static void visual_retry_pending_archives(void)
         sqlite3_stmt *st = NULL;
         int rc = sqlite3_prepare_v2(visual_db,
             "SELECT id,image_path,created_utc,source,model,prompt,description,width,height,"
-            "frame_number,frame_timestamp,jpeg FROM r2_visual_pending_archives "
-            "WHERE id>? AND withdrawn=0 ORDER BY id LIMIT 1", -1, &st, NULL);
+            "frame_number,frame_timestamp,CASE WHEN typeof(jpeg)='blob' AND length(jpeg) BETWEEN 1 AND ?2 "
+            "THEN jpeg END FROM r2_visual_pending_archives "
+            "WHERE id>?1 AND withdrawn=0 ORDER BY id LIMIT 1", -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, R2_VISION_MAX_IMAGE_BYTES);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (rc != SQLITE_ROW) {
             if (rc != SQLITE_DONE) pending = 1;

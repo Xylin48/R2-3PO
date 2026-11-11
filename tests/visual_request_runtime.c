@@ -824,6 +824,32 @@ int main(void)
     }
     assert(unlink(cancelled_path) == 0);
     free(cancelled_path);
+    assert(r2_visual_init(database, library) == 0);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_cancel_cleanup;"
+        "INSERT INTO r2_visual_pending_archives(image_path,created_utc,source,model,description,"
+        "width,height,frame_number,frame_timestamp,jpeg) VALUES('/oversized.jpg','original date',"
+        "'oversized source','original model','retained oversized evidence',1,1,1,1,zeroblob(20971521));"
+        "INSERT INTO r2_visual_pending_archives(image_path,created_utc,source,model,description,"
+        "width,height,frame_number,frame_timestamp,jpeg) VALUES('/text.jpg','original date',"
+        "'text source','original model','invalid storage type',1,1,1,1,'SYNTHETIC-JPEG-BYTES');"
+        "CREATE TRIGGER defer_after_invalid BEFORE INSERT ON r2_visual_experiences "
+        "WHEN NEW.source='valid after malformed pending' BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"valid recovery behind invalid records\",\"focus\":null}", "stop");
+    assert(!r2_visual_analyze_frame(&frame, "valid after malformed pending", "continue recovery"));
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER defer_after_invalid", NULL, NULL, NULL) == SQLITE_OK);
+    r2_visual_shutdown();
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT length(jpeg) FROM r2_visual_pending_archives "
+        "WHERE source='oversized source'") == 20971521);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives "
+        "WHERE source='text source' AND typeof(jpeg)='text'") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences "
+        "WHERE source IN ('oversized source','text source')") == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v JOIN r2_log_events e "
+        "ON e.id=v.life_log_event_id WHERE v.source='valid after malformed pending' "
+        "AND e.details='valid recovery behind invalid records' AND v.prompt='continue recovery'") == 1);
+    r2_visual_shutdown();
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
