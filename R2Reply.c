@@ -201,6 +201,44 @@ static const char *reply_find_fence_close(const char *text, size_t length,
     return text + length;
 }
 
+/* Return the answer after a line label outside Markdown code. */
+static const char *reply_find_final_content(const char *text)
+{
+    size_t length = strlen(text);
+    size_t pos = 0;
+    while (pos < length) {
+        if (pos == 0 || text[pos - 1] == '\n') {
+            size_t line_end = pos;
+            while (line_end < length && text[line_end] != '\n') ++line_end;
+            size_t line_length = line_end - pos;
+            if (line_length && text[line_end - 1] == '\r') --line_length;
+            char fence;
+            size_t fence_length;
+            if (reply_fence_line(text + pos, line_length, 0, 0, 0,
+                                 &fence, &fence_length)) {
+                const char *close = reply_find_fence_close(
+                    text, length, line_end < length ? line_end + 1 : length,
+                    fence, fence_length);
+                pos = (size_t)(close - text);
+                while (pos < length && text[pos] != '\n') ++pos;
+                if (pos < length) ++pos;
+                continue;
+            }
+            if (pos != 0 && !strncasecmp(text + pos, "final:", 6))
+                return text + pos + 6;
+        }
+        if (text[pos] == '`') {
+            size_t run = 1;
+            while (pos + run < length && text[pos + run] == '`') ++run;
+            const char *close = reply_find_matching_ticks(text, length, pos + run, run);
+            pos = close ? (size_t)(close - text) + run : pos + run;
+            continue;
+        }
+        ++pos;
+    }
+    return NULL;
+}
+
 char *r2_reply_sanitize(const char *reply)
 {
     if (!reply) return NULL;
@@ -379,13 +417,11 @@ char *r2_reply_sanitize(const char *reply)
             visible_looks_private = 1;
     }
     if (visible_looks_private) {
-        const char *final = strcasestr(visible, "\nfinal:");
-        if (!final) final = strcasestr(visible, "\n\nfinal:");
-        if (!final) {
+        const char *final_content = reply_find_final_content(visible);
+        if (!final_content) {
             free(clean);
             return NULL;
         }
-        const char *final_content = final + strlen("\nfinal:");
         memmove(clean, final_content, strlen(final_content) + 1);
         trim_reply(clean);
     }
