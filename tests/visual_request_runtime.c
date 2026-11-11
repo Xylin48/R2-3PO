@@ -37,6 +37,20 @@ static const R2VisionFrame *overlapping_frame;
 static const char *overlapping_response;
 static void response(const char *text, const char *reason);
 
+static int uncertain_shared_commit;
+int __real_r2_log_save_shared_sensory(sqlite3 *, const char *, const char *, const char *,
+    const char *, int (*)(sqlite3 *, int64_t, void *), void *);
+int __wrap_r2_log_save_shared_sensory(sqlite3 *db, const char *type, const char *summary,
+    const char *details, const char *source, int (*save)(sqlite3 *, int64_t, void *), void *context)
+{
+    int rc = __real_r2_log_save_shared_sensory(db, type, summary, details, source, save, context);
+    if (uncertain_shared_commit && rc == 0) {
+        uncertain_shared_commit = 0;
+        cancel_request = 1;
+        return -1;
+    }
+    return rc;
+}
 int __real_mkstemps(char *, int);
 int __wrap_mkstemps(char *path, int suffix)
 {
@@ -852,6 +866,26 @@ int main(void)
         "AND e.details='valid recovery behind invalid records' AND v.prompt='continue recovery'") == 1);
     r2_visual_shutdown();
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(database, library) == 0);
+    int before_uncertain_files = archive_count();
+    sqlite3_int64 before_uncertain_rows = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+    response("{\"description\":\"committed before an uncertain result\",\"focus\":null}", "stop");
+    uncertain_shared_commit = 1;
+    assert(!r2_visual_analyze_frame(&frame, "uncertain committed camera", "late cancellation"));
+    assert(!uncertain_shared_commit && cancel_request);
+    cancel_request = 0;
+    assert(archive_count() == before_uncertain_files + 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_uncertain_rows + 1);
+    for (int retry = 0; retry < 2; ++retry) {
+        r2_visual_shutdown();
+        assert(r2_visual_init(database, library) == 0);
+        assert(archive_count() == before_uncertain_files + 1);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v JOIN r2_log_events e "
+            "ON e.id=v.life_log_event_id WHERE v.source='uncertain committed camera' "
+            "AND e.details='committed before an uncertain result' AND v.prompt='late cancellation'") == 1);
+    }
+    r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
     puts("Visual setup/response/session boundaries, complete persistence, encoder cancellation and owned-file cleanup passed with synthetic HTTP/encoder.");

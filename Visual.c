@@ -1488,6 +1488,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     int archive_db_owned = 0;
     int staged = 0;
     int withdraw_requested = 0;
+    int publication_attempted = 0;
     const char *failure = NULL;
     const char *failure_event = "visual_experience_store_failed";
 
@@ -1526,11 +1527,12 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     if (visual_initialized && visual_db && visual_generation == generation_snapshot &&
         !r2_ollama_vision_request_should_abort()) {
         if (visual_archive_matches_claim(image_fd, image_path)) {
+            publication_attempted = 1;
             rc = visual_publish_archive(&experience);
             if (rc == SQLITE_DONE)
                 publish_committed_focus(request_sequence, frame->preview_session, focus);
             else if (!experience.cancelled)
-                failure = "Could not publish the archived interpretation; the pending save was retained.";
+                failure = "Could not confirm publication of the archived interpretation; original evidence was retained.";
         } else {
             withdraw_requested = 1;
             failure_event = "visual_image_archive_failed";
@@ -1561,29 +1563,36 @@ failed:
          * Cancellation, session loss and path replacement withdraw the request. */
         int discard_image = !staged || withdraw_requested || experience.cancelled;
         if (staged && discard_image) {
+            int withdrawal = SQLITE_ABORT;
             if (archive_db_owned) {
-                if (visual_withdraw_archive(archive_db, image_path) != SQLITE_DONE)
+                withdrawal = visual_withdraw_archive(archive_db, image_path);
+                if (withdrawal != SQLITE_DONE)
                     fprintf(stderr, "[R2 Visual] Could not withdraw a cancelled pending save.\n");
             } else {
                 pthread_mutex_lock(&visual_lock);
-                if (visual_db && visual_generation == generation_snapshot &&
-                    visual_withdraw_archive(visual_db, image_path) != SQLITE_DONE)
+                if (visual_db && visual_generation == generation_snapshot)
+                    withdrawal = visual_withdraw_archive(visual_db, image_path);
+                if (withdrawal != SQLITE_DONE)
                     fprintf(stderr, "[R2 Visual] Could not withdraw a cancelled pending save.\n");
                 pthread_mutex_unlock(&visual_lock);
             }
+            /* A late cancellation cannot establish that a failed publication
+             * rolled back. Keep any JPEG that a committed row may reference. */
+            if (withdrawal != SQLITE_DONE && publication_attempted && !experience.cancelled)
+                discard_image = 0;
         }
         if (discard_image) {
             if (visual_archive_matches_claim(image_fd, image_path) && unlink(image_path) == 0)
                 (void)visual_sync_directory(directory_snapshot);
         } else {
-            fprintf(stderr, "[R2 Visual] Original archive evidence remains pending after a storage failure.\n");
+            fprintf(stderr, "[R2 Visual] Retained original archive evidence after a failed or uncertain save.\n");
         }
         close(image_fd);
     }
     if (archive_db_owned) sqlite3_close(archive_db);
     if (failure)
         r2_log_sensory(failure_event,
-                       "R2 analyzed a frame but could not save the observation.",
+                       "R2 analyzed a frame but could not confirm the observation was saved.",
                        failure, experience.source);
     free(jpeg);
     json_object_put(focus);
