@@ -805,6 +805,7 @@ int main(void)
     char *cancelled_path = strdup((const char *)sqlite3_column_text(pending, 0));
     assert(cancelled_path && access(cancelled_path, F_OK) != 0);
     sqlite3_finalize(pending);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_cancel_cleanup", NULL, NULL, NULL) == SQLITE_OK);
     r2_visual_shutdown();
     /* A later restore of the original file must not resurrect the cancellation. */
     repaired = open(cancelled_path, O_WRONLY | O_CREAT | O_EXCL, 0640);
@@ -825,7 +826,7 @@ int main(void)
     assert(unlink(cancelled_path) == 0);
     free(cancelled_path);
     assert(r2_visual_init(database, library) == 0);
-    assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_cancel_cleanup;"
+    assert(sqlite3_exec(visual_db,
         "INSERT INTO r2_visual_pending_archives(image_path,created_utc,source,model,description,"
         "width,height,frame_number,frame_timestamp,jpeg) VALUES('/oversized.jpg','original date',"
         "'oversized source','original model','retained oversized evidence',1,1,1,1,zeroblob(20971521));"
