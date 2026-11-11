@@ -416,6 +416,16 @@ static char *sj_query(const char *query, int limit)
         const unsigned char *details = sqlite3_column_text(st, 6);
         const unsigned char *source = sqlite3_column_text(st, 7);
         const unsigned char *diary_id = sqlite3_column_text(st, 8);
+        const unsigned char *fields[] = {utc, local, kind, type, summary, details, source, diary_id};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            int column = (int)i + 1;
+            if ((!fields[i] && sqlite3_column_type(st, column) != SQLITE_NULL) ||
+                (fields[i] && strlen((const char *)fields[i]) != (size_t)sqlite3_column_bytes(st, column))) {
+                serialization_failed = 1;
+                break;
+            }
+        }
+        if (serialization_failed) break;
         int needed = snprintf(NULL, 0,
             "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s\n\n",
             (long long)sqlite3_column_int64(st, 0),

@@ -207,14 +207,9 @@ char *r2_reply_sanitize(const char *reply)
     size_t input_len = strlen(reply);
     if (!input_len) return NULL;
 
-    /* Some local models emit labeled analysis/final sections rather than XML
-       blocks. If the response begins with a private analysis label and has a
-       distinct final label, expose only the final section. */
+    /* Classify labeled scratch only after private tags have been removed.
+       A Final: line inside a hidden block is never an answer boundary. */
     const char *start = reply;
-    while (*start && isspace((unsigned char)*start)) ++start;
-    int labeled_private = !strncasecmp(start, "analysis:", 9) ||
-                          !strncasecmp(start, "reasoning:", 10) ||
-                          !strncasecmp(start, "thinking:", 9);
     static const char *const scratch_prefixes[] = {
         "we need answer", "we need to answer", "we need respond",
         "we need to respond", "we should answer", "we should respond",
@@ -224,19 +219,6 @@ char *r2_reply_sanitize(const char *reply)
         "i'll answer", "the user asks", "the user wants",
         "we need make sure", "we need ensure", NULL
     };
-    int looks_like_scratch = labeled_private;
-    for (size_t i = 0; !looks_like_scratch && scratch_prefixes[i]; ++i) {
-        size_t n = strlen(scratch_prefixes[i]);
-        if (!strncasecmp(start, scratch_prefixes[i], n))
-            looks_like_scratch = 1;
-    }
-    if (looks_like_scratch) {
-        const char *final = strcasestr(start, "\nfinal:");
-        if (!final) final = strcasestr(start, "\n\nfinal:");
-        if (!final) return NULL;
-        start = final + strlen("\nfinal:");
-    }
-
     size_t len = strlen(start);
     size_t block_count = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -383,9 +365,8 @@ char *r2_reply_sanitize(const char *reply)
     clean[dst] = '\0';
     trim_reply(clean);
 
-    /* Removing a tagged private block can reveal an untagged scratch preamble
-       that was not at byte zero of the model output. Check the visible result
-       again so "<think>...</think>We need to answer..." cannot leak. */
+    /* Models may emit labeled scratch without tags, including after a
+       tagged private preamble. Only inspect the remaining visible text. */
     const char *visible = clean;
     while (*visible && isspace((unsigned char)*visible)) ++visible;
     int visible_looks_private =

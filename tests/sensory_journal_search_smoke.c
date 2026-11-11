@@ -201,6 +201,12 @@ int main(void)
     assert(found && strstr(found, "Diary link: 100"));
     free(found);
 
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db, "UPDATE r2_log_events SET details=CAST(X'61620063' AS TEXT) "
+                       "WHERE summary='Saw 100% battery';") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(r2_sj_search("100%", 20) == NULL);
+
     r2_sj_shutdown();
     remove(R2_DIARY_DATABASE);
     snprintf(sidecar, sizeof(sidecar), "%s-wal", R2_DIARY_DATABASE);
