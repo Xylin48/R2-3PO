@@ -136,4 +136,22 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     with sqlite3.connect(visual_db) as db:
         assert db.execute("SELECT life_log_event_id FROM r2_visual_experiences WHERE id=2").fetchone() == (None,)
 
+    # A copied backup keeps the original absolute paths. Same-named files in
+    # the copy are candidates for relocation, rather than unrecorded memories.
+    restored = root / "restored_archive"
+    restored.mkdir()
+    for name in (owned, staged):
+        (restored / name).write_bytes(b"restored fixture")
+    moved = audit.audit_visual_archive(visual_db, restored)
+    assert moved["error"] is None
+    assert not moved["unindexed_candidates"]
+    outside = moved["paths_outside_library"]
+    assert {"record_type": "published", "id": 1, "path": str(archive / owned),
+            "matching_filename": str(restored / owned)} in outside
+    assert {"record_type": "pending", "id": 21, "path": str(archive / staged),
+            "matching_filename": str(restored / staged)} in outside
+    with sqlite3.connect(visual_db) as db:
+        assert db.execute("SELECT file_path FROM r2_visual_experiences WHERE id=1").fetchone() == (str(archive / owned),)
+        assert db.execute("SELECT image_path FROM r2_visual_pending_archives WHERE id=21").fetchone() == (str(archive / staged),)
+
 print("Read-only database audit detects SQLite FK violations and broken cross-organ references.")

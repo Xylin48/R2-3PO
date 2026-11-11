@@ -1145,3 +1145,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Followed the open file claim through the JPEG write, final SQL publication, startup verification, and unlink paths. The pathname could refer to a replacement file after the original was opened.
 - Compare the current path's device, inode, regular-file type and size with the claimed descriptor before live publication or cleanup. Startup verification uses the same check. Compliant writers still coordinate with the existing file lock.
 - The native regression replaced the directory entry during the owned write and verified that the observation stayed unpublished and the replacement's bytes survived cleanup. This completes the scoped descriptor-to-path custody trace.
+
+### R2-AUD-2026-11-10-096 — Report archive copies whose stored paths point elsewhere
+
+- Traced copied database paths through the read-only archive comparison. Published and pending rows whose absolute directories differed from the selected archive were previously omitted, while their copied filenames could be reported as unindexed.
+- Report the original outside path and any matching filename in the selected directory. Preserve the stored references and leave byte verification and relocation decisions explicit. Relative pending paths are reported as unresolved.
+- The audit fixture passed a copied archive with published and pending rows referencing their original directory, and verified that database paths stayed intact. This completes the scoped restored-copy reporting trace.

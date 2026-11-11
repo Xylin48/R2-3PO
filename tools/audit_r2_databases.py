@@ -387,6 +387,7 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
         "legacy_unindexed_candidates": [],
         "missing_indexed_files": [],
         "unresolved_relative_paths": [],
+        "paths_outside_library": [],
         "pending_life_log_ids": [],
         "pending_archives": [],
         "legacy_unlinked_ids": [],
@@ -428,6 +429,14 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
                 indexed.add(stored.name)
                 if stored.name not in files:
                     report["missing_indexed_files"].append({"id": row_id, "path": path})
+            else:
+                matching_file = str(archive / stored.name) if stored.name in files else None
+                report["paths_outside_library"].append({
+                    "record_type": "published", "id": row_id, "path": path,
+                    "matching_filename": matching_file,
+                })
+                if matching_file is not None:
+                    indexed.add(stored.name)
 
         pending_columns = {row[1].lower() for row in
                            db.execute("PRAGMA table_info(r2_visual_pending_archives)")}
@@ -442,6 +451,19 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
                     report["pending_archives"].append({
                         "id": row_id, "path": path, "file_present": stored.name in files,
                     })
+                elif stored.is_absolute():
+                    matching_file = str(archive / stored.name) if stored.name in files else None
+                    report["paths_outside_library"].append({
+                        "record_type": "pending", "id": row_id, "path": path,
+                        "matching_filename": matching_file,
+                    })
+                    if matching_file is not None:
+                        indexed.add(stored.name)
+                else:
+                    report["unresolved_relative_paths"].append({
+                        "record_type": "pending", "id": row_id, "path": path,
+                    })
+                    indexed.add(stored.name)
 
         for name in sorted(files - indexed):
             if re.fullmatch(r"visual_[0-9]+_[0-9]+_[0-9a-f]{16}\.jpg", name):
