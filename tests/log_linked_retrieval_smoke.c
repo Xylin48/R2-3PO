@@ -108,6 +108,23 @@ int main(void)
     free(from_seed);
     free(from_relation);
 
+    /* Legacy rows can contain bytes that the text interface cannot render. */
+    sqlite3 *legacy = NULL;
+    int exact_ok = sqlite3_open(R2_DIARY_DATABASE, &legacy) == SQLITE_OK &&
+        sqlite3_exec(legacy,
+            "UPDATE r2_log_events SET details='prefix'||char(0)||'tail' "
+            "WHERE event_type='related_experience';", NULL, NULL, NULL) == SQLITE_OK;
+    if (legacy) sqlite3_close(legacy);
+    if (exact_ok) {
+        char *direct = r2_log_search("related prior experience", 10);
+        char *indirect = r2_log_search("explicit current-user identity relationship", 10);
+        exact_ok = !direct && !indirect;
+        free(direct);
+        free(indirect);
+    }
+    if (!exact_ok)
+        fprintf(stderr, "Life Log returned shortened text for an unrepresentable record.\n");
+
     /* A memory_saved bookkeeping failure must be reported, not silently
        treated as a successful cross-database update. */
     int memory_update_ok = 1;
@@ -162,7 +179,7 @@ int main(void)
     }
 
     r2_log_shutdown();
-    if (!ok || !memory_update_ok || !edge_ok) return 1;
+    if (!ok || !memory_update_ok || !edge_ok || !exact_ok) return 1;
     puts("Life Log linked retrieval and failed memory_saved bookkeeping are handled correctly.");
     return 0;
 }

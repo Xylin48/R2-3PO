@@ -170,6 +170,22 @@ static int valid_text(const char *value)
     return value && value[0] != '\0';
 }
 
+/* Formatting a prefix of a stored text field would misrepresent the record. */
+static int log_read_text_fields(sqlite3_stmt *statement, int first, int count,
+                                const char **fields)
+{
+    for (int i = 0; i < count; ++i) {
+        int column = first + i;
+        int type = sqlite3_column_type(statement, column);
+        const char *value = (const char *)sqlite3_column_text(statement, column);
+        if ((!value && type != SQLITE_NULL) ||
+            (value && strlen(value) != (size_t)sqlite3_column_bytes(statement, column)))
+            return -1;
+        fields[i] = value;
+    }
+    return 0;
+}
+
 /* Grow to preserve complete selected query records; never clip their text. */
 static int append_text(char **buffer, size_t *length, size_t *capacity,
                        const char *format, ...)
@@ -2332,18 +2348,16 @@ char *r2_log_status_report(void)
         rc = sqlite3_step(st);
 
     if (rc == SQLITE_ROW) {
-        const unsigned char *utc = sqlite3_column_text(st, 1);
-        const unsigned char *category = sqlite3_column_text(st, 2);
-        const unsigned char *type = sqlite3_column_text(st, 3);
-        const unsigned char *summary = sqlite3_column_text(st, 4);
-        if (append_text(&output, &length, &capacity,
+        const char *fields[4];
+        if (log_read_text_fields(st, 1, 4, fields) != 0 ||
+            append_text(&output, &length, &capacity,
                         "Latest event: #%" PRId64 " at %s (%s/%s)\n"
                         "  %s\n",
                         sqlite3_column_int64(st, 0),
-                        utc ? (const char *)utc : "unknown time",
-                        category ? (const char *)category : "unknown",
-                        type ? (const char *)type : "unknown",
-                        summary ? (const char *)summary : "") != 0) {
+                        fields[0] ? fields[0] : "unknown time",
+                        fields[1] ? fields[1] : "unknown",
+                        fields[2] ? fields[2] : "unknown",
+                        fields[3] ? fields[3] : "") != 0) {
             sqlite3_finalize(st);
             pthread_mutex_unlock(&log_lock);
             free(output);
@@ -2669,13 +2683,8 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
         if (query && !base_already_seen &&
             seen_count < sizeof(seen_ids) / sizeof(seen_ids[0]))
             seen_ids[seen_count++] = id;
-        const unsigned char *utc = sqlite3_column_text(statement, 1);
-        const unsigned char *local = sqlite3_column_text(statement, 2);
-        const unsigned char *category = sqlite3_column_text(statement, 3);
-        const unsigned char *type = sqlite3_column_text(statement, 4);
-        const unsigned char *summary = sqlite3_column_text(statement, 5);
-        const unsigned char *details = sqlite3_column_text(statement, 6);
-        const unsigned char *source = sqlite3_column_text(statement, 7);
+        const char *fields[7];
+        if (log_read_text_fields(statement, 1, 7, fields) != 0) break;
         int memory_saved = sqlite3_column_int(statement, 8);
 
         if (!base_already_seen) {
@@ -2685,21 +2694,21 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
                         "  Summary: %s\n"
                         "  Source: %s | Memory indexed: %s\n",
                         id,
-                        utc ? (const char *)utc : "unknown UTC time",
-                        local ? (const char *)local : "unknown local time",
-                        category ? (const char *)category : "unknown",
-                        type ? (const char *)type : "unknown",
-                        summary ? (const char *)summary : "",
-                        source ? (const char *)source : "unspecified",
+                        fields[0] ? fields[0] : "unknown UTC time",
+                        fields[1] ? fields[1] : "unknown local time",
+                        fields[2] ? fields[2] : "unknown",
+                        fields[3] ? fields[3] : "unknown",
+                        fields[4] ? fields[4] : "",
+                        fields[6] ? fields[6] : "unspecified",
                         memory_saved ? "yes" : "no") != 0) {
             free(output);
             output = NULL;
             break;
         }
 
-        if (details && *(const char *)details) {
+        if (fields[5] && *fields[5]) {
             if (append_text(&output, &length, &capacity,
-                            "  Details: %s\n", (const char *)details) != 0) {
+                            "  Details: %s\n", fields[5]) != 0) {
                 free(output);
                 output = NULL;
                 break;
@@ -2742,45 +2751,36 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
                 if (seen_count < sizeof(seen_ids) / sizeof(seen_ids[0]))
                     seen_ids[seen_count++] = linked_id;
 
-                const unsigned char *relationship = sqlite3_column_text(link_statement, 0);
-                const unsigned char *notes = sqlite3_column_text(link_statement, 1);
-                const unsigned char *linked_category = sqlite3_column_text(link_statement, 3);
-                const unsigned char *linked_type = sqlite3_column_text(link_statement, 4);
-                const unsigned char *linked_summary = sqlite3_column_text(link_statement, 5);
-                const unsigned char *linked_details = sqlite3_column_text(link_statement, 6);
-                const unsigned char *linked_source = sqlite3_column_text(link_statement, 7);
+                const char *edge[2], *linked_fields[5];
+                if (log_read_text_fields(link_statement, 0, 2, edge) != 0 ||
+                    log_read_text_fields(link_statement, 3, 5, linked_fields) != 0)
+                    break;
                 size_t record_start = length;
-                int notes_length = sqlite3_column_bytes(link_statement, 1);
-                int summary_length = sqlite3_column_bytes(link_statement, 5);
-                int details_length = sqlite3_column_bytes(link_statement, 6);
 
                 if (append_text(&output, &length, &capacity,
                                 "  Linked event [%" PRId64 "] via %s | %s/%s\n"
-                                "    Summary: %.*s\n"
+                                "    Summary: %s\n"
                                 "    Source: %s\n",
                                 linked_id,
-                                relationship ? (const char *)relationship : "related",
-                                linked_category ? (const char *)linked_category : "unknown",
-                                linked_type ? (const char *)linked_type : "unknown",
-                                summary_length,
-                                linked_summary ? (const char *)linked_summary : "",
-                                linked_source ? (const char *)linked_source : "unspecified") != 0) {
+                                edge[0] ? edge[0] : "related",
+                                linked_fields[0] ? linked_fields[0] : "unknown",
+                                linked_fields[1] ? linked_fields[1] : "unknown",
+                                linked_fields[2] ? linked_fields[2] : "",
+                                linked_fields[4] ? linked_fields[4] : "unspecified") != 0) {
                     free(output);
                     output = NULL;
                     break;
                 }
-                if (notes && notes_length > 0 &&
+                if (edge[1] && *edge[1] &&
                     append_text(&output, &length, &capacity,
-                                "    Link notes: %.*s\n", notes_length,
-                                (const char *)notes) != 0) {
+                                "    Link notes: %s\n", edge[1]) != 0) {
                     free(output);
                     output = NULL;
                     break;
                 }
-                if (linked_details && details_length > 0 &&
+                if (linked_fields[3] && *linked_fields[3] &&
                     append_text(&output, &length, &capacity,
-                                "    Details: %.*s\n", details_length,
-                                (const char *)linked_details) != 0) {
+                                "    Details: %s\n", linked_fields[3]) != 0) {
                     free(output);
                     output = NULL;
                     break;
