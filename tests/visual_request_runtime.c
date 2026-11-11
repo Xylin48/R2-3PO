@@ -10,7 +10,8 @@
 static const pid_t encoder_pid = 727272;
 static char ppm_path[PATH_MAX], jpeg_path[PATH_MAX];
 static int ppm_fd = -1, fail_write, fail_close, stall_encoder, killed_encoder, reaped_encoder;
-static int fail_file_sync, fail_directory_sync, stop_after_archive_sync;
+static int fail_file_sync, fail_directory_sync, stop_after_archive_sync, archive_write_fd = -1;
+static int fail_partial_archive_write;
 static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_during_http, timeout_clock, clock_calls, read_mode, read_fd = -1;
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
@@ -47,7 +48,19 @@ int __wrap_mkstemps(char *path, int suffix)
 ssize_t __real_write(int, const void *, size_t);
 ssize_t __wrap_write(int fd, const void *p, size_t n)
 {
+    if (fail_partial_archive_write == 2 && fd == archive_write_fd) {
+        fail_partial_archive_write = 0;
+        errno = ENOSPC;
+        return -1;
+    }
+    if (fail_partial_archive_write == 1 && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
+        archive_write_fd = fd;
+        fail_partial_archive_write = 2;
+        return __real_write(fd, p, 7);
+    }
     if (fail_write && fd == ppm_fd) { errno = EIO; return -1; }
+    if (n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n))
+        archive_write_fd = fd;
     if (cancel_on_archive_write && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         cancel_on_archive_write = 0;
         cancel_request = 1;
@@ -91,7 +104,7 @@ int __wrap_fsync(int fd)
     struct stat metadata;
     assert(fstat(fd, &metadata) == 0);
     if ((S_ISDIR(metadata.st_mode) && fail_directory_sync) ||
-        (S_ISREG(metadata.st_mode) && fail_file_sync)) {
+        (fd == archive_write_fd && S_ISREG(metadata.st_mode) && fail_file_sync)) {
         fail_file_sync = fail_directory_sync = 0;
         errno = EIO;
         return -1;
@@ -271,13 +284,27 @@ static void rejected_frame(R2VisionFrame *frame)
 {
     sqlite3_int64 before = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
     int images = archive_count();
+    sqlite3_int64 pending = scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives");
     frame->frame_number++;
     char *result = r2_visual_analyze_frame(frame, "camera fixture", "observe real frame");
     assert(!result && scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before);
     assert(!gate_active && archive_count() == images);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == pending);
     temporary_files_gone();
 }
+static void deferred_frame(R2VisionFrame *frame)
+{
+    sqlite3_int64 before = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+    sqlite3_int64 pending = scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives");
+    int images = archive_count();
+    frame->frame_number++;
+    char *result = r2_visual_analyze_frame(frame, "camera fixture", "observe real frame");
+    assert(!result && scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before);
+    assert(!gate_active && archive_count() == images + 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == pending + 1);
+    temporary_files_gone();
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -403,7 +430,7 @@ int main(void)
         "WHERE e.event_type='visual_experience'");
     assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_overlay_insert BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END", NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"rejected insert\",\"focus\":null}", "stop");
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_overlay_insert", NULL, NULL, NULL) == SQLITE_OK);
 
     uint64_t prior_focus = visual_focus_sequence;
@@ -411,7 +438,7 @@ int main(void)
         "BEFORE INSERT ON r2_visual_experiences BEGIN SELECT RAISE(IGNORE); END",
         NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"skipped insert\",\"focus\":null}", "stop");
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(visual_focus_sequence == prior_focus);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER skip_visual_insert", NULL, NULL, NULL) == SQLITE_OK);
 
@@ -420,7 +447,7 @@ int main(void)
         "BEGIN SELECT RAISE(FAIL, 'fixture Life Log failure'); END",
         NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"Life Log refused this observation\",\"focus\":null}", "stop");
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_visual_event", NULL, NULL, NULL) == SQLITE_OK);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience'")
            == events_before);
@@ -436,11 +463,12 @@ int main(void)
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_pending_archive", NULL, NULL, NULL) == SQLITE_OK);
 
     response("{\"description\":\"archive sync failure fixture\",\"focus\":null}", "stop");
+    archive_write_fd = -1;
     fail_file_sync = 1;
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(!fail_file_sync);
     fail_directory_sync = 1;
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(!fail_directory_sync);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience'")
            == events_before);
@@ -503,14 +531,14 @@ int main(void)
         "AFTER INSERT ON r2_visual_experiences BEGIN SELECT RAISE(FAIL, 'fixture'); END",
         NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"rejected detached row\",\"focus\":null}", "stop");
-    rejected_frame(&frame);
+    deferred_frame(&frame);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER fail_after_detached_insert", NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"saved in a separate Visual library\",\"focus\":null}", "stop");
     actual = r2_visual_analyze_frame(&frame, "detached camera source", "separate database");
     assert(actual && !strcmp(actual, "saved in a separate Visual library"));
     free(actual);
     sqlite3_int64 detached_event = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences");
-    assert(detached_event > 0 && archive_count() == 1);
+    assert(detached_event > 0 && archive_count() == 2);
     sqlite3 *event_db = NULL;
     assert(sqlite3_open(database, &event_db) == SQLITE_OK);
     assert(scalar(event_db, "SELECT id FROM r2_log_events WHERE event_type='visual_experience' "
@@ -535,7 +563,7 @@ int main(void)
     actual = r2_visual_analyze_frame(&frame, "detached camera source", "same captured evidence");
     assert(actual);
     free(actual);
-    assert(archive_count() == 3);
+    assert(archive_count() == 4);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences "
                             "WHERE life_log_event_id IS NULL") == 2);
     assert(scalar(event_db, "SELECT count(*) FROM r2_log_events "
@@ -551,16 +579,16 @@ int main(void)
         assert(r2_log_init() == 0 && r2_sj_init() == 0);
         assert(r2_visual_init(next_db, next_library) == 0);
         assert(scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences "
-                                "ORDER BY id DESC LIMIT 1") == published_event);
+                                "WHERE source='detached camera source' ORDER BY id DESC LIMIT 1") == published_event);
         assert(scalar(visual_db, "SELECT count(DISTINCT life_log_event_id) "
-                                "FROM r2_visual_experiences") == 3);
+                                "FROM r2_visual_experiences WHERE source='detached camera source'") == 3);
         assert(scalar(event_db, "SELECT count(*) FROM r2_log_events e "
                                 "JOIN r2_sensory_journal j ON j.event_id=e.id "
                                 "WHERE e.source='detached camera source'") == 3);
     }
     assert(sqlite3_close(event_db) == SQLITE_OK);
     r2_visual_shutdown(); assert(r2_visual_init(database,library)==0);
-    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==7);
+    assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==12);
     assert(access(R2_VWEBCAM_DIR "/focus.json", F_OK) != 0);
     assert(unsetenv("DISPLAY")==0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
@@ -611,7 +639,7 @@ int main(void)
     assert(close(claim) == 0);
     assert(r2_visual_init(database, library) == 0);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 7);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 12);
     r2_visual_shutdown();
 
     claim = open(recovered_path, O_WRONLY | O_CLOEXEC);
@@ -631,7 +659,7 @@ int main(void)
     for (int i = 0; i < 2; ++i) {
         assert(r2_visual_init(database, library) == 0);
         assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
-        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 8);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 13);
         assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v "
             "JOIN r2_log_events e ON v.life_log_event_id=e.id "
             "JOIN r2_sensory_journal j ON j.event_id=e.id "
@@ -639,7 +667,7 @@ int main(void)
             "AND v.description='archive interrupted before publication' "
             "AND e.details=v.description AND v.prompt='crash boundary'") == 1);
         assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='interrupted camera'") == 1);
-        assert(archive_count() == 9 && access(older_orphan, F_OK) == 0);
+        assert(archive_count() == 14 && access(older_orphan, F_OK) == 0);
         r2_visual_shutdown();
     }
     assert(r2_visual_init(database, library) == 0);
@@ -650,14 +678,14 @@ int main(void)
     assert(!r2_visual_analyze_frame(&frame, "retained camera", "deferred publication"));
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience' AND source='retained camera'") == 0);
-    assert(archive_count() == 10);
+    assert(archive_count() == 15);
     assert(sqlite3_exec(visual_db, "DROP TRIGGER deny_pending_withdrawal", NULL, NULL, NULL) == SQLITE_OK);
     r2_visual_shutdown();
     assert(r2_visual_init(database, library) == 0);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences WHERE source='retained camera'") == 1);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE event_type='visual_experience' AND source='retained camera'") == 1);
-    assert(archive_count() == 10);
+    assert(archive_count() == 15);
     r2_visual_shutdown();
     free(recovered_path);
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
@@ -676,7 +704,7 @@ int main(void)
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 73);
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     assert(r2_visual_init(next_db, next_library) == 0);
-    assert(archive_count() == 4 && scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    assert(archive_count() == 5 && scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
     sqlite3_int64 replay_id = scalar(visual_db, "SELECT life_log_event_id FROM r2_visual_experiences "
         "WHERE source='detached interrupted camera' AND prompt='detached crash boundary'");
     assert(replay_id > 0 && sqlite3_open(database, &event_db) == SQLITE_OK);
@@ -720,6 +748,45 @@ int main(void)
     assert(replacement && replacement_length == 19 && !memcmp(replacement, "REPLACEMENT-ARCHIVE", 19));
     free(replacement);
     assert(unlink(replacement_path) == 0);
+    r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(database, library) == 0);
+    sqlite3_int64 before_partial = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+    response("{\"description\":\"original interpretation survived full storage\",\"focus\":null}", "stop");
+    fail_partial_archive_write = 1;
+    assert(!r2_visual_analyze_frame(&frame, "partial storage camera", "original storage question"));
+    assert(!fail_partial_archive_write);
+    pending = NULL;
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT image_path,jpeg,description,prompt FROM r2_visual_pending_archives",
+        -1, &pending, NULL) == SQLITE_OK && sqlite3_step(pending) == SQLITE_ROW);
+    char *partial_path = strdup((const char *)sqlite3_column_text(pending, 0));
+    assert(partial_path && sqlite3_column_bytes(pending, 1) == 20);
+    unsigned char original_jpeg[20];
+    memcpy(original_jpeg, sqlite3_column_blob(pending, 1), sizeof(original_jpeg));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 2), "original interpretation survived full storage"));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 3), "original storage question"));
+    sqlite3_finalize(pending);
+    r2_visual_shutdown();
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial);
+    r2_visual_shutdown();
+    assert(unlink(partial_path) == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial);
+    r2_visual_shutdown();
+    int repaired = open(partial_path, O_WRONLY | O_CREAT | O_EXCL, 0640);
+    assert(repaired >= 0 && __real_write(repaired, original_jpeg, sizeof(original_jpeg)) == 20);
+    assert(__real_fsync(repaired) == 0 && close(repaired) == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial + 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v JOIN r2_log_events e "
+        "ON e.id=v.life_log_event_id WHERE v.source='partial storage camera' "
+        "AND v.description=e.details AND v.prompt='original storage question'") == 1);
+    free(partial_path);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();

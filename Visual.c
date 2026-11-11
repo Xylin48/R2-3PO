@@ -1446,7 +1446,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     sqlite3 *archive_db = NULL;
     int archive_db_owned = 0;
     int staged = 0;
-    int publication_attempted = 0;
+    int withdraw_requested = 0;
     const char *failure = NULL;
     const char *failure_event = "visual_experience_store_failed";
 
@@ -1476,20 +1476,27 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
         visual_sync_directory(directory_snapshot) != 0) {
         failure_event = "visual_image_archive_failed";
         failure = "Could not write and synchronize the JPEG and archive directory.";
+        withdraw_requested = r2_ollama_vision_request_should_abort();
         goto failed;
     }
 
     pthread_mutex_lock(&visual_lock);
     int rc = SQLITE_ABORT;
     if (visual_initialized && visual_db && visual_generation == generation_snapshot &&
-        !r2_ollama_vision_request_should_abort() &&
-        visual_archive_matches_claim(image_fd, image_path)) {
-        publication_attempted = 1;
-        rc = visual_publish_archive(&experience);
-        if (rc == SQLITE_DONE)
-            publish_committed_focus(request_sequence, frame->preview_session, focus);
-        else if (!r2_ollama_vision_request_should_abort())
-            failure = "Could not publish the archived interpretation.";
+        !r2_ollama_vision_request_should_abort()) {
+        if (visual_archive_matches_claim(image_fd, image_path)) {
+            rc = visual_publish_archive(&experience);
+            if (rc == SQLITE_DONE)
+                publish_committed_focus(request_sequence, frame->preview_session, focus);
+            else if (!experience.cancelled)
+                failure = "Could not publish the archived interpretation; the pending save was retained.";
+        } else {
+            withdraw_requested = 1;
+            failure_event = "visual_image_archive_failed";
+            failure = "The archive path changed during the save.";
+        }
+    } else {
+        withdraw_requested = 1;
     }
     pthread_mutex_unlock(&visual_lock);
     if (rc != SQLITE_DONE) goto failed;
@@ -1502,26 +1509,32 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
 
 failed:
     if (image_fd >= 0) {
-        int discard_image = !publication_attempted || experience.cancelled;
         if (staged) {
+            pthread_mutex_lock(&visual_lock);
+            if (!visual_initialized || visual_generation != generation_snapshot)
+                withdraw_requested = 1;
+            pthread_mutex_unlock(&visual_lock);
+        }
+        /* Storage failure keeps the original evidence eligible for retry.
+         * Cancellation, session loss and path replacement withdraw the request. */
+        int discard_image = !staged || withdraw_requested || experience.cancelled;
+        if (staged && discard_image) {
             if (archive_db_owned) {
-                if (visual_withdraw_archive(archive_db, image_path) == SQLITE_DONE)
-                    discard_image = 1;
+                if (visual_withdraw_archive(archive_db, image_path) != SQLITE_DONE)
+                    fprintf(stderr, "[R2 Visual] Could not withdraw a cancelled pending save.\n");
             } else {
                 pthread_mutex_lock(&visual_lock);
                 if (visual_db && visual_generation == generation_snapshot &&
-                    visual_withdraw_archive(visual_db, image_path) == SQLITE_DONE)
-                    discard_image = 1;
+                    visual_withdraw_archive(visual_db, image_path) != SQLITE_DONE)
+                    fprintf(stderr, "[R2 Visual] Could not withdraw a cancelled pending save.\n");
                 pthread_mutex_unlock(&visual_lock);
             }
         }
-        /* If publication may have run, a failed withdrawal is not evidence
-         * that no record refers to the file. Leave it for restart or audit. */
         if (discard_image) {
             if (visual_archive_matches_claim(image_fd, image_path) && unlink(image_path) == 0)
                 (void)visual_sync_directory(directory_snapshot);
         } else {
-            fprintf(stderr, "[R2 Visual] Retained an archive after an uncertain save outcome.\n");
+            fprintf(stderr, "[R2 Visual] Original archive evidence remains pending after a storage failure.\n");
         }
         close(image_fd);
     }
