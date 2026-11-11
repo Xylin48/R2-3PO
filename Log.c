@@ -521,6 +521,10 @@ static int ensure_tables(void)
         " FOREIGN KEY(from_event_id) REFERENCES r2_log_events(id),"
         " FOREIGN KEY(to_event_id) REFERENCES r2_log_events(id)"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_sensory_journal_reflection_links ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " diary_entry_id INTEGER NOT NULL REFERENCES diary_entries(id)"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_hypotheticals ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL UNIQUE,"
@@ -1936,22 +1940,13 @@ int64_t r2_log_continuity(const char *item_key,
     return rc == SQLITE_DONE ? event_id : -1;
 }
 
-int r2_log_link(int64_t from_event_id, int64_t to_event_id,
-                const char *relationship, const char *notes)
+static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
+                           const char *relationship, const char *notes)
 {
-    if (from_event_id <= 0 || to_event_id <= 0 ||
-        !valid_text(relationship) || strlen(relationship) > 128)
-        return -1;
-
     char utc[40];
     timestamp_pair(utc, sizeof(utc), NULL, 0);
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT OR IGNORE INTO r2_log_links "
         "(from_event_id,to_event_id,relationship,notes,created_utc) "
@@ -1975,7 +1970,6 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         log_structured_insert_error("event link");
-        pthread_mutex_unlock(&log_lock);
         return -1;
     }
 
@@ -1998,8 +1992,76 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
     else if (rc != SQLITE_ROW)
         log_structured_insert_error("event link verification");
     sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
     return rc == SQLITE_ROW ? 0 : -1;
+}
+
+int r2_log_link(int64_t from_event_id, int64_t to_event_id,
+                const char *relationship, const char *notes)
+{
+    if (from_event_id <= 0 || to_event_id <= 0 ||
+        !valid_text(relationship) || strlen(relationship) > 128)
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    int rc = log_initialized && log_db
+        ? log_link_locked(from_event_id, to_event_id, relationship, notes) : -1;
+    pthread_mutex_unlock(&log_lock);
+    return rc;
+}
+
+int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
+                                 size_t speech_count)
+{
+    if (diary_id <= 0 || (speech_count && !speech_ids))
+        return -1;
+    const char *type = "reflection_completed";
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db, "SELECT entry FROM diary_entries WHERE id=?;",
+                                -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    const char *entry = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(st, 0) : NULL;
+    int64_t event_id = valid_text(entry) &&
+        strlen(entry) == (size_t)sqlite3_column_bytes(st, 0)
+        ? log_insert_event_locked(R2_LOG_THINKING, type,
+                                  "Private diary reflection was written.", entry, "internal_thinking")
+        : -1;
+    sqlite3_finalize(st);
+    st = NULL;
+
+    int saved = event_id > 0;
+    if (saved) {
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_sensory_journal_reflection_links(event_id,diary_entry_id) VALUES(?,?);",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, diary_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(st);
+    }
+    for (size_t i = 0; saved && i < speech_count; ++i)
+        saved = log_link_locked(event_id, speech_ids[i], "speech_was_transcribed_for_reflection",
+            "Exact locally recognized audio event; availability alone is not interpretation.") == 0;
+    if (saved)
+        saved = exec_sql("COMMIT;") == 0;
+    if (!saved) {
+        fprintf(stderr, "[R2 Life Log] Could not confirm reflection completion for diary %lld.\n",
+                (long long)diary_id);
+        if (!sqlite3_get_autocommit(log_db))
+            (void)exec_sql("ROLLBACK;");
+    }
+    pthread_mutex_unlock(&log_lock);
+    if (!saved) return -1;
+
+    r2_sj_index_event(event_id, "thinking", type, "internal_thinking");
+    return event_id;
 }
 
 int64_t r2_log_hypothetical(const char *scenario,

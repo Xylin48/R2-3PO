@@ -15,8 +15,8 @@
  * Life Log entries without replacing the underlying records.
  *
  * Database: R2_DIARY_DATABASE (r2_memory.db)
- * Tables are namespaced with r2_log_ and do not alter the
- * existing memories or diary_entries tables.
+ * Life Log tables and their durable relationships do not
+ * alter the existing memories or diary_entries tables.
  * ============================================================
  */
 
@@ -211,6 +211,10 @@ int64_t r2_log_continuity(const char *item_key,
                           const char *origin);
 
 /* Link two events by a named relationship. */
+/* Commit completion, its exact diary ID and captured speech edges together. */
+int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
+                                 size_t speech_count);
+
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,
                 const char *relationship, const char *notes);
 

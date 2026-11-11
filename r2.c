@@ -9379,14 +9379,11 @@ static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
     if (r2_diary_write_with_id(reflection, &diary_id) != 0) return -1;
-    int64_t event_id = r2_log_thinking("reflection_completed",
-                                     "Private diary reflection was written.", reflection);
+    int64_t event_id = r2_log_record_reflection(diary_id,
+        evidence ? evidence->events : NULL, evidence ? evidence->count : 0);
     if (event_id > 0) {
-        if (r2_sj_link_reflection(event_id, diary_id) != 0)
-            fprintf(stderr, "[R2 diary] Could not persist exact reflection-to-diary link.\n");
-        r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_reflection");
         if (event_id_out) *event_id_out = event_id;
-    } else fprintf(stderr, "[R2 diary] Diary row saved, but completion event could not be persisted.\n");
+    } else fprintf(stderr, "[R2 diary] Diary row saved; reflection completion was not confirmed.\n");
     return 0;
 }
 
@@ -9649,7 +9646,8 @@ static void *autonomous_thinking(void *arg)
         }
 
         int64_t reflection_event_id = 0;
-        if (r2_store_reflection(reflection, &speech_evidence, &reflection_event_id) == 0) {
+        int diary_saved = r2_store_reflection(reflection, &speech_evidence, &reflection_event_id);
+        if (diary_saved == 0 && reflection_event_id > 0) {
             log_structured_self_report(reflection, reflection_event_id);
             r2_log_continuity("r2_private_reflection", "routine",
                               "Private autonomous reflection",
@@ -9659,7 +9657,7 @@ static void *autonomous_thinking(void *arg)
                private contents into the active conversation terminal. */
             fprintf(stderr,
                     "[R2 diary] Autonomous reflection written to diary and Life Log.\n");
-        } else {
+        } else if (diary_saved != 0) {
             r2_log_event(R2_LOG_ERROR, "reflection_write_failed",
                          "Failed to write autonomous reflection.",
                          NULL, "autonomous_thinking");

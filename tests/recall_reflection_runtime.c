@@ -133,6 +133,38 @@ int main(void)
             reflections[i]) == speech[i]);
         assert(r2_sj_link_reflection(speech[i], diary_ids[i]) == -1);
     }
+    /* An exact existing link cannot be redirected to another diary row
+       with identical text. */
+    assert(r2_sj_link_reflection(reflections[0], diary_ids[1]) == -1);
+
+    /* Failure on the second speech edge must roll back completion, the
+       diary association and the first edge. The diary itself still exists. */
+    assert(sqlite3_exec(connection,
+        "CREATE TRIGGER fail_reflection_edge BEFORE INSERT ON r2_log_links "
+        "WHEN NEW.relationship='speech_was_transcribed_for_reflection' "
+        "AND NEW.to_event_id=(SELECT MAX(id) FROM r2_log_events WHERE event_type='speech_transcribed') "
+        "BEGIN SELECT RAISE(FAIL,'reflection evidence fixture'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    R2AudioTurnEvidence both = {.events = speech, .count = 2};
+    int64_t incomplete = -1;
+    assert(r2_store_reflection("REFLECTION_WITH_FAILED_EDGE", &both, &incomplete) == 0);
+    assert(incomplete == 0);
+    assert(scalar(connection, "SELECT COUNT(*) FROM diary_entries WHERE entry='REFLECTION_WITH_FAILED_EDGE'", 0) == 1);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='reflection_completed'", 0) == 2);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal_reflection_links", 0) == 2);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_log_links WHERE relationship='speech_was_transcribed_for_reflection'", 0) == 2);
+    assert(sqlite3_exec(connection, "DROP TRIGGER fail_reflection_edge;", NULL, NULL, NULL) == SQLITE_OK);
+
+    /* Journal projection can be offline. Completion and its exact diary
+       association must commit anyway and be discoverable after backfill. */
+    r2_sj_shutdown();
+    int64_t offline_reflection = 0;
+    assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", NULL, &offline_reflection) == 0);
+    assert(offline_reflection > 0);
+    int64_t offline_diary = scalar(connection,
+        "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", offline_reflection);
+    assert(offline_diary > 0 && offline_diary != diary_ids[0] && offline_diary != diary_ids[1]);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal WHERE event_id=?", offline_reflection) == 0);
     assert(diary_ids[0] != diary_ids[1]);
     int64_t absent = -1;
     assert(r2_diary_write_with_id(" \n\t", &absent) == -1 && absent == 0);
@@ -140,6 +172,9 @@ int main(void)
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal WHERE event_id=?", offline_reflection) == 1);
+    assert(scalar(connection,
+        "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", offline_reflection) == offline_diary);
     for (int i = 0; i < 2; ++i) {
         assert(scalar(connection,
             "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", reflections[i]) == diary_ids[i]);
