@@ -15,7 +15,8 @@ static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_du
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
 static uint64_t fixture_preview_session = 1;
-static int switch_preview_during_request, switch_archive_session;
+static int switch_preview_during_request, switch_archive_session, replace_archive_path;
+static char replacement_path[PATH_MAX];
 static CURLoption failed_option;
 
 uint64_t __wrap_r2_eyes_preview_session(void)
@@ -50,6 +51,22 @@ ssize_t __wrap_write(int fd, const void *p, size_t n)
     if (cancel_on_archive_write && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         cancel_on_archive_write = 0;
         cancel_request = 1;
+    }
+    if (replace_archive_path && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
+        replace_archive_path = 0;
+        sqlite3_stmt *pending = NULL;
+        assert(sqlite3_prepare_v2(visual_db, "SELECT image_path FROM r2_visual_pending_archives",
+                                  -1, &pending, NULL) == SQLITE_OK);
+        assert(sqlite3_step(pending) == SQLITE_ROW);
+        const char *path = (const char *)sqlite3_column_text(pending, 0);
+        assert(path && strlen(path) < sizeof(replacement_path));
+        strcpy(replacement_path, path);
+        sqlite3_finalize(pending);
+        assert(unlink(replacement_path) == 0);
+        int replacement = open(replacement_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        assert(replacement >= 0);
+        assert(__real_write(replacement, "REPLACEMENT-ARCHIVE", 19) == 19);
+        assert(close(replacement) == 0);
     }
     if (switch_archive_session && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         int session = switch_archive_session;
@@ -687,6 +704,23 @@ int main(void)
         assert(r2_visual_init(database, library) == 0 && archive_count() == files_before);
         r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     }
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(database, library) == 0);
+    sqlite3_int64 before_replacement = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+    response("{\"description\":\"replaced file must retain its owner\",\"focus\":null}", "stop");
+    replace_archive_path = 1;
+    assert(!r2_visual_analyze_frame(&frame, "replaced archive camera", "file ownership"));
+    assert(!replace_archive_path);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_replacement);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events "
+                           "WHERE event_type='visual_experience' AND source='replaced archive camera'") == 0);
+    size_t replacement_length = 0;
+    unsigned char *replacement = read_file(replacement_path, &replacement_length);
+    assert(replacement && replacement_length == 19 && !memcmp(replacement, "REPLACEMENT-ARCHIVE", 19));
+    free(replacement);
+    assert(unlink(replacement_path) == 0);
+    r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
     puts("Visual setup/response/session boundaries, complete persistence, encoder cancellation and owned-file cleanup passed with synthetic HTTP/encoder.");

@@ -1139,3 +1139,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced the pending write, Visual close/reopen, publication guard, and failure cleanup. Cleanup previously used only the current global connection and generation. Reopening the same library, or switching to another library during a write, left a withdrawn record in the original store.
 - A file-backed request now owns a connection to its original database through completion. Withdrawal uses a transaction so an SQLite AFTER DELETE failure cannot discard the row while reporting failure. Private in-memory databases continue to use their session connection.
 - The native fixture passed reopen of the same store and a switch to a different store during archive writing, with no published observation and no pending row left in the original store. The blocked-withdrawal fixture uses an AFTER DELETE failure and verifies retention followed by exact restart recovery. This completes the scoped connection lifetime and withdrawal trace.
+
+### R2-AUD-2026-11-10-095 — Check archive ownership before publication and cleanup
+
+- Followed the open file claim through the JPEG write, final SQL publication, startup verification, and unlink paths. The pathname could refer to a replacement file after the original was opened.
+- Compare the current path's device, inode, regular-file type and size with the claimed descriptor before live publication or cleanup. Startup verification uses the same check. Compliant writers still coordinate with the existing file lock.
+- The native regression replaced the directory entry during the owned write and verified that the observation stayed unpublished and the replacement's bytes survived cleanup. This completes the scoped descriptor-to-path custody trace.

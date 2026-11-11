@@ -327,6 +327,15 @@ static int visual_prepare_directory(const char *path)
     return -1;
 }
 
+static int visual_archive_matches_claim(int fd, const char *path)
+{
+    struct stat owned, current;
+    return fstat(fd, &owned) == 0 && lstat(path, &current) == 0 &&
+        S_ISREG(owned.st_mode) && S_ISREG(current.st_mode) &&
+        current.st_dev == owned.st_dev && current.st_ino == owned.st_ino &&
+        current.st_size == owned.st_size;
+}
+
 static int visual_create_archive(const char *directory, const R2VisionFrame *frame,
                                  char *path, size_t capacity)
 {
@@ -345,7 +354,7 @@ static int visual_create_archive(const char *directory, const R2VisionFrame *fra
         if (fd >= 0) {
             if (flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
             int error = errno;
-            unlink(path);
+            if (visual_archive_matches_claim(fd, path)) unlink(path);
             close(fd);
             errno = error;
             return -1;
@@ -1139,10 +1148,7 @@ static int visual_verify_pending_image(const char *path, const unsigned char *jp
         if (valid) offset += (size_t)read_size;
     }
     if (valid && visual_sync(fd) == 0 && visual_sync_directory(visual_directory) == 0) {
-        struct stat current;
-        if (lstat(path, &current) == 0 && current.st_dev == st.st_dev && current.st_ino == st.st_ino &&
-            current.st_size == st.st_size)
-            return fd;
+        if (visual_archive_matches_claim(fd, path)) return fd;
     }
     close(fd);
     return -1;
@@ -1476,7 +1482,8 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     pthread_mutex_lock(&visual_lock);
     int rc = SQLITE_ABORT;
     if (visual_initialized && visual_db && visual_generation == generation_snapshot &&
-        !r2_ollama_vision_request_should_abort()) {
+        !r2_ollama_vision_request_should_abort() &&
+        visual_archive_matches_claim(image_fd, image_path)) {
         publication_attempted = 1;
         rc = visual_publish_archive(&experience);
         if (rc == SQLITE_DONE)
@@ -1511,7 +1518,8 @@ failed:
         /* If publication may have run, a failed withdrawal is not evidence
          * that no record refers to the file. Leave it for restart or audit. */
         if (discard_image) {
-            if (unlink(image_path) == 0) (void)visual_sync_directory(directory_snapshot);
+            if (visual_archive_matches_claim(image_fd, image_path) && unlink(image_path) == 0)
+                (void)visual_sync_directory(directory_snapshot);
         } else {
             fprintf(stderr, "[R2 Visual] Retained an archive after an uncertain save outcome.\n");
         }
