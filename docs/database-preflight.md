@@ -58,3 +58,10 @@ Use `--visual-db` if Visual was configured with a separate database. When auditi
 The report separates missing indexed files, unindexed JPEG candidates, unresolved relative paths, and pending Life Log links. Older rows without a recovery key are listed separately. Pending archives have a saved interpretation and are listed separately from files that lack an index or pending record. The report indicates file presence. Visual verifies the complete bytes during restart recovery. While R2 is running, a candidate may be a save that has reached disk before the database commit. The comparison reads file metadata and the index, leaving archives and database records in place.
 
 A copied archive can have the same filenames under a different directory while its database still records the original absolute paths. The archive comparison reports those outside paths and any matching local filenames. A filename match alone establishes a possible copy for review. Restoring the original configured paths keeps existing references usable.
+
+The archive report separates `pending_archives` from `withdrawn_archives`.
+Pending records retain the original interpretation and encoded bytes after a
+storage failure; startup publishes only when the complete owned file verifies.
+Missing or partial files remain pending. Withdrawn records are cancelled saves
+whose cleanup did not finish. Startup excludes them even if a matching JPEG is
+restored later. The read-only report does not delete either kind of record.

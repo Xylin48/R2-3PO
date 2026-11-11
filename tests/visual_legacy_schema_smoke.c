@@ -78,6 +78,16 @@ int main(void)
         "(NULL,'2020-02-03T04:05:06Z','','/legacy/alternate.jpg','another camera','alternate aliases');",
         NULL, NULL, NULL) == SQLITE_OK);
 
+    assert(sqlite3_exec(legacy_db,
+        "CREATE TABLE r2_visual_pending_archives ("
+        "id INTEGER PRIMARY KEY,image_path TEXT NOT NULL UNIQUE,created_utc TEXT NOT NULL,"
+        "source TEXT NOT NULL,model TEXT NOT NULL,prompt TEXT,description TEXT NOT NULL,"
+        "width INTEGER NOT NULL,height INTEGER NOT NULL,frame_number INTEGER NOT NULL,"
+        "frame_timestamp INTEGER NOT NULL,jpeg BLOB NOT NULL);"
+        "INSERT INTO r2_visual_pending_archives VALUES(91,'/legacy/missing.jpg','original date',"
+        "'original source','original model','original question','original interpretation',"
+        "640,480,7,123456,X'001122FF');", NULL, NULL, NULL) == SQLITE_OK);
+
     assert(sqlite3_exec(legacy_db, "CREATE TRIGGER deny_backfill "
         "BEFORE UPDATE ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture'); END",
         NULL, NULL, NULL) == SQLITE_OK);
@@ -86,10 +96,24 @@ int main(void)
     assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
     assert(!visual_column_exists(legacy_db, "created_utc"));
     assert(!visual_column_exists(legacy_db, "life_log_event_id"));
+    sqlite3_stmt *migration = NULL;
+    assert(sqlite3_prepare_v2(legacy_db, "SELECT withdrawn FROM r2_visual_pending_archives",
+        -1, &migration, NULL) == SQLITE_ERROR);
+    sqlite3_finalize(migration);
     assert(sqlite3_exec(legacy_db, "DROP TRIGGER deny_backfill", NULL, NULL, NULL) == SQLITE_OK);
     assert(sqlite3_close(legacy_db) == SQLITE_OK);
     assert(r2_visual_init(path, path) == -1 && !r2_visual_is_initialized());
     assert(r2_visual_init(path, library) == 0);
+    migration = NULL;
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT withdrawn,source,prompt,description,hex(jpeg) FROM r2_visual_pending_archives WHERE id=91",
+        -1, &migration, NULL) == SQLITE_OK && sqlite3_step(migration) == SQLITE_ROW);
+    assert(sqlite3_column_int(migration, 0) == 0);
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 1), "original source"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 2), "original question"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 3), "original interpretation"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 4), "001122FF"));
+    sqlite3_finalize(migration);
     int legacy_rows = 0;
     assert(r2_visual_visit_search("legacy-camera", 2, visit_legacy_visual, &legacy_rows) == 0);
     assert(legacy_rows == 1);

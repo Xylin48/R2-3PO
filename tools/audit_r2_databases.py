@@ -390,6 +390,7 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
         "paths_outside_library": [],
         "pending_life_log_ids": [],
         "pending_archives": [],
+        "withdrawn_archives": [],
         "legacy_unlinked_ids": [],
         "error": None,
     }
@@ -441,27 +442,30 @@ def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
         pending_columns = {row[1].lower() for row in
                            db.execute("PRAGMA table_info(r2_visual_pending_archives)")}
         if {"id", "image_path"} <= pending_columns:
-            for row_id, path in db.execute(
-                    "SELECT id,image_path FROM r2_visual_pending_archives ORDER BY id"):
+            withdrawn_column = "withdrawn" if "withdrawn" in pending_columns else "0"
+            for row_id, path, withdrawn in db.execute(
+                    f"SELECT id,image_path,{withdrawn_column} FROM r2_visual_pending_archives ORDER BY id"):
+                record_type = "withdrawn" if withdrawn else "pending"
+                label = "withdrawn_archives" if withdrawn else "pending_archives"
                 if not isinstance(path, str) or "\x00" in path:
                     continue
                 stored = Path(path)
                 if stored.is_absolute() and stored.parent.resolve() == archive:
                     indexed.add(stored.name)
-                    report["pending_archives"].append({
+                    report[label].append({
                         "id": row_id, "path": path, "file_present": stored.name in files,
                     })
                 elif stored.is_absolute():
                     matching_file = str(archive / stored.name) if stored.name in files else None
                     report["paths_outside_library"].append({
-                        "record_type": "pending", "id": row_id, "path": path,
+                        "record_type": record_type, "id": row_id, "path": path,
                         "matching_filename": matching_file,
                     })
                     if matching_file is not None:
                         indexed.add(stored.name)
                 else:
                     report["unresolved_relative_paths"].append({
-                        "record_type": "pending", "id": row_id, "path": path,
+                        "record_type": record_type, "id": row_id, "path": path,
                     })
                     indexed.add(stored.name)
 

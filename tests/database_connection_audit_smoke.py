@@ -136,6 +136,23 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     with sqlite3.connect(visual_db) as db:
         assert db.execute("SELECT life_log_event_id FROM r2_visual_experiences WHERE id=2").fetchone() == (None,)
 
+    # An older pending table upgrades additively; cancelled cleanup records
+    # remain distinct even if their original JPEG is restored later.
+    with sqlite3.connect(visual_db) as db:
+        db.execute("ALTER TABLE r2_visual_pending_archives ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0")
+        db.executemany("INSERT INTO r2_visual_pending_archives VALUES(?,?,1)", [
+            (23, str(archive / "withdrawn.jpg")),
+            (24, str(archive / "absent-withdrawn.jpg")),
+        ])
+    (archive / "withdrawn.jpg").write_bytes(b"cancelled fixture")
+    withdrawn_report = audit.audit_visual_archive(visual_db, archive)
+    assert withdrawn_report["error"] is None
+    assert withdrawn_report["pending_archives"] == visual["pending_archives"]
+    assert withdrawn_report["withdrawn_archives"] == [
+        {"id": 23, "path": str(archive / "withdrawn.jpg"), "file_present": True},
+        {"id": 24, "path": str(archive / "absent-withdrawn.jpg"), "file_present": False},
+    ]
+
     # A copied backup keeps the original absolute paths. Same-named files in
     # the copy are candidates for relocation, rather than unrecorded memories.
     restored = root / "restored_archive"

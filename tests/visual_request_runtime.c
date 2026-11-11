@@ -788,6 +788,43 @@ int main(void)
         "AND v.description=e.details AND v.prompt='original storage question'") == 1);
     free(partial_path);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    assert(r2_visual_init(database, library) == 0);
+    assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_cancel_cleanup "
+        "AFTER DELETE ON r2_visual_pending_archives BEGIN SELECT RAISE(FAIL, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    response("{\"description\":\"cancelled evidence stays withdrawn\",\"focus\":null}", "stop");
+    cancel_on_archive_write = 1;
+    assert(!r2_visual_analyze_frame(&frame, "cancelled storage camera", "cancel cleanup"));
+    cancel_request = 0;
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives WHERE withdrawn=1") == 1);
+    pending = NULL;
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT image_path FROM r2_visual_pending_archives WHERE withdrawn=1",
+        -1, &pending, NULL) == SQLITE_OK && sqlite3_step(pending) == SQLITE_ROW);
+    char *cancelled_path = strdup((const char *)sqlite3_column_text(pending, 0));
+    assert(cancelled_path && access(cancelled_path, F_OK) != 0);
+    sqlite3_finalize(pending);
+    r2_visual_shutdown();
+    /* A later restore of the original file must not resurrect the cancellation. */
+    repaired = open(cancelled_path, O_WRONLY | O_CREAT | O_EXCL, 0640);
+    assert(repaired >= 0 && __real_write(repaired, "SYNTHETIC-JPEG-BYTES", 20) == 20);
+    assert(__real_fsync(repaired) == 0 && close(repaired) == 0);
+    for (int retry = 0; retry < 2; ++retry) {
+        assert(r2_visual_init(database, library) == 0);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives WHERE withdrawn=1") == 1);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences "
+            "WHERE source='cancelled storage camera'") == 0);
+        assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events "
+            "WHERE event_type='visual_experience' AND source='cancelled storage camera'") == 0);
+        char *withdrawn_recall = r2_visual_search("cancelled evidence stays withdrawn", 10);
+        assert(withdrawn_recall && !strstr(withdrawn_recall, "cancelled evidence stays withdrawn"));
+        free(withdrawn_recall);
+        r2_visual_shutdown();
+    }
+    assert(unlink(cancelled_path) == 0);
+    free(cancelled_path);
+    r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
     puts("Visual setup/response/session boundaries, complete persistence, encoder cancellation and owned-file cleanup passed with synthetic HTTP/encoder.");

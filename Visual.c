@@ -817,6 +817,26 @@ static int visual_backfill(const char *target, const char *source)
     return sqlite3_exec(visual_db, sql, NULL, NULL, NULL);
 }
 
+/* Older pending tables remain writable and retain every original payload. */
+static int visual_migrate_pending_schema(void)
+{
+    sqlite3_stmt *st = NULL;
+    int found = 0;
+    int rc = sqlite3_prepare_v2(visual_db,
+        "PRAGMA table_info(r2_visual_pending_archives)", -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(st, 1);
+            if (name && !strcasecmp(name, "withdrawn")) found = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rc;
+    return found ? SQLITE_OK : sqlite3_exec(visual_db,
+        "ALTER TABLE r2_visual_pending_archives ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0",
+        NULL, NULL, NULL);
+}
+
 static int visual_migrate_schema(void)
 {
     const char *columns[][2] = {
@@ -967,12 +987,13 @@ typedef struct {
 static const char *visual_experience_summary =
     "R2's vision model interpreted a real captured frame.";
 
-static int visual_drop_pending(sqlite3 *db, const char *path)
+static int visual_drop_pending(sqlite3 *db, const char *path, int withdrawn)
 {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "DELETE FROM r2_visual_pending_archives WHERE image_path=?", -1, &st, NULL);
+        "DELETE FROM r2_visual_pending_archives WHERE image_path=? AND withdrawn=?", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, withdrawn);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
@@ -1043,7 +1064,24 @@ static int visual_withdraw_archive(sqlite3 *db, const char *path)
 {
     int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
-    return visual_finish_transaction(db, visual_drop_pending(db, path));
+    sqlite3_stmt *st = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "UPDATE r2_visual_pending_archives SET withdrawn=1 WHERE image_path=?",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
+    sqlite3_finalize(st);
+    rc = visual_finish_transaction(db, rc);
+    if (rc != SQLITE_DONE) return rc;
+
+    /* Commit withdrawal independently of deletion. A failed cleanup must never
+     * make a cancelled observation eligible for restart publication. */
+    rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = visual_finish_transaction(db, visual_drop_pending(db, path, 1));
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[R2 Visual] A withdrawn archive record remains for cleanup.\n");
+    return SQLITE_DONE;
 }
 
 static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
@@ -1065,7 +1103,7 @@ static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
         experience->cancelled = 1;
         return SQLITE_ABORT;
     }
-    return rc == SQLITE_DONE ? visual_drop_pending(db, experience->image_path) : rc;
+    return rc == SQLITE_DONE ? visual_drop_pending(db, experience->image_path, 0) : rc;
 }
 
 static int visual_link_detached(sqlite3_int64 row_id, const char *key,
@@ -1163,7 +1201,7 @@ static void visual_retry_pending_archives(void)
         int rc = sqlite3_prepare_v2(visual_db,
             "SELECT id,image_path,created_utc,source,model,prompt,description,width,height,"
             "frame_number,frame_timestamp,jpeg FROM r2_visual_pending_archives "
-            "WHERE id>? ORDER BY id LIMIT 1", -1, &st, NULL);
+            "WHERE id>? AND withdrawn=0 ORDER BY id LIMIT 1", -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (rc != SQLITE_ROW) {
@@ -1298,11 +1336,12 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         "id INTEGER PRIMARY KEY AUTOINCREMENT,image_path TEXT NOT NULL UNIQUE,"
         "created_utc TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,"
         "prompt TEXT,description TEXT NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,"
-        "frame_number INTEGER NOT NULL,frame_timestamp INTEGER NOT NULL,jpeg BLOB NOT NULL);";
+        "frame_number INTEGER NOT NULL,frame_timestamp INTEGER NOT NULL,jpeg BLOB NOT NULL,withdrawn INTEGER NOT NULL DEFAULT 0);";
     int rc = sqlite3_busy_timeout(visual_db, 5000);
     if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, "PRAGMA synchronous=FULL", NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, schema, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = visual_migrate_pending_schema();
     if (rc == SQLITE_OK) rc = visual_migrate_schema();
     if (rc == SQLITE_OK) rc = sqlite3_exec(visual_db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK) {
@@ -1511,7 +1550,8 @@ failed:
     if (image_fd >= 0) {
         if (staged) {
             pthread_mutex_lock(&visual_lock);
-            if (!visual_initialized || visual_generation != generation_snapshot)
+            if (!visual_initialized || visual_generation != generation_snapshot ||
+                r2_ollama_vision_request_should_abort())
                 withdraw_requested = 1;
             pthread_mutex_unlock(&visual_lock);
         }
