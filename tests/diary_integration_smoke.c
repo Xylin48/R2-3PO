@@ -12,6 +12,8 @@
 #include <string.h>
 #include <sqlite3.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 static int log_ready = 0;
 
@@ -320,12 +322,72 @@ static void verify_legacy_diary_migration(void)
     sqlite3_close(db);
 }
 
+static void verify_migration_rollback(void)
+{
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE r2_diary_entry_links(diary_entry_id INTEGER PRIMARY KEY,linked_at TEXT NOT NULL);"
+        "INSERT INTO r2_diary_entry_links VALUES(1,'');"
+        "CREATE TRIGGER ignore_link_timestamp BEFORE UPDATE ON r2_diary_entry_links "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_diary_init() == -1);
+    assert(scalar_int("SELECT COUNT(*) FROM pragma_table_info('diary_entries') WHERE name='created_at';") == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM pragma_table_info('r2_diary_entry_links') WHERE name='log_event_id';") == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM diary_entries WHERE timestamp='2001-02-03 04:05:06';") == 1);
+    assert(sqlite3_exec(db,
+        "DROP TRIGGER ignore_link_timestamp; DELETE FROM r2_diary_entry_links;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(db) == SQLITE_OK);
+}
+
+static void verify_mirror_flush_failure(void)
+{
+    time_t now = time(NULL);
+    struct tm local;
+    char date[32];
+    assert(localtime_r(&now, &local));
+    assert(strftime(date, sizeof(date), "%Y-%m-%d", &local));
+    char path[1024], backup[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s.md", R2_DIARY_DIR, date);
+    assert(n > 0 && (size_t)n < sizeof(path));
+    n = snprintf(backup, sizeof(backup), "%s.fixture-backup", path);
+    assert(n > 0 && (size_t)n < sizeof(backup));
+    int moved = rename(path, backup) == 0;
+    assert(moved || errno == ENOENT);
+    assert(symlink("/dev/full", path) == 0);
+
+    FILE *diagnostic = tmpfile();
+    assert(diagnostic);
+    int saved_stderr = dup(STDERR_FILENO);
+    assert(saved_stderr >= 0);
+    assert(dup2(fileno(diagnostic), STDERR_FILENO) == STDERR_FILENO);
+    int64_t diary_id = 0;
+    int result = r2_diary_write_with_id("mirror flush failure fixture", &diary_id);
+    assert(fflush(stderr) == 0);
+    assert(dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO);
+    assert(close(saved_stderr) == 0);
+    rewind(diagnostic);
+    char message[4096];
+    size_t count = fread(message, 1, sizeof(message) - 1, diagnostic);
+    message[count] = '\0';
+    assert(fclose(diagnostic) == 0);
+    assert(unlink(path) == 0);
+    if (moved) assert(rename(backup, path) == 0);
+
+    assert(result == 0 && diary_id > 0);
+    assert(strstr(message, "saved in SQLite; Markdown mirror write failed"));
+    assert(scalar_int("SELECT COUNT(*) FROM diary_entries WHERE entry='mirror flush failure fixture';") == 1);
+}
+
 int main(void)
 {
     char *context;
     assert(mkdir(R2_ROOT, 0700) == 0 || errno == EEXIST);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     seed_legacy_diary_entries();
+    verify_migration_rollback();
     assert(r2_diary_init() == 0);
     int legacy_rows = 0;
     assert(r2_diary_visit_search("legacy schema migration fixture", 2,
@@ -357,6 +419,16 @@ int main(void)
     assert(scalar_int("SELECT COUNT(*) FROM diary_entries;") == 1);
     assert(reward_total() == before_reward);
     assert(sqlite3_exec(writer, "DROP TRIGGER ignore_diary_fixture;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER fail_after_diary_fixture AFTER INSERT ON diary_entries "
+        "WHEN NEW.entry='failed diary fixture' BEGIN SELECT RAISE(FAIL,'diary fixture'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    int64_t failed_id = -1;
+    assert(r2_diary_write_with_id("failed diary fixture", &failed_id) == -1);
+    assert(failed_id == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM diary_entries WHERE entry='failed diary fixture';") == 0);
+    assert(reward_total() == before_reward);
+    assert(sqlite3_exec(writer, "DROP TRIGGER fail_after_diary_fixture;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(writer);
 
     log_ready = 1;
@@ -511,6 +583,37 @@ int main(void)
         assert(r2_reward_reconnect_history(PAGE_SIZE) == 0);
     }
 
+    /* A negative legacy placeholder, a misleading event from another source,
+       and a blocked seed must not stop later pages or shorten timestamps. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "INSERT INTO diary_entries(entry,created_at,timestamp) VALUES"
+        "('negative pointer fixture',printf('%0900d',0)||'TIME-END','legacy'),"
+        "('blocked seed fixture','2004-01-02','legacy'),"
+        "('later page fixture','2004-01-03','legacy');"
+        "INSERT INTO r2_diary_entry_links(diary_entry_id,log_event_id,linked_at,memory_indexed) "
+        "SELECT id,-7,'legacy',1 FROM diary_entries WHERE entry='negative pointer fixture';"
+        "INSERT INTO r2_log_events(local_time,category,event_type,summary,details,source) "
+        "SELECT 'legacy','thinking','diary_entry_linked','wrong owner',"
+        "'diary_entry_id='||id||'; misleading','other module' "
+        "FROM diary_entries WHERE entry='negative pointer fixture';"
+        "CREATE TRIGGER block_seed BEFORE INSERT ON r2_diary_entry_links "
+        "WHEN NEW.diary_entry_id=(SELECT id FROM diary_entries WHERE entry='blocked seed fixture') "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_diary_reconnect_history(1) == 2);
+    assert(scalar_int(
+        "SELECT COUNT(*) FROM diary_entries d JOIN r2_diary_entry_links l ON l.diary_entry_id=d.id "
+        "JOIN r2_log_events e ON e.id=l.log_event_id WHERE d.entry='negative pointer fixture' "
+        "AND l.linked_at=d.created_at AND e.source='r2_diary.c' AND e.memory_saved=1 "
+        "AND instr(e.details,'created_at='||d.created_at||';')>0;") == 1);
+    assert(r2_diary_reconnect_history(1) == -1);
+    assert(sqlite3_exec(writer, "DROP TRIGGER block_seed;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(writer) == SQLITE_OK);
+    assert(r2_diary_reconnect_history(1) == 1);
+    assert(r2_diary_reconnect_history(1) == 0);
+
+    verify_mirror_flush_failure();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
     return 0;
