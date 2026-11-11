@@ -2009,10 +2009,9 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
     return rc;
 }
 
-int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
-                                 size_t speech_count)
+int64_t r2_log_complete_reflection(int64_t diary_id)
 {
-    if (diary_id <= 0 || (speech_count && !speech_ids))
+    if (diary_id <= 0)
         return -1;
     const char *type = "reflection_completed";
     pthread_mutex_lock(&log_lock);
@@ -2022,12 +2021,21 @@ int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
     }
 
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(log_db, "SELECT entry FROM diary_entries WHERE id=?;",
-                                -1, &st, NULL);
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT d.entry,p.speech_count FROM r2_diary_pending_reflections p "
+        "LEFT JOIN diary_entries d ON d.id=p.diary_entry_id WHERE p.diary_entry_id=?;",
+        -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(st);
+        (void)exec_sql("ROLLBACK;");
+        pthread_mutex_unlock(&log_lock);
+        return 0; /* No pending completion to consume. */
+    }
     const char *entry = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(st, 0) : NULL;
-    int64_t event_id = valid_text(entry) &&
+    sqlite3_int64 expected = rc == SQLITE_ROW ? sqlite3_column_int64(st, 1) : -1;
+    int64_t event_id = expected >= 0 && valid_text(entry) &&
         strlen(entry) == (size_t)sqlite3_column_bytes(st, 0)
         ? log_insert_event_locked(R2_LOG_THINKING, type,
                                   "Private diary reflection was written.", entry, "internal_thinking")
@@ -2046,9 +2054,43 @@ int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
         saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
         sqlite3_finalize(st);
     }
-    for (size_t i = 0; saved && i < speech_count; ++i)
-        saved = log_link_locked(event_id, speech_ids[i], "speech_was_transcribed_for_reflection",
-            "Exact locally recognized audio event; availability alone is not interpretation.") == 0;
+    if (saved) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT e.id FROM r2_diary_pending_reflection_speech p "
+            "LEFT JOIN r2_log_events e ON e.id=p.speech_event_id "
+            "AND e.category='sensory' AND e.event_type='speech_transcribed' "
+            "WHERE p.diary_entry_id=? ORDER BY p.ordinal;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+        sqlite3_int64 count = 0;
+        if (rc == SQLITE_OK) {
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+                if (count == expected) break;
+                ++count;
+                if (log_link_locked(event_id, sqlite3_column_int64(st, 0),
+                        "speech_was_transcribed_for_reflection",
+                        "Exact locally recognized audio event; availability alone is not interpretation.") != 0)
+                    break;
+            }
+        }
+        saved = rc == SQLITE_DONE && count == expected;
+        sqlite3_finalize(st);
+    }
+    if (saved) {
+        const char *deletions[] = {
+            "DELETE FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?;",
+            "DELETE FROM r2_diary_pending_reflections WHERE diary_entry_id=?;"
+        };
+        for (size_t i = 0; saved && i < sizeof(deletions) / sizeof(deletions[0]); ++i) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(log_db, deletions[i], -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            saved = rc == SQLITE_DONE &&
+                sqlite3_changes64(log_db) == (i == 0 ? expected : 1);
+            sqlite3_finalize(st);
+        }
+    }
     if (saved)
         saved = exec_sql("COMMIT;") == 0;
     if (!saved) {
@@ -2062,6 +2104,30 @@ int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
 
     r2_sj_index_event(event_id, "thinking", type, "internal_thinking");
     return event_id;
+}
+
+int r2_log_replay_reflections(void)
+{
+    int64_t after = 0;
+    int failed = 0;
+    for (;;) {
+        pthread_mutex_lock(&log_lock);
+        sqlite3_stmt *st = NULL;
+        int rc = log_initialized && log_db
+            ? sqlite3_prepare_v2(log_db,
+                "SELECT diary_entry_id FROM r2_diary_pending_reflections "
+                "WHERE diary_entry_id>? ORDER BY diary_entry_id LIMIT 1;",
+                -1, &st, NULL)
+            : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) after = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&log_lock);
+        if (rc == SQLITE_DONE) return failed ? -1 : 0;
+        if (rc != SQLITE_ROW) return -1;
+        if (r2_log_complete_reflection(after) < 0) failed = 1;
+    }
 }
 
 int64_t r2_log_hypothetical(const char *scenario,

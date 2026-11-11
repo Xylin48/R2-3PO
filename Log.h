@@ -210,11 +210,13 @@ int64_t r2_log_continuity(const char *item_key,
                           const char *next_action,
                           const char *origin);
 
-/* Link two events by a named relationship. */
-/* Commit completion, its exact diary ID and captured speech edges together. */
-int64_t r2_log_record_reflection(int64_t diary_id, const int64_t *speech_ids,
-                                 size_t speech_count);
+/* Consume one pending reflection in the same transaction as its event and
+ * speech edges. Returns the new event ID, 0 if no work exists, or -1 on failure. */
+int64_t r2_log_complete_reflection(int64_t diary_id);
+/* Retry every pending reflection once. Returns -1 if any remain blocked. */
+int r2_log_replay_reflections(void);
 
+/* Link two events by a named relationship. */
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,
                 const char *relationship, const char *notes);
 

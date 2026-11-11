@@ -379,6 +379,71 @@ static void verify_mirror_flush_failure(void)
     assert(result == 0 && diary_id > 0);
     assert(strstr(message, "saved in SQLite; Markdown mirror write failed"));
     assert(scalar_int("SELECT COUNT(*) FROM diary_entries WHERE entry='mirror flush failure fixture';") == 1);
+
+    /* Model a restart after the reservation and a partial append reached
+       disk. The repair must add exactly the missing bytes. */
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db, "SELECT created_at FROM diary_entries WHERE id=?;", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, diary_id) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    char record[256];
+    int length = snprintf(record, sizeof(record), "\n\n## %s\n\nmirror flush failure fixture\n",
+                          (const char *)sqlite3_column_text(st, 0));
+    assert(length > 20 && (size_t)length < sizeof(record));
+    sqlite3_finalize(st);
+
+    FILE *file = fopen(path, "a");
+    assert(file);
+    struct stat state;
+    assert(fstat(fileno(file), &state) == 0);
+    assert(sqlite3_prepare_v2(db,
+        "UPDATE r2_diary_pending_mirrors SET start_offset=?,device=?,inode=? WHERE diary_entry_id=?;",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, state.st_size) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 2, (sqlite3_int64)state.st_dev) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 3, (sqlite3_int64)state.st_ino) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 4, diary_id) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+    sqlite3_finalize(st);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(fwrite(record, 1, 20, file) == 20);
+    assert(fclose(file) == 0);
+    r2_diary_shutdown();
+    assert(r2_diary_init() == 0);
+    file = fopen(path, "r+");
+    assert(file && fseeko(file, state.st_size + 19, SEEK_SET) == 0);
+    assert(fputc('X', file) == 'X' && fclose(file) == 0);
+    assert(r2_diary_replay_mirrors() == -1);
+    struct stat conflict;
+    assert(stat(path, &conflict) == 0 && conflict.st_size == state.st_size + 20);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 1);
+    file = fopen(path, "r+");
+    assert(file && fseeko(file, state.st_size + 19, SEEK_SET) == 0);
+    assert(fgetc(file) == 'X');
+    assert(fseeko(file, state.st_size + 19, SEEK_SET) == 0);
+    assert(fputc(record[19], file) == record[19] && fclose(file) == 0);
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db, "CREATE TRIGGER hold_mirror_ack BEFORE DELETE ON r2_diary_pending_mirrors "
+                           "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_diary_replay_mirrors() == -1);
+    assert(stat(path, &conflict) == 0 && conflict.st_size == state.st_size + length);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 1);
+    assert(sqlite3_exec(db, "DROP TRIGGER hold_mirror_ack;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    r2_diary_shutdown();
+    assert(r2_diary_init() == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 0);
+    file = fopen(path, "r");
+    assert(file && fseeko(file, state.st_size, SEEK_SET) == 0);
+    char repaired[256];
+    assert(fread(repaired, 1, sizeof(repaired), file) == (size_t)length);
+    assert(memcmp(repaired, record, (size_t)length) == 0);
+    assert(fclose(file) == 0);
+
 }
 
 int main(void)

@@ -9378,9 +9378,10 @@ static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence
 {
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
-    if (r2_diary_write_with_id(reflection, &diary_id) != 0) return -1;
-    int64_t event_id = r2_log_record_reflection(diary_id,
-        evidence ? evidence->events : NULL, evidence ? evidence->count : 0);
+    if (r2_diary_stage_reflection(reflection, evidence ? evidence->events : NULL,
+                                  evidence ? evidence->count : 0, &diary_id) != 0)
+        return -1;
+    int64_t event_id = r2_log_complete_reflection(diary_id);
     if (event_id > 0) {
         if (event_id_out) *event_id_out = event_id;
     } else fprintf(stderr, "[R2 diary] Diary row saved; reflection completion was not confirmed.\n");
@@ -14567,6 +14568,10 @@ int r2_init(void)
     /* Sensory indexing is part of the connected persistent-memory system. */
     if (r2_sj_init() != 0)
         R2_INIT_FAIL("could not initialize R2 Sensory Journal");
+    if (r2_diary_replay_mirrors() != 0)
+        fprintf(stderr, "[R2 diary] Some Markdown mirrors remain pending.\n");
+    if (r2_log_replay_reflections() != 0)
+        fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
 
     /* The reinforcement ledger is required for durable learning signals. */
     if (r2_reward_init() != 0)

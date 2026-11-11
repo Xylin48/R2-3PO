@@ -62,6 +62,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -591,7 +592,7 @@ static int r2_diary_init_unlocked(void)
         r2_diary_close_failed_init();
         return -1;
     }
-    result = sqlite3_exec(r2_diary_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    result = sqlite3_exec(r2_diary_db, "PRAGMA synchronous=FULL;", NULL, NULL, NULL);
     if (result != SQLITE_OK) {
         fprintf(stderr, "[R2 DIARY] Could not configure SQLite synchronous mode: %s\n",
                 sqlite3_errmsg(r2_diary_db));
@@ -670,6 +671,25 @@ static int r2_diary_init_unlocked(void)
         diary_check_backfill("SELECT 1 FROM r2_diary_entry_links "
                              "WHERE linked_at IS NULL OR linked_at='' LIMIT 1;") != SQLITE_OK) {
         fprintf(stderr, "[R2 DIARY] Could not migrate diary linkage schema: %s\n",
+                sqlite3_errmsg(r2_diary_db));
+        r2_diary_close_failed_init();
+        return -1;
+    }
+
+    if (sqlite3_exec(r2_diary_db,
+            "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflections ("
+            " diary_entry_id INTEGER PRIMARY KEY REFERENCES diary_entries(id),"
+            " speech_count INTEGER NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflection_speech ("
+            " diary_entry_id INTEGER NOT NULL REFERENCES r2_diary_pending_reflections(diary_entry_id),"
+            " ordinal INTEGER NOT NULL,"
+            " speech_event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+            " PRIMARY KEY(diary_entry_id,ordinal));"
+            "CREATE TABLE IF NOT EXISTS r2_diary_pending_mirrors ("
+            " diary_entry_id INTEGER PRIMARY KEY REFERENCES diary_entries(id),"
+            " start_offset INTEGER, device INTEGER, inode INTEGER);",
+            NULL, NULL, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[R2 DIARY] Could not prepare reflection recovery: %s\n",
                 sqlite3_errmsg(r2_diary_db));
         r2_diary_close_failed_init();
         return -1;
@@ -993,7 +1013,54 @@ int r2_diary_reconnect_history(int limit)
  * ============================================================
  */
 
-static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
+static int diary_stage_reflection(int64_t diary_id, const int64_t *speech_ids,
+                                  size_t speech_count)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "INSERT INTO r2_diary_pending_reflections(diary_entry_id,speech_count) VALUES(?,?);",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, (sqlite3_int64)speech_count);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE || sqlite3_changes(r2_diary_db) != 1) return -1;
+    if (!speech_count) return 0;
+
+    st = NULL;
+    rc = sqlite3_prepare_v2(r2_diary_db,
+        "INSERT INTO r2_diary_pending_reflection_speech(diary_entry_id,ordinal,speech_event_id) "
+        "SELECT ?1,?2,id FROM r2_log_events WHERE id=?3 "
+        "AND category='sensory' AND event_type='speech_transcribed';", -1, &st, NULL);
+    for (size_t i = 0; rc == SQLITE_OK && i < speech_count; ++i) {
+        rc = sqlite3_bind_int64(st, 1, diary_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, (sqlite3_int64)i);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, speech_ids[i]);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc != SQLITE_DONE || sqlite3_changes(r2_diary_db) != 1) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        rc = sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
+static int diary_stage_mirror(int64_t diary_id)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "INSERT INTO r2_diary_pending_mirrors(diary_entry_id) VALUES(?);", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) == 1 ? 0 : -1;
+}
+
+static int64_t diary_insert_entry_row(const char *entry, const char *timestamp,
+                                      int reflection, const int64_t *speech_ids,
+                                      size_t speech_count)
 {
     int present[sizeof(diary_time_aliases) / sizeof(diary_time_aliases[0])];
     char sql[1024] = "INSERT INTO diary_entries(entry,created_at";
@@ -1046,20 +1113,211 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp)
     int64_t id = rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) == 1
         ? sqlite3_last_insert_rowid(r2_diary_db) : -1;
     sqlite3_finalize(st);
-    if (id > 0 && sqlite3_exec(r2_diary_db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK)
+    if (id > 0 && diary_stage_mirror(id) == 0 &&
+        (!reflection || diary_stage_reflection(id, speech_ids, speech_count) == 0) &&
+        sqlite3_exec(r2_diary_db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK)
         return id;
     if (!sqlite3_get_autocommit(r2_diary_db))
         (void)sqlite3_exec(r2_diary_db, "ROLLBACK;", NULL, NULL, NULL);
     return -1;
 }
 
+/* Compare the exact bytes already present at a reserved append position.
+   The caller holds the file lock and may append only the missing suffix. */
+static int mirror_prefix(int fd, off_t start, const char *record, size_t length,
+                         size_t *present)
+{
+    struct stat state;
+    if (fstat(fd, &state) != 0) return -1;
+    if (start < 0 || state.st_size < start) { errno = ESTALE; return -1; }
+    off_t available = state.st_size - start;
+    *present = (uintmax_t)available < length ? (size_t)available : length;
+    char buffer[8192];
+    for (size_t done = 0; done < *present;) {
+        size_t chunk = *present - done;
+        if (chunk > sizeof(buffer)) chunk = sizeof(buffer);
+        ssize_t n = pread(fd, buffer, chunk, start + (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return -1;
+        if (n == 0 || memcmp(buffer, record + done, (size_t)n) != 0) {
+            errno = ESTALE;
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    return 0;
+}
+
+static int mirror_reserve(int64_t id, int fd, off_t *start)
+{
+    struct stat state;
+    if (fstat(fd, &state) != 0) return -1;
+    if (!S_ISREG(state.st_mode)) { errno = EINVAL; return -1; }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "SELECT start_offset,device,inode FROM r2_diary_pending_mirrors WHERE diary_entry_id=?;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
+        *start = (off_t)sqlite3_column_int64(st, 0);
+        int same = sqlite3_column_int64(st, 1) == (sqlite3_int64)state.st_dev &&
+                   sqlite3_column_int64(st, 2) == (sqlite3_int64)state.st_ino;
+        sqlite3_finalize(st);
+        if (!same) { errno = ESTALE; return -1; }
+        return 0;
+    }
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) return 1; /* Another worker already finished. */
+    if (rc != SQLITE_ROW) { errno = EIO; return -1; }
+
+    *start = state.st_size;
+    st = NULL;
+    rc = sqlite3_prepare_v2(r2_diary_db,
+        "UPDATE r2_diary_pending_mirrors SET start_offset=?1,device=?2,inode=?3 "
+        "WHERE diary_entry_id=?4 AND start_offset IS NULL;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, *start);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, (sqlite3_int64)state.st_dev);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, (sqlite3_int64)state.st_ino);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 4, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE || sqlite3_changes(r2_diary_db) != 1) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int mirror_append(int64_t id, const char *path, const char *record, size_t length)
+{
+    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_NONBLOCK | O_CLOEXEC, 0666);
+    if (fd < 0) return -1;
+    int result = -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) goto done;
+    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0) goto done;
+    int sync_error = fsync(directory) == 0 ? 0 : errno;
+    if (close(directory) != 0 && !sync_error) sync_error = errno;
+    if (sync_error) { errno = sync_error; goto done; }
+    off_t start;
+    int reserved = mirror_reserve(id, fd, &start);
+    if (reserved != 0) {
+        result = reserved > 0 ? 0 : -1;
+        goto done;
+    }
+    size_t present;
+    if (mirror_prefix(fd, start, record, length, &present) != 0) goto done;
+    while (present < length) {
+        ssize_t written = write(fd, record + present, length - present);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            goto done;
+        }
+        present += (size_t)written;
+    }
+    if (fsync(fd) != 0 || mirror_prefix(fd, start, record, length, &present) != 0)
+        goto done;
+    if (present != length) { errno = ESTALE; goto done; }
+    struct stat open_file, named_file;
+    if (fstat(fd, &open_file) != 0 || stat(path, &named_file) != 0) goto done;
+    if (open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
+        errno = ESTALE;
+        goto done;
+    }
+    /* Keep the advisory lock through acknowledgement. A close error is
+       reported and leaves the row pending for exact-byte verification. */
+    int guard = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (guard < 0) goto done;
+    if (close(fd) != 0) {
+        int error = errno;
+        fd = guard;
+        errno = error;
+        goto done;
+    }
+    fd = guard;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "DELETE FROM r2_diary_pending_mirrors WHERE diary_entry_id=?;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) == 1) result = 0;
+    else errno = EIO;
+done:
+    {
+        int error = errno;
+        (void)close(fd);
+        errno = error;
+    }
+    return result;
+}
+
+/* One ordered pass over pending entries. A failed record blocks later
+   appends to that same daily file, while other days can still recover. */
+static int diary_replay_mirrors_unlocked(const char *day)
+{
+    int64_t after = 0;
+    int failed = 0;
+    if (!r2_diary_db) return -1;
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(r2_diary_db,
+            "SELECT p.diary_entry_id,d.created_at,d.entry FROM r2_diary_pending_mirrors p "
+            "LEFT JOIN diary_entries d ON d.id=p.diary_entry_id "
+            "WHERE p.diary_entry_id>?1 AND (?2 IS NULL OR substr(d.created_at,1,10)=?2) "
+            "AND NOT EXISTS (SELECT 1 FROM r2_diary_pending_mirrors earlier "
+            "JOIN diary_entries e ON e.id=earlier.diary_entry_id "
+            "WHERE e.id<d.id AND substr(e.created_at,1,10)=substr(d.created_at,1,10)) "
+            "ORDER BY p.diary_entry_id LIMIT 1;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, day, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc != SQLITE_ROW) {
+            sqlite3_finalize(st);
+            return rc == SQLITE_DONE && !failed ? 0 : -1;
+        }
+        after = sqlite3_column_int64(st, 0);
+        const char *timestamp = (const char *)sqlite3_column_text(st, 1);
+        const char *entry = (const char *)sqlite3_column_text(st, 2);
+        char path[R2_MAX_PATH];
+        char *record = NULL;
+        int path_size = -1;
+        int length = -1;
+        if (timestamp && strlen(timestamp) == 19 &&
+            strspn(timestamp, "0123456789- :") == 19 &&
+            entry && strlen(entry) == (size_t)sqlite3_column_bytes(st, 2)) {
+            path_size = snprintf(path, sizeof(path), "%s/%.10s.md", R2_DIARY_DIR, timestamp);
+            length = asprintf(&record, "\n\n## %s\n\n%s\n", timestamp, entry);
+        }
+        sqlite3_finalize(st);
+        if (path_size < 0 || (size_t)path_size >= sizeof(path) || length < 0) {
+            failed = 1;
+            fprintf(stderr, "[R2 DIARY] Could not prepare Markdown mirror for entry #%" PRId64 ".\n", after);
+        } else if (mirror_append(after, path, record, (size_t)length) != 0) {
+            failed = 1;
+            fprintf(stderr, "[R2 DIARY] Entry #%" PRId64 " saved in SQLite; Markdown mirror write failed for %s: %s\n",
+                    after, path, strerror(errno));
+        }
+        free(record);
+    }
+}
+
+int r2_diary_replay_mirrors(void)
+{
+    pthread_mutex_lock(&r2_diary_write_lock);
+    int result = diary_replay_mirrors_unlocked(NULL);
+    pthread_mutex_unlock(&r2_diary_write_lock);
+    return result;
+}
+
 static int r2_diary_write_unlocked(
-    const char *entry, int64_t *entry_id_out
+    const char *entry, int64_t *entry_id_out, int reflection,
+    const int64_t *speech_ids, size_t speech_count
 )
 {
     char timestamp[64];
-    char diary_file[R2_MAX_PATH];
-
     int64_t diary_entry_id = 0;
 
     if (!r2_diary_db)
@@ -1101,7 +1359,7 @@ static int r2_diary_write_unlocked(
      * --------------------------------------------------------
      */
 
-    diary_entry_id = diary_insert_entry_row(entry, timestamp);
+    diary_entry_id = diary_insert_entry_row(entry, timestamp, reflection, speech_ids, speech_count);
     if (diary_entry_id <= 0)
         return -1;
     if (entry_id_out) *entry_id_out = diary_entry_id;
@@ -1127,33 +1385,10 @@ static int r2_diary_write_unlocked(
      * --------------------------------------------------------
      */
 
-    /* Derive the daily path from the same timestamp used in SQLite. */
-    int written = snprintf(diary_file, sizeof(diary_file), "%s/%.10s.md",
-                           R2_DIARY_DIR, timestamp);
-    if (written < 0 || (size_t)written >= sizeof(diary_file)) {
-        fprintf(stderr, "[R2 DIARY] Entry #%" PRId64 " saved in SQLite; mirror path is too long.\n",
-                diary_entry_id);
-        return 0;
-    }
-
-    FILE *file = fopen(diary_file, "a");
-    if (!file) {
-        fprintf(stderr, "[R2 DIARY] Entry #%" PRId64 " saved in SQLite; could not open mirror %s: %s\n",
-                diary_entry_id, diary_file, strerror(errno));
-        return 0;
-    }
-
-    int mirror_error = 0;
-    if (fprintf(file, "\n\n## %s\n\n", timestamp) < 0 ||
-        fputs(entry, file) == EOF || fputc('\n', file) == EOF)
-        mirror_error = errno ? errno : EIO;
-    if (fclose(file) == EOF && !mirror_error)
-        mirror_error = errno ? errno : EIO;
-
-    if (mirror_error)
-        fprintf(stderr, "[R2 DIARY] Entry #%" PRId64 " saved in SQLite; Markdown mirror write failed for %s: %s\n",
-                diary_entry_id, diary_file, strerror(mirror_error));
-    else
+    char day[11];
+    memcpy(day, timestamp, 10);
+    day[10] = '\0';
+    if (diary_replay_mirrors_unlocked(day) == 0)
         printf("[R2 DIARY] Entry written: %s\n", timestamp);
 
     return 0;
@@ -1163,7 +1398,19 @@ int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 {
     if (entry_id_out) *entry_id_out = 0;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry, entry_id_out);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 0, NULL, 0);
+    pthread_mutex_unlock(&r2_diary_write_lock);
+    return rc;
+}
+
+int r2_diary_stage_reflection(const char *entry, const int64_t *speech_ids,
+                              size_t speech_count, int64_t *entry_id_out)
+{
+    if (entry_id_out) *entry_id_out = 0;
+    if ((speech_count && !speech_ids) || speech_count > (size_t)INT64_MAX)
+        return -1;
+    pthread_mutex_lock(&r2_diary_write_lock);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 1, speech_ids, speech_count);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
 }

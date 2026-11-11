@@ -57,7 +57,7 @@ void r2_diary_shutdown(void);
 
 /* Reconcile all existing/pending diary entries with Life Log and memory.
  * Uses bounded pages rather than stopping at the first legacy batch; returns
- * linked-entry count or -1 on query/allocation error. */
+ * linked-entry count, or -1 on a query/allocation error or if all attempts fail. */
 int r2_diary_reconnect_history(int limit);
 
 
@@ -70,6 +70,13 @@ int r2_diary_write(
 );
 /* Stable ID of the actual inserted row, protected by the diary write lock. */
 int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out);
+
+/* Commit reflection prose and its original speech IDs in the same write. */
+int r2_diary_stage_reflection(const char *entry, const int64_t *speech_ids,
+                              size_t speech_count, int64_t *entry_id_out);
+
+/* Retry pending Markdown appends in order within each day. */
+int r2_diary_replay_mirrors(void);
 
 char *r2_diary_recent(
     int count

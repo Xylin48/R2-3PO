@@ -121,6 +121,11 @@ int main(void)
     int64_t reflections[2], diary_ids[2];
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
+    int64_t invalid_id = -1;
+    assert(r2_diary_stage_reflection("REFLECTION_WITH_NON_SPEECH_EVIDENCE", &second, 1, &invalid_id) == -1);
+    assert(invalid_id == 0);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM diary_entries WHERE entry='REFLECTION_WITH_NON_SPEECH_EVIDENCE'", 0) == 0);
     for (int i = 0; i < 2; ++i) {
         R2AudioTurnEvidence evidence = {.events = &speech[i], .count = 1};
         assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", &evidence, &reflections[i]) == 0);
@@ -153,6 +158,18 @@ int main(void)
     assert(scalar(connection, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='reflection_completed'", 0) == 2);
     assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal_reflection_links", 0) == 2);
     assert(scalar(connection, "SELECT COUNT(*) FROM r2_log_links WHERE relationship='speech_was_transcribed_for_reflection'", 0) == 2);
+    int64_t pending_diary = scalar(connection,
+        "SELECT id FROM diary_entries WHERE entry='REFLECTION_WITH_FAILED_EDGE'", 0);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM r2_diary_pending_reflections WHERE diary_entry_id=? AND speech_count=2",
+        pending_diary) == 1);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?", pending_diary) == 2);
+    int64_t no_speech_pending = 0;
+    assert(r2_diary_stage_reflection("REFLECTION_PENDING_WITHOUT_AUDIO", NULL, 0, &no_speech_pending) == 0);
+    assert(r2_log_replay_reflections() == -1);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM r2_sensory_journal_reflection_links WHERE diary_entry_id=?", no_speech_pending) == 1);
     assert(sqlite3_exec(connection, "DROP TRIGGER fail_reflection_edge;", NULL, NULL, NULL) == SQLITE_OK);
 
     /* Journal projection can be offline. Completion and its exact diary
@@ -172,6 +189,30 @@ int main(void)
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
+    assert(r2_log_replay_reflections() == 0);
+    assert(r2_log_replay_reflections() == 0);
+    assert(r2_log_complete_reflection(pending_diary) == 0);
+    int64_t recovered = scalar(connection,
+        "SELECT event_id FROM r2_sensory_journal_reflection_links WHERE diary_entry_id=?", pending_diary);
+    assert(recovered > 0);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM r2_sensory_journal_reflection_links WHERE diary_entry_id=?", pending_diary) == 1);
+    assert(scalar(connection,
+        "SELECT COUNT(*) FROM r2_log_links WHERE from_event_id=? AND relationship='speech_was_transcribed_for_reflection'",
+        recovered) == 2);
+    for (int i = 0; i < 2; ++i) {
+        sqlite3_stmt *edge = NULL;
+        assert(sqlite3_prepare_v2(connection,
+            "SELECT 1 FROM r2_log_links WHERE from_event_id=? AND to_event_id=? "
+            "AND relationship='speech_was_transcribed_for_reflection';", -1, &edge, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(edge, 1, recovered) == SQLITE_OK);
+        assert(sqlite3_bind_int64(edge, 2, speech[i]) == SQLITE_OK);
+        assert(sqlite3_step(edge) == SQLITE_ROW);
+        sqlite3_finalize(edge);
+    }
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_diary_pending_reflections", 0) == 0);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_diary_pending_reflection_speech", 0) == 0);
+    assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal WHERE event_id=?", recovered) == 1);
     assert(scalar(connection, "SELECT COUNT(*) FROM r2_sensory_journal WHERE event_id=?", offline_reflection) == 1);
     assert(scalar(connection,
         "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", offline_reflection) == offline_diary);
