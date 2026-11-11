@@ -70,7 +70,7 @@ require("visual_parse_complete_json(response.data, response.length)" in builder
         "vision rejects prefix-only JSON, generation-limited output and embedded-NUL text")
 publication = source[source.index("char *r2_visual_analyze_frame("):source.index("static int visual_query(")]
 require(publication.count("visual_generation == generation_snapshot") >= 3
-        and "visual_stage_archive(&experience" in publication
+        and "visual_stage_archive(archive_db, &experience" in publication
         and "visual_publish_archive(&experience)" in publication,
         "an in-flight observation cannot populate a replacement visual-library session")
 print("Vision JSON allocation and ownership smoke passed.")

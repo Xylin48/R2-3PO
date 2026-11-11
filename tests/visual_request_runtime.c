@@ -15,7 +15,7 @@ static int cancel_request, cancel_on_archive_write, cancel_after_gate, cancel_du
 static char probe_path[PATH_MAX], database[PATH_MAX], library[PATH_MAX], next_db[PATH_MAX], next_library[PATH_MAX];
 static int fail_handle, fail_headers, defer_gate, gate_active, gate_begin_count, gate_end_count, perform_count, init_count, cleanup_count, restart_library;
 static uint64_t fixture_preview_session = 1;
-static int switch_preview_during_request;
+static int switch_preview_during_request, switch_archive_session;
 static CURLoption failed_option;
 
 uint64_t __wrap_r2_eyes_preview_session(void)
@@ -50,6 +50,13 @@ ssize_t __wrap_write(int fd, const void *p, size_t n)
     if (cancel_on_archive_write && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         cancel_on_archive_write = 0;
         cancel_request = 1;
+    }
+    if (switch_archive_session && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
+        int session = switch_archive_session;
+        switch_archive_session = 0;
+        r2_visual_shutdown();
+        assert(r2_visual_init(session == 1 ? database : next_db,
+                              session == 1 ? library : next_library) == 0);
     }
     if (overlapping_frame && n == 20 && !memcmp(p, "SYNTHETIC-JPEG-BYTES", n)) {
         const R2VisionFrame *newer = overlapping_frame;
@@ -620,7 +627,7 @@ int main(void)
     }
     assert(r2_visual_init(database, library) == 0);
     assert(sqlite3_exec(visual_db, "CREATE TRIGGER deny_pending_withdrawal "
-        "BEFORE DELETE ON r2_visual_pending_archives BEGIN SELECT RAISE(IGNORE); END",
+        "AFTER DELETE ON r2_visual_pending_archives BEGIN SELECT RAISE(FAIL, 'fixture'); END",
         NULL, NULL, NULL) == SQLITE_OK);
     response("{\"description\":\"archive retained after interrupted publication\",\"focus\":null}", "stop");
     assert(!r2_visual_analyze_frame(&frame, "retained camera", "deferred publication"));
@@ -660,6 +667,26 @@ int main(void)
         "WHERE e.source='detached interrupted camera' AND e.details='detached archive interrupted'") == replay_id);
     assert(sqlite3_close(event_db) == SQLITE_OK);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    for (int session = 1; session <= 2; ++session) {
+        assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+        assert(r2_visual_init(database, library) == 0);
+        sqlite3_int64 records_before = scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences");
+        int files_before = archive_count();
+        response("{\"description\":\"withdrawn across Visual sessions\",\"focus\":null}", "stop");
+        switch_archive_session = session;
+        assert(!r2_visual_analyze_frame(&frame, "withdrawn session camera", "session change"));
+        assert(!switch_archive_session);
+        sqlite3 *original = NULL;
+        assert(sqlite3_open(database, &original) == SQLITE_OK);
+        assert(scalar(original, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+        assert(scalar(original, "SELECT count(*) FROM r2_visual_experiences") == records_before);
+        assert(scalar(original, "SELECT count(*) FROM r2_log_events "
+                               "WHERE event_type='visual_experience' AND source='withdrawn session camera'") == 0);
+        assert(sqlite3_close(original) == SQLITE_OK);
+        r2_visual_shutdown();
+        assert(r2_visual_init(database, library) == 0 && archive_count() == files_before);
+        r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
+    }
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();
     puts("Visual setup/response/session boundaries, complete persistence, encoder cancellation and owned-file cleanup passed with synthetic HTTP/encoder.");

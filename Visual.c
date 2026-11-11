@@ -970,28 +970,28 @@ static int visual_drop_pending(sqlite3 *db, const char *path)
     return rc;
 }
 
-static int visual_finish_transaction(int rc)
+static int visual_finish_transaction(sqlite3 *db, int rc)
 {
     if (rc == SQLITE_DONE) {
-        int commit = sqlite3_exec(visual_db, "COMMIT", NULL, NULL, NULL);
+        int commit = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
         if (commit == SQLITE_OK) return SQLITE_DONE;
         rc = commit;
     }
-    if (!sqlite3_get_autocommit(visual_db))
-        (void)sqlite3_exec(visual_db, "ROLLBACK", NULL, NULL, NULL);
+    if (!sqlite3_get_autocommit(db))
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     return rc;
 }
 
-static int visual_stage_archive(const VisualExperience *experience,
+static int visual_stage_archive(sqlite3 *db, const VisualExperience *experience,
                                 const unsigned char *jpeg, size_t length)
 {
     const R2VisionFrame *frame = experience->frame;
     const char *fields[] = {experience->image_path, experience->created,
         experience->source, experience->model, experience->question, experience->description};
-    int rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
     sqlite3_stmt *st = NULL;
-    rc = sqlite3_prepare_v2(visual_db,
+    rc = sqlite3_prepare_v2(db,
         "INSERT INTO r2_visual_pending_archives(image_path,created_utc,source,model,prompt,"
         "description,width,height,frame_number,frame_timestamp,jpeg) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         -1, &st, NULL);
@@ -1006,9 +1006,35 @@ static int visual_stage_archive(const VisualExperience *experience,
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 10, (sqlite3_int64)frame->timestamp);
     if (rc == SQLITE_OK) rc = sqlite3_bind_blob64(st, 11, jpeg, length, SQLITE_STATIC);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    if (rc == SQLITE_DONE && sqlite3_changes(visual_db) != 1) rc = SQLITE_CONSTRAINT;
+    if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
-    return visual_finish_transaction(rc);
+    return visual_finish_transaction(db, rc);
+}
+
+/* Each file-backed request keeps its original connection across a Visual
+ * close/reopen. A private in-memory database has no persistent cleanup backlog. */
+static sqlite3 *visual_open_archive_db(int *owned)
+{
+    *owned = 0;
+    const char *path = sqlite3_db_filename(visual_db, "main");
+    if (!path || !*path) return visual_db;
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_busy_timeout(db, 5000);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(db, "PRAGMA synchronous=FULL", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+    *owned = 1;
+    return db;
+}
+
+static int visual_withdraw_archive(sqlite3 *db, const char *path)
+{
+    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+    return visual_finish_transaction(db, visual_drop_pending(db, path));
 }
 
 static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
@@ -1060,7 +1086,7 @@ static int visual_save_separate(VisualExperience *experience)
     if (rc != SQLITE_OK) return rc;
     rc = visual_save_experience(visual_db, 0, experience);
     sqlite3_int64 row_id = sqlite3_last_insert_rowid(visual_db);
-    rc = visual_finish_transaction(rc);
+    rc = visual_finish_transaction(visual_db, rc);
     if (rc != SQLITE_DONE) return rc;
 
     if (visual_link_detached(row_id, experience->image_path, experience->description,
@@ -1411,6 +1437,8 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     VisualExperience experience = {frame, created, source ? source : "Eyes",
                                    image_path, model_snapshot, question, description, 0, 0};
     int image_fd = -1;
+    sqlite3 *archive_db = NULL;
+    int archive_db_owned = 0;
     int staged = 0;
     int publication_attempted = 0;
     const char *failure = NULL;
@@ -1419,11 +1447,15 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     pthread_mutex_lock(&visual_lock);
     if (visual_initialized && visual_db && visual_generation == generation_snapshot &&
         !r2_ollama_vision_request_should_abort()) {
-        image_fd = visual_create_archive(directory_snapshot, frame, image_path, sizeof(image_path));
-        if (image_fd < 0) {
+        archive_db = visual_open_archive_db(&archive_db_owned);
+        if (archive_db)
+            image_fd = visual_create_archive(directory_snapshot, frame, image_path, sizeof(image_path));
+        if (!archive_db) {
+            failure = "Could not retain the original archive database.";
+        } else if (image_fd < 0) {
             failure_event = "visual_image_archive_failed";
             failure = "Could not create and claim the JPEG path.";
-        } else if (visual_stage_archive(&experience, jpeg, jpeg_length) != SQLITE_DONE) {
+        } else if (visual_stage_archive(archive_db, &experience, jpeg, jpeg_length) != SQLITE_DONE) {
             failure = "Could not save the pending interpretation.";
         } else {
             staged = 1;
@@ -1456,6 +1488,7 @@ char *r2_visual_analyze_frame(const R2VisionFrame *frame,
     if (rc != SQLITE_DONE) goto failed;
 
     close(image_fd);
+    if (archive_db_owned) sqlite3_close(archive_db);
     free(jpeg);
     json_object_put(focus);
     return description;
@@ -1464,11 +1497,16 @@ failed:
     if (image_fd >= 0) {
         int discard_image = !publication_attempted || experience.cancelled;
         if (staged) {
-            pthread_mutex_lock(&visual_lock);
-            if (visual_db && visual_generation == generation_snapshot &&
-                visual_drop_pending(visual_db, image_path) == SQLITE_DONE)
-                discard_image = 1;
-            pthread_mutex_unlock(&visual_lock);
+            if (archive_db_owned) {
+                if (visual_withdraw_archive(archive_db, image_path) == SQLITE_DONE)
+                    discard_image = 1;
+            } else {
+                pthread_mutex_lock(&visual_lock);
+                if (visual_db && visual_generation == generation_snapshot &&
+                    visual_withdraw_archive(visual_db, image_path) == SQLITE_DONE)
+                    discard_image = 1;
+                pthread_mutex_unlock(&visual_lock);
+            }
         }
         /* If publication may have run, a failed withdrawal is not evidence
          * that no record refers to the file. Leave it for restart or audit. */
@@ -1479,6 +1517,7 @@ failed:
         }
         close(image_fd);
     }
+    if (archive_db_owned) sqlite3_close(archive_db);
     if (failure)
         r2_log_sensory(failure_event,
                        "R2 analyzed a frame but could not save the observation.",
