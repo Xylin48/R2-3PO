@@ -176,6 +176,58 @@ static void test_complete_workspace_listing(void)
     assert(close(dir) == 0); /* The fixture root is removed by the workflow. */
 }
 
+static int sync_failure;
+int __real_fsync(int fd);
+int __wrap_fsync(int fd)
+{
+    if (sync_failure) {
+        struct stat state;
+        assert(fstat(fd, &state) == 0);
+        if ((sync_failure == 1 && S_ISREG(state.st_mode)) ||
+            (sync_failure == 2 && S_ISDIR(state.st_mode))) {
+            sync_failure = 0;
+            errno = EIO;
+            return -1;
+        }
+    }
+    return __real_fsync(fd);
+}
+
+static void test_workspace_replacement(void)
+{
+    const char target[] = R2_WORKSPACE "/write-fixture";
+    char output[PATH_MAX];
+    assert(workspace_write("write-fixture", "original", output) == WORKSPACE_WRITE_OK);
+    assert(strcmp(target, output) == 0);
+    assert(chmod(target, 0640) == 0);
+
+    sync_failure = 1;
+    assert(workspace_write("write-fixture", "failed replacement", output) == -1);
+    assert(sync_failure == 0);
+    char *text = read_entire_file(target);
+    assert(text && strcmp(text, "original") == 0);
+    free(text);
+
+    sync_failure = 2;
+    assert(workspace_write("write-fixture", "new complete version", output) ==
+           WORKSPACE_WRITE_SYNC_UNCONFIRMED);
+    assert(sync_failure == 0);
+    text = read_entire_file(target);
+    assert(text && strcmp(text, "new complete version") == 0);
+    free(text);
+    struct stat state;
+    assert(stat(target, &state) == 0 && (state.st_mode & 0777) == 0640);
+    assert(link(target, R2_WORKSPACE "/write-alias") == 0);
+    assert(workspace_write("write-fixture", "cannot replace one hardlink", output) == -1);
+    assert(unlink(R2_WORKSPACE "/write-alias") == 0);
+
+    DIR *dir = opendir(R2_WORKSPACE);
+    assert(dir);
+    struct dirent *entry;
+    while ((entry = readdir(dir))) assert(strncmp(entry->d_name, ".r2-write-", 10) != 0);
+    assert(closedir(dir) == 0 && unlink(target) == 0);
+}
+
 int main(void)
 {
     test_file_reads();
@@ -183,6 +235,7 @@ int main(void)
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     test_complete_workspace_listing();
+    test_workspace_replacement();
     assert(r2_ears_init(&ears) == 0 && r2_ears_init(&ears_desktop) == 0);
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
@@ -326,9 +379,9 @@ int main(void)
     free(result); free(request);
     r2_ears_extra_requested = NULL;
     r2_ears_desktop_requested = r2_ears_recent_requested = 0;
-    int64_t turn = r2_log_conversation_turn(expected, reply);
+    int64_t turn = r2_log_conversation_turn_with_links(expected, reply,
+        evidence.events, evidence.count, NULL, 0);
     assert(turn > 0);
-    r2_audio_turn_link(turn, &evidence);
     r2_audio_turn_evidence = NULL;
     free(evidence.events);
     verify_turn(connection, turn, expected, reply);
@@ -368,7 +421,13 @@ int main(void)
 
     /* Preserve the exact turn and queue the structured archive on failure. */
     sql(connection, "CREATE TRIGGER reject_archive BEFORE INSERT ON r2_log_conversations BEGIN SELECT RAISE(FAIL,'fixture'); END;");
-    int64_t fallback = r2_log_conversation_turn(expected, reply);
+    sql(connection, "CREATE TRIGGER reject_speech_link BEFORE INSERT ON r2_log_links "
+                    "WHEN NEW.relationship='speech_was_transcribed_for_turn' BEGIN SELECT RAISE(IGNORE); END;");
+    int64_t archive = r2_log_archive_context_review("request", "original", "notes");
+    assert(archive > 0);
+    const int64_t duplicate_speech[] = {speech_ids[0], speech_ids[0]};
+    int64_t fallback = r2_log_conversation_turn_with_links(expected, reply,
+        duplicate_speech, 2, &archive, 1);
     assert(fallback > 0);
     sqlite3_stmt *st = NULL;
     assert(sqlite3_prepare_v2(connection, "SELECT instr(details,'REPLY-END!') FROM r2_log_events WHERE id=?", -1, &st, NULL) == SQLITE_OK);
@@ -379,7 +438,11 @@ int main(void)
     assert(sqlite3_bind_int64(st, 1, fallback) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(sqlite3_column_int(st, 0) == 1);
     sqlite3_finalize(st);
-    sql(connection, "DROP TRIGGER reject_archive;");
+    assert(sqlite3_prepare_v2(connection, "SELECT COUNT(*) FROM r2_log_pending_turn_links WHERE event_id=?", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, fallback) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int(st, 0) == 2);
+    sqlite3_finalize(st);
+    sql(connection, "DROP TRIGGER reject_archive; DROP TRIGGER reject_speech_link;");
     assert(sqlite3_close(connection) == SQLITE_OK);
     connection = NULL;
     r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
@@ -387,6 +450,17 @@ int main(void)
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
     verify_turn(connection, turn, expected, reply);
     verify_turn(connection, fallback, expected, reply);
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT c.conversation_event_id,(SELECT COUNT(*) FROM r2_log_links "
+        "WHERE from_event_id=?1 AND to_event_id=?2 AND relationship='speech_was_transcribed_for_turn'),"
+        "(SELECT COUNT(*) FROM r2_log_pending_turn_links) "
+        "FROM r2_log_context_reviews c WHERE c.id=?3", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, fallback) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 2, speech_ids[0]) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 3, archive) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int64(st, 0) == fallback);
+    assert(sqlite3_column_int(st, 1) == 1 && sqlite3_column_int(st, 2) == 0);
+    sqlite3_finalize(st);
     assert(sqlite3_prepare_v2(connection, "SELECT COUNT(*) FROM r2_log_pending_conversations", -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
     sqlite3_finalize(st);

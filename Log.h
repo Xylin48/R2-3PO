@@ -181,6 +181,9 @@ int r2_log_system_snapshot(const char *reason);
 /* Full conversation record, including exact user and assistant text. */
 int64_t r2_log_conversation_turn(const char *user_text,
                                 const char *assistant_text);
+int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
+                                            const int64_t *speech_ids, size_t speech_count,
+                                            const int64_t *review_ids, size_t review_count);
 
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.

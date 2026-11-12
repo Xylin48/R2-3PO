@@ -71,6 +71,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -412,24 +413,6 @@ static void r2_audio_turn_record(int64_t event_id)
     evidence->events[evidence->count++] = event_id;
 }
 
-static void r2_audio_evidence_link(int64_t turn_event_id, const R2AudioTurnEvidence *evidence,
-                                    const char *relationship)
-{
-    if (turn_event_id <= 0 || !evidence) return;
-    for (size_t i = 0; i < evidence->count; ++i)
-        if (r2_log_link(turn_event_id, evidence->events[i],
-                        relationship,
-                        "Exact locally recognized audio event; availability alone is not interpretation.") != 0)
-            fprintf(stderr, "[Ears] Could not link turn %lld to speech event %lld.\n",
-                    (long long)turn_event_id, (long long)evidence->events[i]);
-}
-
-
-static void r2_audio_turn_link(int64_t event_id, const R2AudioTurnEvidence *evidence)
-{
-    r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_turn");
-}
-
 typedef struct {
     int64_t *archives;
     size_t count;
@@ -446,17 +429,6 @@ static int r2_context_turn_record(int64_t archive_id)
     scope->archives = grown;
     scope->archives[scope->count++] = archive_id;
     return 0;
-}
-
-static void r2_context_turn_link(int64_t conversation_id)
-{
-    if (!r2_turn_context_reviews || conversation_id <= 0) return;
-    for (size_t i = 0; i < r2_turn_context_reviews->count; ++i) {
-        int64_t archive = r2_turn_context_reviews->archives[i];
-        if (r2_log_link_context_review(archive, conversation_id) != 0)
-            fprintf(stderr, "[R2 Context] Could not link review archive #%lld to conversation #%lld.\n",
-                    (long long)archive, (long long)conversation_id);
-    }
 }
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
@@ -2483,99 +2455,160 @@ static char *workspace_list(const char *rel)
 }
 
 
-static int workspace_write(
-    const char *rel,
-    const char *content,
-    char out[PATH_MAX])
+/* Open the resolved parent from the workspace root. Keep this descriptor
+ * through publication so a renamed parent cannot redirect pathname lookup. */
+static int workspace_open_write_parent(char *parent)
 {
-    char p[PATH_MAX];
+    size_t root_length = strlen(R2_WORKSPACE);
+    if (strncmp(parent, R2_WORKSPACE, root_length) != 0 ||
+        (parent[root_length] && parent[root_length] != '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    int dir = open(R2_WORKSPACE, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) return -1;
+    char *next = NULL;
+    for (char *part = strtok_r(parent + root_length, "/", &next); part;
+         part = strtok_r(NULL, "/", &next)) {
+        if (!strcmp(part, ".") || !strcmp(part, "..")) {
+            close(dir);
+            errno = EINVAL;
+            return -1;
+        }
+        int child = openat(dir, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int error = errno;
+        close(dir);
+        if (child < 0) { errno = error; return -1; }
+        dir = child;
+    }
+    return dir;
+}
 
-    if (safe_path(rel, p) != 0)
+enum { WORKSPACE_WRITE_OK = 0, WORKSPACE_WRITE_SYNC_UNCONFIRMED = 1 };
+
+static int workspace_copy_access_acl(int original, int replacement)
+{
+    const char acl_name[] = "system.posix_acl_access";
+    ssize_t length = fgetxattr(original, acl_name, NULL, 0);
+    if (length < 0) {
+        if (errno == ENOTSUP) return 0;
+        if (errno != ENODATA) return -1;
+        return fremovexattr(replacement, acl_name) == 0 || errno == ENODATA ? 0 : -1;
+    }
+    if (length == 0) { errno = EIO; return -1; }
+    void *acl = malloc((size_t)length);
+    if (!acl) return -1;
+    ssize_t got = fgetxattr(original, acl_name, acl, (size_t)length);
+    if (got >= 0 && got != length) errno = ESTALE;
+    int rc = got == length ? fsetxattr(replacement, acl_name, acl, (size_t)length, 0) : -1;
+    free(acl);
+    return rc;
+}
+
+static int workspace_write(const char *rel, const char *content, char out[PATH_MAX])
+{
+    char path[PATH_MAX];
+    if (safe_path(rel, path) != 0) return -1;
+    char *slash = strrchr(path, '/');
+    if (!slash || !slash[1] || !strcmp(slash + 1, ".") || !strcmp(slash + 1, ".."))
         return -1;
 
     char parent[PATH_MAX];
+    memcpy(parent, path, (size_t)(slash - path));
+    parent[slash - path] = '\0';
+    const char *name = slash + 1;
+    int dir = workspace_open_write_parent(parent);
+    if (dir < 0) return -1;
 
-    int written = snprintf(
-        parent,
-        sizeof(parent),
-        "%s",
-        p
-    );
-
-    if (written < 0 ||
-        (size_t)written >= sizeof(parent))
-        return -1;
-
-    char *slash =
-        strrchr(parent, '/');
-
-    if (slash) {
-
-        *slash = '\0';
-
-        if (*parent) {
-
-            struct stat pst;
-
-            if (stat(parent, &pst) != 0 ||
-                !S_ISDIR(pst.st_mode))
-                return -1;
+    int result = -1, fd = -1, original = -1;
+    char temporary[64] = "";
+    struct stat before, current, staging;
+    int exists = fstatat(dir, name, &before, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!exists && errno != ENOENT) goto cleanup;
+    if (exists) {
+        if (!S_ISREG(before.st_mode) || before.st_nlink != 1) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        /* Check the caller's existing write access without truncating. */
+        original = openat(dir, name, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (original < 0 || fstat(original, &current) != 0) goto cleanup;
+        if (current.st_dev != before.st_dev || current.st_ino != before.st_ino) {
+            errno = ESTALE;
+            goto cleanup;
         }
     }
 
-    FILE *f = fopen(p, "w");
+    /* Generate an exclusive sibling name. Retrying collisions never touches
+     * the destination. Temporary bytes stay private until publication. */
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        uint64_t random;
+        if (getentropy(&random, sizeof(random)) != 0) goto cleanup;
+        snprintf(temporary, sizeof(temporary), ".r2-write-%016llx", (unsigned long long)random);
+        fd = openat(dir, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) break;
+        temporary[0] = '\0';
+        if (errno != EEXIST) goto cleanup;
+    }
+    if (fd < 0) goto cleanup;
 
-    if (!f)
-        return -1;
-
-    if (content) {
-
-        size_t content_len =
-            strlen(content);
-
-        if (content_len > 0) {
-
-            size_t written_bytes =
-                fwrite(
-                    content,
-                    1,
-                    content_len,
-                    f
-                );
-
-            if (written_bytes != content_len) {
-
-                fclose(f);
-                return -1;
-            }
+    const char *cursor = content ? content : "";
+    size_t remaining = strlen(cursor);
+    while (remaining) {
+        size_t chunk = remaining > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : remaining;
+        ssize_t written = write(fd, cursor, chunk);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            goto cleanup;
         }
+        cursor += (size_t)written;
+        remaining -= (size_t)written;
     }
-
-    if (fclose(f) != 0) {
-        r2_log_file_event("write", rel, "failed_on_close", NULL);
-        return -1;
+    if (exists) {
+        if (fstat(fd, &staging) != 0) goto cleanup;
+        if ((staging.st_uid != before.st_uid || staging.st_gid != before.st_gid) &&
+            fchown(fd, before.st_uid, before.st_gid) != 0) goto cleanup;
+        if (fchmod(fd, before.st_mode & 0777) != 0 ||
+            workspace_copy_access_acl(original, fd) != 0) goto cleanup;
     }
+    if (fsync(fd) != 0) goto cleanup;
+    int closed = close(fd);
+    fd = -1;
+    if (closed != 0) goto cleanup;
 
-    r2_log_file_event("write", rel, "success", "Workspace file was written by R2.");
-
-    if (out) {
-
-        int out_written =
-            snprintf(
-                out,
-                PATH_MAX,
-                "%s",
-                p
-            );
-
-        if (out_written < 0 ||
-            out_written >= PATH_MAX)
-            return -1;
+    if (exists) {
+        if (fstatat(dir, name, &current, AT_SYMLINK_NOFOLLOW) != 0) goto cleanup;
+        if (current.st_dev != before.st_dev || current.st_ino != before.st_ino ||
+            current.st_nlink != 1 || current.st_ctim.tv_sec != before.st_ctim.tv_sec ||
+            current.st_ctim.tv_nsec != before.st_ctim.tv_nsec) {
+            errno = ESTALE;
+            goto cleanup;
+        }
+        if (renameat(dir, temporary, dir, name) != 0) goto cleanup;
+    } else if (renameat2(dir, temporary, dir, name, RENAME_NOREPLACE) != 0) {
+        goto cleanup;
     }
+    temporary[0] = '\0';
+    if (out) strcpy(out, path);
+    result = fsync(dir) == 0 ? WORKSPACE_WRITE_OK : WORKSPACE_WRITE_SYNC_UNCONFIRMED;
 
-    return 0;
+cleanup:
+    {
+        int error = errno;
+        if (fd >= 0) close(fd);
+        if (original >= 0) close(original);
+        if (temporary[0]) unlinkat(dir, temporary, 0);
+        close(dir);
+        if (result >= 0)
+            r2_log_file_event("write", rel,
+                result == WORKSPACE_WRITE_OK ? "success" : "published_sync_unconfirmed",
+                result == WORKSPACE_WRITE_OK ? "Workspace file was written by R2." :
+                "Complete file was published, but syncing its directory failed.");
+        errno = error;
+        return result;
+    }
 }
-
 
 static int workspace_delete(
     const char *rel,
@@ -8440,13 +8473,8 @@ static char *process_tools_with_status(
 
                     char written[PATH_MAX];
 
-                    if (
-                        workspace_write(
-                            path,
-                            data,
-                            written
-                        ) == 0
-                    ) {
+                    int write_status = workspace_write(path, data, written);
+                    if (write_status == WORKSPACE_WRITE_OK) {
 
                         (void)r2_reward_apply("filesystem_write", "file_generation", 3,
                             "A requested workspace file was written successfully.", 0);
@@ -8460,6 +8488,13 @@ static char *process_tools_with_status(
                             strlen(data)
                         );
 
+                    } else if (write_status == WORKSPACE_WRITE_SYNC_UNCONFIRMED) {
+                        APPEND(
+                            "REAL WRITE RESULT:\n"
+                            "Published complete file: %s\n"
+                            "Persistence after power loss could not be confirmed.\n",
+                            written
+                        );
                     } else {
 
                         (void)r2_reward_apply("filesystem_write", "file_generation", -2,
@@ -14049,9 +14084,11 @@ finalize_reply:
 
     pthread_mutex_unlock(&messages_lock);
 
-    int64_t turn_event_id = r2_log_conversation_turn(message, reply);
-    r2_audio_turn_link(turn_event_id, r2_audio_turn_evidence);
-    r2_context_turn_link(turn_event_id);
+    const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
+    const R2TurnContextReviews *reviews = r2_turn_context_reviews;
+    int64_t turn_event_id = r2_log_conversation_turn_with_links(message, reply,
+        speech ? speech->events : NULL, speech ? speech->count : 0,
+        reviews ? reviews->archives : NULL, reviews ? reviews->count : 0);
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),

@@ -86,6 +86,9 @@ int main(void)
         "INSERT INTO r2_log_milestones VALUES(1,'legacy-first','Old milestone');"
         "CREATE TABLE r2_log_conversations(id INTEGER PRIMARY KEY,user_text TEXT,assistant_text TEXT);"
         "INSERT INTO r2_log_conversations VALUES(1,'old question','old answer');"
+        "INSERT INTO r2_log_conversations VALUES(2,printf('%.*c',10000,'u')||'LEGACY-USER-END',"
+        "printf('%.*c',12000,'a')||'LEGACY-ANSWER-END');"
+        "INSERT INTO r2_log_conversations VALUES(3,'left'||char(0)||'right','old answer');"
         "CREATE TABLE r2_log_inner_states(id INTEGER PRIMARY KEY,state_kind TEXT,description TEXT,"
         "evidence TEXT,confidence REAL,origin TEXT);"
         "INSERT INTO r2_log_inner_states VALUES(1,'curious','Old state','legacy evidence',0.7,'old beta');"
@@ -247,6 +250,13 @@ int main(void)
         "WHERE l.id=1 AND l.from_event_id=7 AND l.to_event_id=8") == 1);
     assert(scalar(db,
         "SELECT COUNT(*) FROM r2_log_events WHERE event_type='legacy_log_link_restored'") >= 8);
+    assert(scalar(db,
+        "SELECT COUNT(*) FROM r2_log_conversations c JOIN r2_log_events e ON e.id=c.event_id "
+        "WHERE c.id=2 AND instr(e.details,c.user_text)>0 AND instr(e.details,c.assistant_text)>0;") == 1);
+    assert(scalar(db,
+        "SELECT COUNT(*) FROM r2_log_conversations c JOIN r2_log_events e ON e.id=c.event_id "
+        "WHERE c.id=3 AND instr(e.details,'[hex bytes] 6c656674007269676874')>0 "
+        "AND hex(c.user_text)='6C656674007269676874';") == 1);
     sqlite3_stmt *integrity = NULL;
     assert(sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1,
                               &integrity, NULL) == SQLITE_OK);

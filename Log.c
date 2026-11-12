@@ -63,6 +63,9 @@ static int64_t current_session_id = 0;
 static struct timespec process_start_time;
 static int process_clock_ready = 0;
 static void log_replay_conversation_archives(void);
+static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
+                           const char *relationship, const char *notes);
+static int log_link_context_review_locked(int64_t archive_id, int64_t conversation_id);
 
 /* ------------------------------------------------------------
  * SMALL INTERNAL HELPERS
@@ -501,6 +504,12 @@ static int ensure_tables(void)
         " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
         " user_text TEXT NOT NULL, assistant_text TEXT NOT NULL"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_pending_turn_links ("
+        " event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+        " kind INTEGER NOT NULL CHECK(kind IN (0,1)),"
+        " target_id INTEGER NOT NULL CHECK(target_id>0),"
+        " PRIMARY KEY(event_id,kind,target_id)"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_inner_states ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -602,6 +611,29 @@ typedef struct R2LegacyLogLinkBackfill {
     const char *details_expression;
 } R2LegacyLogLinkBackfill;
 
+/* SQLite text can contain NUL bytes. Encode such a legacy value losslessly
+ * so the recovered event remains usable through the text recall interface. */
+static char *log_legacy_text(sqlite3_stmt *st, int column)
+{
+    const unsigned char *value = sqlite3_column_text(st, column);
+    if (!value) return NULL; /* These queries use COALESCE. */
+    size_t length = (size_t)sqlite3_column_bytes(st, column);
+    if (!memchr(value, '\0', length)) return strdup((const char *)value);
+    static const char prefix[] = "[hex bytes] ";
+    if (length > (SIZE_MAX - sizeof(prefix)) / 2) return NULL;
+    char *encoded = malloc(sizeof(prefix) + length * 2);
+    if (!encoded) return NULL;
+    memcpy(encoded, prefix, sizeof(prefix) - 1);
+    char *out = encoded + sizeof(prefix) - 1;
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < length; ++i) {
+        *out++ = hex[value[i] >> 4];
+        *out++ = hex[value[i] & 15];
+    }
+    *out = '\0';
+    return encoded;
+}
+
 static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
 {
     if (!spec || !spec->table || !spec->link_column ||
@@ -641,48 +673,37 @@ static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
         }
 
         sqlite3_int64 row_id = sqlite3_column_int64(st, 0);
-        const unsigned char *summary_text = sqlite3_column_text(st, 1);
-        const unsigned char *details_text = sqlite3_column_text(st, 2);
-        char legacy_summary[384], legacy_details[1400];
-        snprintf(legacy_summary, sizeof(legacy_summary), "%s",
-                 summary_text ? (const char *)summary_text : "");
-        snprintf(legacy_details, sizeof(legacy_details), "%s",
-                 details_text ? (const char *)details_text : "");
+        char *legacy_summary = log_legacy_text(st, 1);
+        char *legacy_details = log_legacy_text(st, 2);
         sqlite3_finalize(st);
+        st = NULL;
 
-        char source[256], summary[512], details[2048];
+        char source[256], summary[512];
         snprintf(source, sizeof(source), "LogMigration:%s:%lld",
                  spec->table, (long long)row_id);
-        snprintf(summary, sizeof(summary),
-                 "Recovered legacy %s record #%lld: %.300s",
-                 spec->table, (long long)row_id, legacy_summary);
-        snprintf(details, sizeof(details),
-                 "table=%s; legacy_id=%lld; legacy_summary=%s; legacy_details=%s",
-                 spec->table, (long long)row_id, legacy_summary, legacy_details);
+        snprintf(summary, sizeof(summary), "Recovered legacy %s record #%lld",
+                 spec->table, (long long)row_id);
 
         int64_t event_id = -1;
         rc = sqlite3_prepare_v2(log_db,
             "SELECT id FROM r2_log_events WHERE event_type=? AND source=? "
             "ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
-        if (rc != SQLITE_OK) {
-            if (st) sqlite3_finalize(st);
-            return -1;
-        }
-        sqlite3_bind_text(st, 1, "legacy_log_link_restored", -1, SQLITE_STATIC);
-        sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(st);
-        if (rc == SQLITE_ROW)
-            event_id = sqlite3_column_int64(st, 0);
-        else if (rc != SQLITE_DONE) {
-            sqlite3_finalize(st);
-            return -1;
-        }
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, "legacy_log_link_restored", -1, SQLITE_STATIC);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) event_id = sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
+        st = NULL;
 
-        if (event_id <= 0)
-            event_id = r2_log_event(R2_LOG_THINKING,
-                                    "legacy_log_link_restored",
+        char *details = NULL;
+        if (rc == SQLITE_DONE && legacy_summary && legacy_details &&
+            asprintf(&details, "table=%s; legacy_id=%lld; legacy_summary=%s; legacy_details=%s",
+                     spec->table, (long long)row_id, legacy_summary, legacy_details) >= 0)
+            event_id = r2_log_event(R2_LOG_THINKING, "legacy_log_link_restored",
                                     summary, details, source);
+        free(details);
+        free(legacy_summary);
+        free(legacy_details);
         if (event_id <= 0) {
             fprintf(stderr, "[R2 Log] Could not create a Life Log link for %s row %lld.\n",
                     spec->table, (long long)row_id);
@@ -703,9 +724,9 @@ static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
             if (st) sqlite3_finalize(st);
             return -1;
         }
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_int64(st, 2, row_id);
-        rc = sqlite3_step(st);
+        rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, row_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         int changed = sqlite3_changes(log_db);
         sqlite3_finalize(st);
         if (rc != SQLITE_DONE || changed != 1) {
@@ -757,7 +778,7 @@ static int log_restore_missing_event_links(void)
          "COALESCE(t.description,t.milestone_key,'Legacy milestone')",
          "'milestone_key='||COALESCE(t.milestone_key,'')"},
         {"r2_log_conversations", "event_id",
-         "substr(COALESCE(t.user_text,'Legacy conversation'),1,300)",
+         "COALESCE(t.user_text,'Legacy conversation')",
          "'assistant_text='||COALESCE(t.assistant_text,'')"},
         {"r2_log_inner_states", "event_id",
          "COALESCE(t.description,t.state_kind,'Legacy inner state')",
@@ -1214,6 +1235,71 @@ static int log_publish_conversation_archive_locked(int64_t event_id)
     return log_finish_write(saved);
 }
 
+/* Kind zero identifies a sensory event and kind one a context review.
+ * Replay independently from the text archive so either can recover first. */
+static int log_publish_turn_links_locked(int64_t event_id)
+{
+    if (exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT p.kind,p.target_id,EXISTS(SELECT 1 FROM r2_log_events e "
+        "WHERE e.id=p.target_id AND e.category='sensory' AND e.event_type='speech_transcribed') "
+        "FROM r2_log_pending_turn_links p WHERE p.event_id=?;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    int saved = rc == SQLITE_OK;
+    sqlite3_int64 count = 0;
+    while (saved && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        ++count;
+        int kind = sqlite3_column_int(st, 0);
+        int64_t target = sqlite3_column_int64(st, 1);
+        if (kind == 0) {
+            saved = sqlite3_column_int(st, 2) && log_link_locked(event_id, target,
+                "speech_was_transcribed_for_turn",
+                "Exact locally recognized audio event; availability alone is not interpretation.") == 0;
+        } else {
+            saved = kind == 1 && log_link_context_review_locked(target, event_id) == 0;
+        }
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (saved && rc == SQLITE_DONE) {
+        rc = sqlite3_prepare_v2(log_db,
+            "DELETE FROM r2_log_pending_turn_links WHERE event_id=?;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE && sqlite3_changes64(log_db) == count;
+        sqlite3_finalize(st);
+    } else {
+        saved = 0;
+    }
+    return log_finish_write(saved);
+}
+
+static int log_stage_turn_links_locked(int64_t event_id, int kind,
+                                       const int64_t *ids, size_t count)
+{
+    if (!count) return 0;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "INSERT INTO r2_log_pending_turn_links(event_id,kind,target_id) VALUES(?1,?2,?3) "
+        "ON CONFLICT(event_id,kind,target_id) DO NOTHING;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, kind);
+    for (size_t i = 0; rc == SQLITE_OK && i < count; ++i) {
+        rc = sqlite3_bind_int64(st, 3, ids[i]);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE && sqlite3_changes(log_db) == 0) {
+            /* A duplicate supplied ID is fine. An ignored staging write is not. */
+            size_t earlier = 0;
+            while (earlier < i && ids[earlier] != ids[i]) ++earlier;
+            if (earlier == i) rc = SQLITE_CONSTRAINT;
+        }
+        if (rc == SQLITE_DONE) rc = sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
 static void log_replay_conversation_archives(void)
 {
     int64_t after = 0;
@@ -1221,11 +1307,20 @@ static void log_replay_conversation_archives(void)
     while (log_initialized && log_db) {
         sqlite3_stmt *statement = NULL;
         int rc = sqlite3_prepare_v2(log_db,
-            "SELECT event_id FROM r2_log_pending_conversations "
-            "WHERE event_id>? ORDER BY event_id LIMIT 1;", -1, &statement, NULL);
+            "WITH next_event(id) AS (SELECT MIN(id) FROM ("
+            "SELECT MIN(event_id) AS id FROM r2_log_pending_conversations WHERE event_id>?1 "
+            "UNION ALL SELECT MIN(event_id) FROM r2_log_pending_turn_links WHERE event_id>?1)) "
+            "SELECT id,EXISTS(SELECT 1 FROM r2_log_pending_conversations WHERE event_id=next_event.id),"
+            "EXISTS(SELECT 1 FROM r2_log_pending_turn_links WHERE event_id=next_event.id) "
+            "FROM next_event WHERE id IS NOT NULL;", -1, &statement, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, after);
         if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-        if (rc == SQLITE_ROW) after = sqlite3_column_int64(statement, 0);
+        int archive = 0, links = 0;
+        if (rc == SQLITE_ROW) {
+            after = sqlite3_column_int64(statement, 0);
+            archive = sqlite3_column_int(statement, 1);
+            links = sqlite3_column_int(statement, 2);
+        }
         sqlite3_finalize(statement);
         if (rc != SQLITE_ROW) {
             if (rc != SQLITE_DONE)
@@ -1233,8 +1328,10 @@ static void log_replay_conversation_archives(void)
                         sqlite3_errmsg(log_db));
             break;
         }
-        if (log_publish_conversation_archive_locked(after) != 0)
+        if (archive && log_publish_conversation_archive_locked(after) != 0)
             fprintf(stderr, "[R2 Life Log] Conversation archive remains pending for event #%" PRId64 ".\n", after);
+        if (links && log_publish_turn_links_locked(after) != 0)
+            fprintf(stderr, "[R2 Life Log] Conversation evidence remains pending for event #%" PRId64 ".\n", after);
     }
     pthread_mutex_unlock(&log_lock);
 }
@@ -1245,10 +1342,12 @@ static void log_replay_conversation_archives(void)
  * The dedicated table is for durable full-text continuity; the event
  * details make the same turn discoverable through r2_log_search().
  */
-int64_t r2_log_conversation_turn(const char *user_text,
-                                const char *assistant_text)
+int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
+                                            const int64_t *speech_ids, size_t speech_count,
+                                            const int64_t *review_ids, size_t review_count)
 {
-    if (!valid_text(user_text) || !valid_text(assistant_text))
+    if (!valid_text(user_text) || !valid_text(assistant_text) ||
+        (speech_count && !speech_ids) || (review_count && !review_ids))
         return -1;
 
     size_t user_len = strlen(user_text);
@@ -1299,13 +1398,23 @@ int64_t r2_log_conversation_turn(const char *user_text,
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
+                    log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
     if (result == 0 && log_publish_conversation_archive_locked(event_id) != 0)
         fprintf(stderr, "[R2 Life Log] Conversation archive remains pending for event #%" PRId64 ".\n", event_id);
+    if (result == 0 && (speech_count || review_count) &&
+        log_publish_turn_links_locked(event_id) != 0)
+        fprintf(stderr, "[R2 Life Log] Conversation evidence remains pending for event #%" PRId64 ".\n", event_id);
     pthread_mutex_unlock(&log_lock);
     if (result != 0) return -1;
     r2_sj_index_event(event_id, "conversation", "conversation_turn", "r2_talk");
     return event_id;
+}
+
+int64_t r2_log_conversation_turn(const char *user_text, const char *assistant_text)
+{
+    return r2_log_conversation_turn_with_links(user_text, assistant_text, NULL, 0, NULL, 0);
 }
 
 /* ------------------------------------------------------------
@@ -1503,15 +1612,14 @@ int64_t r2_log_thinking(const char *thought_kind, const char *summary,
 int64_t r2_log_file_event(const char *action, const char *path,
                           const char *result, const char *details)
 {
-    char summary[2048];
-
     if (!valid_text(action) || !valid_text(path) || !valid_text(result))
         return -1;
 
-    snprintf(summary, sizeof(summary), "%s: %s (%s)", action, path, result);
-
-    return r2_log_event(R2_LOG_FILESYSTEM, action, summary,
-                        details, "filesystem");
+    char *summary = NULL;
+    if (asprintf(&summary, "%s: %s (%s)", action, path, result) < 0) return -1;
+    int64_t id = r2_log_event(R2_LOG_FILESYSTEM, action, summary, details, "filesystem");
+    free(summary);
+    return id;
 }
 
 int64_t r2_log_media_event(const char *action, const char *media_type,
@@ -2280,14 +2388,8 @@ int64_t r2_log_archive_context_review(const char *request, const char *original,
     return id;
 }
 
-int r2_log_link_context_review(int64_t archive_id, int64_t conversation_id)
+static int log_link_context_review_locked(int64_t archive_id, int64_t conversation_id)
 {
-    if (archive_id <= 0 || conversation_id <= 0) return -1;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_context_reviews SET conversation_event_id=?1 WHERE id=?2 "
@@ -2299,8 +2401,17 @@ int r2_log_link_context_review(int64_t archive_id, int64_t conversation_id)
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int linked = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
     return linked ? 0 : -1;
+}
+
+int r2_log_link_context_review(int64_t archive_id, int64_t conversation_id)
+{
+    if (archive_id <= 0 || conversation_id <= 0) return -1;
+    pthread_mutex_lock(&log_lock);
+    int rc = log_initialized && log_db ?
+        log_link_context_review_locked(archive_id, conversation_id) : -1;
+    pthread_mutex_unlock(&log_lock);
+    return rc;
 }
 
 char *r2_log_read_context_review(int64_t id)
