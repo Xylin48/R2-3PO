@@ -27,7 +27,6 @@
 #include <unistd.h>
 
 #define REALITY_MAX_TEXT 4096
-#define REALITY_MAX_OUTPUT 32768
 
 static sqlite3 *reality_db = NULL;
 static sqlite3 *fridge_db = NULL;
@@ -3408,37 +3407,45 @@ int r2_reality_tick(void)
 
 static char *query_text(const char *sql, const char *arg)
 {
-    if (!r2_reality_is_initialized()) return NULL;
-    size_t cap = 4096, len = 0;
-    char *out = malloc(cap);
-    if (!out) return NULL;
-    out[0] = '\0';
+    char *out = NULL;
+    size_t length = 0;
+    FILE *stream = open_memstream(&out, &length);
+    if (!stream) return NULL;
+
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(reality_db, sql, -1, &st, NULL);
-    if (rc == SQLITE_OK && arg) bind_text(st, 1, arg);
-    if (rc == SQLITE_OK) while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        const unsigned char *a = sqlite3_column_text(st, 0);
-        const unsigned char *b = sqlite3_column_text(st, 1);
-        const unsigned char *c = sqlite3_column_text(st, 2);
-        char line[8192];
-        snprintf(line, sizeof(line), "%s%s%s%s%s%s\n", a?(const char*)a:"", b?" — ":"", b?(const char*)b:"", c?" (":"", c?(const char*)c:"", c?")":"");
-        size_t n = strlen(line);
-        if (len+n+1 > cap) {
-            size_t next=cap;
-            while(next<len+n+1) next*=2;
-            if(next>REALITY_MAX_OUTPUT) { break; }
-            char *grown=realloc(out,next);
-            if(!grown) break;
-            out=grown; cap=next;
+    int rc = reality_ready && reality_db
+        ? sqlite3_prepare_v2(reality_db, sql, -1, &st, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK && arg)
+        rc = sqlite3_bind_text(st, 1, arg, -1, SQLITE_TRANSIENT);
+    int failed = rc != SQLITE_OK;
+    while (!failed && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *fields[3] = {0};
+        for (int i = 0; i < 3; ++i) {
+            fields[i] = (const char *)sqlite3_column_text(st, i);
+            if (fields[i] ? strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i)
+                          : sqlite3_column_type(st, i) != SQLITE_NULL) {
+                failed = 1;
+                break;
+            }
         }
-        memcpy(out+len,line,n); len+=n; out[len]='\0';
+        if (!failed)
+            failed = fprintf(stream, "%s%s%s%s%s%s\n",
+                fields[0] ? fields[0] : "",
+                fields[1] ? " — " : "", fields[1] ? fields[1] : "",
+                fields[2] ? " (" : "", fields[2] ? fields[2] : "",
+                fields[2] ? ")" : "") < 0;
     }
-    if (st) sqlite3_finalize(st);
+    sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
-    if (rc != SQLITE_DONE && len == 0) { free(out); return NULL; }
-    if (!len) snprintf(out, cap, "(nothing here yet)\n");
-    return out;
+    if (fclose(stream) != 0) failed = 1;
+    if (failed || rc != SQLITE_DONE) {
+        free(out);
+        return NULL;
+    }
+    if (length > 0) return out;
+    free(out);
+    return strdup("(nothing here yet)\n");
 }
 
 char *r2_reality_list(const char *container)

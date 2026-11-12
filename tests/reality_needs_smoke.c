@@ -26,6 +26,34 @@ static void fail(const char *message)
     exit(1);
 }
 
+static void verify_complete_legacy_inventory(void)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &db) != SQLITE_OK)
+        fail("could not open inventory fixture");
+    const char *seed =
+        "WITH nums(n) AS (VALUES(1),(2),(3),(4)) "
+        "INSERT INTO r2_reality_objects(name,description,quantity,container) "
+        "SELECT 'legacy_long_'||n,printf('%09000d',0)||'TAIL_'||n,1,'pockets' FROM nums;";
+    if (sqlite3_exec(db, seed, NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not seed long legacy inventory descriptions");
+    char *list = r2_reality_list("pockets");
+    if (!list || strlen(list) < 36000 || !strstr(list, "TAIL_1") ||
+        !strstr(list, "TAIL_2") || !strstr(list, "TAIL_3") || !strstr(list, "TAIL_4"))
+        fail("legacy inventory omitted part of a row or result");
+    free(list);
+
+    if (sqlite3_exec(db, "UPDATE r2_reality_objects SET description='prefix'||char(0)||'suffix' "
+                         "WHERE name='legacy_long_4';", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not seed embedded NUL inventory description");
+    list = r2_reality_list("pockets");
+    if (list) fail("an unrepresentable description returned a partial inventory");
+    if (sqlite3_exec(db, "DELETE FROM r2_reality_objects WHERE name GLOB 'legacy_long_*';",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not clear inventory fixtures");
+    sqlite3_close(db);
+}
+
 static void verify_vcr_tape_identity(void)
 {
     const char *first = R2_ROOT "/first|x11=tape.mp4";
@@ -517,6 +545,7 @@ int main(void)
     seed_legacy_reality_owned_tables();
     seed_legacy_shared_reality_tables();
     if (r2_reality_init() != 0) fail("Reality initialization failed");
+    verify_complete_legacy_inventory();
     char *initial_status = r2_reality_status();
     if (!initial_status || !strstr(initial_status, "SELF CONTINUITY") ||
         !strstr(initial_status, "Hunger:")) {
