@@ -341,7 +341,7 @@ int main(void)
     free(recalled);
     free(large);
 
-    /* If the dedicated archive rejects an insert, full event text survives. */
+    /* Preserve the exact turn and queue the structured archive on failure. */
     sql(connection, "CREATE TRIGGER reject_archive BEFORE INSERT ON r2_log_conversations BEGIN SELECT RAISE(FAIL,'fixture'); END;");
     int64_t fallback = r2_log_conversation_turn(expected, reply);
     assert(fallback > 0);
@@ -350,6 +350,10 @@ int main(void)
     assert(sqlite3_bind_int64(st, 1, fallback) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(sqlite3_column_int(st, 0) > 200000);
     sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(connection, "SELECT COUNT(*) FROM r2_log_pending_conversations WHERE event_id=?", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, fallback) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
     sql(connection, "DROP TRIGGER reject_archive;");
     assert(sqlite3_close(connection) == SQLITE_OK);
     connection = NULL;
@@ -357,6 +361,10 @@ int main(void)
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
     verify_turn(connection, turn, expected, reply);
+    verify_turn(connection, fallback, expected, reply);
+    assert(sqlite3_prepare_v2(connection, "SELECT COUNT(*) FROM r2_log_pending_conversations", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+    sqlite3_finalize(st);
     for (int i = 0; i < 3; ++i) verify_event(connection, speech_ids[i], original_sources[i], expected);
     verify_event(connection, independent_id, extra_name, expected);
     verify_visual_sources(connection);

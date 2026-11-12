@@ -168,6 +168,49 @@ int main(void)
     assert(journal_index_calls == indexed + 1);
     assert(scalar(writer, "SELECT session_id FROM r2_log_events "
                           "WHERE event_type='fixture_after_ignore';") == actual_session);
+
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER ignore_activity BEFORE INSERT ON r2_log_activity_sessions "
+        "WHEN NEW.activity_key='restart-fixture' BEGIN SELECT RAISE(IGNORE); END;"
+        "CREATE TRIGGER ignore_milestone BEFORE INSERT ON r2_log_milestones "
+        "WHEN NEW.milestone_key='test-first' BEGIN SELECT RAISE(IGNORE); END;"
+        "CREATE TRIGGER ignore_location BEFORE INSERT ON r2_log_events "
+        "WHEN NEW.event_type='location_changed' BEGIN SELECT RAISE(IGNORE); END;"
+        "CREATE TRIGGER ignore_pending_turn BEFORE INSERT ON r2_log_pending_conversations "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
+    assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) < 0);
+    assert(r2_log_milestone("test-first", "Milestone fixture", NULL) < 0);
+    assert(r2_log_location_transition("park", 0) < 0);
+    assert(r2_log_conversation_turn("ignored stage", "reply") < 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events;") == event_count);
+    assert(scalar(writer, "SELECT is_home FROM r2_log_location_state WHERE id=1;") == 1);
+    assert(sqlite3_exec(writer,
+        "DROP TRIGGER ignore_activity; DROP TRIGGER ignore_milestone; "
+        "DROP TRIGGER ignore_location; DROP TRIGGER ignore_pending_turn;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_milestone("test-first", "Milestone fixture", NULL) > 0);
+    assert(r2_log_milestone("test-first", "Milestone fixture", NULL) == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE source='test-first';") == 1);
+    assert(r2_log_location_transition("park", 0) == 0);
+    assert(r2_log_location_transition("home", 1) == 0);
+    assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) > 0);
+    assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) < 0);
+    assert(sqlite3_exec(writer,
+        "UPDATE r2_log_activity_sessions SET start_monotonic_ms=0, "
+        "started_epoch=CAST(strftime('%s','now') AS INTEGER)-3600 WHERE activity_key='restart-fixture';"
+        "CREATE TRIGGER ignore_activity_end BEFORE UPDATE OF end_event_id ON r2_log_activity_sessions "
+        "WHEN NEW.activity_key='restart-fixture' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_activity_end("restart-fixture", "ready", "fixture", NULL) < 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='activity_ended' "
+                          "AND source='restart-fixture';") == 0);
+    assert(sqlite3_exec(writer, "DROP TRIGGER ignore_activity_end;", NULL, NULL, NULL) == SQLITE_OK);
+    r2_log_shutdown();
+    assert(r2_log_init() == 0);
+    assert(r2_log_activity_end("restart-fixture", "ready", "fixture", NULL) > 0);
+    assert(scalar(writer, "SELECT duration_ms FROM r2_log_activity_sessions "
+                          "WHERE activity_key='restart-fixture';") >= 3600000);
     sqlite3_close(writer);
 
     sqlite3 *db = NULL;

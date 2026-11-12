@@ -132,6 +132,35 @@ int main(void)
     assert(atomic_load(&wakeups) >= 1);
     assert(seconds_between(before, after) < 1.0);
 
+    /* A moved stream wakes its reader and cannot supply old or new PCM
+     * under the original source label, even when a fragment is retained. */
+    atomic_store(&capture.cancelled, 0);
+    atomic_store(&waiting, 0);
+    atomic_store(&readable, 8);
+    assert(r2_audio_capture_read(&capture, head, sizeof(head)) == 3);
+    __wrap_pa_threaded_mainloop_lock(capture.mainloop);
+    r2_capture_stream_moved(capture.stream, &capture);
+    __wrap_pa_threaded_mainloop_unlock(capture.mainloop);
+    memset(tail, 0, sizeof(tail));
+    assert(r2_audio_capture_read(&capture, tail, sizeof(tail)) == -1 && errno == ENODEV);
+    assert(tail[0] == 0 && atomic_load(&dropped) == 1);
+
+    /* A move must also release a reader blocked in silence. */
+    capture.stream_moved = 0;
+    capture.fragment_size = capture.fragment_offset = 0;
+    atomic_store(&readable, 0);
+    assert(pthread_create(&thread, NULL, read_during_silence, &reader) == 0);
+    for (int i = 0; i < 1500 && !atomic_load(&waiting); ++i) {
+        struct timespec pause = {0, 1000000L};
+        (void)nanosleep(&pause, NULL);
+    }
+    assert(atomic_load(&waiting));
+    __wrap_pa_threaded_mainloop_lock(capture.mainloop);
+    r2_capture_stream_moved(capture.stream, &capture);
+    __wrap_pa_threaded_mainloop_unlock(capture.mainloop);
+    assert(pthread_join(thread, NULL) == 0);
+    assert(reader.got == -1 && reader.saved_errno == ENODEV);
+
     puts("Signalable async capture preserves partial chunks and wakes silent PCM reads on cancellation.");
     return 0;
 }

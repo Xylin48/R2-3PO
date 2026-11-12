@@ -62,6 +62,7 @@ static int log_initialized = 0;
 static int64_t current_session_id = 0;
 static struct timespec process_start_time;
 static int process_clock_ready = 0;
+static void log_replay_conversation_archives(void);
 
 /* ------------------------------------------------------------
  * SMALL INTERNAL HELPERS
@@ -153,6 +154,14 @@ static int exec_sql(const char *sql)
     }
 
     return 0;
+}
+
+/* Call with log_lock held and an owned write transaction. */
+static int log_finish_write(int saved)
+{
+    if (saved && exec_sql("COMMIT;") == 0) return 0;
+    if (!sqlite3_get_autocommit(log_db)) (void)exec_sql("ROLLBACK;");
+    return -1;
 }
 
 static int bind_optional_text(sqlite3_stmt *statement, int index,
@@ -487,6 +496,10 @@ static int ensure_tables(void)
         " user_text TEXT NOT NULL,"
         " assistant_text TEXT NOT NULL,"
         " FOREIGN KEY(event_id) REFERENCES r2_log_events(id)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_pending_conversations ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " user_text TEXT NOT NULL, assistant_text TEXT NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS r2_log_inner_states ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -833,6 +846,7 @@ int r2_log_init(void)
         r2_log_shutdown();
         return -1;
     }
+    log_replay_conversation_archives();
 
     if (r2_log_session_start() != 0) {
         fprintf(stderr,
@@ -1169,6 +1183,62 @@ int64_t r2_log_event_with_memory(
     return event_id;
 }
 
+/* The searchable event is already committed. Publish and acknowledge the
+ * archive in a second transaction so an archive failure cannot lose the turn. */
+static int log_publish_conversation_archive_locked(int64_t event_id)
+{
+    if (exec_sql("BEGIN IMMEDIATE;") != 0) return -1;
+    sqlite3_stmt *statement = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "INSERT INTO r2_log_conversations(event_id,user_text,assistant_text) "
+        "SELECT p.event_id,p.user_text,p.assistant_text FROM r2_log_pending_conversations p "
+        "WHERE p.event_id=? AND NOT EXISTS "
+        "(SELECT 1 FROM r2_log_conversations c WHERE c.event_id=p.event_id);",
+        -1, &statement, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    sqlite3_finalize(statement);
+    statement = NULL;
+    if (rc == SQLITE_DONE) {
+        rc = sqlite3_prepare_v2(log_db,
+            "DELETE FROM r2_log_pending_conversations WHERE event_id=?1 AND EXISTS "
+            "(SELECT 1 FROM r2_log_conversations c WHERE c.event_id=?1 "
+            "AND c.user_text COLLATE BINARY=r2_log_pending_conversations.user_text "
+            "AND c.assistant_text COLLATE BINARY=r2_log_pending_conversations.assistant_text);",
+            -1, &statement, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    }
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(statement);
+    return log_finish_write(saved);
+}
+
+static void log_replay_conversation_archives(void)
+{
+    int64_t after = 0;
+    pthread_mutex_lock(&log_lock);
+    while (log_initialized && log_db) {
+        sqlite3_stmt *statement = NULL;
+        int rc = sqlite3_prepare_v2(log_db,
+            "SELECT event_id FROM r2_log_pending_conversations "
+            "WHERE event_id>? ORDER BY event_id LIMIT 1;", -1, &statement, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+        if (rc == SQLITE_ROW) after = sqlite3_column_int64(statement, 0);
+        sqlite3_finalize(statement);
+        if (rc != SQLITE_ROW) {
+            if (rc != SQLITE_DONE)
+                fprintf(stderr, "[R2 Life Log] Could not read pending conversation archives: %s\n",
+                        sqlite3_errmsg(log_db));
+            break;
+        }
+        if (log_publish_conversation_archive_locked(after) != 0)
+            fprintf(stderr, "[R2 Life Log] Conversation archive remains pending for event #%" PRId64 ".\n", after);
+    }
+    pthread_mutex_unlock(&log_lock);
+}
+
 /*
  * Store the exact visible conversation turn in both the searchable
  * chronological event stream and the dedicated conversation table.
@@ -1204,38 +1274,37 @@ int64_t r2_log_conversation_turn(const char *user_text,
     char summary[1024];
     size_t preview = user_len;
     if (preview > 800) preview = 800;
+    while (preview && ((unsigned char)user_text[preview] & 0xc0) == 0x80) --preview;
     snprintf(summary, sizeof(summary),
              "Conversation turn: %.*s",
              (int)preview, user_text);
-    int64_t event_id = r2_log_event(
-        R2_LOG_CONVERSATION, "conversation_turn",
-        summary, details, "r2_talk");
-    free(details);
-    if (event_id < 0) return -1;
-
     sqlite3_stmt *statement = NULL;
-    int rc;
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
-        return event_id; /* Event details still preserve the turn. */
+        free(details);
+        return -1;
     }
-    rc = sqlite3_prepare_v2(
+    int64_t event_id = log_insert_event_locked(R2_LOG_CONVERSATION, "conversation_turn",
+                                               summary, details, "r2_talk");
+    free(details);
+    int rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(
         log_db,
-        "INSERT OR REPLACE INTO r2_log_conversations "
+        "INSERT INTO r2_log_pending_conversations "
         "(event_id,user_text,assistant_text) VALUES(?,?,?);",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, user_text, (sqlite3_uint64)user_len, SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 3, assistant_text, (sqlite3_uint64)assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc != SQLITE_DONE)
-        fprintf(stderr, "[R2 Life Log] Conversation archive insert failed: %s\n",
-                sqlite3_errmsg(log_db));
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    int result = log_finish_write(saved);
+    if (result == 0 && log_publish_conversation_archive_locked(event_id) != 0)
+        fprintf(stderr, "[R2 Life Log] Conversation archive remains pending for event #%" PRId64 ".\n", event_id);
     pthread_mutex_unlock(&log_lock);
-
-    /* The searchable event remains authoritative if the archive insert fails. */
+    if (result != 0) return -1;
+    r2_sj_index_event(event_id, "conversation", "conversation_turn", "r2_talk");
     return event_id;
 }
 
@@ -1355,12 +1424,9 @@ int64_t r2_log_milestone(
 )
 {
     sqlite3_stmt *statement = NULL;
-    int64_t event_id;
-    int64_t milestone_id = -1;
     char utc[40];
-    char local[48];
 
-    if (!valid_text(milestone_key) || !valid_text(description))
+    if (!valid_text(milestone_key) || !valid_text(description) || strlen(description) > 8192)
         return -1;
 
     /*
@@ -1368,41 +1434,30 @@ int64_t r2_log_milestone(
      * duplicate "first" milestones.
      */
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
-    int exists = 0;
     int lookup_rc = sqlite3_prepare_v2(log_db,
         "SELECT 1 FROM r2_log_milestones WHERE milestone_key=?;",
         -1, &statement, NULL);
     if (lookup_rc == SQLITE_OK)
         lookup_rc = sqlite3_bind_text(statement, 1, milestone_key, -1, SQLITE_TRANSIENT);
-    if (lookup_rc == SQLITE_OK) exists = sqlite3_step(statement) == SQLITE_ROW;
+    if (lookup_rc == SQLITE_OK) lookup_rc = sqlite3_step(statement);
     sqlite3_finalize(statement);
-    pthread_mutex_unlock(&log_lock);
-    if (exists)
-        return 0;
-
-    event_id = r2_log_event(
-        R2_LOG_MILESTONE, "milestone",
-        description, details, milestone_key
-    );
-    if (event_id < 0)
-        return -1;
-
-    timestamp_pair(utc, sizeof(utc), local, sizeof(local));
-
-    pthread_mutex_lock(&log_lock);
-
-    if (!log_initialized || !log_db) {
+    statement = NULL;
+    if (lookup_rc != SQLITE_DONE) {
+        (void)log_finish_write(0);
         pthread_mutex_unlock(&log_lock);
-        return -1;
+        return lookup_rc == SQLITE_ROW ? 0 : -1;
     }
 
-    int rc = sqlite3_prepare_v2(
+    int64_t event_id = log_insert_event_locked(R2_LOG_MILESTONE, "milestone",
+                                               description, details, milestone_key);
+    timestamp_pair(utc, sizeof(utc), NULL, 0);
+    int rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(
         log_db,
-        "INSERT OR IGNORE INTO r2_log_milestones "
+        "INSERT INTO r2_log_milestones "
         "(milestone_key, description, first_event_id, recorded_utc) "
         "VALUES (?, ?, ?, ?);",
         -1, &statement, NULL
@@ -1412,16 +1467,13 @@ int64_t r2_log_milestone(
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, description, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 3, event_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, utc, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) {
-        rc = sqlite3_step(statement);
-        if (rc == SQLITE_DONE && sqlite3_changes(log_db) > 0)
-            milestone_id = sqlite3_last_insert_rowid(log_db);
-    }
-
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
 
-    return milestone_id >= 0 ? event_id : 0;
+    return result == 0 ? event_id : -1;
 }
 
 /* ------------------------------------------------------------
@@ -1512,7 +1564,7 @@ int64_t r2_log_activity_start(const char *activity_key,
         (details && strlen(details) > 3000)) return -1;
 
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
@@ -1531,20 +1583,22 @@ int64_t r2_log_activity_start(const char *activity_key,
             rc = step_rc;
     }
     if (statement) sqlite3_finalize(statement);
-    pthread_mutex_unlock(&log_lock);
-    if (rc != SQLITE_OK) return -1;
+    statement = NULL;
+    if (rc != SQLITE_OK) {
+        (void)log_finish_write(0);
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
 
     snprintf(event_details, sizeof(event_details), "activity_key=%s%s%s",
              activity_key, details && *details ? "; " : "",
              details && *details ? details : "");
     snprintf(summary, sizeof(summary), "R2 started activity '%s'.", activity_name);
-    int64_t event_id = r2_log_event(R2_LOG_MEDIA, "activity_started",
+    int64_t event_id = log_insert_event_locked(R2_LOG_MEDIA, "activity_started",
         summary, event_details, activity_key);
-    if (event_id < 0) return -1;
 
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
-    pthread_mutex_lock(&log_lock);
-    rc = sqlite3_prepare_v2(log_db,
+    rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_activity_sessions "
         "(activity_key,activity_name,started_utc,started_local,started_epoch,"
         "start_monotonic_ms,start_event_id,status) VALUES (?,?,?,?,?,?,?,'active')",
@@ -1557,10 +1611,11 @@ int64_t r2_log_activity_start(const char *activity_key,
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 6, (sqlite3_int64)r2_log_elapsed_ms());
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc == SQLITE_DONE) rc = SQLITE_OK;
-    if (statement) sqlite3_finalize(statement);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(statement);
+    int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
-    if (rc != SQLITE_OK) return -1;
+    if (result != 0) return -1;
 
     /* Every explicitly started activity is a voluntary choice signal for the
        shared preference evaluator. Start/end events are not double-counted. */
@@ -1575,10 +1630,12 @@ int64_t r2_log_activity_end(const char *activity_key,
                             const char *details)
 {
     sqlite3_stmt *statement = NULL;
-    char activity_name[513] = "unknown activity";
-    char start_local[48] = "unknown";
-    char utc[40], local[48], summary[2048], event_details[4096];
-    sqlite3_int64 started_epoch = 0, started_monotonic = 0;
+    char *activity_name = NULL, *start_local = NULL;
+    char utc[40], local[48];
+    char *event_details = NULL, *summary = NULL;
+    const char *state_text = valid_text(last_verified_state) ? last_verified_state : "unknown";
+    const char *reason_text = valid_text(stop_reason) ? stop_reason : "unknown";
+    sqlite3_int64 started_epoch = 0, started_monotonic = 0, start_session = 0;
     sqlite3_int64 ended_epoch = (sqlite3_int64)time(NULL);
     sqlite3_int64 duration_ms = -1;
     int rc;
@@ -1587,62 +1644,58 @@ int64_t r2_log_activity_end(const char *activity_key,
         (stop_reason && strlen(stop_reason) > 1024) ||
         (details && strlen(details) > 2000)) return -1;
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
     rc = sqlite3_prepare_v2(log_db,
-        "SELECT activity_name,started_local,started_epoch,start_monotonic_ms "
-        "FROM r2_log_activity_sessions WHERE activity_key=? AND status='active' "
-        "ORDER BY id DESC LIMIT 1", -1, &statement, NULL);
+        "SELECT a.activity_name,a.started_local,a.started_epoch,a.start_monotonic_ms,e.session_id "
+        "FROM r2_log_activity_sessions a LEFT JOIN r2_log_events e ON e.id=a.start_event_id "
+        "WHERE a.activity_key=? AND a.status='active' ORDER BY a.id DESC LIMIT 1", -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) {
-        rc = sqlite3_step(statement);
-        if (rc == SQLITE_ROW) {
-            const unsigned char *name = sqlite3_column_text(statement, 0);
-            const unsigned char *started = sqlite3_column_text(statement, 1);
-            if (name) snprintf(activity_name, sizeof(activity_name), "%s", (const char *)name);
-            if (started) snprintf(start_local, sizeof(start_local), "%s", (const char *)started);
-            started_epoch = sqlite3_column_int64(statement, 2);
-            started_monotonic = sqlite3_column_int64(statement, 3);
-            rc = SQLITE_OK;
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    if (rc == SQLITE_ROW) {
+        const char *fields[2];
+        if (log_read_text_fields(statement, 0, 2, fields) == 0) {
+            activity_name = strdup(fields[0] ? fields[0] : "unknown activity");
+            start_local = strdup(fields[1] ? fields[1] : "unknown");
         }
+        started_epoch = sqlite3_column_int64(statement, 2);
+        started_monotonic = sqlite3_column_int64(statement, 3);
+        start_session = sqlite3_column_int64(statement, 4);
     }
-    if (statement) sqlite3_finalize(statement);
-    pthread_mutex_unlock(&log_lock);
-    if (rc != SQLITE_OK) return -1;
+    sqlite3_finalize(statement);
+    statement = NULL;
 
     uint64_t elapsed = r2_log_elapsed_ms();
-    if (elapsed >= (uint64_t)started_monotonic)
+    if (start_session > 0 && start_session == current_session_id &&
+        started_monotonic >= 0 && elapsed >= (uint64_t)started_monotonic) {
         duration_ms = (sqlite3_int64)(elapsed - (uint64_t)started_monotonic);
-    double seconds = difftime((time_t)ended_epoch, (time_t)started_epoch);
-    if (seconds < 0.0) seconds = -1.0;
-    if (seconds >= 0.0) {
-        snprintf(summary, sizeof(summary),
-                 "R2 ended activity '%s' after %.0f seconds; last verified state: %s; stop reason: %s.",
-                 activity_name, seconds,
-                 valid_text(last_verified_state) ? last_verified_state : "unknown",
-                 valid_text(stop_reason) ? stop_reason : "unknown");
-    } else {
-        snprintf(summary, sizeof(summary),
-                 "R2 ended activity '%s'; duration unknown; last verified state: %s; stop reason: %s.",
-                 activity_name,
-                 valid_text(last_verified_state) ? last_verified_state : "unknown",
-                 valid_text(stop_reason) ? stop_reason : "unknown");
+    } else if (started_epoch > 0 && ended_epoch >= started_epoch &&
+               ended_epoch - started_epoch <= INT64_MAX / 1000) {
+        duration_ms = (ended_epoch - started_epoch) * 1000;
     }
-    snprintf(event_details, sizeof(event_details),
-             "activity_key=%s; started=%s; duration_seconds=%.0f; duration_ms=%lld; "
-             "last_verified_state=%s; stop_reason=%s%s%s",
-             activity_key, start_local, seconds, (long long)duration_ms,
-             valid_text(last_verified_state) ? last_verified_state : "unknown",
-             valid_text(stop_reason) ? stop_reason : "unknown",
-             details && *details ? "; " : "", details && *details ? details : "");
-    int64_t event_id = r2_log_event(R2_LOG_MEDIA, "activity_ended", summary,
-                                    event_details, activity_key);
-    if (event_id < 0) return -1;
+
+    int64_t event_id = -1;
+    if (activity_name && start_local &&
+        asprintf(&summary, "R2 ended activity '%s'; last verified state: %s; stop reason: %s.",
+                 activity_name, state_text, reason_text) >= 0 &&
+        asprintf(&event_details,
+                 "activity_key=%s; activity=%s; started=%s; duration_seconds=%.3f; "
+                 "duration_ms=%lld; last_verified_state=%s; stop_reason=%s%s%s",
+                 activity_key, activity_name, start_local,
+                 duration_ms >= 0 ? duration_ms / 1000.0 : -1.0,
+                 (long long)duration_ms, state_text, reason_text,
+                 details && *details ? "; " : "", details && *details ? details : "") >= 0) {
+        event_id = log_insert_event_locked(R2_LOG_MEDIA, "activity_ended",
+                                           summary, event_details, activity_key);
+    }
+    free(summary);
+    free(event_details);
+    free(activity_name);
+    free(start_local);
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
-    pthread_mutex_lock(&log_lock);
-    rc = sqlite3_prepare_v2(log_db,
+    rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_activity_sessions SET ended_utc=?,ended_local=?,ended_epoch=?,"
         "duration_ms=?,last_verified_state=?,stop_reason=?,end_event_id=?,status='ended' "
         "WHERE activity_key=? AND status='active'",
@@ -1653,18 +1706,16 @@ int64_t r2_log_activity_end(const char *activity_key,
     if (rc == SQLITE_OK) rc = duration_ms >= 0
         ? sqlite3_bind_int64(statement, 4, duration_ms)
         : sqlite3_bind_null(statement, 4);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, valid_text(last_verified_state) ? last_verified_state : "unknown", -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, valid_text(stop_reason) ? stop_reason : "unknown", -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, state_text, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, reason_text, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) {
-        rc = sqlite3_step(statement);
-        if (rc == SQLITE_DONE && sqlite3_changes(log_db) > 0) rc = SQLITE_OK;
-        else if (rc == SQLITE_DONE) rc = SQLITE_ERROR;
-    }
-    if (statement) sqlite3_finalize(statement);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) > 0;
+    sqlite3_finalize(statement);
+    int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_OK ? event_id : -1;
+    return result == 0 ? event_id : -1;
 }
 
 
@@ -1679,26 +1730,30 @@ int r2_log_location_transition(const char *location, int is_home)
     char summary[640], details[1200];
     if (!valid_text(location) || strlen(location) > 256) return -1;
     pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
     rc = sqlite3_prepare_v2(log_db,
         "SELECT current_location,is_home,was_away FROM r2_log_location_state WHERE id=1",
         -1, &statement, NULL);
-    if (rc == SQLITE_OK && sqlite3_step(statement) == SQLITE_ROW) {
-        const unsigned char *old = sqlite3_column_text(statement, 0);
-        if (old) snprintf(previous, sizeof(previous), "%s", (const char *)old);
+    const char *old;
+    if (rc == SQLITE_OK && sqlite3_step(statement) == SQLITE_ROW &&
+        log_read_text_fields(statement, 0, 1, &old) == 0 &&
+        (!old || strlen(old) < sizeof(previous))) {
+        if (old) strcpy(previous, old);
         previous_home = sqlite3_column_int(statement, 1);
         was_away = sqlite3_column_int(statement, 2);
     } else {
         if (statement) sqlite3_finalize(statement);
+        (void)log_finish_write(0);
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
     sqlite3_finalize(statement);
     statement = NULL;
-    if (!strcasecmp(previous, location)) {
+    if (!strcasecmp(previous, location) && previous_home == !!is_home) {
+        (void)log_finish_write(0);
         pthread_mutex_unlock(&log_lock);
         return 0;
     }
@@ -1711,21 +1766,24 @@ int r2_log_location_transition(const char *location, int is_home)
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, is_home ? 1 : 0);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, is_home ? 0 : 1);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    if (rc == SQLITE_DONE) rc = SQLITE_OK;
-    if (statement) sqlite3_finalize(statement);
-    pthread_mutex_unlock(&log_lock);
-    if (rc != SQLITE_OK) return -1;
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(statement);
     snprintf(summary, sizeof(summary), "R2 moved to %s.", location);
     snprintf(details, sizeof(details),
              "Previous location=%s; destination=%s; destination classified as %s.",
              previous, location, is_home ? "home" : "away");
-    if (r2_log_event(R2_LOG_WORLD, "location_changed", summary, details,
-                     "world_location") < 0) return -1;
-    if (should_welcome) {
-        (void)r2_log_event(R2_LOG_CONTINUITY, "internal_notification",
-                           "Private notification delivered to R2: Welcome Home.",
+    if (saved)
+        saved = log_insert_event_locked(R2_LOG_WORLD, "location_changed", summary, details,
+                                        "world_location") > 0;
+    if (saved && should_welcome)
+        saved = log_insert_event_locked(R2_LOG_CONTINUITY, "internal_notification",
+                           "Private Welcome Home notification recorded for R2.",
                            "Triggered only by a persisted away-to-home transition.",
-                           "world_location");
+                           "world_location") > 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    if (result != 0) return -1;
+    if (should_welcome) {
         (void)r2_save_memory(
             "Welcome Home. You have returned home after being away.",
             "private_notification");
