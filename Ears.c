@@ -218,7 +218,7 @@ static pa_sample_spec r2_ears_sample_spec(void)
 static char *r2_ears_find_microphone(void)
 {
     R2AudioDiscovery sources;
-    if (r2_audio_discover(&sources) != 0) return NULL;
+    if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_MICROPHONE, NULL, NULL) != 0) return NULL;
     char *selected = sources.microphone_source;
     sources.microphone_source = NULL;
     r2_audio_discovery_free(&sources);
@@ -236,7 +236,7 @@ int r2_ears_microphone_available(void)
 int r2_ears_desktop_playing(void)
 {
     R2AudioDiscovery sources;
-    if (r2_audio_discover(&sources) != 0) return 0;
+    if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_PLAYBACK, NULL, NULL) != 0) return 0;
     int playing = sources.desktop_playing;
     r2_audio_discovery_free(&sources);
     return playing;
@@ -245,7 +245,7 @@ int r2_ears_desktop_playing(void)
 long r2_ears_playback_pid(void)
 {
     R2AudioDiscovery sources;
-    if (r2_audio_discover(&sources) != 0) return -1;
+    if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_PLAYBACK, NULL, NULL) != 0) return -1;
     long pid = sources.playback_pid;
     r2_audio_discovery_free(&sources);
     return pid;
@@ -406,7 +406,7 @@ int r2_ears_open_source_cancelable(
         source_name[0] == '\0')
     {
         R2AudioDiscovery sources;
-        if (r2_audio_discover_cancelable(&sources, cancelled, userdata) != 0)
+        if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_MICROPHONE, cancelled, userdata) != 0)
             return -1;
         resolved_source = sources.microphone_source;
         sources.microphone_source = NULL;
@@ -574,7 +574,7 @@ int r2_ears_open_desktop_cancelable(R2Ears *ears,
 {
     if (!ears) { errno = EINVAL; return -1; }
     R2AudioDiscovery sources;
-    if (r2_audio_discover_cancelable(&sources, cancelled, userdata) != 0) return -1;
+    if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_PLAYBACK, cancelled, userdata) != 0) return -1;
     int rc = sources.desktop_monitor ? r2_ears_open_source_cancelable(
         ears, sources.desktop_monitor, cancelled, userdata) : -1;
     r2_audio_discovery_free(&sources);
@@ -585,7 +585,7 @@ int r2_ears_open_desktop(R2Ears *ears)
 {
     if (!ears) return -1;
     R2AudioDiscovery sources;
-    if (r2_audio_discover(&sources) != 0) return -1;
+    if (r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_PLAYBACK, NULL, NULL) != 0) return -1;
     int rc = sources.desktop_monitor
         ? r2_ears_open_desktop_source(ears, sources.desktop_monitor) : -1;
     r2_audio_discovery_free(&sources);

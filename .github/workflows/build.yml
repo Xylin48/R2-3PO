@@ -164,7 +164,7 @@ jobs:
 
       - name: Exercise source discovery with synthetic microphone and desktop playback
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread -lpthread -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_mainloop_iterate
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_source_discovery_smoke.c -o /tmp/r2-ears-source-discovery-smoke -lpulse-simple -lpulse -lpthread -lpthread -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_mainloop_iterate -Wl,--wrap=pa_context_get_source_info_list -Wl,--wrap=pa_context_get_sink_input_info_list -Wl,--wrap=pa_operation_unref
           /tmp/r2-ears-source-discovery-smoke
 
       - name: Wake a truly blocked asynchronous Pulse read on stop
@@ -189,7 +189,7 @@ jobs:
 
       - name: Cancel supplementary output handshakes before joining Watch
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_discover_cancelable
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_discover_cancelable -Wl,--wrap=r2_audio_discover_selected
           /tmp/r2-ears-extra-connect-cancel
 
       - name: Cancel a real libpulse handshake stalled on a silent local server

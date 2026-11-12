@@ -35,6 +35,14 @@ int r2_audio_discover(R2AudioDiscovery *result);
 /* Predicate is polled during the nonblocking native query; no device opens. */
 int r2_audio_discover_cancelable(R2AudioDiscovery *result,
                                   int (*cancelled)(void *), void *userdata);
+typedef enum {
+    R2_AUDIO_DISCOVER_MICROPHONE = 1,
+    R2_AUDIO_DISCOVER_PLAYBACK = 2
+} R2AudioDiscoveryScope;
+
+/* Explicit listeners can query just their own device class. */
+int r2_audio_discover_selected(R2AudioDiscovery *result, unsigned scope,
+                               int (*cancelled)(void *), void *userdata);
 void r2_audio_discovery_free(R2AudioDiscovery *result);
 
 #endif

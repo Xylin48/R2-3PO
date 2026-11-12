@@ -24,6 +24,7 @@
 #define REWARD_DB_PATH R2_HOME "/r2_rewards.db"
 #define REWARD_TARGET_MAX 256
 #define REWARD_REASON_MAX 1024
+#define REWARD_DETAILS_CAPACITY (REWARD_TARGET_MAX + 128 + REWARD_REASON_MAX + 384)
 #define REWARD_DECAY_SECONDS (30 * 60)
 
 static sqlite3 *reward_db = NULL;
@@ -200,18 +201,18 @@ static void format_reward_event(const PendingReward *event,
                                 char *summary, size_t summary_size,
                                 char *details, size_t details_size)
 {
-    int duration = (int)(event->expires_at - event->occurred_at);
-    if (duration < 0) duration = 0;
+    uint64_t duration = event->expires_at > event->occurred_at
+        ? (uint64_t)event->expires_at - (uint64_t)event->occurred_at : 0;
     snprintf(summary, summary_size,
-        "R2 recorded a %s learning signal (%+d points) for %.240s.",
+        "R2 recorded a %s learning signal (%+d points) for %s.",
         event->points > 0 ? "positive" : "corrective",
         event->points, event->target);
     snprintf(details, details_size,
-        "reward_event_id=%lld; target=%s; source=%s; points=%+d; reason=%.900s; "
-        "temporary_enjoyment_modifier=%+d/100; modifier_expires_after_seconds=%d; "
+        "reward_event_id=%lld; target=%s; source=%s; points=%+d; reason=%s; "
+        "temporary_enjoyment_modifier=%+d/100; modifier_expires_after_seconds=%llu; "
         "reward_total_is_not_a_measure_of_worth.",
         (long long)event->id, event->target, event->source, event->points,
-        event->reason, event->modifier, duration);
+        event->reason, event->modifier, (unsigned long long)duration);
 }
 
 static int64_t find_existing_log_event(sqlite3_int64 reward_id)
@@ -452,8 +453,12 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, expires);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) {
-                reward_id = sqlite3_last_insert_rowid(reward_db);
-                rc = SQLITE_OK;
+                if (sqlite3_changes(reward_db) != 1)
+                    rc = SQLITE_CONSTRAINT;
+                else {
+                    reward_id = sqlite3_last_insert_rowid(reward_db);
+                    rc = SQLITE_OK;
+                }
             }
         }
         if (st) sqlite3_finalize(st);
@@ -497,7 +502,7 @@ static int reward_apply_internal(const char *target, const char *source, int poi
            after committing the reward but before recording the choice. Its
            stable reward_event_id makes the replay idempotent. */
         if (voluntary_choice && prior_event.id > 0) {
-            char prior_summary[512], prior_details[1600];
+            char prior_summary[512], prior_details[REWARD_DETAILS_CAPACITY];
             format_reward_event(&prior_event, prior_summary, sizeof(prior_summary),
                                 prior_details, sizeof(prior_details));
             int choice_rc = r2_addiction_record_choice(prior_event.target, "activity",
@@ -521,7 +526,7 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     event.occurred_at = now;
     event.modifier = modifier;
     event.expires_at = expires;
-    char summary[512], details[1600];
+    char summary[512], details[REWARD_DETAILS_CAPACITY];
     format_reward_event(&event, summary, sizeof(summary), details, sizeof(details));
 
     if (r2_log_is_initialized()) {
@@ -620,7 +625,7 @@ int r2_reward_reconnect_history(int limit)
             free(pending);
             return -1;
         }
-        char summary[512], details[1600];
+        char summary[512], details[REWARD_DETAILS_CAPACITY];
         format_reward_event(item, summary, sizeof(summary), details, sizeof(details));
         if (log_event_id <= 0)
             log_event_id = r2_log_event_with_memory(R2_LOG_WORLD,
@@ -635,6 +640,16 @@ int r2_reward_reconnect_history(int limit)
     }
     free(pending);
     return linked;
+}
+
+static double reward_remaining(sqlite3_int64 start, sqlite3_int64 end,
+                               sqlite3_int64 now)
+{
+    if (end <= start || end <= now) return 0.0;
+    if (now <= start) return 1.0;
+    uint64_t duration = (uint64_t)end - (uint64_t)start;
+    uint64_t remaining = (uint64_t)end - (uint64_t)now;
+    return (double)remaining / (double)duration;
 }
 
 int r2_reward_current_modifier(const char *target)
@@ -656,12 +671,7 @@ int r2_reward_current_modifier(const char *target)
             int modifier = sqlite3_column_int(st, 0);
             sqlite3_int64 start = sqlite3_column_int64(st, 1);
             sqlite3_int64 end = sqlite3_column_int64(st, 2);
-            if (end > start) {
-                double remaining = (double)(end - now) / (double)(end - start);
-                if (remaining < 0.0) remaining = 0.0;
-                if (remaining > 1.0) remaining = 1.0;
-                result = (int)(modifier * remaining);
-            }
+            result = (int)(modifier * reward_remaining(start, end, now));
         }
     }
     if (st) sqlite3_finalize(st);
@@ -672,8 +682,6 @@ int r2_reward_current_modifier(const char *target)
 char *r2_reward_context(void)
 {
     sqlite3_stmt *st = NULL;
-    const size_t capacity = 4096;
-    size_t used = 0;
     sqlite3_int64 now = (sqlite3_int64)time(NULL);
 
     pthread_mutex_lock(&reward_lock);
@@ -681,106 +689,61 @@ char *r2_reward_context(void)
         pthread_mutex_unlock(&reward_lock);
         return strdup("Reward context unavailable: the reward database could not be opened.\n");
     }
-
-    char *out = malloc(capacity);
-    if (!out) {
-        pthread_mutex_unlock(&reward_lock);
-        return NULL;
-    }
-    out[0] = '\0';
-
     int rc = sqlite3_prepare_v2(reward_db,
         "SELECT points FROM reward_totals WHERE id=1", -1, &st, NULL);
-    if (rc == SQLITE_OK)
-        rc = sqlite3_step(st);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc != SQLITE_ROW) {
-        fprintf(stderr, "[R2 Reward] Could not read cumulative reward total: %s\n",
-                sqlite3_errmsg(reward_db));
-        if (st) sqlite3_finalize(st);
+        sqlite3_finalize(st);
         pthread_mutex_unlock(&reward_lock);
-        free(out);
         return strdup("Reward context unavailable: the cumulative reward total could not be read.\n");
     }
-    int total = sqlite3_column_int(st, 0);
+    sqlite3_int64 total = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     st = NULL;
 
-    int n = snprintf(out, capacity,
-        "LEARNING/REINFORCEMENT CONTEXT (simulated feedback, not objective worth):\n"
-        "Cumulative points: %d. Positive feedback is +1..+5; corrective feedback is at most -7.\n"
-        "Temporary enjoyment modifiers decay over 30 minutes and must not be treated as permanent preferences.\n",
-        total);
-    if (n < 0 || (size_t)n >= capacity) {
+    char *out = NULL;
+    size_t length = 0;
+    FILE *stream = open_memstream(&out, &length);
+    if (!stream) {
         pthread_mutex_unlock(&reward_lock);
-        free(out);
         return NULL;
     }
-    used = (size_t)n;
+    int failed = fprintf(stream,
+        "LEARNING/REINFORCEMENT CONTEXT (simulated feedback, not objective worth):\n"
+        "Cumulative points: %lld. Positive feedback is +1..+5; corrective feedback is at most -7.\n"
+        "Temporary enjoyment modifiers decay over 30 minutes and must not be treated as permanent preferences.\n",
+        (long long)total) < 0;
 
     rc = sqlite3_prepare_v2(reward_db,
         "SELECT target,points,reason,occurred_at,expires_at FROM reward_events "
         "ORDER BY id DESC LIMIT 8", -1, &st, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "[R2 Reward] Could not prepare recent reward context: %s\n",
-                sqlite3_errmsg(reward_db));
-        if (st) sqlite3_finalize(st);
-        pthread_mutex_unlock(&reward_lock);
-        free(out);
-        return strdup("Reward context unavailable: recent reward events could not be read.\n");
-    }
-
-    int omitted = 0;
-    int failed = 0;
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (used + 256 >= capacity) {
-            omitted = 1;
-            break;
-        }
+    if (rc != SQLITE_OK) failed = 1;
+    while (!failed && (rc = sqlite3_step(st)) == SQLITE_ROW) {
         const char *target = (const char *)sqlite3_column_text(st, 0);
-        int points = sqlite3_column_int(st, 1);
         const char *reason = (const char *)sqlite3_column_text(st, 2);
-        sqlite3_int64 occurred = sqlite3_column_int64(st, 3);
-        sqlite3_int64 expires = sqlite3_column_int64(st, 4);
-        double remaining = 0.0;
-        if (expires > now && expires > occurred) {
-            remaining = occurred > now ? 1.0 :
-                (double)(expires - now) / (double)(expires - occurred);
-            if (remaining < 0.0) remaining = 0.0;
-            if (remaining > 1.0) remaining = 1.0;
-        }
-        int modifier = (int)(points * 2.0 * remaining);
-        n = snprintf(out + used, capacity - used,
-            "Recent: target=%.160s; points=%+d; temporary_modifier=%+d; reason=%.160s\n",
-            target ? target : "unknown", points, modifier, reason ? reason : "");
-        if (n < 0 || (size_t)n >= capacity - used) {
+        if ((target ? strlen(target) != (size_t)sqlite3_column_bytes(st, 0)
+                    : sqlite3_column_type(st, 0) != SQLITE_NULL) ||
+            (reason ? strlen(reason) != (size_t)sqlite3_column_bytes(st, 2)
+                    : sqlite3_column_type(st, 2) != SQLITE_NULL)) {
             failed = 1;
             break;
         }
-        used += (size_t)n;
+        int points = sqlite3_column_int(st, 1);
+        sqlite3_int64 occurred = sqlite3_column_int64(st, 3);
+        sqlite3_int64 expires = sqlite3_column_int64(st, 4);
+        double remaining = reward_remaining(occurred, expires, now);
+        long long modifier = (long long)(points * 2.0 * remaining);
+        failed = fprintf(stream,
+            "Recent: target=%s; points=%+d; temporary_modifier=%+lld; reason=%s\n",
+            target ? target : "unknown", points, modifier, reason ? reason : "") < 0;
     }
-    if (!omitted && !failed && rc != SQLITE_DONE)
-        failed = 1;
-    if (st) sqlite3_finalize(st);
-
-    if (failed) {
-        fprintf(stderr, "[R2 Reward] Recent reward context query failed: %s\n",
-                sqlite3_errmsg(reward_db));
-        pthread_mutex_unlock(&reward_lock);
-        free(out);
-        return strdup("Reward context unavailable: recent reward events could not be read completely.\n");
-    }
-    if (omitted) {
-        const char *note = "Additional recent reward events omitted from context; full history remains stored.\n";
-        size_t note_len = strlen(note);
-        if (note_len < capacity - used) {
-            memcpy(out + used, note, note_len);
-            used += note_len;
-            out[used] = '\0';
-        }
-    }
-
+    if (!failed && rc != SQLITE_DONE) failed = 1;
+    sqlite3_finalize(st);
+    if (fclose(stream) != 0) failed = 1;
     pthread_mutex_unlock(&reward_lock);
-    return out;
+    if (!failed) return out;
+    free(out);
+    return strdup("Reward context unavailable: recent reward events could not be read completely.\n");
 }
 
 int r2_reward_review_diary(int64_t diary_entry_id, const char *entry)

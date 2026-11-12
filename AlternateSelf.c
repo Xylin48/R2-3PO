@@ -389,6 +389,7 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
         "WHERE scenario=? AND COALESCE(assumptions,'')=COALESCE(?,'') "
         "AND COALESCE(predicted_outcome,'')=COALESCE(?,'') "
         "AND COALESCE(conclusion,'')=COALESCE(?,'') AND status!='discarded' "
+        "AND branch_kind='counterfactual' "
         "ORDER BY id LIMIT 1;", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 2, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 2);
@@ -428,7 +429,8 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     if (rc == SQLITE_DONE && sqlite3_changes(as_db) == 0) {
         sqlite3_stmt *existing = NULL;
         int existing_rc = sqlite3_prepare_v2(as_db,
-            "SELECT id FROM r2_alternate_self_branches WHERE log_event_id=?;",
+            "SELECT id FROM r2_alternate_self_branches "
+            "WHERE log_event_id=? AND branch_kind='counterfactual';",
             -1, &existing, NULL);
         if (existing_rc == SQLITE_OK)
             existing_rc = sqlite3_bind_int64(existing, 1, hypothetical_event_id);
