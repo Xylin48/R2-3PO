@@ -274,6 +274,27 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(read.call_count, 3)
         self.assertIn("incomplete or invalid assistant turn", errors.getvalue())
 
+    def test_generation_limit_cannot_pass_either_probe(self) -> None:
+        for vision in (False, True):
+            with self.subTest(vision=vision):
+                text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
+                image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
+                (image if vision else text)["done_reason"] = "length"
+                replies = [{"models": [{"name": "qwen3.5:9b"}]}, text, image]
+                with patch.object(probe, "_read_json", side_effect=replies) as read, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(probe.preflight(timeout=1))
+                self.assertEqual(read.call_count, 3 if vision else 2)
+
+    def test_negated_blue_does_not_pass_the_vision_probe(self) -> None:
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"done": True, "message": {"role": "assistant", "content": '{"color":"not blue"}'}},
+        ]) as read, contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(probe.preflight(timeout=1))
+        self.assertEqual(read.call_count, 3)
+
     def test_http_500_body_is_preserved_for_text_generation(self) -> None:
         errors = io.StringIO()
         failure = urllib.error.HTTPError(
