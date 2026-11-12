@@ -152,12 +152,37 @@ static void test_file_reads(void)
     free(text);
     assert(unlink(path) == 0);
 }
+
+static void test_complete_workspace_listing(void)
+{
+    const char directory[] = R2_WORKSPACE "/list-fixture";
+    assert(mkdir(directory, 0700) == 0);
+    int dir = open(directory, O_RDONLY | O_DIRECTORY);
+    assert(dir >= 0);
+    for (int i = 0; i <= 10000; ++i) {
+        char name[32];
+        assert(snprintf(name, sizeof(name), "entry-%05d", i) > 0);
+        int fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        assert(fd >= 0 && close(fd) == 0);
+    }
+    assert(symlinkat("missing-target", dir, "z-link") == 0);
+    char *listing = workspace_list("list-fixture");
+    assert(listing && !strncmp(listing, "FILE entry-00000\n", strlen("FILE entry-00000\n")));
+    assert(strstr(listing, "FILE entry-10000\nLINK z-link\n"));
+    size_t lines = 0;
+    for (const char *p = listing; *p; ++p) if (*p == '\n') ++lines;
+    assert(lines == 10002);
+    free(listing);
+    assert(close(dir) == 0); /* The fixture root is removed by the workflow. */
+}
+
 int main(void)
 {
     test_file_reads();
     assert(mkdir(R2_ROOT, 0700) == 0 || errno == EEXIST);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
+    test_complete_workspace_listing();
     assert(r2_ears_init(&ears) == 0 && r2_ears_init(&ears_desktop) == 0);
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);

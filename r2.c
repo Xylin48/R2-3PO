@@ -1617,6 +1617,23 @@ static int save_memory(
    the separate dynamic relevant-memory retrieval performed on each turn.
 */
 
+static int memory_read_fields(sqlite3_stmt *statement, int first, int count,
+                              const char **fields)
+{
+    for (int i = 0; i < count; ++i) {
+        int column = first + i;
+        int type = sqlite3_column_type(statement, column);
+        const char *value = (const char *)sqlite3_column_text(statement, column);
+        if ((!value && type != SQLITE_NULL) ||
+            (value && strlen(value) != (size_t)sqlite3_column_bytes(statement, column))) {
+            fprintf(stderr, "[R2 memory] Stored row contains an unreadable or non-text field.\n");
+            return -1;
+        }
+        fields[i] = value;
+    }
+    return 0;
+}
+
 static char *get_startup_memories(int limit)
 {
     if (limit <= 0)
@@ -1666,12 +1683,11 @@ static char *get_startup_memories(int limit)
     }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        const char *memory = (const char *)sqlite3_column_text(st, 0);
-        const char *category = (const char *)sqlite3_column_text(st, 1);
-        const char *updated = (const char *)sqlite3_column_text(st, 2);
-        if (!memory) memory = "";
-        if (!category) category = "general";
-        if (!updated) updated = "";
+        const char *fields[3];
+        if (memory_read_fields(st, 0, 3, fields) != 0) break;
+        const char *memory = fields[0] ? fields[0] : "";
+        const char *category = fields[1] ? fields[1] : "general";
+        const char *updated = fields[2] ? fields[2] : "";
 
         size_t memory_len = strlen(memory);
         size_t category_len = strlen(category);
@@ -2080,12 +2096,14 @@ static char *get_relevant_memories(const char *query, int limit)
                 break;
             }
 
-            const char *memory = (const char *)sqlite3_column_text(st, 1);
-            const char *category = (const char *)sqlite3_column_text(st, 2);
-            const char *updated = (const char *)sqlite3_column_text(st, 3);
-            if (!memory) memory = "";
-            if (!category) category = "";
-            if (!updated) updated = "";
+            const char *fields[3];
+            if (memory_read_fields(st, 1, 3, fields) != 0) {
+                failed = 1;
+                break;
+            }
+            const char *memory = fields[0] ? fields[0] : "";
+            const char *category = fields[1] ? fields[1] : "";
+            const char *updated = fields[2] ? fields[2] : "";
 
             size_t memory_length = strlen(memory);
             size_t category_length = strlen(category);
@@ -2133,9 +2151,9 @@ static char *get_relevant_memories(const char *query, int limit)
             if (insert_at >= (size_t)limit)
                 continue;
 
-            char *memory_copy = xstrdup(memory);
-            char *category_copy = xstrdup(category);
-            char *updated_copy = xstrdup(updated);
+            char *memory_copy = strdup(memory);
+            char *category_copy = strdup(category);
+            char *updated_copy = strdup(updated);
             if (!memory_copy || !category_copy || !updated_copy) {
                 free(memory_copy);
                 free(category_copy);
@@ -2209,10 +2227,13 @@ static char *get_relevant_memories(const char *query, int limit)
                 failed = 1;
                 break;
             }
-            const char *memory = (const char *)sqlite3_column_text(st, 0);
-            const char *category = (const char *)sqlite3_column_text(st, 1);
-            if (!memory) memory = "";
-            if (!category) category = "general";
+            const char *fields[2];
+            if (memory_read_fields(st, 0, 2, fields) != 0) {
+                failed = 1;
+                break;
+            }
+            const char *memory = fields[0] ? fields[0] : "";
+            const char *category = fields[1] ? fields[1] : "general";
             if (append_memory_record(&out, &length, &capacity, category, memory) != 0) {
                 fprintf(stderr, "[R2 memory] Could not serialize recent-memory context.\n");
                 failed = 1;
@@ -2374,236 +2395,91 @@ static char *workspace_read(const char *rel)
 }
 
 
-static int compare_dirent_names(const void *left, const void *right)
+typedef struct {
+    char *name;
+    const char *kind;
+} WorkspaceListEntry;
+
+static int compare_workspace_entries(const void *left, const void *right)
 {
-    const struct dirent *a = *(const struct dirent *const *)left;
-    const struct dirent *b = *(const struct dirent *const *)right;
-    return strcasecmp(a->d_name, b->d_name);
+    const WorkspaceListEntry *a = left, *b = right;
+    return strcasecmp(a->name, b->name);
 }
 
 static char *workspace_list(const char *rel)
 {
-    char p[PATH_MAX];
-
-    if (safe_path(
-            rel && *rel ? rel : ".",
-            p) != 0) {
-        r2_log_file_event("list", rel && *rel ? rel : ".", "blocked_or_invalid_path", NULL);
+    char path[PATH_MAX];
+    if (!rel || !*rel) rel = ".";
+    if (safe_path(rel, path) != 0) {
+        r2_log_file_event("list", rel, "blocked_or_invalid_path", NULL);
+        return NULL;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        r2_log_file_event("list", rel, "failed_to_open_directory", NULL);
         return NULL;
     }
 
-    DIR *d = opendir(p);
-
-    if (!d) {
-        r2_log_file_event("list", rel && *rel ? rel : ".", "failed_to_open_directory", NULL);
-        return NULL;
-    }
-
-    size_t cap = 256;
-    size_t len = 0;
-
-    char *out = malloc(cap);
-
-    if (!out) {
-        closedir(d);
-        return NULL;
-    }
-
-    out[0] = '\0';
-
-    struct dirent **names = NULL;
-    size_t n = 0;
-    size_t nc = 0;
-
-    struct dirent *e;
-    int entries_truncated = 0;
-
-    while ((e = readdir(d)) != NULL) {
-
-        if (!strcmp(e->d_name, ".") ||
-            !strcmp(e->d_name, ".."))
-            continue;
-
-        if (n >= 10000) {
-            entries_truncated = 1;
+    WorkspaceListEntry *entries = NULL;
+    size_t count = 0, capacity = 0, bytes = 1;
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) {
+            failed = errno != 0;
             break;
         }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
-        if (n == nc) {
-
-            size_t new_nc = nc ? nc * 2 : 32;
-
-            struct dirent **tmp =
-                realloc(
-                    names,
-                    new_nc * sizeof(*names)
-                );
-
-            if (!tmp) {
-
-                for (size_t k = 0; k < n; ++k)
-                    free(names[k]);
-
-                free(names);
-                free(out);
-                closedir(d);
-
-                return NULL;
-            }
-
-            names = tmp;
-            nc = new_nc;
+        struct stat state;
+        if (fstatat(dirfd(dir), entry->d_name, &state, AT_SYMLINK_NOFOLLOW) != 0) {
+            failed = 1;
+            break;
         }
-
-        names[n] =
-            malloc(sizeof(struct dirent));
-
-        if (!names[n])
-            continue;
-
-        memcpy(
-            names[n],
-            e,
-            sizeof(struct dirent)
-        );
-
-        n++;
+        if (count == capacity) {
+            if (capacity > SIZE_MAX / 2) { failed = 1; break; }
+            size_t next = capacity ? capacity * 2 : 32;
+            WorkspaceListEntry *grown = reallocarray(entries, next, sizeof(*grown));
+            if (!grown) { failed = 1; break; }
+            entries = grown;
+            capacity = next;
+        }
+        const char *kind = S_ISDIR(state.st_mode) ? "DIR " :
+                           S_ISLNK(state.st_mode) ? "LINK" : "FILE";
+        size_t record_size = strlen(entry->d_name) + strlen(kind) + 2;
+        if (record_size > SIZE_MAX - bytes) { failed = 1; break; }
+        char *name = strdup(entry->d_name);
+        if (!name) { failed = 1; break; }
+        entries[count++] = (WorkspaceListEntry){name, kind};
+        bytes += record_size;
     }
+    if (closedir(dir) != 0) failed = 1;
 
-    closedir(d);
-
-    if (n > 1)
-        qsort(names, n, sizeof(*names), compare_dirent_names);
-
-    for (size_t i = 0; i < n; ++i) {
-
-        char fp[PATH_MAX];
-        struct stat st;
-
-        int written = snprintf(
-            fp,
-            sizeof(fp),
-            "%s/%s",
-            p,
-            names[i]->d_name
-        );
-
-        if (written < 0 ||
-            (size_t)written >= sizeof(fp)) {
-
-            free(names[i]);
-            names[i] = NULL;
-            continue;
-        }
-
-        if (lstat(fp, &st) != 0) {
-
-            free(names[i]);
-            names[i] = NULL;
-            continue;
-        }
-
-        const char *kind =
-            S_ISDIR(st.st_mode) ? "DIR " :
-            S_ISLNK(st.st_mode) ? "LINK" :
-                                  "FILE";
-
-        size_t needed =
-            strlen(kind) +
-            1 +
-            strlen(names[i]->d_name) +
-            1;
-
-        if (len + needed + 1 > cap) {
-
-            size_t new_cap = cap;
-
-            while (len + needed + 1 > new_cap) {
-
-                if (new_cap > SIZE_MAX / 2) {
-
-                    for (size_t k = i; k < n; ++k)
-                        free(names[k]);
-
-                    free(names);
-                    free(out);
-
-                    return NULL;
+    char *result = NULL;
+    if (!failed && count) {
+        if (count > 1) qsort(entries, count, sizeof(*entries), compare_workspace_entries);
+        result = malloc(bytes);
+        if (result) {
+            size_t offset = 0;
+            for (size_t i = 0; i < count; ++i) {
+                int written = snprintf(result + offset, bytes - offset, "%s %s\n",
+                                       entries[i].kind, entries[i].name);
+                if (written < 0 || (size_t)written >= bytes - offset) {
+                    free(result);
+                    result = NULL;
+                    break;
                 }
-
-                new_cap *= 2;
-            }
-
-            char *tmp =
-                realloc(out, new_cap);
-
-            if (!tmp) {
-
-                for (size_t k = i; k < n; ++k)
-                    free(names[k]);
-
-                free(names);
-                free(out);
-
-                return NULL;
-            }
-
-            out = tmp;
-            cap = new_cap;
-        }
-
-        int added = snprintf(
-            out + len,
-            cap - len,
-            "%s %s\n",
-            kind,
-            names[i]->d_name
-        );
-
-        if (added < 0 ||
-            (size_t)added >= cap - len) {
-
-            for (size_t k = i + 1; k < n; ++k)
-                free(names[k]);
-
-            free(names);
-            free(out);
-
-            return NULL;
-        }
-
-        len += (size_t)added;
-
-        free(names[i]);
-        names[i] = NULL;
-    }
-
-    if (entries_truncated) {
-        const char *note = "[listing truncated after 10000 entries]\n";
-        size_t note_length = strlen(note);
-        if (len + note_length + 1 > cap) {
-            char *expanded = realloc(out, len + note_length + 1);
-            if (expanded) {
-                out = expanded;
-                cap = len + note_length + 1;
+                offset += (size_t)written;
             }
         }
-        if (len + note_length + 1 <= cap) {
-            memcpy(out + len, note, note_length + 1);
-            len += note_length;
-        }
+    } else if (!failed) {
+        result = strdup("(empty)\n");
     }
-
-    free(names);
-
-    if (len == 0) {
-        free(out);
-        r2_log_file_event("list", rel && *rel ? rel : ".", "success_empty", NULL);
-        return strdup("(empty)\n");
-    }
-
-    r2_log_file_event("list", rel && *rel ? rel : ".", "success", NULL);
-    return out;
+    for (size_t i = 0; i < count; ++i) free(entries[i].name);
+    free(entries);
+    r2_log_file_event("list", rel, result ? (count ? "success" : "success_empty") : "incomplete", NULL);
+    return result;
 }
 
 
