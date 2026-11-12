@@ -545,6 +545,18 @@ int main(void)
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
+    set_response("  preference | I prefer quiet music.  ", "stop", 1);
+    char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.");
+    assert(decision && !strcmp(decision, "preference | I prefer quiet music."));
+    free(decision);
+    struct json_object *messages = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &messages));
+    struct json_object *evaluation = json_object_array_get_idx(messages,
+        json_object_array_length(messages) - 1);
+    struct json_object *evaluation_text = NULL;
+    assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
+    assert(strstr(json_object_get_string(evaluation_text), "Evaluate only this exchange."));
+
     r2_log_shutdown(); assert(r2_log_init() == 0);
     stored = r2_log_search("ollama_output_limit_reached", 10);
     assert(stored && strstr(stored, partial)); free(stored);

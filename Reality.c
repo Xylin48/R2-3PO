@@ -1837,8 +1837,7 @@ static int inventory_transfer_snapshot_locked(const char *name,
         "SELECT description,quantity,fullness,energy,ingredients,taste "
         "FROM r2_fridge_items WHERE name=? COLLATE NOCASE", -1, &st, NULL);
     if (rc == SQLITE_OK) {
-        bind_text(st, 1, name);
-        rc = sqlite3_step(st);
+        rc = bind_text(st, 1, name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
         if (rc == SQLITE_ROW) {
             const unsigned char *description = sqlite3_column_text(st, 0);
             const unsigned char *ingredients = sqlite3_column_text(st, 4);
@@ -1912,7 +1911,9 @@ static int inventory_transfer_journal_begin_locked(const char *operation,
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     if (st) sqlite3_finalize(st);
-    if (rc == SQLITE_DONE) rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
+    if (rc == SQLITE_DONE)
+        rc = sqlite3_changes(reality_db) == 1
+            ? sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL) : SQLITE_CONSTRAINT;
     if (rc != SQLITE_OK) {
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
         return -1;

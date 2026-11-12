@@ -9656,26 +9656,13 @@ static char *memory_decision(
         "behavior, or experience. Do not use self-memory to "
         "establish an arbitrary identity label.";
 
-    size_t n =
-        strlen(user) +
-        strlen(reply) +
-        64;
-
-    char *u =
-        malloc(n);
-
-    if (!u)
-        return NULL;
-
-    snprintf(
-        u,
-        n,
+    char *u = NULL;
+    if (asprintf(&u,
         "LATEST USER MESSAGE:\n%s\n\n"
         "LATEST R2 RESPONSE:\n%s\n\n"
         "Evaluate only this exchange.",
-        user,
-        reply
-    );
+        user, reply) < 0)
+        return NULL;
 
     Message m = {
         "user",
@@ -9798,9 +9785,12 @@ static char *memory_decision(
         }
     }
 
-    *sep = '|';
-
-    return res;
+    /* Trimming the category can insert a terminator before the separator. */
+    char *normalized = NULL;
+    if (asprintf(&normalized, "%s | %s", category, memory) < 0)
+        normalized = NULL;
+    free(res);
+    return normalized;
 }
 
 

@@ -773,6 +773,24 @@ int main(void)
         r2_fridge_add_item("inventory_crash_move", "Original fridge stack", 3,
                            12.0, 1.0, "old ingredients", "old taste") != 0)
         fail("could not seed interrupted move-to-fridge fixture");
+    sqlite3 *stage_db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &stage_db) != SQLITE_OK ||
+        sqlite3_exec(stage_db,
+            "CREATE TRIGGER ignore_transfer_stage BEFORE INSERT ON r2_inventory_transfer_journal "
+            "BEGIN SELECT RAISE(IGNORE); END;",
+            NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not block transfer journal staging");
+    if (r2_reality_move_item("inventory_crash_move", "fridge") == 0)
+        fail("an ignored transfer journal insert must reject the move");
+    if (sqlite3_exec(stage_db, "DROP TRIGGER ignore_transfer_stage",
+                     NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_close(stage_db) != SQLITE_OK)
+        fail("could not remove transfer journal stage trigger");
+    char *unchanged_stock = r2_fridge_list();
+    if (!unchanged_stock || !strstr(unchanged_stock, "Original fridge stack"))
+        fail("an ignored transfer journal insert must preserve the original stock");
+    free(unchanged_stock);
+
     if (setenv("R2_TEST_INVENTORY_CRASH_AFTER_FRIDGE_ADD", "1", 1) != 0)
         fail("could not enable move-to-fridge crash injection");
     if (r2_reality_move_item("inventory_crash_move", "fridge") == 0)
