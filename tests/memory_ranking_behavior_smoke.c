@@ -74,6 +74,12 @@ int main(void)
 
     printf("PASS: bounded memory ranking orders by score, timestamp, and stable ID; excludes weaker matches.\n");
     free(result);
+
+    assert(db_exec("UPDATE memories SET memory='nebula prefix'||char(0)||'tail' "
+                   "WHERE memory='nebula quiet';") == 0);
+    assert(get_relevant_memories("nebula", 10) == NULL);
+    assert(get_relevant_memories("", 10) == NULL);
+    assert(get_startup_memories(10) == NULL);
     context_cache_invalidate();
     sqlite3_close(db);
     db = NULL;

@@ -7,13 +7,22 @@
 int __wrap_r2_visual_is_initialized(void) { return 1; }
 
 static const char *expected_source;
+static atomic_int analysis_waiting = ATOMIC_VAR_INIT(0);
+static atomic_int analysis_may_finish = ATOMIC_VAR_INIT(0);
 
 char *__wrap_r2_visual_analyze_frame(const R2VisionFrame *frame, const char *source,
                                     const char *question)
 {
-    (void)question;
     assert(expected_source && source && strcmp(source, expected_source) == 0);
     assert(frame->size == 12 && frame->data[11] == 11);
+    if (question && strcmp(question, "source lifetime during analysis") == 0) {
+        atomic_store(&analysis_waiting, 1);
+        while (!atomic_load(&analysis_may_finish)) {
+            struct timespec pause = {0, 1000000L};
+            nanosleep(&pause, NULL);
+        }
+        if (r2_ollama_vision_request_should_abort()) return NULL;
+    }
     return strdup("visual fixture result");
 }
 
@@ -48,6 +57,28 @@ static pid_t wait_for_child(const char *path)
     return -1;
 }
 
+static void *direct_look(void *unused)
+{
+    (void)unused;
+    return r2_vision_see("direct close");
+}
+
+static void *analyze_in_flight(void *use_media)
+{
+    const char *question = "source lifetime during analysis";
+    return use_media ? r2_vision_media_see(question) : r2_vision_see(question);
+}
+
+static void wait_for_analysis(void)
+{
+    double deadline = monotonic_seconds() + 2.0;
+    while (!atomic_load(&analysis_waiting)) {
+        assert(monotonic_seconds() < deadline);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+}
+
 static void assert_reaped(pid_t child)
 {
     int status;
@@ -79,8 +110,67 @@ static int cancel_when_probe_started(void *path)
     return access(path, F_OK) == 0;
 }
 
+static atomic_int frame_waiting = ATOMIC_VAR_INIT(0);
+static atomic_int force_frame_timeout = ATOMIC_VAR_INIT(0);
+int __real_pthread_cond_clockwait(pthread_cond_t *, pthread_mutex_t *, clockid_t,
+                                  const struct timespec *);
+int __wrap_pthread_cond_clockwait(pthread_cond_t *cond, pthread_mutex_t *lock,
+                                 clockid_t clock_id, const struct timespec *deadline)
+{
+    assert(cond == &vision_watch_frame_cond && clock_id == CLOCK_MONOTONIC);
+    atomic_store(&frame_waiting, 1);
+    if (atomic_load(&force_frame_timeout)) return ETIMEDOUT;
+    return __real_pthread_cond_clockwait(cond, lock, clock_id, deadline);
+}
+
+static void *wait_for_first_frame(void *unused)
+{
+    (void)unused;
+    R2VisionFrame frame;
+    char *source = NULL;
+    unsigned char *pixels = NULL;
+    assert(r2_vision_copy_watched_frame(&frame, &source, &pixels) == -1);
+    assert(!source && !pixels);
+    return NULL;
+}
+
+static void check_first_frame_lifecycle(void)
+{
+    atomic_store(&vision_watch_running, 1);
+    pthread_t waiter;
+    assert(pthread_create(&waiter, NULL, wait_for_first_frame, NULL) == 0);
+    while (!atomic_load(&frame_waiting)) sched_yield();
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session; /* replacement publishes before the old waiter runs */
+    vision_watch_frame_generation = 1;
+    unsigned char data = 42;
+    vision_watch_latest_frame = (R2VisionFrame){.data = &data, .size = 1};
+    vision_watch_latest_frame_data = &data;
+    vision_watch_latest_source = "replacement";
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
+    assert(pthread_join(waiter, NULL) == 0);
+    vision_watch_frame_generation = 0;
+    vision_watch_latest_frame = (R2VisionFrame){0};
+    vision_watch_latest_frame_data = NULL;
+    vision_watch_latest_source = NULL;
+
+    atomic_store(&frame_waiting, 0);
+    assert(pthread_create(&waiter, NULL, wait_for_first_frame, NULL) == 0);
+    while (!atomic_load(&frame_waiting)) sched_yield();
+    r2_request_shutdown();
+    assert(pthread_join(waiter, NULL) == 0);
+    shutting_down = 0;
+    atomic_store(&force_frame_timeout, 1);
+    wait_for_first_frame(NULL);
+    assert(errno == ETIMEDOUT);
+    atomic_store(&force_frame_timeout, 0);
+    atomic_store(&vision_watch_running, 0);
+}
+
 int main(void)
 {
+    check_first_frame_lifecycle();
     char root[] = "/tmp/r2-visual-lifecycle-XXXXXX";
     assert(mkdtemp(root));
     char probe[PATH_MAX], decoder[PATH_MAX], ready[PATH_MAX], release[PATH_MAX];
@@ -158,6 +248,30 @@ int main(void)
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(r2_eyes_open_file(eyes, "probe-failed") == -1);
+
+    /* Closing Eyes also cancels a deliberate direct read with no Watch worker. */
+    assert(r2_eyes_open_file(eyes, "stalled") == 0);
+    child = wait_for_child(ready);
+    pthread_t look;
+    assert(pthread_create(&look, NULL, direct_look, NULL) == 0);
+    double lock_deadline = monotonic_seconds() + 2.0;
+    for (;;) {
+        int rc = pthread_mutex_trylock(&visual_capture_lock);
+        if (rc == EBUSY) break;
+        assert(rc == 0 && monotonic_seconds() < lock_deadline);
+        pthread_mutex_unlock(&visual_capture_lock);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    start = monotonic_seconds();
+    assert(r2_vision_close() == 0 && monotonic_seconds() - start < 2.0);
+    void *look_result = NULL;
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
+    assert_reaped(child);
+    assert(!r2_sense_auto_allowed(1) && !r2_eyes_status());
+    assert(r2_eyes_start_for_watch() == 0);
+    assert(unlink(ready) == 0);
+    r2_sense_set_auto_allowed(1, 1);
 
     /* Stop must wake a worker blocked before its first complete frame. */
     assert(r2_eyes_open_file(eyes, "stalled") == 0);
@@ -303,6 +417,16 @@ int main(void)
     free(saved_source);
 
     assert(r2_eyes_open_file(eyes, camera_source) == 0);
+    child = wait_for_child(ready);
+    assert(pthread_create(&look, NULL, analyze_in_flight, NULL) == 0);
+    wait_for_analysis();
+    assert(r2_eyes_release_source() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
+    assert_reaped(child);
+    assert(unlink(ready) == 0);
+
+    assert(r2_eyes_open_file(eyes, camera_source) == 0);
     assert(r2_vision_watch_start() == 0);
     child = wait_for_child(ready);
     observation = r2_vision_see("watched source");
@@ -335,7 +459,22 @@ int main(void)
     }
     assert(observation);
     free(observation);
+    int media_flag = 1;
+    atomic_store(&analysis_waiting, 0);
+    atomic_store(&analysis_may_finish, 0);
+    assert(pthread_create(&look, NULL, analyze_in_flight, &media_flag) == 0);
+    wait_for_analysis();
+    assert(r2_eyes_release_source() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && look_result);
+    free(look_result);
+    atomic_store(&analysis_waiting, 0);
+    atomic_store(&analysis_may_finish, 0);
+    assert(pthread_create(&look, NULL, analyze_in_flight, &media_flag) == 0);
+    wait_for_analysis();
     assert(r2_vision_media_stop() == 0);
+    atomic_store(&analysis_may_finish, 1);
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(unsetenv("DISPLAY") == 0);

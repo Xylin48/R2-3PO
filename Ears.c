@@ -461,15 +461,17 @@ int r2_ears_open_source_cancelable(
         r2_audio_capture_cancel(capture);
     pthread_mutex_unlock(&ears->transport_lock);
 
-    if (r2_audio_capture_connect(capture, actual_source, &spec,
-                                 R2_EARS_FRAME_BYTES) != 0 ||
-        atomic_load(&ears->cancel_requested)) {
-        int failed_errno = errno ? errno : ECANCELED;
+    int connected = r2_audio_capture_connect(capture, actual_source, &spec, R2_EARS_FRAME_BYTES);
+    int connect_error = connected != 0 ? errno : 0;
+    if (connected != 0 || atomic_load(&ears->cancel_requested)) {
+        int failed_errno = atomic_load(&ears->cancel_requested) ? ECANCELED :
+                           connect_error ? connect_error : EIO;
+        const char *details = failed_errno == ECANCELED ? "Audio connection was cancelled." :
+                              failed_errno == ENODEV ? "The server did not retain the requested recording source." :
+                              "PulseAudio/PipeWire connection failed.";
         r2_log_sensory("audio_source_open_failed",
                        "R2 Ears could not open the live audio source.",
-                       failed_errno == ECANCELED ? "Audio connection was cancelled."
-                                                 : "PulseAudio/PipeWire connection failed.",
-                       actual_source);
+                       details, actual_source);
         r2_ears_close(ears);
         free(resolved_source);
         errno = failed_errno;
@@ -772,7 +774,8 @@ ssize_t r2_ears_read(
             if (read_errno != ECANCELED) {
                 r2_log_sensory("audio_read_failed",
                                "R2 Ears encountered a live audio capture error.",
-                               "Asynchronous PulseAudio recording failed.",
+                               read_errno == ENODEV ? "The recording source changed and needs to be reopened." :
+                                                      "Asynchronous PulseAudio recording failed.",
                                ears->event.source_name);
             }
             /* The reader never releases this handle. Stop joins before close. */

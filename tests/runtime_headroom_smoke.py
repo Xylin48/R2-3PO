@@ -81,7 +81,7 @@ for label, source, needle in (
     ("fridge schema migration", reality, "static int fridge_migrate_schema(void)"),
     ("Reality need-state migration", reality, "static int migrate_reality_self_schema(void)"),
     ("visual experience schema migration", visual, "static int visual_migrate_schema(void)"),
-    ("diary link schema migration", diary, "diary_link_ensure_column(\"memory_indexed\""),
+    ("diary link schema migration", diary, "diary_ensure_column(\"r2_diary_entry_links\", \"memory_indexed\""),
     ("Life Log schema migration", life_log, "static int migrate_legacy_log_schema(void)"),
     ("repeated-interest schema migration", addiction, "static int migrate_addiction_schema(void)"),
     ("Alternate-Self schema migration", alternate_self, "static int migrate_altself_schema(void)"),

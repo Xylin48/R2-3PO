@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -226,6 +227,8 @@ def _relationship_check(
             ("r2_sensory_journal", "event_id"),
             ("r2_sensory_journal_diary_links", "event_id"),
             ("r2_sensory_journal_diary_links", "diary_entry_id"),
+            ("r2_sensory_journal_reflection_links", "event_id"),
+            ("r2_sensory_journal_reflection_links", "diary_entry_id"),
             ("r2_log_activity_sessions", "start_event_id"),
             ("r2_log_milestones", "first_event_id"),
             ("r2_log_conversations", "event_id"),
@@ -299,6 +302,8 @@ def audit_relationships(
         ("r2_memory.db", "r2_sensory_journal", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_diary_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_diary_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
+        ("r2_memory.db", "r2_sensory_journal_reflection_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_memory.db", "r2_sensory_journal_reflection_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
         ("r2_rewards.db", "reward_events", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
     ]
     output = []
@@ -377,15 +382,125 @@ def audit_root(root: Path) -> dict[str, Any]:
     }
 
 
+def audit_visual_archive(database: Path, library: Path) -> dict[str, Any]:
+    """Compare an archive directory with its Visual index without opening images."""
+    report: dict[str, Any] = {
+        "database": str(database),
+        "library": str(library),
+        "unindexed_candidates": [],
+        "legacy_unindexed_candidates": [],
+        "missing_indexed_files": [],
+        "unresolved_relative_paths": [],
+        "paths_outside_library": [],
+        "pending_life_log_ids": [],
+        "pending_archives": [],
+        "withdrawn_archives": [],
+        "legacy_unlinked_ids": [],
+        "error": None,
+    }
+    db = None
+    try:
+        if database.is_symlink() or not database.is_file():
+            raise OSError("Visual database must be an existing regular file")
+        archive = library.resolve(strict=True)
+        with os.scandir(archive) as entries:
+            files = {entry.name for entry in entries if entry.is_file(follow_symlinks=False)}
+        db = _readonly_connection(database)
+        # Keep final and pending rows in the same SQLite snapshot.
+        db.execute("BEGIN")
+        columns = {row[1].lower() for row in db.execute("PRAGMA table_info(r2_visual_experiences)")}
+        path_columns = [name for name in ("image_path", "file_path", "path") if name in columns]
+        if "id" not in columns or not path_columns:
+            raise sqlite3.DatabaseError("Visual index lacks an ID or a supported image path column")
+
+        paths = ",".join(f"NULLIF({name},'')" for name in path_columns)
+        event_id = "life_log_event_id" if "life_log_event_id" in columns else "NULL"
+        key = "life_log_archive_key" if "life_log_archive_key" in columns else "NULL"
+        indexed = set()
+        for row_id, path, linked, archive_key in db.execute(
+                f"SELECT id,COALESCE({paths},NULL),{event_id},{key} FROM r2_visual_experiences ORDER BY id"):
+            if linked is None:
+                label = "pending_life_log_ids" if archive_key else "legacy_unlinked_ids"
+                report[label].append(row_id)
+            if not isinstance(path, str) or not path or "\x00" in path:
+                continue
+            stored = Path(path)
+            if not stored.is_absolute():
+                report["unresolved_relative_paths"].append({"id": row_id, "path": path})
+                # Its original working directory is unknown. Avoid suggesting
+                # that any same-named archive is unindexed.
+                indexed.add(stored.name)
+            elif stored.parent.resolve() == archive:
+                indexed.add(stored.name)
+                if stored.name not in files:
+                    report["missing_indexed_files"].append({"id": row_id, "path": path})
+            else:
+                matching_file = str(archive / stored.name) if stored.name in files else None
+                report["paths_outside_library"].append({
+                    "record_type": "published", "id": row_id, "path": path,
+                    "matching_filename": matching_file,
+                })
+                if matching_file is not None:
+                    indexed.add(stored.name)
+
+        pending_columns = {row[1].lower() for row in
+                           db.execute("PRAGMA table_info(r2_visual_pending_archives)")}
+        if {"id", "image_path"} <= pending_columns:
+            withdrawn_column = "withdrawn" if "withdrawn" in pending_columns else "0"
+            for row_id, path, withdrawn in db.execute(
+                    f"SELECT id,image_path,{withdrawn_column} FROM r2_visual_pending_archives ORDER BY id"):
+                record_type = "withdrawn" if withdrawn else "pending"
+                label = "withdrawn_archives" if withdrawn else "pending_archives"
+                if not isinstance(path, str) or "\x00" in path:
+                    continue
+                stored = Path(path)
+                if stored.is_absolute() and stored.parent.resolve() == archive:
+                    indexed.add(stored.name)
+                    report[label].append({
+                        "id": row_id, "path": path, "file_present": stored.name in files,
+                    })
+                elif stored.is_absolute():
+                    matching_file = str(archive / stored.name) if stored.name in files else None
+                    report["paths_outside_library"].append({
+                        "record_type": record_type, "id": row_id, "path": path,
+                        "matching_filename": matching_file,
+                    })
+                    if matching_file is not None:
+                        indexed.add(stored.name)
+                else:
+                    report["unresolved_relative_paths"].append({
+                        "record_type": record_type, "id": row_id, "path": path,
+                    })
+                    indexed.add(stored.name)
+
+        for name in sorted(files - indexed):
+            if re.fullmatch(r"visual_[0-9]+_[0-9]+_[0-9a-f]{16}\.jpg", name):
+                report["unindexed_candidates"].append(name)
+            elif re.fullmatch(r"visual_[0-9]+_[0-9]+\.jpg", name):
+                report["legacy_unindexed_candidates"].append(name)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if db is not None:
+            db.close()
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True,
                         help="R2 data directory containing SQLite database files")
     parser.add_argument("--snapshot-dir", type=Path,
                         help="optional destination for non-overwriting SQLite snapshots")
+    parser.add_argument("--visual-library", type=Path,
+                        help="compare a Visual JPEG directory with its SQLite index")
+    parser.add_argument("--visual-db", type=Path,
+                        help="detached Visual index to use with --visual-library")
     parser.add_argument("--json", action="store_true",
                         help="emit machine-readable JSON")
     args = parser.parse_args()
+    if args.visual_db is not None and args.visual_library is None:
+        parser.error("--visual-db requires --visual-library")
 
     audit_root_path = args.root
     snapshot_errors: list[str] = []
@@ -407,6 +522,9 @@ def main() -> int:
     report["snapshot_errors"] = snapshot_errors
     report["snapshot_created"] = snapshot_created
     report["snapshot_dir"] = str(args.snapshot_dir.resolve()) if args.snapshot_dir else None
+    if args.visual_library is not None:
+        report["visual_archive"] = audit_visual_archive(
+            args.visual_db or audit_root_path / "r2_memory.db", args.visual_library)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -448,12 +566,23 @@ def main() -> int:
             print("Note: suspicious legacy rows are reported only; no rows are changed.")
         if snapshot_created:
             print("Snapshots are per-database; stop R2 first for cross-database consistency.")
+        if "visual_archive" in report:
+            visual = report["visual_archive"]
+            print(f"Visual archive audit: {visual['library']}")
+            if visual["error"]:
+                print(f"  ERROR: {visual['error']}")
+            else:
+                for label, items in visual.items():
+                    if isinstance(items, list) and items:
+                        print(f"  {label}: {json.dumps(items)}")
+                print("Unindexed files are candidates. Stop R2 before interpreting archive differences.")
 
     # Missing expected databases are a failed preflight, not a clean pass.
     # The report remains read-only and still lists every missing path.
     return 2 if (report["summary"]["integrity_failures"] or
                   report["summary"]["relationship_failures"] or
-                  report["summary"]["missing"] or snapshot_errors) else 0
+                  report["summary"]["missing"] or snapshot_errors or
+                  report.get("visual_archive", {}).get("error")) else 0
 
 
 if __name__ == "__main__":

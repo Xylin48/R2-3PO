@@ -90,6 +90,22 @@ int main(void)
                               "same diary prose");
     authoritative_link(db, 101, first);
     authoritative_link(db, 102, second);
+    sql(db,
+        "CREATE TABLE r2_sensory_journal(event_id INTEGER PRIMARY KEY,journal_kind TEXT NOT NULL);"
+        "CREATE TRIGGER reject_index BEFORE INSERT ON r2_sensory_journal "
+        "WHEN NEW.event_id=2 BEGIN SELECT RAISE(IGNORE); END;");
+    assert(r2_sj_init() == -1);
+    assert(r2_sj_count() == -1);
+    sqlite3_stmt *check = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT (SELECT COUNT(*) FROM pragma_table_info('r2_sensory_journal') WHERE name='indexed_utc'),"
+        "(SELECT COUNT(*) FROM r2_sensory_journal),"
+        "(SELECT COUNT(*) FROM sqlite_master WHERE name='r2_sensory_journal_diary_links');",
+        -1, &check, NULL) == SQLITE_OK);
+    assert(sqlite3_step(check) == SQLITE_ROW);
+    for (int i = 0; i < 3; ++i) assert(sqlite3_column_int(check, i) == 0);
+    sqlite3_finalize(check);
+    sql(db, "DROP TRIGGER reject_index;");
     sqlite3_close(db);
 
     assert(r2_sj_init() == 0);
@@ -131,6 +147,14 @@ int main(void)
     r2_sj_index_event(unique, "thinking", "diary_entry_written", "diary");
     expect_link("Unique legacy event", "Diary link: 104");
 
+    /* The old projected ID must not be presented once its row no longer
+       matches, even when a different row is now the sole prose match. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    sql(db, "UPDATE diary_entries SET entry='edited older text' WHERE id=104;"
+            "INSERT INTO diary_entries(id,entry) VALUES(105,'unique old prose');");
+    sqlite3_close(db);
+    expect_link("Unique legacy event", "Diary link: none");
+
     /* An interrupted Journal projection is restored from the durable exact
        diary linkage rather than guessed from repeated prose. */
     r2_sj_shutdown();
@@ -140,6 +164,7 @@ int main(void)
     assert(r2_sj_init() == 0);
     expect_link("Exact new diary entry", "Diary link: 103");
     expect_link("Ambiguous older entry", "Diary link: none");
+    expect_link("Unique legacy event", "Diary link: none");
     r2_sj_shutdown();
     (void)remove(R2_DIARY_DATABASE);
     puts("Sensory Journal exact diary identity and backward-compatible migration passed.");

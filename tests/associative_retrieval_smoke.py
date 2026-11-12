@@ -92,9 +92,9 @@ require(
     "specific concepts and multi-cue coverage receive more weight than short generic overlaps",
 )
 require(
-    "char *memory_copy = xstrdup(memory);" in memory_ranker
-    and "char *category_copy = xstrdup(category);" in memory_ranker
-    and "char *updated_copy = xstrdup(updated);" in memory_ranker
+    "char *memory_copy = strdup(memory);" in memory_ranker
+    and "char *category_copy = strdup(category);" in memory_ranker
+    and "char *updated_copy = strdup(updated);" in memory_ranker
     and "if (!memory_copy || !category_copy || !updated_copy)" in memory_ranker
     and "free(memory_copy);" in memory_ranker
     and "free(category_copy);" in memory_ranker

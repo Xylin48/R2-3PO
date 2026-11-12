@@ -18,8 +18,8 @@ media = core[core.index("static void *r2_media_capture_worker("):
              core.index("/* Capture and inference are separate workers.")]
 assert "r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled," in media
 assert "media_latest_frame" in media and "media_latest_source" in media
-assert "r2_visual_analyze_frame" in media[media.index("char *r2_vision_media_see("):]
-assert "r2_visual_analyze_frame" not in media[:media.index("char *r2_vision_media_see(")]
+assert "r2_vision_analyze_snapshot" in media[media.index("char *r2_vision_media_see("):]
+assert "r2_vision_analyze_snapshot" not in media[:media.index("char *r2_vision_media_see(")]
 assert "media_visual_change_notice" in media
 assert "r2_eyes_set_auxiliary(media_eyes, 1)" in media
 assert "int auxiliary_display;" in eyes
@@ -35,10 +35,10 @@ camera = core[core.index("static void *vision_watch_capture_worker("):
               core.index("static char *r2_vision_current_frame_base64(void)", core.index("static void *vision_watch_capture_worker("))]
 assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in camera
 assert "camera_visual_change_notice" in camera
-assert "r2_visual_analyze_frame" not in camera
+assert "r2_vision_analyze_snapshot" not in camera
 current_frame = core[core.index("static char *r2_vision_current_frame_base64(void)\n{"):
                      core.index("static void *vision_watch_worker(")]
-assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in current_frame
+assert "r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled," in current_frame
 assert "r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled," not in current_frame
 
 worker = shell[shell.index("static void shell_watch_media_poll("):
@@ -67,7 +67,7 @@ explicit_look = core[core.index("static char *vision_analyze_current_frame(const
                      core.index("char *r2_vision_see(const char *question)")]
 assert "if (atomic_load(&vision_watch_running))" in explicit_look
 assert "r2_vision_copy_watched_frame(&frame, &source, &frame_copy)" in explicit_look
-assert explicit_look.index("r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled,") > explicit_look.index("} else {")  # direct fallback only
+assert explicit_look.index("r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled,") > explicit_look.index("} else {")  # direct fallback only
 snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\n"):
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "pthread_mutex_lock(&vision_watch_frame_lock)" in snapshot

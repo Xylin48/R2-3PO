@@ -27,6 +27,21 @@ int main(void)
     assert(reply && !strcmp(reply, "The answer is 42."));
     free(reply);
 
+    reply = r2_reply_sanitize("Analysis: Planning.\n<think>\nFinal: Still private.\n</think>\nFinal: Public answer.");
+    assert(reply && !strcmp(reply, "Public answer."));
+    free(reply);
+    reply = r2_reply_sanitize("Analysis: Planning.\n<think>\nFinal: Still private.");
+    assert(reply == NULL);
+
+    reply = r2_reply_sanitize("Analysis: Planning.\n```text\nFinal: Private example.\n```\nFinal: Public answer.");
+    assert(reply && !strcmp(reply, "Public answer."));
+    free(reply);
+    reply = r2_reply_sanitize("Analysis: Planning.\n~~~text\nFinal: Private example.");
+    assert(reply == NULL);
+    reply = r2_reply_sanitize("Analysis: Planning with `an example\nFinal: Private example.`\nFinal: Public answer.");
+    assert(reply && !strcmp(reply, "Public answer."));
+    free(reply);
+
     /* A truncated private block must not leak its contents. */
     reply = r2_reply_sanitize("Visible preface. <think>unfinished private thoughts");
     assert(reply && !strcmp(reply, "Visible preface."));

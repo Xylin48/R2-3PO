@@ -25,6 +25,22 @@ int64_t r2_log_sensory(const char *sense, const char *observation,
     return 1;
 }
 
+int r2_log_is_initialized(void) { return 0; }
+int64_t r2_log_save_visual_once(const char *key, const char *description, const char *source)
+{
+    (void)key; (void)description; (void)source;
+    return -1;
+}
+
+int r2_log_save_shared_sensory(sqlite3 *peer, const char *type, const char *summary,
+                              const char *details, const char *source,
+                              int (*save)(sqlite3 *, int64_t, void *), void *context)
+{
+    (void)peer; (void)type; (void)summary; (void)details; (void)source;
+    (void)save; (void)context;
+    return 1;
+}
+
 static int visit_legacy_visual(void *context, int64_t id, const char *row, size_t length)
 {
     int *count = context;
@@ -38,13 +54,16 @@ static int visit_legacy_visual(void *context, int64_t id, const char *row, size_
 
 int main(void)
 {
-    char path[] = "/tmp/r2-visual-legacy-smoke-XXXXXX";
-    int fd = mkstemp(path);
-    assert(fd >= 0);
-    assert(close(fd) == 0);
-    assert(sqlite3_open(path, &visual_db) == SQLITE_OK);
+    char root[] = "/tmp/r2-visual-legacy-smoke-XXXXXX";
+    assert(mkdtemp(root));
+    char path[PATH_MAX], library[PATH_MAX];
+    assert(snprintf(path, sizeof(path), "%s/legacy.db", root) < (int)sizeof(path));
+    assert(snprintf(library, sizeof(library), "%s/archive", root) < (int)sizeof(library));
+    assert(unsetenv("DISPLAY") == 0);
+    sqlite3 *legacy_db = NULL;
+    assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
 
-    assert(sqlite3_exec(visual_db,
+    assert(sqlite3_exec(legacy_db,
         "CREATE TABLE r2_visual_experiences ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "created_at TEXT,"
@@ -59,8 +78,42 @@ int main(void)
         "(NULL,'2020-02-03T04:05:06Z','','/legacy/alternate.jpg','another camera','alternate aliases');",
         NULL, NULL, NULL) == SQLITE_OK);
 
-    assert(visual_migrate_schema() == SQLITE_OK);
-    visual_initialized = 1;
+    assert(sqlite3_exec(legacy_db,
+        "CREATE TABLE r2_visual_pending_archives ("
+        "id INTEGER PRIMARY KEY,image_path TEXT NOT NULL UNIQUE,created_utc TEXT NOT NULL,"
+        "source TEXT NOT NULL,model TEXT NOT NULL,prompt TEXT,description TEXT NOT NULL,"
+        "width INTEGER NOT NULL,height INTEGER NOT NULL,frame_number INTEGER NOT NULL,"
+        "frame_timestamp INTEGER NOT NULL,jpeg BLOB NOT NULL);"
+        "INSERT INTO r2_visual_pending_archives VALUES(91,'/legacy/missing.jpg','original date',"
+        "'original source','original model','original question','original interpretation',"
+        "640,480,7,123456,X'001122FF');", NULL, NULL, NULL) == SQLITE_OK);
+
+    assert(sqlite3_exec(legacy_db, "CREATE TRIGGER deny_backfill "
+        "BEFORE UPDATE ON r2_visual_experiences BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy_db) == SQLITE_OK);
+    assert(r2_visual_init(path, library) == -1 && !r2_visual_is_initialized());
+    assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
+    assert(!visual_column_exists(legacy_db, "created_utc"));
+    assert(!visual_column_exists(legacy_db, "life_log_event_id"));
+    sqlite3_stmt *migration = NULL;
+    assert(sqlite3_prepare_v2(legacy_db, "SELECT withdrawn FROM r2_visual_pending_archives",
+        -1, &migration, NULL) == SQLITE_ERROR);
+    sqlite3_finalize(migration);
+    assert(sqlite3_exec(legacy_db, "DROP TRIGGER deny_backfill", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy_db) == SQLITE_OK);
+    assert(r2_visual_init(path, path) == -1 && !r2_visual_is_initialized());
+    assert(r2_visual_init(path, library) == 0);
+    migration = NULL;
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT withdrawn,source,prompt,description,hex(jpeg) FROM r2_visual_pending_archives WHERE id=91",
+        -1, &migration, NULL) == SQLITE_OK && sqlite3_step(migration) == SQLITE_ROW);
+    assert(sqlite3_column_int(migration, 0) == 0);
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 1), "original source"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 2), "original question"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 3), "original interpretation"));
+    assert(!strcmp((const char *)sqlite3_column_text(migration, 4), "001122FF"));
+    sqlite3_finalize(migration);
     int legacy_rows = 0;
     assert(r2_visual_visit_search("legacy-camera", 2, visit_legacy_visual, &legacy_rows) == 0);
     assert(legacy_rows == 1);
@@ -81,9 +134,9 @@ int main(void)
     assert(strcmp((const char *)sqlite3_column_text(st, 1), "/legacy/old.jpg") == 0);
     sqlite3_finalize(st);
 
-    assert(visual_insert_compat("2026-10-16T07:00:00Z", "Eyes",
+    assert(visual_insert_compat(visual_db, "2026-10-16T07:00:00Z", "Eyes",
         "/new/frame.jpg", "qwen3.5:9b", NULL, "new frame",
-        640, 480, 7, 123456, 0) == SQLITE_DONE);
+        640, 480, 7, 123456, 0, NULL) == SQLITE_DONE);
 
     assert(sqlite3_prepare_v2(visual_db,
         "SELECT created_utc,image_path,created_at,timestamp,file_path,path "
@@ -96,9 +149,10 @@ int main(void)
         assert(strcmp((const char *)sqlite3_column_text(st, i), expected) == 0);
     }
     sqlite3_finalize(st);
-    assert(sqlite3_close(visual_db) == SQLITE_OK);
-    visual_db = NULL;
+    r2_visual_shutdown();
     assert(unlink(path) == 0);
+    assert(rmdir(library) == 0);
+    assert(rmdir(root) == 0);
     puts("Legacy visual schema migration preserves old rows and supports new writes.");
     return 0;
 }

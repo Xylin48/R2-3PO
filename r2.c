@@ -71,6 +71,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <dirent.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -120,6 +121,7 @@ static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t media_source_revision = ATOMIC_VAR_INIT(1);
 /* Watch owns a particular media receiver generation, not "the media slot".
  * Protected by media_lifecycle_lock, which already serializes replacement. */
 static atomic_uint_fast64_t visual_watch_next_token = ATOMIC_VAR_INIT(1);
@@ -132,6 +134,14 @@ static char *media_latest_source;
 /* Chosen display attention never changes camera capture or playback. */
 static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
+static atomic_int eyes_source_changing = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t eyes_source_revision = ATOMIC_VAR_INIT(1);
+
+typedef struct {
+    const atomic_uint_fast64_t *revision;
+    uint_fast64_t expected;
+} R2VisionRequestSource;
+static _Thread_local const R2VisionRequestSource *vision_request_source;
 static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int desktop_auto_allowed = ATOMIC_VAR_INIT(1);
 
@@ -403,24 +413,6 @@ static void r2_audio_turn_record(int64_t event_id)
     evidence->events[evidence->count++] = event_id;
 }
 
-static void r2_audio_evidence_link(int64_t turn_event_id, const R2AudioTurnEvidence *evidence,
-                                    const char *relationship)
-{
-    if (turn_event_id <= 0 || !evidence) return;
-    for (size_t i = 0; i < evidence->count; ++i)
-        if (r2_log_link(turn_event_id, evidence->events[i],
-                        relationship,
-                        "Exact locally recognized audio event; availability alone is not interpretation.") != 0)
-            fprintf(stderr, "[Ears] Could not link turn %lld to speech event %lld.\n",
-                    (long long)turn_event_id, (long long)evidence->events[i]);
-}
-
-
-static void r2_audio_turn_link(int64_t event_id, const R2AudioTurnEvidence *evidence)
-{
-    r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_turn");
-}
-
 typedef struct {
     int64_t *archives;
     size_t count;
@@ -437,17 +429,6 @@ static int r2_context_turn_record(int64_t archive_id)
     scope->archives = grown;
     scope->archives[scope->count++] = archive_id;
     return 0;
-}
-
-static void r2_context_turn_link(int64_t conversation_id)
-{
-    if (!r2_turn_context_reviews || conversation_id <= 0) return;
-    for (size_t i = 0; i < r2_turn_context_reviews->count; ++i) {
-        int64_t archive = r2_turn_context_reviews->archives[i];
-        if (r2_log_link_context_review(archive, conversation_id) != 0)
-            fprintf(stderr, "[R2 Context] Could not link review archive #%lld to conversation #%lld.\n",
-                    (long long)archive, (long long)conversation_id);
-    }
 }
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id);
@@ -1608,6 +1589,23 @@ static int save_memory(
    the separate dynamic relevant-memory retrieval performed on each turn.
 */
 
+static int memory_read_fields(sqlite3_stmt *statement, int first, int count,
+                              const char **fields)
+{
+    for (int i = 0; i < count; ++i) {
+        int column = first + i;
+        int type = sqlite3_column_type(statement, column);
+        const char *value = (const char *)sqlite3_column_text(statement, column);
+        if ((!value && type != SQLITE_NULL) ||
+            (value && strlen(value) != (size_t)sqlite3_column_bytes(statement, column))) {
+            fprintf(stderr, "[R2 memory] Stored row contains an unreadable or non-text field.\n");
+            return -1;
+        }
+        fields[i] = value;
+    }
+    return 0;
+}
+
 static char *get_startup_memories(int limit)
 {
     if (limit <= 0)
@@ -1657,12 +1655,11 @@ static char *get_startup_memories(int limit)
     }
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        const char *memory = (const char *)sqlite3_column_text(st, 0);
-        const char *category = (const char *)sqlite3_column_text(st, 1);
-        const char *updated = (const char *)sqlite3_column_text(st, 2);
-        if (!memory) memory = "";
-        if (!category) category = "general";
-        if (!updated) updated = "";
+        const char *fields[3];
+        if (memory_read_fields(st, 0, 3, fields) != 0) break;
+        const char *memory = fields[0] ? fields[0] : "";
+        const char *category = fields[1] ? fields[1] : "general";
+        const char *updated = fields[2] ? fields[2] : "";
 
         size_t memory_len = strlen(memory);
         size_t category_len = strlen(category);
@@ -2071,12 +2068,14 @@ static char *get_relevant_memories(const char *query, int limit)
                 break;
             }
 
-            const char *memory = (const char *)sqlite3_column_text(st, 1);
-            const char *category = (const char *)sqlite3_column_text(st, 2);
-            const char *updated = (const char *)sqlite3_column_text(st, 3);
-            if (!memory) memory = "";
-            if (!category) category = "";
-            if (!updated) updated = "";
+            const char *fields[3];
+            if (memory_read_fields(st, 1, 3, fields) != 0) {
+                failed = 1;
+                break;
+            }
+            const char *memory = fields[0] ? fields[0] : "";
+            const char *category = fields[1] ? fields[1] : "";
+            const char *updated = fields[2] ? fields[2] : "";
 
             size_t memory_length = strlen(memory);
             size_t category_length = strlen(category);
@@ -2124,9 +2123,9 @@ static char *get_relevant_memories(const char *query, int limit)
             if (insert_at >= (size_t)limit)
                 continue;
 
-            char *memory_copy = xstrdup(memory);
-            char *category_copy = xstrdup(category);
-            char *updated_copy = xstrdup(updated);
+            char *memory_copy = strdup(memory);
+            char *category_copy = strdup(category);
+            char *updated_copy = strdup(updated);
             if (!memory_copy || !category_copy || !updated_copy) {
                 free(memory_copy);
                 free(category_copy);
@@ -2200,10 +2199,13 @@ static char *get_relevant_memories(const char *query, int limit)
                 failed = 1;
                 break;
             }
-            const char *memory = (const char *)sqlite3_column_text(st, 0);
-            const char *category = (const char *)sqlite3_column_text(st, 1);
-            if (!memory) memory = "";
-            if (!category) category = "general";
+            const char *fields[2];
+            if (memory_read_fields(st, 0, 2, fields) != 0) {
+                failed = 1;
+                break;
+            }
+            const char *memory = fields[0] ? fields[0] : "";
+            const char *category = fields[1] ? fields[1] : "general";
             if (append_memory_record(&out, &length, &capacity, category, memory) != 0) {
                 fprintf(stderr, "[R2 memory] Could not serialize recent-memory context.\n");
                 failed = 1;
@@ -2365,332 +2367,248 @@ static char *workspace_read(const char *rel)
 }
 
 
-static int compare_dirent_names(const void *left, const void *right)
+typedef struct {
+    char *name;
+    const char *kind;
+} WorkspaceListEntry;
+
+static int compare_workspace_entries(const void *left, const void *right)
 {
-    const struct dirent *a = *(const struct dirent *const *)left;
-    const struct dirent *b = *(const struct dirent *const *)right;
-    return strcasecmp(a->d_name, b->d_name);
+    const WorkspaceListEntry *a = left, *b = right;
+    return strcasecmp(a->name, b->name);
 }
 
 static char *workspace_list(const char *rel)
 {
-    char p[PATH_MAX];
-
-    if (safe_path(
-            rel && *rel ? rel : ".",
-            p) != 0) {
-        r2_log_file_event("list", rel && *rel ? rel : ".", "blocked_or_invalid_path", NULL);
+    char path[PATH_MAX];
+    if (!rel || !*rel) rel = ".";
+    if (safe_path(rel, path) != 0) {
+        r2_log_file_event("list", rel, "blocked_or_invalid_path", NULL);
+        return NULL;
+    }
+    DIR *dir = opendir(path);
+    if (!dir) {
+        r2_log_file_event("list", rel, "failed_to_open_directory", NULL);
         return NULL;
     }
 
-    DIR *d = opendir(p);
-
-    if (!d) {
-        r2_log_file_event("list", rel && *rel ? rel : ".", "failed_to_open_directory", NULL);
-        return NULL;
-    }
-
-    size_t cap = 256;
-    size_t len = 0;
-
-    char *out = malloc(cap);
-
-    if (!out) {
-        closedir(d);
-        return NULL;
-    }
-
-    out[0] = '\0';
-
-    struct dirent **names = NULL;
-    size_t n = 0;
-    size_t nc = 0;
-
-    struct dirent *e;
-    int entries_truncated = 0;
-
-    while ((e = readdir(d)) != NULL) {
-
-        if (!strcmp(e->d_name, ".") ||
-            !strcmp(e->d_name, ".."))
-            continue;
-
-        if (n >= 10000) {
-            entries_truncated = 1;
+    WorkspaceListEntry *entries = NULL;
+    size_t count = 0, capacity = 0, bytes = 1;
+    int failed = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) {
+            failed = errno != 0;
             break;
         }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
 
-        if (n == nc) {
-
-            size_t new_nc = nc ? nc * 2 : 32;
-
-            struct dirent **tmp =
-                realloc(
-                    names,
-                    new_nc * sizeof(*names)
-                );
-
-            if (!tmp) {
-
-                for (size_t k = 0; k < n; ++k)
-                    free(names[k]);
-
-                free(names);
-                free(out);
-                closedir(d);
-
-                return NULL;
-            }
-
-            names = tmp;
-            nc = new_nc;
+        struct stat state;
+        if (fstatat(dirfd(dir), entry->d_name, &state, AT_SYMLINK_NOFOLLOW) != 0) {
+            failed = 1;
+            break;
         }
-
-        names[n] =
-            malloc(sizeof(struct dirent));
-
-        if (!names[n])
-            continue;
-
-        memcpy(
-            names[n],
-            e,
-            sizeof(struct dirent)
-        );
-
-        n++;
+        if (count == capacity) {
+            if (capacity > SIZE_MAX / 2) { failed = 1; break; }
+            size_t next = capacity ? capacity * 2 : 32;
+            WorkspaceListEntry *grown = reallocarray(entries, next, sizeof(*grown));
+            if (!grown) { failed = 1; break; }
+            entries = grown;
+            capacity = next;
+        }
+        const char *kind = S_ISDIR(state.st_mode) ? "DIR " :
+                           S_ISLNK(state.st_mode) ? "LINK" : "FILE";
+        size_t record_size = strlen(entry->d_name) + strlen(kind) + 2;
+        if (record_size > SIZE_MAX - bytes) { failed = 1; break; }
+        char *name = strdup(entry->d_name);
+        if (!name) { failed = 1; break; }
+        entries[count++] = (WorkspaceListEntry){name, kind};
+        bytes += record_size;
     }
+    if (closedir(dir) != 0) failed = 1;
 
-    closedir(d);
-
-    if (n > 1)
-        qsort(names, n, sizeof(*names), compare_dirent_names);
-
-    for (size_t i = 0; i < n; ++i) {
-
-        char fp[PATH_MAX];
-        struct stat st;
-
-        int written = snprintf(
-            fp,
-            sizeof(fp),
-            "%s/%s",
-            p,
-            names[i]->d_name
-        );
-
-        if (written < 0 ||
-            (size_t)written >= sizeof(fp)) {
-
-            free(names[i]);
-            names[i] = NULL;
-            continue;
-        }
-
-        if (lstat(fp, &st) != 0) {
-
-            free(names[i]);
-            names[i] = NULL;
-            continue;
-        }
-
-        const char *kind =
-            S_ISDIR(st.st_mode) ? "DIR " :
-            S_ISLNK(st.st_mode) ? "LINK" :
-                                  "FILE";
-
-        size_t needed =
-            strlen(kind) +
-            1 +
-            strlen(names[i]->d_name) +
-            1;
-
-        if (len + needed + 1 > cap) {
-
-            size_t new_cap = cap;
-
-            while (len + needed + 1 > new_cap) {
-
-                if (new_cap > SIZE_MAX / 2) {
-
-                    for (size_t k = i; k < n; ++k)
-                        free(names[k]);
-
-                    free(names);
-                    free(out);
-
-                    return NULL;
+    char *result = NULL;
+    if (!failed && count) {
+        if (count > 1) qsort(entries, count, sizeof(*entries), compare_workspace_entries);
+        result = malloc(bytes);
+        if (result) {
+            size_t offset = 0;
+            for (size_t i = 0; i < count; ++i) {
+                int written = snprintf(result + offset, bytes - offset, "%s %s\n",
+                                       entries[i].kind, entries[i].name);
+                if (written < 0 || (size_t)written >= bytes - offset) {
+                    free(result);
+                    result = NULL;
+                    break;
                 }
-
-                new_cap *= 2;
-            }
-
-            char *tmp =
-                realloc(out, new_cap);
-
-            if (!tmp) {
-
-                for (size_t k = i; k < n; ++k)
-                    free(names[k]);
-
-                free(names);
-                free(out);
-
-                return NULL;
-            }
-
-            out = tmp;
-            cap = new_cap;
-        }
-
-        int added = snprintf(
-            out + len,
-            cap - len,
-            "%s %s\n",
-            kind,
-            names[i]->d_name
-        );
-
-        if (added < 0 ||
-            (size_t)added >= cap - len) {
-
-            for (size_t k = i + 1; k < n; ++k)
-                free(names[k]);
-
-            free(names);
-            free(out);
-
-            return NULL;
-        }
-
-        len += (size_t)added;
-
-        free(names[i]);
-        names[i] = NULL;
-    }
-
-    if (entries_truncated) {
-        const char *note = "[listing truncated after 10000 entries]\n";
-        size_t note_length = strlen(note);
-        if (len + note_length + 1 > cap) {
-            char *expanded = realloc(out, len + note_length + 1);
-            if (expanded) {
-                out = expanded;
-                cap = len + note_length + 1;
+                offset += (size_t)written;
             }
         }
-        if (len + note_length + 1 <= cap) {
-            memcpy(out + len, note, note_length + 1);
-            len += note_length;
-        }
+    } else if (!failed) {
+        result = strdup("(empty)\n");
     }
-
-    free(names);
-
-    if (len == 0) {
-        free(out);
-        r2_log_file_event("list", rel && *rel ? rel : ".", "success_empty", NULL);
-        return strdup("(empty)\n");
-    }
-
-    r2_log_file_event("list", rel && *rel ? rel : ".", "success", NULL);
-    return out;
+    for (size_t i = 0; i < count; ++i) free(entries[i].name);
+    free(entries);
+    r2_log_file_event("list", rel, result ? (count ? "success" : "success_empty") : "incomplete", NULL);
+    return result;
 }
 
 
-static int workspace_write(
-    const char *rel,
-    const char *content,
-    char out[PATH_MAX])
+/* Open the resolved parent from the workspace root. Keep this descriptor
+ * through publication so a renamed parent cannot redirect pathname lookup. */
+static int workspace_open_write_parent(char *parent)
 {
-    char p[PATH_MAX];
+    size_t root_length = strlen(R2_WORKSPACE);
+    if (strncmp(parent, R2_WORKSPACE, root_length) != 0 ||
+        (parent[root_length] && parent[root_length] != '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    int dir = open(R2_WORKSPACE, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dir < 0) return -1;
+    char *next = NULL;
+    for (char *part = strtok_r(parent + root_length, "/", &next); part;
+         part = strtok_r(NULL, "/", &next)) {
+        if (!strcmp(part, ".") || !strcmp(part, "..")) {
+            close(dir);
+            errno = EINVAL;
+            return -1;
+        }
+        int child = openat(dir, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int error = errno;
+        close(dir);
+        if (child < 0) { errno = error; return -1; }
+        dir = child;
+    }
+    return dir;
+}
 
-    if (safe_path(rel, p) != 0)
+enum { WORKSPACE_WRITE_OK = 0, WORKSPACE_WRITE_SYNC_UNCONFIRMED = 1 };
+
+static int workspace_copy_access_acl(int original, int replacement)
+{
+    const char acl_name[] = "system.posix_acl_access";
+    ssize_t length = fgetxattr(original, acl_name, NULL, 0);
+    if (length < 0) {
+        if (errno == ENOTSUP) return 0;
+        if (errno != ENODATA) return -1;
+        return fremovexattr(replacement, acl_name) == 0 || errno == ENODATA ? 0 : -1;
+    }
+    if (length == 0) { errno = EIO; return -1; }
+    void *acl = malloc((size_t)length);
+    if (!acl) return -1;
+    ssize_t got = fgetxattr(original, acl_name, acl, (size_t)length);
+    if (got >= 0 && got != length) errno = ESTALE;
+    int rc = got == length ? fsetxattr(replacement, acl_name, acl, (size_t)length, 0) : -1;
+    free(acl);
+    return rc;
+}
+
+static int workspace_write(const char *rel, const char *content, char out[PATH_MAX])
+{
+    char path[PATH_MAX];
+    if (safe_path(rel, path) != 0) return -1;
+    char *slash = strrchr(path, '/');
+    if (!slash || !slash[1] || !strcmp(slash + 1, ".") || !strcmp(slash + 1, ".."))
         return -1;
 
     char parent[PATH_MAX];
+    memcpy(parent, path, (size_t)(slash - path));
+    parent[slash - path] = '\0';
+    const char *name = slash + 1;
+    int dir = workspace_open_write_parent(parent);
+    if (dir < 0) return -1;
 
-    int written = snprintf(
-        parent,
-        sizeof(parent),
-        "%s",
-        p
-    );
-
-    if (written < 0 ||
-        (size_t)written >= sizeof(parent))
-        return -1;
-
-    char *slash =
-        strrchr(parent, '/');
-
-    if (slash) {
-
-        *slash = '\0';
-
-        if (*parent) {
-
-            struct stat pst;
-
-            if (stat(parent, &pst) != 0 ||
-                !S_ISDIR(pst.st_mode))
-                return -1;
+    int result = -1, fd = -1, original = -1;
+    char temporary[64] = "";
+    struct stat before, current, staging;
+    int exists = fstatat(dir, name, &before, AT_SYMLINK_NOFOLLOW) == 0;
+    if (!exists && errno != ENOENT) goto cleanup;
+    if (exists) {
+        if (!S_ISREG(before.st_mode) || before.st_nlink != 1) {
+            errno = EINVAL;
+            goto cleanup;
+        }
+        /* Check the caller's existing write access without truncating. */
+        original = openat(dir, name, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (original < 0 || fstat(original, &current) != 0) goto cleanup;
+        if (current.st_dev != before.st_dev || current.st_ino != before.st_ino) {
+            errno = ESTALE;
+            goto cleanup;
         }
     }
 
-    FILE *f = fopen(p, "w");
+    /* Generate an exclusive sibling name. Retrying collisions never touches
+     * the destination. Temporary bytes stay private until publication. */
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        uint64_t random;
+        if (getentropy(&random, sizeof(random)) != 0) goto cleanup;
+        snprintf(temporary, sizeof(temporary), ".r2-write-%016llx", (unsigned long long)random);
+        fd = openat(dir, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) break;
+        temporary[0] = '\0';
+        if (errno != EEXIST) goto cleanup;
+    }
+    if (fd < 0) goto cleanup;
 
-    if (!f)
-        return -1;
-
-    if (content) {
-
-        size_t content_len =
-            strlen(content);
-
-        if (content_len > 0) {
-
-            size_t written_bytes =
-                fwrite(
-                    content,
-                    1,
-                    content_len,
-                    f
-                );
-
-            if (written_bytes != content_len) {
-
-                fclose(f);
-                return -1;
-            }
+    const char *cursor = content ? content : "";
+    size_t remaining = strlen(cursor);
+    while (remaining) {
+        size_t chunk = remaining > (size_t)SSIZE_MAX ? (size_t)SSIZE_MAX : remaining;
+        ssize_t written = write(fd, cursor, chunk);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            goto cleanup;
         }
+        cursor += (size_t)written;
+        remaining -= (size_t)written;
     }
-
-    if (fclose(f) != 0) {
-        r2_log_file_event("write", rel, "failed_on_close", NULL);
-        return -1;
+    if (exists) {
+        if (fstat(fd, &staging) != 0) goto cleanup;
+        if ((staging.st_uid != before.st_uid || staging.st_gid != before.st_gid) &&
+            fchown(fd, before.st_uid, before.st_gid) != 0) goto cleanup;
+        if (fchmod(fd, before.st_mode & 0777) != 0 ||
+            workspace_copy_access_acl(original, fd) != 0) goto cleanup;
     }
+    if (fsync(fd) != 0) goto cleanup;
+    int closed = close(fd);
+    fd = -1;
+    if (closed != 0) goto cleanup;
 
-    r2_log_file_event("write", rel, "success", "Workspace file was written by R2.");
-
-    if (out) {
-
-        int out_written =
-            snprintf(
-                out,
-                PATH_MAX,
-                "%s",
-                p
-            );
-
-        if (out_written < 0 ||
-            out_written >= PATH_MAX)
-            return -1;
+    if (exists) {
+        if (fstatat(dir, name, &current, AT_SYMLINK_NOFOLLOW) != 0) goto cleanup;
+        if (current.st_dev != before.st_dev || current.st_ino != before.st_ino ||
+            current.st_nlink != 1 || current.st_ctim.tv_sec != before.st_ctim.tv_sec ||
+            current.st_ctim.tv_nsec != before.st_ctim.tv_nsec) {
+            errno = ESTALE;
+            goto cleanup;
+        }
+        if (renameat(dir, temporary, dir, name) != 0) goto cleanup;
+    } else if (renameat2(dir, temporary, dir, name, RENAME_NOREPLACE) != 0) {
+        goto cleanup;
     }
+    temporary[0] = '\0';
+    if (out) strcpy(out, path);
+    result = fsync(dir) == 0 ? WORKSPACE_WRITE_OK : WORKSPACE_WRITE_SYNC_UNCONFIRMED;
 
-    return 0;
+cleanup:
+    {
+        int error = errno;
+        if (fd >= 0) close(fd);
+        if (original >= 0) close(original);
+        if (temporary[0]) unlinkat(dir, temporary, 0);
+        close(dir);
+        if (result >= 0)
+            r2_log_file_event("write", rel,
+                result == WORKSPACE_WRITE_OK ? "success" : "published_sync_unconfirmed",
+                result == WORKSPACE_WRITE_OK ? "Workspace file was written by R2." :
+                "Complete file was published, but syncing its directory failed.");
+        errno = error;
+        return result;
+    }
 }
-
 
 static int workspace_delete(
     const char *rel,
@@ -3016,9 +2934,16 @@ void r2_ollama_vision_request_end(void)
     pthread_mutex_unlock(&ollama_request_lock);
 }
 
+static int r2_vision_request_source_changed(void)
+{
+    return vision_request_source &&
+        (!atomic_load(&eyes_auto_allowed) ||
+         atomic_load(vision_request_source->revision) != vision_request_source->expected);
+}
+
 int r2_ollama_vision_request_should_abort(void)
 {
-    return shutting_down || atomic_load(&foreground_ollama_waiting) > 0 ||
+    return shutting_down || r2_vision_request_source_changed() || atomic_load(&foreground_ollama_waiting) > 0 ||
            (atomic_load(&foreground_conversation_waiting) > 0 &&
             !ollama_foreground_turn_mode) ||
            (vision_watch_worker_context && !atomic_load(&vision_watch_running));
@@ -8548,13 +8473,8 @@ static char *process_tools_with_status(
 
                     char written[PATH_MAX];
 
-                    if (
-                        workspace_write(
-                            path,
-                            data,
-                            written
-                        ) == 0
-                    ) {
+                    int write_status = workspace_write(path, data, written);
+                    if (write_status == WORKSPACE_WRITE_OK) {
 
                         (void)r2_reward_apply("filesystem_write", "file_generation", 3,
                             "A requested workspace file was written successfully.", 0);
@@ -8568,6 +8488,13 @@ static char *process_tools_with_status(
                             strlen(data)
                         );
 
+                    } else if (write_status == WORKSPACE_WRITE_SYNC_UNCONFIRMED) {
+                        APPEND(
+                            "REAL WRITE RESULT:\n"
+                            "Published complete file: %s\n"
+                            "Persistence after power loss could not be confirmed.\n",
+                            written
+                        );
                     } else {
 
                         (void)r2_reward_apply("filesystem_write", "file_generation", -2,
@@ -9362,15 +9289,13 @@ static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence
 {
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
-    if (r2_diary_write_with_id(reflection, &diary_id) != 0) return -1;
-    int64_t event_id = r2_log_thinking("reflection_completed",
-                                     "Private diary reflection was written.", reflection);
+    if (r2_diary_stage_reflection(reflection, evidence ? evidence->events : NULL,
+                                  evidence ? evidence->count : 0, &diary_id) != 0)
+        return -1;
+    int64_t event_id = r2_log_complete_reflection(diary_id);
     if (event_id > 0) {
-        if (r2_sj_link_reflection(event_id, diary_id) != 0)
-            fprintf(stderr, "[R2 diary] Could not persist exact reflection-to-diary link.\n");
-        r2_audio_evidence_link(event_id, evidence, "speech_was_transcribed_for_reflection");
         if (event_id_out) *event_id_out = event_id;
-    } else fprintf(stderr, "[R2 diary] Diary row saved, but completion event could not be persisted.\n");
+    } else fprintf(stderr, "[R2 diary] Diary row saved; reflection completion was not confirmed.\n");
     return 0;
 }
 
@@ -9633,7 +9558,8 @@ static void *autonomous_thinking(void *arg)
         }
 
         int64_t reflection_event_id = 0;
-        if (r2_store_reflection(reflection, &speech_evidence, &reflection_event_id) == 0) {
+        int diary_saved = r2_store_reflection(reflection, &speech_evidence, &reflection_event_id);
+        if (diary_saved == 0 && reflection_event_id > 0) {
             log_structured_self_report(reflection, reflection_event_id);
             r2_log_continuity("r2_private_reflection", "routine",
                               "Private autonomous reflection",
@@ -9643,7 +9569,7 @@ static void *autonomous_thinking(void *arg)
                private contents into the active conversation terminal. */
             fprintf(stderr,
                     "[R2 diary] Autonomous reflection written to diary and Life Log.\n");
-        } else {
+        } else if (diary_saved != 0) {
             r2_log_event(R2_LOG_ERROR, "reflection_write_failed",
                          "Failed to write autonomous reflection.",
                          NULL, "autonomous_thinking");
@@ -10451,12 +10377,52 @@ static int r2_vision_capture_cancelled(void *running)
     return shutting_down || (running && !atomic_load((atomic_int *)running));
 }
 
-/* Analyze the next real frame. Never starts a camera implicitly here. */
+static int r2_vision_direct_cancelled(void *userdata)
+{
+    return shutting_down || !atomic_load(&eyes_auto_allowed) ||
+        atomic_load(&eyes_source_changing) ||
+        atomic_load(&eyes_source_revision) != *(const uint_fast64_t *)userdata;
+}
+
+/* The request owns a copied frame. Carry its source generation through the
+ * encoder and model callbacks without holding capture or lifecycle locks. */
+static char *r2_vision_analyze_snapshot(const R2VisionFrame *frame,
+                                       const char *source, const char *question,
+                                       const R2VisionRequestSource *origin)
+{
+    const R2VisionRequestSource *saved = vision_request_source;
+    vision_request_source = origin;
+    char *result = r2_vision_request_source_changed() ? NULL
+        : r2_visual_analyze_frame(frame, source, question);
+    vision_request_source = saved;
+    return result;
+}
+
+static char *r2_vision_encode_snapshot(const R2VisionFrame *frame,
+                                      const R2VisionRequestSource *origin)
+{
+    const R2VisionRequestSource *saved = vision_request_source;
+    vision_request_source = origin;
+    char *encoded = r2_vision_request_source_changed() ? NULL
+        : r2_visual_frame_base64(frame);
+    if (encoded && r2_vision_request_source_changed()) {
+        free(encoded);
+        encoded = NULL;
+    }
+    vision_request_source = saved;
+    return encoded;
+}
+
+/* Deliberate visual analysis can request the normal Eyes startup path. */
 static char *vision_analyze_current_frame(const char *question, int open_camera)
 {
     if (!r2_visual_is_initialized() || !atomic_load(&eyes_auto_allowed))
         return NULL;
 
+    if (open_camera && r2_eyes_status() <= 0 && r2_eyes_start_impl(NULL, 0) != 0)
+        return NULL;
+    uint_fast64_t revision = atomic_load(&eyes_source_revision);
+    if (r2_vision_direct_cancelled(&revision)) return NULL;
     R2VisionFrame frame = {0};
     char *source = NULL;
     unsigned char *frame_copy = NULL;
@@ -10475,23 +10441,15 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
     } else {
         /* Direct capture is only for an Eyes source without a running watcher. */
         pthread_mutex_lock(&visual_capture_lock);
-        if ((!eyes || !r2_eyes_is_open(eyes)) && open_camera) {
-            if (!eyes || r2_eyes_open_camera(eyes) != 0) {
-                pthread_mutex_unlock(&visual_capture_lock);
-                r2_log_sensory("vision_camera_start_failed",
-                               "R2 could not start a camera for visual analysis.",
-                               "The camera did not open successfully.", "r2_vision");
-                return NULL;
-            }
-        }
-        if (!eyes || !r2_eyes_is_open(eyes)) {
+        if (r2_vision_direct_cancelled(&revision) || !eyes || !r2_eyes_is_open(eyes)) {
             pthread_mutex_unlock(&visual_capture_lock);
             return NULL;
         }
 
-        int captured = r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL);
+        int captured = r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled, &revision);
         if (captured != 1) {
             pthread_mutex_unlock(&visual_capture_lock);
+            if (r2_vision_direct_cancelled(&revision)) return NULL;
             r2_log_sensory("vision_frame_unavailable",
                            "R2 could not obtain a new frame for visual analysis.",
                            captured == 0 ? "The visual stream reached its end." :
@@ -10519,7 +10477,9 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         pthread_mutex_unlock(&visual_capture_lock);
     }
 
-    char *description = r2_visual_analyze_frame(&frame, source, question);
+    R2VisionRequestSource origin = {&eyes_source_revision, revision};
+    char *description = r2_vision_direct_cancelled(&revision) ? NULL
+        : r2_vision_analyze_snapshot(&frame, source, question, &origin);
     free(source);
     free(frame_copy);
     return description;
@@ -10549,9 +10509,10 @@ char *r2_vision_search(const char *query, int limit)
 
 /* Serialize the end of a media generation with attention and frame readers.
  * The worker can end on its own while a lifecycle caller is joining it. */
-static void r2_vision_media_end_capture(void)
+static void r2_vision_media_end_capture(int replaced)
 {
     pthread_mutex_lock(&media_frame_lock);
+    if (replaced) atomic_fetch_add(&media_source_revision, 1);
     atomic_store(&media_capture_running, 0);
     int had_attention = atomic_exchange(&media_attention_selected, 0);
     pthread_mutex_unlock(&media_frame_lock);
@@ -10634,14 +10595,14 @@ static void *r2_media_capture_worker(void *unused)
         }
         have_previous = 1;
     }
-    r2_vision_media_end_capture();
+    r2_vision_media_end_capture(0);
     return NULL;
 }
 
 /* Caller holds media_lifecycle_lock. Join before closing or replacing Eyes. */
 static int r2_vision_media_stop_locked(void)
 {
-    r2_vision_media_end_capture();
+    r2_vision_media_end_capture(1);
     if (media_capture_thread_started) {
         pthread_join(media_capture_thread, NULL);
         media_capture_thread_started = 0;
@@ -10740,7 +10701,7 @@ static int r2_vision_media_open(int kind, unsigned long window,
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
-        r2_vision_media_end_capture();
+        r2_vision_media_end_capture(1);
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
@@ -10814,6 +10775,7 @@ char *r2_vision_media_see(const char *question)
         !atomic_load(&eyes_auto_allowed)) return NULL;
     pthread_mutex_lock(&media_frame_lock);
     R2VisionFrame frame = media_latest_frame;
+    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
     char *source = NULL;
     if (atomic_load(&media_capture_running) && frame.data && frame.size &&
         media_latest_source)
@@ -10824,7 +10786,7 @@ char *r2_vision_media_see(const char *question)
         frame.data = copy;
     }
     pthread_mutex_unlock(&media_frame_lock);
-    char *description = copy ? r2_visual_analyze_frame(&frame, source, question) : NULL;
+    char *description = copy ? r2_vision_analyze_snapshot(&frame, source, question, &origin) : NULL;
     free(source);
     free(copy);
     return description;
@@ -10877,6 +10839,7 @@ static char *r2_vision_media_current_frame_base64(void)
         return NULL;
     }
     R2VisionFrame frame = media_latest_frame;
+    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
     unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
     if (copy) {
         memcpy(copy, frame.data, frame.size);
@@ -10884,7 +10847,11 @@ static char *r2_vision_media_current_frame_base64(void)
     }
     pthread_mutex_unlock(&media_frame_lock);
     if (!copy) return NULL;
-    char *encoded = r2_visual_frame_base64(&frame);
+    char *encoded = r2_vision_encode_snapshot(&frame, &origin);
+    if (encoded && !r2_vision_media_attention_status()) {
+        free(encoded);
+        encoded = NULL;
+    }
     free(copy);
     return encoded;
 }
@@ -10897,6 +10864,8 @@ static pthread_t vision_watch_capture_thread;
 static int vision_watch_capture_thread_started = 0;
 static pthread_mutex_t vision_watch_frame_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t vision_watch_frame_cond = PTHREAD_COND_INITIALIZER;
+/* Changes across worker replacement, independent of the per-session frame count. */
+static uint64_t vision_watch_session = 1;
 static uint64_t vision_watch_frame_generation = 0;
 static int vision_watch_capture_done = 0;
 static R2VisionFrame vision_watch_latest_frame;
@@ -10915,11 +10884,21 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
     if (!frame || !source_out || !owned_data) return -1;
     *owned_data = NULL;
     *source_out = NULL;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return -1;
+    deadline.tv_sec += 5; /* Same first-frame budget as a live Eyes decoder. */
     pthread_mutex_lock(&vision_watch_frame_lock);
-    while (!shutting_down && atomic_load(&vision_watch_running) &&
-           vision_watch_frame_generation == 0 && !vision_watch_capture_done)
-        pthread_cond_wait(&vision_watch_frame_cond, &vision_watch_frame_lock);
-    if (!shutting_down && atomic_load(&vision_watch_running) &&
+    uint64_t session = vision_watch_session;
+    int wait_result = 0;
+    while (!shutting_down && atomic_load(&eyes_auto_allowed) &&
+           atomic_load(&vision_watch_running) && session == vision_watch_session &&
+           vision_watch_frame_generation == 0 && !vision_watch_capture_done) {
+        wait_result = pthread_cond_clockwait(&vision_watch_frame_cond, &vision_watch_frame_lock,
+                                              CLOCK_MONOTONIC, &deadline);
+        if (wait_result != 0) break;
+    }
+    if (wait_result == 0 && !shutting_down && atomic_load(&eyes_auto_allowed) &&
+        atomic_load(&vision_watch_running) && session == vision_watch_session &&
         !vision_watch_capture_done && vision_watch_frame_generation > 0 &&
         vision_watch_latest_frame.data && vision_watch_latest_frame_data &&
         vision_watch_latest_frame.size > 0 && vision_watch_latest_source) {
@@ -10937,6 +10916,7 @@ static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
         }
     }
     pthread_mutex_unlock(&vision_watch_frame_lock);
+    if (wait_result) errno = wait_result;
     return *owned_data ? 0 : -1;
 }
 
@@ -11045,6 +11025,8 @@ static void *vision_watch_capture_worker(void *unused)
 }
 static char *r2_vision_current_frame_base64(void)
 {
+    uint_fast64_t revision = atomic_load(&eyes_source_revision);
+    if (r2_vision_direct_cancelled(&revision)) return NULL;
     R2VisionFrame frame = {0};
     char *source = NULL;
     unsigned char *frame_copy = NULL;
@@ -11053,8 +11035,8 @@ static char *r2_vision_current_frame_base64(void)
         (void)r2_vision_copy_watched_frame(&frame, &source, &frame_copy);
     } else {
         pthread_mutex_lock(&visual_capture_lock);
-        int captured = (eyes && r2_eyes_is_open(eyes))
-            ? r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled, NULL) : -1;
+        int captured = (!r2_vision_direct_cancelled(&revision) && eyes && r2_eyes_is_open(eyes))
+            ? r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled, &revision) : -1;
         if (captured == 1 && r2_eyes_get_frame(eyes, &frame) == 0 &&
             frame.data && frame.size > 0 && (source = r2_eyes_copy_source(eyes))) {
             frame_copy = malloc(frame.size);
@@ -11075,9 +11057,11 @@ static char *r2_vision_current_frame_base64(void)
         return NULL;
     }
 
-    char *encoded = r2_visual_frame_base64(&frame);
+    R2VisionRequestSource origin = {&eyes_source_revision, revision};
+    char *encoded = r2_vision_direct_cancelled(&revision) ? NULL
+        : r2_vision_encode_snapshot(&frame, &origin);
     free(frame_copy);
-    if (!encoded)
+    if (!encoded && !r2_vision_direct_cancelled(&revision))
         r2_log_sensory("visual_input_encoding_failed",
                        "R2's current visual frame could not be encoded for the conversation brain.",
                        "Frame-to-JPEG/base64 encoding failed; no visual interpretation was substituted.",
@@ -11161,6 +11145,7 @@ static int r2_vision_watch_start_impl(uint64_t *watch_token_out)
     /* Reap both completed workers before reusing their lifecycle state. */
     atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
@@ -11247,6 +11232,7 @@ static int r2_vision_watch_stop_locked(void)
     vision_watch_owner_token = 0;
     atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
+    ++vision_watch_session;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
     if (vision_watch_thread_started) {
@@ -11354,18 +11340,11 @@ int r2_vision_open_file(const char *path)
     return path && *path ? r2_vision_media_open(3, 0, path, NULL, NULL, NULL) : -1;
 }
 
+static int r2_eyes_stop_with_media(void);
+
 int r2_vision_close(void)
 {
-    pthread_mutex_lock(&eyes_source_owner_lock);
-    eyes_watch_token = 0;
-    pthread_mutex_unlock(&eyes_source_owner_lock);
-    r2_sense_set_auto_allowed(1, 0);
-    (void)r2_vision_media_set_attention(0);
-    (void)r2_vision_media_stop();
-    (void)r2_vision_watch_stop();
-    pthread_mutex_lock(&visual_capture_lock);
-    if (eyes) r2_eyes_close(eyes);
-    pthread_mutex_unlock(&visual_capture_lock);
+    (void)r2_eyes_stop_with_media();
     r2_log_sensory("vision_input_closed",
                    "R2 closed Eyes and media attention by choice.",
                    "Watch discovery will not reopen the eyes until that choice is reversed.",
@@ -11392,6 +11371,8 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
         }
     }
     eyes_watch_token = 0;
+    atomic_store(&eyes_source_changing, 1);
+    atomic_fetch_add(&eyes_source_revision, 1);
     if (replace) r2_sense_set_auto_allowed(1, 1);
     /* Reopening a source cannot reuse the previous worker's frame snapshot
      * or wait behind a stalled read while holding the source-owner mutex. */
@@ -11409,6 +11390,7 @@ static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace)
         eyes_watch_token = (uint64_t)atomic_fetch_add(&visual_watch_next_token, 1);
         *watch_token_out = eyes_watch_token;
     }
+    atomic_store(&eyes_source_changing, 0);
     pthread_mutex_unlock(&eyes_source_owner_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "eyes_started" : "eyes_start_failed",
                  rc == 0 ? "R2 Eyes camera and continuous raw-frame input are active."
@@ -11433,10 +11415,13 @@ uint64_t r2_eyes_start_for_watch(void)
 static int r2_eyes_release_source_locked(void)
 {
     if (!eyes) return -1;
+    atomic_store(&eyes_source_changing, 1);
+    atomic_fetch_add(&eyes_source_revision, 1);
     (void)r2_vision_watch_stop();
     pthread_mutex_lock(&visual_capture_lock);
     r2_eyes_close(eyes);
     pthread_mutex_unlock(&visual_capture_lock);
+    atomic_store(&eyes_source_changing, 0);
     return 0;
 }
 
@@ -11463,12 +11448,21 @@ int r2_eyes_watch_owns(uint64_t token)
     return token && atomic_load(&eyes_watch_token) == token;
 }
 
-int r2_eyes_stop(void)
+static int r2_eyes_stop_with_media(void)
 {
+    pthread_mutex_lock(&eyes_source_owner_lock);
     r2_sense_set_auto_allowed(1, 0);
+    eyes_watch_token = 0;
+    int rc = r2_eyes_release_source_locked();
     (void)r2_vision_media_set_attention(0);
     (void)r2_vision_media_stop();
-    int rc = r2_eyes_release_source();
+    pthread_mutex_unlock(&eyes_source_owner_lock);
+    return rc;
+}
+
+int r2_eyes_stop(void)
+{
+    int rc = r2_eyes_stop_with_media();
     r2_log_event(R2_LOG_SENSORY, "eyes_stopped",
                  "R2 deliberately closed his eyes; Watch will respect the decision.",
                  NULL, "r2_eyes_stop");
@@ -11494,7 +11488,18 @@ int r2_sense_auto_allowed(int which)
 void r2_sense_set_auto_allowed(int which, int allowed)
 {
     switch (which) {
-        case 1: atomic_store(&eyes_auto_allowed, allowed != 0); break;
+        case 1:
+            atomic_store(&eyes_auto_allowed, allowed != 0);
+            if (!allowed) {
+                atomic_fetch_add(&eyes_source_revision, 1);
+                pthread_mutex_lock(&media_frame_lock);
+                atomic_fetch_add(&media_source_revision, 1);
+                pthread_mutex_unlock(&media_frame_lock);
+                pthread_mutex_lock(&vision_watch_frame_lock);
+                pthread_cond_broadcast(&vision_watch_frame_cond);
+                pthread_mutex_unlock(&vision_watch_frame_lock);
+            }
+            break;
         case 2: atomic_store(&microphone_auto_allowed, allowed != 0); break;
         case 3: atomic_store(&desktop_auto_allowed, allowed != 0); break;
         default: break;
@@ -13253,6 +13258,9 @@ void r2_request_shutdown(void)
     shutting_down = 1;
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
+    pthread_mutex_lock(&vision_watch_frame_lock);
+    pthread_cond_broadcast(&vision_watch_frame_cond);
+    pthread_mutex_unlock(&vision_watch_frame_lock);
     r2_ears_extra_cancel_pending();
     r2_ears_cancel_pending_inputs(0);
 }
@@ -14076,9 +14084,11 @@ finalize_reply:
 
     pthread_mutex_unlock(&messages_lock);
 
-    int64_t turn_event_id = r2_log_conversation_turn(message, reply);
-    r2_audio_turn_link(turn_event_id, r2_audio_turn_evidence);
-    r2_context_turn_link(turn_event_id);
+    const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
+    const R2TurnContextReviews *reviews = r2_turn_context_reviews;
+    int64_t turn_event_id = r2_log_conversation_turn_with_links(message, reply,
+        speech ? speech->events : NULL, speech ? speech->count : 0,
+        reviews ? reviews->archives : NULL, reviews ? reviews->count : 0);
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -14471,6 +14481,10 @@ int r2_init(void)
     /* Sensory indexing is part of the connected persistent-memory system. */
     if (r2_sj_init() != 0)
         R2_INIT_FAIL("could not initialize R2 Sensory Journal");
+    if (r2_diary_replay_mirrors() != 0)
+        fprintf(stderr, "[R2 diary] Some Markdown mirrors remain pending.\n");
+    if (r2_log_replay_reflections() != 0)
+        fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
 
     /* The reinforcement ledger is required for durable learning signals. */
     if (r2_reward_init() != 0)

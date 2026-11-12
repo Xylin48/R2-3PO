@@ -367,10 +367,10 @@ static void check_foreground_context_review(void)
     assert(!strcmp(turn[1].content, history));
     free(answer);
     free(reviewed_bytes); reviewed_bytes = NULL; reviewed_size = 0; staged_calls = 0;
-    int64_t conversation = r2_log_conversation_turn(query, "Verified answer");
+    int64_t conversation = r2_log_conversation_turn_with_links(query, "Verified answer",
+        NULL, 0, context_scope.archives, context_scope.count);
     int64_t repeated = r2_log_conversation_turn(query, "A different answer to the same text");
     assert(conversation > 0 && repeated > 0 && conversation != repeated && context_scope.count == 1);
-    r2_context_turn_link(conversation);
     assert(r2_log_link_context_review(context_scope.archives[0], conversation) == 0);
     assert(r2_log_link_context_review(context_scope.archives[0], repeated) != 0);
     r2_log_shutdown();

@@ -39,7 +39,7 @@ checks = {
     "marker cleanup failure returns a visible fallback instead of exposing control text": "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in r2 and "if (!reply_has_visible_text(sound_clean_reply))" in r2,
     "empty or marker-only replies trigger recovery before a visible fallback is returned": "Model output contained no visible reply after marker cleanup; retrying once." in r2 and "Retry still produced no visible reply" in r2 and "Your message hasn't been discarded" in r2,
     "tool output append preserves full action output with exact-size allocation": "asprintf(&_part, __VA_ARGS__)" in r2 and "memcpy(results + len, _part, (size_t)_n)" in r2 and "[tool output truncated]" not in r2 and "snprintf(results, cap, \"%s\", _capture_failure)" in r2,
-    "reply sanitizer rechecks scratch exposed after hidden tags": "visible_looks_private" in reply_module and "Removing a tagged private block" in reply_module,
+    "reply sanitizer classifies scratch and finds the answer in visible text": "visible_looks_private" in reply_module and "reply_find_final_content(visible)" in reply_module,
 }
 failed = [label for label, ok in checks.items() if not ok]
 for label, ok in checks.items():

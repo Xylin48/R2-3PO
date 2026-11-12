@@ -55,15 +55,16 @@ helper_start = core.index("static char *r2_vision_current_frame_base64(void)\n{"
 helper_end = core.index("\nstatic void *vision_watch_worker(void *unused)", helper_start)
 helper = core[helper_start:helper_end]
 assert "r2_vision_copy_watched_frame(&frame, &source, &frame_copy)" in helper
-assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in helper
+assert "r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled," in helper
 snapshot = core[core.index("static int r2_vision_copy_watched_frame(R2VisionFrame *frame,\n"):
                 core.index("static void *vision_watch_capture_worker(void *unused)")]
 assert "vision_watch_latest_frame_data" in snapshot
 assert "vision_watch_frame_generation == 0 && !vision_watch_capture_done" in snapshot
-assert "pthread_cond_wait(&vision_watch_frame_cond" in snapshot
+assert "pthread_cond_clockwait(&vision_watch_frame_cond" in snapshot
+assert "session == vision_watch_session" in snapshot
 assert "!vision_watch_capture_done && vision_watch_frame_generation > 0" in snapshot
 assert "memcpy(copy, vision_watch_latest_frame_data," in snapshot
-assert "r2_visual_frame_base64(&frame)" in helper
+assert "r2_vision_encode_snapshot(&frame, &origin)" in helper
 assert "r2_visual_analyze_frame(" not in helper
 assert "r2_eyes_open_camera" not in helper
 

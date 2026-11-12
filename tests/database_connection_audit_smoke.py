@@ -76,6 +76,20 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert broken[0]["source_table"] == "reward_events"
     assert broken[0]["orphan_values"] == [999]
 
+    # Legacy copies may lack declared foreign keys on exact reflection links.
+    with sqlite3.connect(memory) as db:
+        db.executescript("""
+            CREATE TABLE r2_sensory_journal_reflection_links(event_id INTEGER, diary_entry_id INTEGER);
+            INSERT INTO r2_sensory_journal_reflection_links VALUES(2,10),(101,102),(NULL,NULL);
+        """)
+    reflection_links = {
+        item["source_column"]: item
+        for item in audit.audit_relationships(root, reports["databases"])
+        if item["source_table"] == "r2_sensory_journal_reflection_links"
+    }
+    assert reflection_links["event_id"]["orphan_values"] == [101, None]
+    assert reflection_links["diary_entry_id"]["orphan_values"] == [102, None]
+
     # Verify PRAGMA foreign_key_check detects broken in-file organ links even
     # when the source database was created with foreign-key enforcement off.
     with sqlite3.connect(memory) as db:
@@ -91,5 +105,84 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     # Auditing must not repair or rewrite the original rows.
     with sqlite3.connect(rewards) as db:
         assert db.execute("SELECT log_event_id FROM reward_events WHERE id=2").fetchone()[0] == 999
+
+    archive = root / "Visual_Library"
+    archive.mkdir()
+    owned = "visual_10_20_0123456789abcdef.jpg"
+    candidate = "visual_10_20_abcdef0123456789.jpg"
+    legacy = "visual_11_22.jpg"
+    relative = "visual_12_22_0123456789abcdef.jpg"
+    staged = "visual_14_23_0123456789abcdef.jpg"
+    for name in (owned, candidate, legacy, relative, staged, "family-photo.jpg"):
+        (archive / name).write_bytes(b"fixture")
+    (archive / "visual_13_22_0123456789abcdef.jpg").symlink_to(archive / owned)
+    visual_db = root / "detached.db"
+    with sqlite3.connect(visual_db) as db:
+        db.executescript("""
+            CREATE TABLE r2_visual_experiences(
+                id INTEGER PRIMARY KEY, image_path TEXT, file_path TEXT,
+                life_log_event_id INTEGER, life_log_archive_key TEXT
+            );
+        """)
+        missing = str(archive / "missing.jpg")
+        db.executemany("INSERT INTO r2_visual_experiences VALUES(?,?,?,?,?)", [
+            (1, "", str(archive / owned), 17, None),
+            (2, missing, None, None, "pending-key"),
+            (3, f"archive/{relative}", None, None, None),
+        ])
+        db.execute("CREATE TABLE r2_visual_pending_archives(id INTEGER PRIMARY KEY, image_path TEXT)")
+        db.executemany("INSERT INTO r2_visual_pending_archives VALUES(?,?)", [
+            (21, str(archive / staged)), (22, str(archive / "missing-staged.jpg")),
+        ])
+    visual = audit.audit_visual_archive(visual_db, archive)
+    assert visual["error"] is None
+    assert visual["unindexed_candidates"] == [candidate]
+    assert visual["legacy_unindexed_candidates"] == [legacy]
+    assert visual["missing_indexed_files"] == [{"id": 2, "path": missing}]
+    assert visual["pending_life_log_ids"] == [2]
+    assert visual["pending_archives"] == [
+        {"id": 21, "path": str(archive / staged), "file_present": True},
+        {"id": 22, "path": str(archive / "missing-staged.jpg"), "file_present": False},
+    ]
+    assert visual["legacy_unlinked_ids"] == [3]
+    assert visual["unresolved_relative_paths"] == [{"id": 3, "path": f"archive/{relative}"}]
+    assert (archive / candidate).read_bytes() == b"fixture"
+    with sqlite3.connect(visual_db) as db:
+        assert db.execute("SELECT life_log_event_id FROM r2_visual_experiences WHERE id=2").fetchone() == (None,)
+
+    # An older pending table upgrades additively; cancelled cleanup records
+    # remain distinct even if their original JPEG is restored later.
+    with sqlite3.connect(visual_db) as db:
+        db.execute("ALTER TABLE r2_visual_pending_archives ADD COLUMN withdrawn INTEGER NOT NULL DEFAULT 0")
+        db.executemany("INSERT INTO r2_visual_pending_archives VALUES(?,?,1)", [
+            (23, str(archive / "withdrawn.jpg")),
+            (24, str(archive / "absent-withdrawn.jpg")),
+        ])
+    (archive / "withdrawn.jpg").write_bytes(b"cancelled fixture")
+    withdrawn_report = audit.audit_visual_archive(visual_db, archive)
+    assert withdrawn_report["error"] is None
+    assert withdrawn_report["pending_archives"] == visual["pending_archives"]
+    assert withdrawn_report["withdrawn_archives"] == [
+        {"id": 23, "path": str(archive / "withdrawn.jpg"), "file_present": True},
+        {"id": 24, "path": str(archive / "absent-withdrawn.jpg"), "file_present": False},
+    ]
+
+    # A copied backup keeps the original absolute paths. Same-named files in
+    # the copy are candidates for relocation, rather than unrecorded memories.
+    restored = root / "restored_archive"
+    restored.mkdir()
+    for name in (owned, staged):
+        (restored / name).write_bytes(b"restored fixture")
+    moved = audit.audit_visual_archive(visual_db, restored)
+    assert moved["error"] is None
+    assert not moved["unindexed_candidates"]
+    outside = moved["paths_outside_library"]
+    assert {"record_type": "published", "id": 1, "path": str(archive / owned),
+            "matching_filename": str(restored / owned)} in outside
+    assert {"record_type": "pending", "id": 21, "path": str(archive / staged),
+            "matching_filename": str(restored / staged)} in outside
+    with sqlite3.connect(visual_db) as db:
+        assert db.execute("SELECT file_path FROM r2_visual_experiences WHERE id=1").fetchone() == (str(archive / owned),)
+        assert db.execute("SELECT image_path FROM r2_visual_pending_archives WHERE id=21").fetchone() == (str(archive / staged),)
 
 print("Read-only database audit detects SQLite FK violations and broken cross-organ references.")

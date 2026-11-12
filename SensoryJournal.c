@@ -36,32 +36,53 @@ static int sj_column_exists(const char *table, const char *column)
 {
     char sql[256];
     int n = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
-    if (n < 0 || (size_t)n >= sizeof(sql)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(sj_db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(sj_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcmp((const char *)name, column)) {
-                found = 1;
+            if (!name) {
+                rc = SQLITE_NOMEM;
                 break;
             }
+            if (sqlite3_stricmp((const char *)name, column) == 0)
+                found = 1;
         }
     }
-    if (st) sqlite3_finalize(st);
-    return found;
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? found : -1;
 }
 
 static int sj_ensure_column(const char *table, const char *column,
                             const char *declaration)
 {
-    if (sj_column_exists(table, column)) return SQLITE_OK;
+    int exists = sj_column_exists(table, column);
+    if (exists < 0) return SQLITE_ERROR;
+    if (exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
                      "ALTER TABLE %s ADD COLUMN %s %s;",
                      table, column, declaration);
     if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_TOOBIG;
     return sqlite3_exec(sj_db, sql, NULL, NULL, NULL);
+}
+
+static int sj_index_complete(void)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(sj_db,
+        "SELECT e.id FROM r2_log_events e "
+        "WHERE e.category IN ('sensory','thinking','conversation') "
+        "AND NOT EXISTS (SELECT 1 FROM r2_sensory_journal j WHERE j.event_id=e.id) LIMIT 1;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW)
+        fprintf(stderr, "[R2 Sensory Journal] Reconciliation left event %lld unindexed.\n",
+                (long long)sqlite3_column_int64(st, 0));
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE;
 }
 
 int r2_sj_init(void)
@@ -109,7 +130,7 @@ int r2_sj_init(void)
         ");"
         "CREATE INDEX IF NOT EXISTS r2_sensory_journal_diary_entry_idx "
         "ON r2_sensory_journal_diary_links(diary_entry_id);";
-    if (sj_exec(schema) != 0 ||
+    if (sj_exec("BEGIN IMMEDIATE;") != 0 || sj_exec(schema) != 0 ||
         sj_ensure_column("r2_sensory_journal", "indexed_utc",
                          "TEXT NOT NULL DEFAULT ''") != SQLITE_OK ||
         sj_ensure_column("r2_sensory_journal_diary_links", "linked_utc",
@@ -124,20 +145,21 @@ int r2_sj_init(void)
             "JOIN diary_entries d ON d.entry=e.details "
             "WHERE e.category='thinking' "
             "AND e.event_type IN ('diary_entry_written','reflection_completed') "
+            "AND NOT EXISTS (SELECT 1 FROM r2_sensory_journal_reflection_links r WHERE r.event_id=e.id) "
             "AND (SELECT COUNT(*) FROM diary_entries match_row "
             "WHERE match_row.entry=e.details)=1;"
             "INSERT OR IGNORE INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
             "SELECT id,category,CURRENT_TIMESTAMP FROM r2_log_events "
             "WHERE category IN ('sensory','thinking','conversation');") != 0) {
-        sqlite3_close(sj_db);
-        sj_db = NULL;
-        pthread_mutex_unlock(&sj_lock);
-        return -1;
+        goto failed;
     }
     /* The diary organ's own entry-to-event table is authoritative. Its
        stable IDs survive identical diary prose and old database schemas. */
-    if (sj_column_exists("r2_diary_entry_links", "diary_entry_id") &&
-        sj_column_exists("r2_diary_entry_links", "log_event_id") &&
+    int diary_id_column = sj_column_exists("r2_diary_entry_links", "diary_entry_id");
+    int log_id_column = sj_column_exists("r2_diary_entry_links", "log_event_id");
+    if (diary_id_column < 0 || log_id_column < 0)
+        goto failed;
+    if (diary_id_column && log_id_column &&
         sj_exec("INSERT OR REPLACE INTO r2_sensory_journal_diary_links "
                 "(event_id,diary_entry_id,linked_utc) "
                 "SELECT e.id,d.id,CURRENT_TIMESTAMP "
@@ -145,15 +167,24 @@ int r2_sj_init(void)
                 "JOIN r2_log_events e ON e.id=l.log_event_id "
                 "JOIN diary_entries d ON d.id=l.diary_entry_id "
                 "WHERE e.category='thinking' AND e.event_type='diary_entry_linked';") != 0) {
-        sqlite3_close(sj_db);
-        sj_db = NULL;
-        pthread_mutex_unlock(&sj_lock);
-        return -1;
+        goto failed;
     }
+    if (!sj_index_complete() || sj_exec("COMMIT;") != 0)
+        goto failed;
     sj_ready = 1;
     pthread_mutex_unlock(&sj_lock);
     fprintf(stderr, "[R2 Sensory Journal] Initialized.\n");
     return 0;
+
+failed:
+    fprintf(stderr, "[R2 Sensory Journal] Migration or reconciliation failed: %s\n",
+            sqlite3_errmsg(sj_db));
+    if (!sqlite3_get_autocommit(sj_db))
+        (void)sj_exec("ROLLBACK;");
+    sqlite3_close(sj_db);
+    sj_db = NULL;
+    pthread_mutex_unlock(&sj_lock);
+    return -1;
 }
 
 void r2_sj_shutdown(void)
@@ -200,10 +231,13 @@ void r2_sj_index_event(int64_t event_id, const char *category,
          !strcmp(event_type, "reflection_completed"))) {
         sqlite3_stmt *link = NULL;
         int link_rc = sqlite3_prepare_v2(sj_db,
-            "INSERT OR REPLACE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
+            "INSERT OR IGNORE INTO r2_sensory_journal_diary_links(event_id,diary_entry_id,linked_utc) "
             "SELECT e.id,d.id,CURRENT_TIMESTAMP FROM r2_log_events e "
             "JOIN diary_entries d ON d.entry=e.details "
-            "WHERE e.id=? AND (SELECT COUNT(*) FROM diary_entries match_row "
+            "WHERE e.id=? AND e.category='thinking' "
+            "AND e.event_type IN ('diary_entry_written','reflection_completed') "
+            "AND NOT EXISTS (SELECT 1 FROM r2_sensory_journal_reflection_links r WHERE r.event_id=e.id) "
+            "AND (SELECT COUNT(*) FROM diary_entries match_row "
                 "WHERE match_row.entry=e.details)=1 "
                 "ORDER BY d.id DESC LIMIT 1;",
             -1, &link, NULL);
@@ -268,9 +302,11 @@ int r2_sj_link_reflection(int64_t event_id, int64_t diary_entry_id)
     if (!sj_ready || !sj_db) { pthread_mutex_unlock(&sj_lock); return -1; }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(sj_db,
-        "INSERT OR REPLACE INTO r2_sensory_journal_reflection_links(event_id,diary_entry_id) "
+        "INSERT INTO r2_sensory_journal_reflection_links(event_id,diary_entry_id) "
         "SELECT e.id,d.id FROM r2_log_events e JOIN diary_entries d ON d.id=? "
-        "WHERE e.id=? AND e.category='thinking' AND e.event_type='reflection_completed';",
+        "WHERE e.id=? AND e.category='thinking' AND e.event_type='reflection_completed' "
+        "ON CONFLICT(event_id) DO UPDATE SET diary_entry_id=excluded.diary_entry_id "
+        "WHERE r2_sensory_journal_reflection_links.diary_entry_id=excluded.diary_entry_id;",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_entry_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
@@ -302,8 +338,9 @@ static char *sj_query(const char *query, int limit)
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
         "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (SELECT COUNT(*) FROM diary_entries match_row "
-        "WHERE match_row.entry=e.details)<>1 "
+        "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
+        "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
+        "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
         "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
@@ -313,8 +350,9 @@ static char *sj_query(const char *query, int limit)
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
         "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (SELECT COUNT(*) FROM diary_entries match_row "
-        "WHERE match_row.entry=e.details)<>1 "
+        "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
+        "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
+        "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
         "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
@@ -378,6 +416,16 @@ static char *sj_query(const char *query, int limit)
         const unsigned char *details = sqlite3_column_text(st, 6);
         const unsigned char *source = sqlite3_column_text(st, 7);
         const unsigned char *diary_id = sqlite3_column_text(st, 8);
+        const unsigned char *fields[] = {utc, local, kind, type, summary, details, source, diary_id};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            int column = (int)i + 1;
+            if ((!fields[i] && sqlite3_column_type(st, column) != SQLITE_NULL) ||
+                (fields[i] && strlen((const char *)fields[i]) != (size_t)sqlite3_column_bytes(st, column))) {
+                serialization_failed = 1;
+                break;
+            }
+        }
+        if (serialization_failed) break;
         int needed = snprintf(NULL, 0,
             "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s\n\n",
             (long long)sqlite3_column_int64(st, 0),

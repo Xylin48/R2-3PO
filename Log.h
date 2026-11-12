@@ -15,8 +15,8 @@
  * Life Log entries without replacing the underlying records.
  *
  * Database: R2_DIARY_DATABASE (r2_memory.db)
- * Tables are namespaced with r2_log_ and do not alter the
- * existing memories or diary_entries tables.
+ * Life Log tables and their durable relationships do not
+ * alter the existing memories or diary_entries tables.
  * ============================================================
  */
 
@@ -74,6 +74,18 @@ int64_t r2_log_event(
     const char *details,
     const char *source
 );
+
+struct sqlite3;
+/* Commit a sensory event with a companion row in the same database.
+ * The callback uses the supplied connection, returns SQLITE_DONE on success,
+ * and must not reenter Life Log. Returns 0 on commit, 1 for an unavailable
+ * or separate log database, and -1 if the transaction failed. */
+int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
+                                const char *summary, const char *details, const char *source,
+                                int (*save)(struct sqlite3 *, int64_t, void *), void *context);
+
+/* Resolve or publish a detached Visual observation by its persisted archive key. */
+int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source);
 
 /* Idempotency check for replayable event outboxes such as verified virtual
  * game events. The source identifier must be stable across retries. */
@@ -169,6 +181,9 @@ int r2_log_system_snapshot(const char *reason);
 /* Full conversation record, including exact user and assistant text. */
 int64_t r2_log_conversation_turn(const char *user_text,
                                 const char *assistant_text);
+int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
+                                            const int64_t *speech_ids, size_t speech_count,
+                                            const int64_t *review_ids, size_t review_count);
 
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
@@ -197,6 +212,12 @@ int64_t r2_log_continuity(const char *item_key,
                           const char *status,
                           const char *next_action,
                           const char *origin);
+
+/* Consume one pending reflection in the same transaction as its event and
+ * speech edges. Returns the new event ID, 0 if no work exists, or -1 on failure. */
+int64_t r2_log_complete_reflection(int64_t diary_id);
+/* Retry every pending reflection once. Returns -1 if any remain blocked. */
+int r2_log_replay_reflections(void);
 
 /* Link two events by a named relationship. */
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,

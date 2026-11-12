@@ -26,6 +26,7 @@ struct R2AudioCapture {
     pa_time_event *connect_timeout;
     atomic_int mainloop_started;
     int connect_timed_out;
+    int stream_moved; /* Protected by the threaded mainloop lock. */
     atomic_int cancelled;
     /* A peek fragment stays valid until dropped. Retain its offset so
      * arbitrarily large producer chunks are never silently discarded. */
@@ -58,6 +59,14 @@ static void r2_capture_stream_readable(pa_stream *stream, size_t size, void *use
     (void)stream;
     (void)size;
     R2AudioCapture *capture = userdata;
+    r2_capture_wake(capture->mainloop);
+}
+
+static void r2_capture_stream_moved(pa_stream *stream, void *userdata)
+{
+    (void)stream;
+    R2AudioCapture *capture = userdata;
+    capture->stream_moved = 1;
     r2_capture_wake(capture->mainloop);
 }
 
@@ -140,12 +149,14 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
     if (!capture->stream) goto failed;
     pa_stream_set_state_callback(capture->stream, r2_capture_stream_state, capture);
     pa_stream_set_read_callback(capture->stream, r2_capture_stream_readable, capture);
+    /* A stream moved at any point in this connection must be reopened. */
+    pa_stream_set_moved_callback(capture->stream, r2_capture_stream_moved, capture);
     pa_buffer_attr attr = {
         .maxlength = UINT32_MAX, .tlength = UINT32_MAX,
         .prebuf = UINT32_MAX, .minreq = UINT32_MAX,
         .fragsize = (uint32_t)fragment_bytes
     };
-    if (pa_stream_connect_record(capture->stream, source, &attr, PA_STREAM_NOFLAGS) < 0)
+    if (pa_stream_connect_record(capture->stream, source, &attr, PA_STREAM_DONT_MOVE) < 0)
         goto failed;
     for (;;) {
         pa_stream_state_t state = pa_stream_get_state(capture->stream);
@@ -161,6 +172,11 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
     }
     if (capture->connect_timed_out || atomic_load(&capture->cancelled)) {
         errno = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
+        goto failed;
+    }
+    const char *selected = pa_stream_get_device_name(capture->stream);
+    if (capture->stream_moved || !selected || strcmp(selected, source) != 0) {
+        errno = ENODEV;
         goto failed;
     }
     pa_threaded_mainloop_get_api(capture->mainloop)->time_free(capture->connect_timeout);
@@ -194,6 +210,7 @@ ssize_t r2_audio_capture_read(R2AudioCapture *capture, void *buffer, size_t byte
     int error = EIO;
     while (copied < bytes) {
         if (atomic_load(&capture->cancelled)) { error = ECANCELED; goto failed; }
+        if (capture->stream_moved) { error = ENODEV; goto failed; }
         if (pa_context_get_state(capture->context) != PA_CONTEXT_READY ||
             pa_stream_get_state(capture->stream) != PA_STREAM_READY)
             goto failed;
@@ -256,6 +273,7 @@ void r2_audio_capture_free(R2AudioCapture *capture)
     if (capture->stream) {
         pa_stream_set_state_callback(capture->stream, NULL, NULL);
         pa_stream_set_read_callback(capture->stream, NULL, NULL);
+        pa_stream_set_moved_callback(capture->stream, NULL, NULL);
         pa_stream_disconnect(capture->stream);
         pa_stream_unref(capture->stream);
     }

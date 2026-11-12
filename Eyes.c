@@ -342,24 +342,11 @@ static void r2_vwebcam_start_viewer(void)
     r2_vwebcam_pid = child;
 }
 
+static void r2_eyes_close_stream(FILE *stream, pid_t *child);
+
 static void r2_vwebcam_stop_viewer(void)
 {
-    if (r2_vwebcam_pid <= 0)
-        return;
-    int status = 0;
-    pid_t ended = waitpid(r2_vwebcam_pid, &status, WNOHANG);
-    if (ended == r2_vwebcam_pid || (ended < 0 && errno == ECHILD)) {
-        r2_vwebcam_pid = -1;
-        return;
-    }
-    if (ended == 0)
-        (void)kill(r2_vwebcam_pid, SIGTERM);
-    while (waitpid(r2_vwebcam_pid, &status, 0) < 0) {
-        if (errno == EINTR)
-            continue;
-        break;
-    }
-    r2_vwebcam_pid = -1;
+    r2_eyes_close_stream(NULL, &r2_vwebcam_pid);
 }
 
 static uint64_t r2_eyes_timestamp(void)
