@@ -286,19 +286,24 @@ int r2_addiction_record_choice(const char *target, const char *target_type,
     /* Reinforcement choices carry a stable reward_event_id in details. If
        a caller retries after the reward transaction committed but before this
        side effect completed, treat the already-recorded choice as success. */
-    if (source && strcmp(source, "reinforcement") == 0 &&
-        details && strstr(details, "reward_event_id=") != NULL) {
+    static const char reward_prefix[] = "reward_event_id=";
+    size_t prefix_length = sizeof(reward_prefix) - 1;
+    size_t digits = details && strncmp(details, reward_prefix, prefix_length) == 0
+        ? strspn(details + prefix_length, "0123456789") : 0;
+    if (source && strcmp(source, "reinforcement") == 0 && digits > 0 &&
+        details[prefix_length + digits] == ';') {
         sqlite3_stmt *existing = NULL;
         int check_rc = sqlite3_prepare_v2(addiction_db,
             "SELECT 1 FROM addiction_events WHERE target=? COLLATE NOCASE "
-            "AND event_kind='choice' AND source=? AND details=? LIMIT 1",
+            "AND event_kind='choice' AND source=? AND substr(details,1,length(?3))=?3 LIMIT 1",
             -1, &existing, NULL);
         if (check_rc == SQLITE_OK) {
             check_rc = sqlite3_bind_text(existing, 1, target, -1, SQLITE_TRANSIENT);
             if (check_rc == SQLITE_OK)
                 check_rc = sqlite3_bind_text(existing, 2, source, -1, SQLITE_TRANSIENT);
             if (check_rc == SQLITE_OK)
-                check_rc = sqlite3_bind_text(existing, 3, details, -1, SQLITE_TRANSIENT);
+                check_rc = sqlite3_bind_text64(existing, 3, details, prefix_length + digits + 1,
+                                               SQLITE_TRANSIENT, SQLITE_UTF8);
             if (check_rc == SQLITE_OK) check_rc = sqlite3_step(existing);
             if (check_rc == SQLITE_ROW) {
                 sqlite3_finalize(existing);
@@ -361,6 +366,8 @@ int r2_addiction_record_choice(const char *target, const char *target_type,
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(addiction_db) != 1)
+        rc = SQLITE_CONSTRAINT;
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE) {
         st = NULL;
@@ -446,6 +453,8 @@ int r2_addiction_rate_enjoyment(const char *target, const char *target_type,
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, details ? details : "", -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(addiction_db) != 1)
+        rc = SQLITE_CONSTRAINT;
     if (st) sqlite3_finalize(st);
     if (rc == SQLITE_DONE)
         rc = update_status_locked(target, target_type, &changed, old_status, sizeof(old_status),
@@ -527,22 +536,31 @@ char *r2_addiction_report(void)
             omitted = 1;
             break;
         }
-        const unsigned char *target = sqlite3_column_text(st, 0);
-        const unsigned char *type = sqlite3_column_text(st, 1);
-        const unsigned char *status = sqlite3_column_text(st, 3);
-        char line[512];
-        int n = snprintf(line, sizeof(line),
-            "%.160s [%.24s] enjoyment=%d/100; choices/14d=%d; choice_days=%d; status=%.24s\n",
-            target ? (const char *)target : "unknown",
-            type ? (const char *)type : "activity",
+        const char *target = (const char *)sqlite3_column_text(st, 0);
+        const char *type = (const char *)sqlite3_column_text(st, 1);
+        const char *status = (const char *)sqlite3_column_text(st, 3);
+        if ((target ? strlen(target) != (size_t)sqlite3_column_bytes(st, 0)
+                    : sqlite3_column_type(st, 0) != SQLITE_NULL) ||
+            (type ? strlen(type) != (size_t)sqlite3_column_bytes(st, 1)
+                    : sqlite3_column_type(st, 1) != SQLITE_NULL) ||
+            (status ? strlen(status) != (size_t)sqlite3_column_bytes(st, 3)
+                    : sqlite3_column_type(st, 3) != SQLITE_NULL)) {
+            failed = 1;
+            break;
+        }
+        char *line = NULL;
+        int n = asprintf(&line,
+            "%s [%s] enjoyment=%d/100; choices/14d=%d; choice_days=%d; status=%s\n",
+            target ? target : "unknown", type ? type : "activity",
             sqlite3_column_int(st, 2), sqlite3_column_int(st, 4),
-            sqlite3_column_int(st, 5), status ? (const char *)status : "inactive");
-        if (n <= 0 || (size_t)n >= sizeof(line)) {
+            sqlite3_column_int(st, 5), status ? status : "inactive");
+        if (n < 0) {
             failed = 1;
             break;
         }
         size_t add = (size_t)n;
         if (add > SIZE_MAX - len - 1) {
+            free(line);
             failed = 1;
             break;
         }
@@ -558,6 +576,7 @@ char *r2_addiction_report(void)
             }
             char *grown = realloc(out, next);
             if (!grown) {
+                free(line);
                 failed = 1;
                 break;
             }
@@ -565,6 +584,7 @@ char *r2_addiction_report(void)
             cap = next;
         }
         memcpy(out + len, line, add);
+        free(line);
         len += add;
         out[len] = '\0';
         rows++;

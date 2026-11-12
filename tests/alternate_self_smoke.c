@@ -240,6 +240,20 @@ int main(void)
     memcpy(archive + archive_length - sizeof("ARCHIVE-END") + 1, "ARCHIVE-END", sizeof("ARCHIVE-END"));
     int64_t imagined = r2_altself_create_imagination(
         "New imagination", "Provenance kept with the branch.", "A hypothetical result.", archive);
+    const char *prediction =
+        "Not evaluated yet. This imagined scene is not automatically a prediction.";
+    int64_t repeated_scene = r2_log_hypothetical(
+        "New imagination", "Provenance kept with the branch.", prediction,
+        "A hypothetical result.", "smoke test");
+    int64_t counterfactual = r2_altself_import_hypothesis(
+        "New imagination", "Provenance kept with the branch.", prediction,
+        "A hypothetical result.", repeated_scene, 0);
+    if (!check(counterfactual > 0 && counterfactual != imagined &&
+               r2_altself_is_imagination(counterfactual) == 0,
+               "counterfactual import preserves distinct imagination provenance")) {
+        free(archive);
+        goto done;
+    }
     int64_t large = r2_altself_create("Large historical note", "An intact branch note",
         archive, NULL, NULL, 0);
     r2_altself_shutdown();

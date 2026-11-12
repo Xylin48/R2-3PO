@@ -22,7 +22,7 @@ assert "PA_PROP_APPLICATION_PROCESS_ID" in probe
 assert "info->corked" in probe
 assert "info->sink" in probe
 assert "r2_discovery_add_producer(scan, producer)" in probe
-assert "r2_audio_discover(&sources)" in ears
+assert "r2_audio_discover_selected(&sources, R2_AUDIO_DISCOVER_PLAYBACK" in ears
 vision = eyes[eyes.index("static int r2_eyes_find_window("):
               eyes.index("static FILE *r2_eyes_start_vlc(")]
 assert '"xdotool", "search", "--onlyvisible", "--pid"' in vision

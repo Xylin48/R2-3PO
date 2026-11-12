@@ -108,6 +108,28 @@ int main(void)
     assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_once_keys WHERE target='old target' AND source='old key'") == 1);
     assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_once_keys WHERE target='once target' AND source='once source'") == 1);
 
+    assert(sqlite3_exec(reward_db,
+        "CREATE TRIGGER skip_reward BEFORE INSERT ON reward_events WHEN NEW.target='skip' "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_reward_apply_once("skip", "once", 1, "not committed", 0) == -1);
+    assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 7);
+    assert(scalar(reward_db, "SELECT COUNT(*) FROM reward_once_keys WHERE target='skip'") == 0);
+    assert(sqlite3_exec(reward_db, "DROP TRIGGER skip_reward", NULL, NULL, NULL) == SQLITE_OK);
+    char reason[1025];
+    memset(reason, 'a', sizeof(reason) - 1);
+    strcpy(reason + 1007, "REWARD-REASON-END");
+    for (int i = 0; i < 8; ++i)
+        assert(r2_reward_apply("complete record", "fixture", 1, reason, 0) == 0);
+    char *context = r2_reward_context();
+    assert(context);
+    const char *match = context;
+    for (int i = 0; i < 8; ++i) {
+        match = strstr(match, "REWARD-REASON-END");
+        assert(match);
+        ++match;
+    }
+    free(context);
+
     r2_reward_shutdown();
     puts("Reward ledger additive migration preserved legacy rows and allowed writable/idempotent operations.");
     return 0;

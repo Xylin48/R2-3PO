@@ -37,13 +37,11 @@ fridge_list_start = reality.find("char *r2_fridge_list(void)")
 fridge_list_end = reality.find("char *r2_fridge_context(void)", fridge_list_start)
 fridge_list = reality[fridge_list_start:fridge_list_end] if fridge_list_start >= 0 and fridge_list_end > fridge_list_start else ""
 if (
-    "if (add >= sizeof(line))" not in fridge_list
-    or "add = sizeof(line) - 1;" not in fridge_list
-    or '" [entry truncated]\\n"' not in fridge_list
-    or "if (add > SIZE_MAX - len - 1) break;" not in fridge_list
-    or "memcpy(out + len, line, add);" not in fridge_list
+    "open_memstream(&out, &length)" not in fridge_list
+    or "sqlite3_column_bytes(st, 1)" not in fridge_list
+    or "if (failed || rc != SQLITE_DONE)" not in fridge_list
 ):
-    raise SystemExit("fridge context must clamp snprintf's required length to stored bytes before copying")
+    raise SystemExit("fridge context must preserve complete rows and reject partial results")
 
 required_rules = (
     "Never infer that food exists merely because R2 is hungry",

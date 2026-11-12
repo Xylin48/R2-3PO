@@ -23,6 +23,27 @@ int __wrap_pa_mainloop_iterate(pa_mainloop *loop, int block, int *result)
     if ((uintptr_t)loop == 1) return 0;
     return __real_pa_mainloop_iterate(loop, block, result);
 }
+static unsigned queried;
+static int fail_sources, fail_playback;
+pa_operation *__wrap_pa_context_get_source_info_list(pa_context *context,
+    pa_source_info_cb_t cb, void *userdata)
+{
+    queried |= R2_AUDIO_DISCOVER_MICROPHONE;
+    cb(context, NULL, fail_sources ? -1 : 1, userdata);
+    return (pa_operation *)(uintptr_t)1;
+}
+pa_operation *__wrap_pa_context_get_sink_input_info_list(pa_context *context,
+    pa_sink_input_info_cb_t cb, void *userdata)
+{
+    queried |= R2_AUDIO_DISCOVER_PLAYBACK;
+    cb(context, NULL, fail_playback ? -1 : 1, userdata);
+    return (pa_operation *)(uintptr_t)1;
+}
+void __wrap_pa_operation_unref(pa_operation *operation)
+{
+    assert((uintptr_t)operation == 1);
+}
+
 static atomic_int cancel_scan = ATOMIC_VAR_INIT(0);
 static int scan_cancelled(void *unused)
 {
@@ -40,6 +61,18 @@ static void *cancel_discovery(void *unused)
 
 int main(void)
 {
+    R2PulseScan isolated = {0};
+    fail_playback = 1;
+    assert(r2_discovery_collect(&isolated, R2_AUDIO_DISCOVER_MICROPHONE) == 0);
+    assert(queried == R2_AUDIO_DISCOVER_MICROPHONE);
+    queried = 0;
+    fail_playback = 0;
+    fail_sources = 1;
+    assert(r2_discovery_collect(&isolated, R2_AUDIO_DISCOVER_PLAYBACK) == 0);
+    assert(queried == R2_AUDIO_DISCOVER_PLAYBACK);
+    assert(r2_discovery_collect(&isolated,
+        R2_AUDIO_DISCOVER_MICROPHONE | R2_AUDIO_DISCOVER_PLAYBACK) == -1);
+
     /* Pending native metadata queries remain cancellable without waiting
      * for the full discovery deadline or claiming a device disappeared. */
     uint64_t started = r2_discovery_now_ms();

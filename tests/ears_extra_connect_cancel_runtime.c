@@ -83,14 +83,21 @@ ssize_t __wrap_r2_audio_capture_read(R2AudioCapture *capture, void *pcm, size_t 
     errno = ECANCELED;
     return -1;
 }
-int __wrap_r2_audio_discover_cancelable(R2AudioDiscovery *audio,
+int __wrap_r2_audio_discover_selected(R2AudioDiscovery *audio, unsigned scope,
                                        int (*cancelled)(void *), void *userdata)
 {
+    assert(scope & R2_AUDIO_DISCOVER_MICROPHONE);
     memset(audio, 0, sizeof(*audio));
     if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
     audio->microphone_source = strdup("test.direct.mic");
     assert(audio->microphone_source);
     return 0;
+}
+int __wrap_r2_audio_discover_cancelable(R2AudioDiscovery *audio,
+                                       int (*cancelled)(void *), void *userdata)
+{
+    return __wrap_r2_audio_discover_selected(audio,
+        R2_AUDIO_DISCOVER_MICROPHONE | R2_AUDIO_DISCOVER_PLAYBACK, cancelled, userdata);
 }
 static void *direct_listen(void *unused)
 {

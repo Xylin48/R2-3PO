@@ -110,6 +110,26 @@ int main(void)
     }
     sqlite3_finalize(st);
     assert(has_source && has_details);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER skip_choice BEFORE INSERT ON addiction_events "
+        "WHEN NEW.target='skip' BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_addiction_record_choice("skip", "activity", 66, "fixture", NULL) == -1);
+    assert(r2_addiction_rate_enjoyment("skip", "activity", 66, "fixture", NULL) == -1);
+    assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_targets WHERE target='skip'") == 0);
+    char target[257];
+    memset(target, 't', sizeof(target) - 1);
+    strcpy(target + 240, "LONG-TARGET-END");
+    assert(r2_addiction_record_choice(target, "complete-kind", 66,
+        "reinforcement", "reward_event_id=7; previous format") == 0);
+    assert(r2_addiction_record_choice(target, "complete-kind", 66,
+        "reinforcement", "reward_event_id=7; complete format") == 0);
+    assert(r2_addiction_record_choice(target, "complete-kind", 66,
+        "reinforcement", "reward_event_id=70; independent choice") == 0);
+    assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_events WHERE source='reinforcement'") == 2);
+    char *report = r2_addiction_report();
+    assert(report && strstr(report, target));
+    free(report);
+    r2_addiction_shutdown();
     sqlite3_close(db);
     puts("Addiction legacy-schema migration smoke passed.");
     return 0;

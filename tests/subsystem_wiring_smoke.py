@@ -27,7 +27,7 @@ if reward_start < 0 or reward_end < 0:
 reward_context = reward[reward_start:reward_end]
 for marker in (
     "if (rc != SQLITE_ROW)",
-    "if (!omitted && !failed && rc != SQLITE_DONE)",
+    "if (!failed && rc != SQLITE_DONE)",
     "Reward context unavailable: the cumulative reward total could not be read.",
     "Reward context unavailable: recent reward events could not be read completely.",
 ):

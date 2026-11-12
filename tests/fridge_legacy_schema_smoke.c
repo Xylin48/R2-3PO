@@ -61,8 +61,7 @@ int main(void)
     assert(sqlite3_column_int(st, 2) == 4);
     sqlite3_finalize(st);
 
-    /* An unusually long legacy description must never make the context
-       formatter copy snprintf's required length past its fixed line buffer. */
+    /* Preserve complete legacy descriptions in the model's fridge context. */
     char *long_description = malloc(6000);
     assert(long_description != NULL);
     memset(long_description, 'x', 5999);
@@ -76,9 +75,30 @@ int main(void)
     sqlite3_finalize(st);
     char *fridge_context = r2_fridge_list();
     assert(fridge_context != NULL);
-    assert(strstr(fridge_context, " [entry truncated]\n") != NULL);
+    assert(strstr(fridge_context, long_description) != NULL);
+    assert(strstr(fridge_context, "oversized description") != NULL);
     free(fridge_context);
     free(long_description);
+
+    assert(sqlite3_exec(fridge_db,
+        "CREATE TRIGGER ignore_fridge_stock BEFORE INSERT ON r2_fridge_items "
+        "WHEN NEW.name='new apples' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_fridge_add_item("new apples", "ignored addition", 1,
+        25.0, 5.0, "apple", "sweet") != 0);
+    InventoryTransferSnapshot snapshot = {
+        .name = "new apples", .fridge_exists = 1, .fridge_quantity = 8,
+        .fridge_description = "recovered stock"
+    };
+    assert(inventory_transfer_restore_fridge_locked(&snapshot) != 0);
+    assert(sqlite3_prepare_v2(fridge_db,
+        "SELECT quantity,qty,amount FROM r2_fridge_items WHERE name='new apples'",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int(st, 0) == 4);
+    assert(sqlite3_column_int(st, 1) == 4);
+    assert(sqlite3_column_int(st, 2) == 4);
+    sqlite3_finalize(st);
 
     assert(sqlite3_close(fridge_db) == SQLITE_OK);
     fridge_db = NULL;

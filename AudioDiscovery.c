@@ -260,8 +260,50 @@ static int r2_discovery_run(R2PulseScan *scan, pa_operation *operation)
     return result;
 }
 
-int r2_audio_discover_cancelable(R2AudioDiscovery *result,
-                                  int (*cancelled)(void *), void *userdata)
+static int r2_discovery_collect(R2PulseScan *scan, unsigned scope)
+{
+    if (scope & R2_AUDIO_DISCOVER_MICROPHONE) {
+        scan->done = scan->failed = 0;
+        if (r2_discovery_run(scan, pa_context_get_source_info_list(
+                scan->context, r2_discovery_source_info, scan)) < 0) return -1;
+        if (!scan->data.microphone_source) {
+            scan->data.microphone_source = scan->fallback_microphone;
+            scan->fallback_microphone = NULL;
+        }
+    }
+    if (!(scope & R2_AUDIO_DISCOVER_PLAYBACK)) return 0;
+
+    scan->done = scan->failed = 0;
+    if (r2_discovery_run(scan, pa_context_get_sink_input_info_list(
+            scan->context, r2_discovery_sink_input, scan)) < 0) return -1;
+    /* Resolve every distinct active sink's actual monitor. Keep the
+     * first-selected monitor as the legacy desktop listener for existing
+     * explicit attention commands, without hiding other simultaneously
+     * audible outputs. No hard device-count cap is imposed. */
+    for (size_t i = 0; i < scan->data.playback_output_count; ++i) {
+        scan->done = scan->failed = 0;
+        scan->resolving_output_slot = i;
+        pa_operation *op = pa_context_get_sink_info_by_index(
+            scan->context, scan->data.playback_outputs[i].sink_index,
+            r2_discovery_sink_info, scan);
+        if (r2_discovery_run(scan, op) < 0 ||
+            !scan->data.playback_outputs[i].monitor) return -1;
+    }
+    /* A manually requested desktop listener can still open the default
+     * monitor when no app currently plays to an output sink. */
+    if (!scan->data.desktop_playing && scan->data.default_sink) {
+        scan->done = scan->failed = 0;
+        scan->resolving_output_slot = SIZE_MAX;
+        if (r2_discovery_run(scan,
+            pa_context_get_sink_info_by_name(scan->context, scan->data.default_sink,
+                                              r2_discovery_sink_info, scan)) < 0 ||
+            !scan->data.desktop_monitor) return -1;
+    }
+    return 0;
+}
+
+int r2_audio_discover_selected(R2AudioDiscovery *result, unsigned scope,
+                               int (*cancelled)(void *), void *userdata)
 {
     if (!result) { errno = EINVAL; return -1; }
     memset(result, 0, sizeof(*result));
@@ -302,41 +344,7 @@ int r2_audio_discover_cancelable(R2AudioDiscovery *result,
     scan.done = scan.failed = 0;
     if (r2_discovery_run(&scan, pa_context_get_server_info(
             scan.context, r2_discovery_server_info, &scan)) < 0) goto fail;
-    scan.done = scan.failed = 0;
-    if (r2_discovery_run(&scan, pa_context_get_source_info_list(
-            scan.context, r2_discovery_source_info, &scan)) < 0) goto fail;
-    if (!scan.data.microphone_source) {
-        scan.data.microphone_source = scan.fallback_microphone;
-        scan.fallback_microphone = NULL;
-    }
-
-    scan.done = scan.failed = 0;
-    if (r2_discovery_run(&scan, pa_context_get_sink_input_info_list(
-            scan.context, r2_discovery_sink_input, &scan)) < 0) goto fail;
-    /* Resolve every distinct active sink's actual monitor. Keep the
-     * first-selected monitor as the legacy desktop listener for existing
-     * explicit attention commands, without hiding other simultaneously
-     * audible outputs. No hard device-count cap is imposed. */
-    for (size_t i = 0; i < scan.data.playback_output_count; ++i) {
-        scan.done = scan.failed = 0;
-        scan.resolving_output_slot = i;
-        pa_operation *op = pa_context_get_sink_info_by_index(
-            scan.context, scan.data.playback_outputs[i].sink_index,
-            r2_discovery_sink_info, &scan);
-        if (r2_discovery_run(&scan, op) < 0 ||
-            !scan.data.playback_outputs[i].monitor) goto fail;
-    }
-    /* A manually requested desktop listener can still open the default
-     * monitor when no app currently plays to an output sink. */
-    if (!scan.data.desktop_playing && scan.data.default_sink) {
-        scan.done = scan.failed = 0;
-        scan.resolving_output_slot = SIZE_MAX;
-        if (r2_discovery_run(&scan,
-            pa_context_get_sink_info_by_name(scan.context, scan.data.default_sink,
-                                              r2_discovery_sink_info, &scan)) < 0 ||
-            !scan.data.desktop_monitor) goto fail;
-    }
-
+    if (r2_discovery_collect(&scan, scope) != 0) goto fail;
     if (cancelled && cancelled(userdata)) { errno = ECANCELED; goto fail; }
     pa_context_disconnect(scan.context);
     pa_context_unref(scan.context);
@@ -357,6 +365,13 @@ fail:
     r2_audio_discovery_free(&scan.data);
     errno = errno ? errno : EIO;
     return -1;
+}
+
+int r2_audio_discover_cancelable(R2AudioDiscovery *result,
+                                  int (*cancelled)(void *), void *userdata)
+{
+    return r2_audio_discover_selected(result,
+        R2_AUDIO_DISCOVER_MICROPHONE | R2_AUDIO_DISCOVER_PLAYBACK, cancelled, userdata);
 }
 
 int r2_audio_discover(R2AudioDiscovery *result)
