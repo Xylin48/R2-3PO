@@ -232,6 +232,9 @@ char *r2_process_tools(const char *input);
  */
 int r2_write_diary(void);
 
+/* Sync adapter-verified events from the console command the caller selected. */
+int r2_sync_gameboy_verified_events(const char *path);
+
 /* Simulate a sleep transition and generate/store a private dream report. */
 int r2_sleep_and_dream(double hours);
 int r2_eat_and_learn(const char *food, double fullness);

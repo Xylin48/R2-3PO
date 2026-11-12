@@ -33,23 +33,11 @@ assert 'R2_GAMEBOY_ROOT="$R2_ROOT/Devices/GameBoyAdvance"' in launcher
 assert '"R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"' in service
 assert "execv(device, argv)" in handler
 assert "system(" not in handler and "popen(" not in handler, "arguments must never enter a shell"
-assert "shell_gameboy_sync_verified_events()" in handler
+assert "r2_sync_gameboy_verified_events(device)" in handler
 assert "shell_gameboy_log_session_start(&after)" in handler
 assert "shell_gameboy_log_session_end(&before" in handler
 assert shell.count("static int shell_gameboy(") == 1
 assert 'shell_gameboy(shell_starts_with(command, "gameboy ") ? shell_trim(command + 8) : NULL);' in shell
-capture_start = shell.find("static int shell_gameboy_capture_events(")
-ack_start = shell.find("static int shell_gameboy_ack_event(")
-ack_end = shell.find("static void shell_gameboy_sync_verified_events(", ack_start)
-assert capture_start >= 0 and ack_start > capture_start and ack_end > ack_start
-capture = shell[capture_start:ack_start]
-ack = shell[ack_start:ack_end]
-assert 'getenv("R2_GAMEBOY_EXECUTABLE")' in capture
-assert 'getenv("R2_GAMEBOY_EXECUTABLE")' in ack, (
-    "event acknowledgements must use the same configured executable as event reads"
-)
-assert 'configured && *configured' in ack
-
 for command in (
     '"status"', '"verify"', '"list"', '"power"', '"insert"',
     '"eject"', '"press"', '"move"', '"events"',
@@ -59,23 +47,21 @@ assert 'choices=("pockets", "shelf", "box", "room")' in gameboy
 
 # Adapter event delivery is at-least-once until acknowledgement. Replay must
 # reuse its durable Life Log record and apply the learning signal only once.
-sync_start = core.index("static int sync_gameboy_verified_events(void)")
-sync_end = core.index("\nstatic char *process_tools_with_status", sync_start)
+sync_start = core.index("static int gameboy_sync_verified_event(")
+sync_end = core.index("\nstatic int r2_parse_control_positive_id", sync_start)
 sync = core[sync_start:sync_end]
-assert "gameboy_find_life_event_for_console_event(event_id)" in sync
-assert 'R2_LOG_MEDIA, "virtual_game_event", summary, details, source' in sync
-assert "r2_reward_apply_once(" in sync
+assert "gameboy_find_life_event_for_console_event(source, event_id)" in sync
+assert 'r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary, details, source)' in sync
+assert "json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN)" in sync
 assert 'snprintf(reward_source, sizeof(reward_source), "game_event:%lld"' in sync
-assert "if (reward_rc < 0)" in sync and "leaving it pending" in sync
-assert 'run_gameboy_console("ack_event", event_id_text' in sync
+assert sync.index("r2_reward_apply_once(") < sync.index('run_gameboy_console(path, "ack_event"')
+assert 'run_gameboy_console(path, "events", NULL, NULL, &output)' in sync
+assert "r2_sync_gameboy_verified_events(console_path)" in core
 helper_start = core.index("static int64_t gameboy_find_life_event_for_console_event")
-helper_end = core.index("static int sync_gameboy_verified_events", helper_start)
-helper = core[helper_start:helper_end]
-assert "event_type IN ('gameboy_game_event','virtual_game_event')" in helper
-assert "AND details LIKE ?" in helper
-assert 'snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld"' in sync
-assert 'R2_LOG_MEDIA, "virtual_game_event", summary, details, source' in sync
-assert "sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT)" in helper
+helper = core[helper_start:sync_start]
+assert "event_type='virtual_game_event' AND source=?" in helper
+assert "event_type='gameboy_game_event' AND source='GameBoyAdvance'" in helper
+assert "sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT)" in helper
 
 assert "static void *tv_control_server(void *unused)" in shell
 assert "static int tv_control_start(void)" in shell

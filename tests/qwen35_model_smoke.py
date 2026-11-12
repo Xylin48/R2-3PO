@@ -316,21 +316,20 @@ require(
 
 
 require(
-    "shell_gameboy_sync_verified_events" in shell
-    and 'context=virtual' in shell
-    and "r2_log_event_exists" in shell
-    and "r2_log_event_exists" in log_header
-    and "int r2_log_event_exists(" in log,
-    "verified in-game events sync to Life Log with stable idempotency keys",
+    "r2_sync_gameboy_verified_events(device)" in shell
+    and "r2_sync_gameboy_verified_events(console_path)" in core
+    and "gameboy_find_life_event_for_console_event(source, event_id)" in core,
+    "shell and model sync verified in-game events through the same durable path",
 )
+gameboy_sync_start = core.index("static int gameboy_sync_verified_event(")
+gameboy_sync_end = core.index("static int r2_parse_control_positive_id(", gameboy_sync_start)
+gameboy_sync = core[gameboy_sync_start:gameboy_sync_end]
 require(
-    'r2_log_event(R2_LOG_MEDIA, "virtual_game_event"' in shell
-    and "does not change physical Reality" in shell
-    and 'r2_reality_' not in shell[shell.find("static const char *shell_gameboy_json_string"):shell.find("static int shell_gameboy(const char *arg)")],
+    '"context", ""), "virtual"' in gameboy_sync
+    and 'r2_log_event(R2_LOG_MEDIA, "virtual_game_event"' in gameboy_sync
+    and 'r2_reality_' not in gameboy_sync,
     "synced game events remain virtual and never mutate physical Reality",
 )
-
-
 require(
     'if (!reply || !*reply)' in shell
     and "Conversation backend returned no visible answer" in shell

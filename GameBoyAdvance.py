@@ -283,14 +283,18 @@ def connect() -> sqlite3.Connection:
 def record_event(db: sqlite3.Connection, context: str, event_type: str,
                  summary: str, details: str | None = None,
                  game_title: str | None = None, session_id: str | None = None,
-                 evidence_source: str | None = None, verified: bool = False) -> None:
-    db.execute(
+                 evidence_source: str | None = None, verified: bool = False,
+                 *, commit: bool = True) -> None:
+    inserted = db.execute(
         "INSERT INTO console_events(timestamp,context,event_type,summary,details,game_title,session_id,"
         "evidence_source,verified,life_log_synced) VALUES(?,?,?,?,?,?,?,?,?,0)",
         (utc_now(), context, event_type, summary, details, game_title, session_id,
          evidence_source, 1 if verified else 0),
     )
-    db.commit()
+    if inserted.rowcount != 1:
+        raise sqlite3.IntegrityError(f"Console event {event_type} was not recorded.")
+    if commit:
+        db.commit()
 
 
 def record_verified_game_event(db: sqlite3.Connection, event_type: str,
@@ -398,7 +402,8 @@ def reconcile(db: sqlite3.Connection) -> sqlite3.Row:
 
 def read_rom_title(path: Path) -> str:
     try:
-        data = path.read_bytes()[:0x200]
+        with path.open("rb") as rom:
+            data = rom.read(0x200)
         if path.suffix.lower() == ".gba" and len(data) >= 0xAC:
             raw = data[0xA0:0xAC]
         elif path.suffix.lower() in {".gb", ".gbc"} and len(data) >= 0x144:
@@ -592,8 +597,9 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
                      "R2 powered on the Game Boy Advance with no cartridge inserted.")
         return {"ok": True, "message": "Console powered on. The cartridge slot is empty; no emulator was launched.",
                 **status_data(db)}
-    rom = Path(cartridge).resolve()
+    proc = None
     try:
+        rom = Path(cartridge).resolve()
         if rom.parent != CARTRIDGES.resolve() or not rom.is_file():
             raise ValueError("The inserted cartridge file is missing or outside Cartridges.")
         if rom.suffix.lower() not in ROM_EXTENSIONS:
@@ -621,24 +627,42 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
             return {"ok": False, "message": f"mGBA exited immediately with status {proc.returncode}.",
                     **status_data(db)}
         ticks = process_start_ticks(proc.pid)
-        db.execute(
-            "UPDATE console_state SET power_state='on', emulator_pid=?, emulator_start_ticks=?, "
-            "game_started_at=?, session_id=? WHERE id=1",
-            (proc.pid, ticks, utc_now(), session_id),
-        )
-        db.commit()
-        record_event(db, "physical", "console_powered_on",
-                     f"R2 powered on the Game Boy Advance with {title} inserted.",
-                     "The console launched mGBA with only the ROM recorded in the cartridge slot.",
-                     title, session_id)
-        record_event(db, "virtual", "game_session_started",
-                     f"An emulated game session began: {title}.",
-                     "This is an in-game context; it is not a claim that game events are physical-world events.",
-                     title, session_id)
-        return {"ok": True, "message": f"Console powered on; started {title}.",
-                **status_data(db)}
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "message": str(exc), **status_data(db)}
+        if ticks is None:
+            raise ValueError("mGBA started but its process identity could not be verified.")
+        with db:
+            updated = db.execute(
+                "UPDATE console_state SET power_state='on', emulator_pid=?, emulator_start_ticks=?, "
+                "game_started_at=?, session_id=? WHERE id=1 AND power_state='off' "
+                "AND EXISTS (SELECT 1 FROM cartridge.cartridge_slot WHERE id=1 AND rom_path=?)",
+                (proc.pid, ticks, utc_now(), session_id, cartridge),
+            )
+            if updated.rowcount != 1:
+                raise sqlite3.IntegrityError("Console or cartridge changed while mGBA was starting.")
+            record_event(db, "physical", "console_powered_on",
+                         f"R2 powered on the Game Boy Advance with {title} inserted.",
+                         "The console launched mGBA with only the ROM recorded in the cartridge slot.",
+                         title, session_id, commit=False)
+            record_event(db, "virtual", "game_session_started",
+                         f"An emulated game session began: {title}.",
+                         "This is an in-game context; it is not a claim that game events are physical-world events.",
+                         title, session_id, commit=False)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        message = str(exc)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired) as cleanup_error:
+                message = f"{message} Could not confirm mGBA cleanup: {cleanup_error}"
+        return {"ok": False, "message": message, **status_data(db)}
+    state = status_data(db)
+    if not state["game_running"] or state["session_id"] != session_id:
+        return {"ok": False, "message": "mGBA stopped before startup could be confirmed.", **state}
+    return {"ok": True, "message": f"Console powered on; started {title}.", **state}
 
 
 def power_off(db: sqlite3.Connection) -> dict[str, Any]:

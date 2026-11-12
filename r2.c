@@ -7530,40 +7530,48 @@ static char *extract_marker(
    TOOL PROCESSING
    ============================================================ */
 
-/* Game Boy console bridge: argv-based execution, never a shell command. */
-static int run_gameboy_console(const char *subcommand,
-                               const char *arg1,
-                               const char *arg2,
-                               char *output,
-                               size_t output_size)
+static const char *gameboy_console_path(void)
 {
     const char *configured = getenv("R2_GAMEBOY_CONSOLE");
-    const char *path = configured && *configured
-        ? configured
-        : R2_HOME "/Devices/GameBoyAdvance/GameBoyAdvance";
-    int pipes[2];
-    pid_t pid;
-    int status = 0;
-    size_t used = 0;
+    if (!configured || !*configured) configured = getenv("R2_GAMEBOY_EXECUTABLE");
+    return configured && *configured
+        ? configured : R2_ROOT "/Devices/GameBoyAdvance/GameBoyAdvance";
+}
 
-    if (!subcommand || !output || output_size < 2 || pipe(pipes) != 0)
+/* Game Boy console bridge: argv-based execution, never a shell command.
+ * Read the complete response, including lists and pending event batches. */
+static int run_gameboy_console(const char *path, const char *subcommand,
+                               const char *arg1, const char *arg2, char **output)
+{
+    int pipes[2];
+    int status = 0;
+    char *response = NULL;
+    size_t length = 0;
+    *output = NULL;
+    FILE *stream = open_memstream(&response, &length);
+    if (!stream) return -1;
+    if (pipe(pipes) != 0) {
+        fclose(stream);
+        free(response);
         return -1;
-    output[0] = '\0';
-    pid = fork();
+    }
+
+    pid_t pid = fork();
     if (pid < 0) {
         close(pipes[0]);
         close(pipes[1]);
+        fclose(stream);
+        free(response);
         return -1;
     }
     if (pid == 0) {
         char *argv[7];
         int n = 0;
-        int nullfd;
         close(pipes[0]);
         if (dup2(pipes[1], STDOUT_FILENO) < 0)
             _exit(126);
         close(pipes[1]);
-        nullfd = open("/dev/null", O_WRONLY);
+        int nullfd = open("/dev/null", O_WRONLY);
         if (nullfd >= 0) {
             (void)dup2(nullfd, STDERR_FILENO);
             close(nullfd);
@@ -7579,38 +7587,49 @@ static int run_gameboy_console(const char *subcommand,
     }
 
     close(pipes[1]);
+    int failed = 0;
     for (;;) {
-        char buffer[1024];
+        char buffer[4096];
         ssize_t count = read(pipes[0], buffer, sizeof(buffer));
         if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            close(pipes[0]);
-            /* Closing the pipe may cause the child to exit via SIGPIPE; still
-               reap it reliably before returning the I/O failure. */
-            while (waitpid(pid, &status, 0) < 0) {
-                if (errno == EINTR) continue;
-                return -1;
-            }
-            return -1;
-        }
-        if (used + 1 < output_size) {
-            size_t copy = (size_t)count;
-            if (copy > output_size - used - 1)
-                copy = output_size - used - 1;
-            memcpy(output + used, buffer, copy);
-            used += copy;
-            output[used] = '\0';
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 || fwrite(buffer, 1, (size_t)count, stream) != (size_t)count) {
+            failed = 1;
+            break;
         }
     }
     close(pipes[0]);
+    if (fclose(stream) != 0) failed = 1;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno == EINTR) continue;
+        failed = 1;
+        break;
+    }
+    if (failed || !WIFEXITED(status) || !response || memchr(response, '\0', length)) {
+        free(response);
         return -1;
     }
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return -1;
+    *output = response;
+    return WEXITSTATUS(status);
+}
+
+static json_object *gameboy_parse_response(const char *response)
+{
+    if (!response) return NULL;
+    size_t length = strlen(response);
+    if (length > INT_MAX) return NULL;
+    struct json_tokener *tokener = json_tokener_new();
+    if (!tokener) return NULL;
+    json_tokener_set_flags(tokener, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    json_object *result = json_tokener_parse_ex(tokener, response, (int)length);
+    size_t end = json_tokener_get_parse_end(tokener);
+    while (end < length && isspace((unsigned char)response[end])) ++end;
+    if (json_tokener_get_error(tokener) != json_tokener_success || end != length) {
+        if (result) json_object_put(result);
+        result = NULL;
+    }
+    json_tokener_free(tokener);
+    return result;
 }
 
 static int gameboy_json_bool(struct json_object *object, const char *key,
@@ -7633,7 +7652,8 @@ static const char *gameboy_json_string(struct json_object *object,
         !json_object_object_get_ex(object, key, &value) ||
         !json_object_is_type(value, json_type_string))
         return fallback;
-    return json_object_get_string(value);
+    const char *text = json_object_get_string(value);
+    return text && strlen(text) == (size_t)json_object_get_string_len(value) ? text : fallback;
 }
 
 static void gameboy_end_activity_sessions(const char *reason)
@@ -7671,133 +7691,125 @@ static void gameboy_start_activity_sessions(const char *title)
  * process exits between the Life Log write and adapter acknowledgement. Find its
  * existing durable Life Log record so replay can finish reward/ack work without
  * duplicating the historical event. */
-static int64_t gameboy_find_life_event_for_console_event(int64_t console_event_id)
+static int64_t gameboy_find_life_event_for_console_event(const char *source,
+                                                        int64_t console_event_id)
 {
-    if (console_event_id <= 0)
-        return 0;
-
     sqlite3 *log_db = NULL;
     sqlite3_stmt *stmt = NULL;
-    int64_t life_event_id = 0;
+    int64_t life_event_id = -1;
     char pattern[96];
-    snprintf(pattern, sizeof(pattern), "%%console_event_id=%lld;%%",
+    snprintf(pattern, sizeof(pattern), "%%; console_event_id=%lld;%%",
              (long long)console_event_id);
 
     if (sqlite3_open_v2(R2_DIARY_DATABASE, &log_db,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         if (log_db) sqlite3_close(log_db);
-        return 0;
+        return -1;
     }
     sqlite3_busy_timeout(log_db, 3000);
     int lookup_rc = sqlite3_prepare_v2(log_db,
         "SELECT id FROM r2_log_events "
-        "WHERE event_type IN ('gameboy_game_event','virtual_game_event') "
-        "AND details LIKE ? ORDER BY id LIMIT 1",
+        "WHERE (event_type='virtual_game_event' AND source=?) OR "
+        "(event_type='gameboy_game_event' AND source='GameBoyAdvance' "
+        "AND details LIKE ?) ORDER BY id LIMIT 1",
         -1, &stmt, NULL);
     if (lookup_rc == SQLITE_OK)
-        lookup_rc = sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
+        lookup_rc = sqlite3_bind_text(stmt, 1, source, -1, SQLITE_TRANSIENT);
+    if (lookup_rc == SQLITE_OK)
+        lookup_rc = sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT);
     if (lookup_rc == SQLITE_OK) {
         lookup_rc = sqlite3_step(stmt);
         if (lookup_rc == SQLITE_ROW)
             life_event_id = sqlite3_column_int64(stmt, 0);
+        else if (lookup_rc == SQLITE_DONE)
+            life_event_id = 0;
     }
-    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_finalize(stmt);
     sqlite3_close(log_db);
     return life_event_id;
 }
 
-/* Pull only adapter-verified virtual events into the authoritative Life Log.
- * Each console event is acknowledged only after the Life Log insert succeeds. */
-static int sync_gameboy_verified_events(void)
+static int gameboy_sync_verified_event(const char *path, json_object *item)
 {
-    char output[8192] = {0};
-    int rc = run_gameboy_console("events", NULL, NULL, output, sizeof(output));
-    if (rc != 0 || !output[0])
-        return 0;
-    struct json_object *events = json_tokener_parse(output);
-    if (!events || !json_object_is_type(events, json_type_array)) {
-        if (events) json_object_put(events);
-        return 0;
+    struct json_object *id_object = NULL;
+    if (!json_object_is_type(item, json_type_object) ||
+        !json_object_object_get_ex(item, "event_id", &id_object) ||
+        !json_object_is_type(id_object, json_type_int) ||
+        !gameboy_json_bool(item, "verified", 0) ||
+        strcmp(gameboy_json_string(item, "context", ""), "virtual") != 0)
+        return -1;
+
+    int64_t event_id = json_object_get_int64(id_object);
+    const char *event_type = gameboy_json_string(item, "event_type", "");
+    const char *summary = gameboy_json_string(item, "summary", "");
+    const char *title = gameboy_json_string(item, "game_title", "unknown game");
+    const char *evidence = gameboy_json_string(item, "evidence_source", "");
+    if (event_id <= 0 || !*event_type || !*summary || strncmp(evidence, "adapter:", 8) != 0)
+        return -1;
+
+    char source[96];
+    snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)event_id);
+    int64_t life_event_id = gameboy_find_life_event_for_console_event(source, event_id);
+    if (life_event_id == 0) {
+        const char *details = json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN);
+        if (!details) return -1;
+        life_event_id = r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary, details, source);
+        if (life_event_id > 0)
+            life_event_id = gameboy_find_life_event_for_console_event(source, event_id);
     }
+    if (life_event_id <= 0) return -1;
 
-    int synced = 0;
-    size_t count = json_object_array_length(events);
-    for (size_t i = 0; i < count; ++i) {
-        struct json_object *item = json_object_array_get_idx(events, i);
-        struct json_object *id_object = NULL;
-        if (!item || !json_object_is_type(item, json_type_object) ||
-            !json_object_object_get_ex(item, "event_id", &id_object))
-            continue;
-        int64_t event_id = json_object_get_int64(id_object);
-        const char *event_type = gameboy_json_string(item, "event_type", "unknown");
-        const char *summary_text = gameboy_json_string(item, "summary", "Verified game event.");
-        const char *details_text = gameboy_json_string(item, "details", "");
-        const char *title = gameboy_json_string(item, "game_title", "unknown game");
-        const char *evidence = gameboy_json_string(item, "evidence_source", "unknown");
-        const char *session = gameboy_json_string(item, "session_id", "unknown");
-        const char *timestamp = gameboy_json_string(item, "timestamp", "unknown");
-        if (event_id <= 0 || !*evidence || strncmp(evidence, "adapter:", 8) != 0)
-            continue;
-
-        char summary[1200];
-        char details[4096];
-        snprintf(summary, sizeof(summary), "%s: %.800s",
-                 title && *title ? title : "Game Boy game",
-                 summary_text ? summary_text : "Verified game event.");
-        snprintf(details, sizeof(details),
-                 "context=virtual; event_type=%s; game_title=%s; "
-                 "evidence_source=%s; console_event_id=%lld; session_id=%s; "
-                 "observed_at=%s; adapter_details=%.2200s",
-                 event_type, title, evidence, (long long)event_id,
-                 session, timestamp, details_text ? details_text : "");
-        /* Adapter events are at-least-once until acknowledged. Reuse the
-           durable Life Log event on replay instead of duplicating history. */
-        int64_t life_event_id =
-            gameboy_find_life_event_for_console_event(event_id);
-        if (life_event_id <= 0) {
-            char source[96];
-            snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld",
-                     (long long)event_id);
-            life_event_id = r2_log_event(
-                R2_LOG_MEDIA, "virtual_game_event", summary, details, source);
-        }
-        if (life_event_id <= 0)
-            continue;
-
-        /* Reinforce only adapter-verified state changes. The source key includes
-           the stable adapter event ID, so a crash or failed acknowledgement
-           cannot award the same event twice while the target remains per-game. */
-        char reward_target[300];
-        char reward_source[96];
-        snprintf(reward_target, sizeof(reward_target), "game:%.240s",
-                 title && *title ? title : "unknown");
-        snprintf(reward_source, sizeof(reward_source), "game_event:%lld",
-                 (long long)event_id);
-        int reward_points = (!strcmp(event_type, "life_lost") ||
-                             !strcmp(event_type, "damage_taken")) ? -1 :
-                            (!strcmp(event_type, "game_completed") ||
-                             !strcmp(event_type, "level_completed")) ? 3 : 1;
-        int reward_rc = r2_reward_apply_once(
-            reward_target, reward_source, reward_points,
+    /* Keep the existing per-game reward target and per-event retry identity. */
+    char reward_target[300];
+    char reward_source[96];
+    snprintf(reward_target, sizeof(reward_target), "game:%.240s",
+             *title ? title : "unknown");
+    snprintf(reward_source, sizeof(reward_source), "game_event:%lld", (long long)event_id);
+    int reward_points = (!strcmp(event_type, "life_lost") ||
+                         !strcmp(event_type, "damage_taken")) ? -1 :
+                        (!strcmp(event_type, "game_completed") ||
+                         !strcmp(event_type, "level_completed")) ? 3 : 1;
+    if (r2_reward_apply_once(reward_target, reward_source, reward_points,
             "A separately verified game-state change was recorded by the adapter.",
-            reward_points > 0);
-        if (reward_rc < 0) {
-            /* Leave the adapter event pending so reward persistence can retry. */
-            fprintf(stderr,
-                    "[R2 Game Boy] Could not persist reward for adapter event %lld; leaving it pending.\n",
-                    (long long)event_id);
-            continue;
-        }
+            reward_points > 0) < 0)
+        return -1;
 
-        char event_id_text[32];
-        char ack_output[512] = {0};
-        snprintf(event_id_text, sizeof(event_id_text), "%lld", (long long)event_id);
-        if (run_gameboy_console("ack_event", event_id_text, NULL,
-                                ack_output, sizeof(ack_output)) == 0)
-            synced++;
+    char event_id_text[32];
+    char *ack_output = NULL;
+    snprintf(event_id_text, sizeof(event_id_text), "%lld", (long long)event_id);
+    int rc = run_gameboy_console(path, "ack_event", event_id_text, NULL, &ack_output);
+    json_object *ack = gameboy_parse_response(ack_output);
+    free(ack_output);
+    int acknowledged = rc == 0 && gameboy_json_bool(ack, "ok", 0);
+    if (ack) json_object_put(ack);
+    return acknowledged ? 0 : -1;
+}
+
+/* Both callers use the same Life Log, Reward, and console acknowledgement order.
+ * Serializing delivery prevents the shell and model from racing the same row. */
+int r2_sync_gameboy_verified_events(const char *path)
+{
+    if (!path || !*path) return -1;
+    static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&sync_lock);
+    char *output = NULL;
+    int rc = run_gameboy_console(path, "events", NULL, NULL, &output);
+    json_object *events = rc == 0 ? gameboy_parse_response(output) : NULL;
+    free(output);
+    int synced = 0;
+    int incomplete = !json_object_is_type(events, json_type_array);
+    if (!incomplete) {
+        size_t count = json_object_array_length(events);
+        for (size_t i = 0; i < count; ++i) {
+            if (gameboy_sync_verified_event(path, json_object_array_get_idx(events, i)) == 0)
+                ++synced;
+            else
+                incomplete = 1;
+        }
     }
-    json_object_put(events);
-    return synced;
+    if (events) json_object_put(events);
+    pthread_mutex_unlock(&sync_lock);
+    return incomplete ? -1 : synced;
 }
 
 static int r2_parse_control_positive_id(const char *text, long long *id_out)
@@ -8941,13 +8953,13 @@ static char *process_tools_with_status(
                 arg2 = nf >= 3 ? fields[2] : "120";
             }
 
-            char console_output[8192] = {0};
+            const char *console_path = gameboy_console_path();
+            char *console_output = NULL;
             int command_rc = command
-                ? run_gameboy_console(command, arg1, arg2,
-                                      console_output, sizeof(console_output))
+                ? run_gameboy_console(console_path, command, arg1, arg2, &console_output)
                 : -1;
-            struct json_object *console_json = console_output[0]
-                ? json_tokener_parse(console_output) : NULL;
+            struct json_object *console_json = gameboy_parse_response(console_output);
+            free(console_output);
             int response_is_list = command && !strcmp(command, "list") &&
                 console_json && json_object_is_type(console_json, json_type_array);
             int response_is_status = command && !strcmp(command, "status") &&
@@ -9015,10 +9027,12 @@ static char *process_tools_with_status(
             }
 
             if (command_ok) {
-                int synced_events = sync_gameboy_verified_events();
+                int synced_events = r2_sync_gameboy_verified_events(console_path);
                 if (synced_events > 0)
                     APPEND("GAME BOY: synchronized %d verified in-game event(s) with the Life Log.\n",
                            synced_events);
+                else if (synced_events < 0)
+                    APPEND("GAME BOY: verified event synchronization is incomplete.\n");
             }
 
             if (command_ok && command &&

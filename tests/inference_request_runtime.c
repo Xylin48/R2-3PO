@@ -463,6 +463,81 @@ static void check_staged_imagination(void)
     db = NULL;
 }
 
+static void check_gameboy_delivery(void)
+{
+    char directory[] = R2_ROOT "/gameboy-delivery-XXXXXX";
+    assert(mkdtemp(directory));
+    char executable[sizeof(directory) + 16];
+    char event_path[sizeof(directory) + 16];
+    char ack_path[sizeof(directory) + 16];
+    snprintf(executable, sizeof(executable), "%s/console", directory);
+    snprintf(event_path, sizeof(event_path), "%s/events.json", directory);
+    snprintf(ack_path, sizeof(ack_path), "%s/ack-attempted", directory);
+
+    FILE *script = fopen(executable, "w");
+    assert(script);
+    assert(fputs("#!/bin/sh\n"
+                 "cd \"$(dirname \"$0\")\" || exit 1\n"
+                 "case \"$2\" in\n"
+                 "events) cat events.json ;;\n"
+                 "ack_event)\n"
+                 "  [ \"$3\" = 350001 ] || exit 1\n"
+                 "  if [ -e ack-attempted ]; then printf '%s\\n' '{\"ok\":true}';\n"
+                 "  else touch ack-attempted; printf '%s\\n' '{\"ok\":false}'; fi ;;\n"
+                 "*) exit 1 ;;\n"
+                 "esac\n", script) >= 0);
+    assert(fclose(script) == 0 && chmod(executable, 0700) == 0);
+
+    char *details = text(70000, 'd', "Complete adapter evidence ");
+    memcpy(details + 70000 - sizeof("VERIFIED-TAIL") + 1, "VERIFIED-TAIL", sizeof("VERIFIED-TAIL"));
+    FILE *events = fopen(event_path, "w");
+    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+                            "\"context\":\"virtual\",\"event_type\":\"life_lost\","
+                            "\"summary\":\"Lost a life\",\"game_title\":\"Fixture game\","
+                            "\"evidence_source\":\"adapter:fixture\",\"details\":\"%s\"}]\n",
+                            details) > 0);
+    assert(fclose(events) == 0);
+
+    assert(r2_reward_init() == 0);
+    sqlite3 *rewards = NULL;
+    assert(sqlite3_open(R2_HOME "/r2_rewards.db", &rewards) == SQLITE_OK);
+    assert(sqlite3_exec(rewards,
+        "CREATE TRIGGER reject_gameboy_reward BEFORE INSERT ON reward_events "
+        "WHEN NEW.source='game_event:350001' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
+    assert(access(ack_path, F_OK) != 0 && errno == ENOENT);
+    assert(sqlite3_exec(rewards, "DROP TRIGGER reject_gameboy_reward", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
+    assert(access(ack_path, F_OK) == 0);
+    assert(r2_sync_gameboy_verified_events(executable) == 1);
+
+    sqlite3_stmt *statement = NULL;
+    assert(sqlite3_prepare_v2(rewards,
+        "SELECT COUNT(*) FROM reward_events WHERE source='game_event:350001'",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1);
+    sqlite3_finalize(statement);
+    sqlite3_close(rewards);
+    r2_reward_shutdown();
+
+    sqlite3 *history = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &history) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(history,
+        "SELECT details FROM r2_log_events WHERE source='GameBoyAdvance.py:event:350001'",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW);
+    json_object *stored = gameboy_parse_response((const char *)sqlite3_column_text(statement, 0));
+    assert(stored && strcmp(gameboy_json_string(stored, "details", ""), details) == 0);
+    json_object_put(stored);
+    assert(sqlite3_step(statement) == SQLITE_DONE);
+    sqlite3_finalize(statement);
+    sqlite3_close(history);
+    free(details);
+    assert(unlink(executable) == 0 && unlink(event_path) == 0 && unlink(ack_path) == 0);
+    assert(rmdir(directory) == 0);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -471,6 +546,7 @@ int main(void)
     check_boundaries();
     check_retry_and_isolated_inputs();
     check_foreground_context_review();
+    check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
     char *query = text(1000, 'u', "ACTUAL CURRENT USER: ");

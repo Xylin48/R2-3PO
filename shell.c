@@ -2219,134 +2219,6 @@ static void shell_gameboy_log_session_end(const ShellGameboyStatus *state,
 }
 
 
-static const char *shell_gameboy_json_string(json_object *object, const char *key)
-{
-    json_object *value = NULL;
-    if (!object || !json_object_object_get_ex(object, key, &value) ||
-        !value || !json_object_is_type(value, json_type_string))
-        return "";
-    const char *text_value = json_object_get_string(value);
-    return text_value ? text_value : "";
-}
-
-static int shell_gameboy_capture_events(char *output, size_t capacity)
-{
-    const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-    const char *device = configured && *configured
-        ? configured : "/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance";
-    int pipefd[2], status = 0;
-    size_t used = 0;
-    pid_t child;
-    if (!output || capacity < 2 || pipe(pipefd) != 0) return 0;
-    output[0] = '\0';
-    int read_failed = 0;
-    child = fork();
-    if (child < 0) {
-        close(pipefd[0]); close(pipefd[1]);
-        return 0;
-    }
-    if (child == 0) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
-        close(pipefd[1]);
-        execl(device, device, "--json", "events", (char *)NULL);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    while (used + 1 < capacity) {
-        ssize_t n = read(pipefd[0], output + used, capacity - used - 1);
-        if (n > 0) used += (size_t)n;
-        else if (n == 0) break;
-        else if (errno != EINTR) {
-            read_failed = 1;
-            break;
-        }
-    }
-    close(pipefd[0]);
-    output[used] = '\0';
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 0;
-    }
-    return !read_failed && WIFEXITED(status) &&
-           WEXITSTATUS(status) == 0 && used > 0;
-}
-
-static int shell_gameboy_ack_event(int64_t event_id)
-{
-    const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-    const char *device = configured && *configured
-        ? configured : "/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance";
-    char id[32];
-    pid_t child;
-    int status = 0;
-    snprintf(id, sizeof(id), "%lld", (long long)event_id);
-    child = fork();
-    if (child < 0) return 0;
-    if (child == 0) {
-        if (!freopen("/dev/null", "w", stdout)) _exit(126);
-        execl(device, device, "--json", "ack_event", id, (char *)NULL);
-        _exit(127);
-    }
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 0;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
-/* Verified game-world events use an outbox in the console DB. Copy them into
-   the Life Log as explicitly virtual events, then acknowledge only after the
-   durable Life Log record exists. A stable source key makes retries idempotent. */
-static void shell_gameboy_sync_verified_events(void)
-{
-    char output[65536];
-    if (!shell_gameboy_capture_events(output, sizeof(output))) return;
-    json_object *root = json_tokener_parse(output);
-    if (!root || !json_object_is_type(root, json_type_array)) {
-        if (root) json_object_put(root);
-        return;
-    }
-    size_t count = json_object_array_length(root);
-    for (size_t i = 0; i < count; ++i) {
-        json_object *item = json_object_array_get_idx(root, i);
-        json_object *id_value = NULL, *verified_value = NULL;
-        if (!item || !json_object_is_type(item, json_type_object) ||
-            !json_object_object_get_ex(item, "event_id", &id_value) ||
-            !json_object_object_get_ex(item, "verified", &verified_value) ||
-            !json_object_get_boolean(verified_value) ||
-            strcmp(shell_gameboy_json_string(item, "context"), "virtual") != 0)
-            continue;
-
-        int64_t id = json_object_get_int64(id_value);
-        const char *event_summary = shell_gameboy_json_string(item, "summary");
-        const char *event_details = shell_gameboy_json_string(item, "details");
-        const char *title = shell_gameboy_json_string(item, "game_title");
-        const char *session = shell_gameboy_json_string(item, "session_id");
-        const char *evidence = shell_gameboy_json_string(item, "evidence_source");
-        char source[256], summary[1800], details[3600];
-        if (id <= 0 || !*event_summary || strncmp(evidence, "adapter:", 8) != 0)
-            continue;
-        snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)id);
-        if (!r2_log_event_exists("virtual_game_event", source)) {
-            snprintf(summary, sizeof(summary),
-                     "While playing %.200s, R2 encountered a virtual game event: %.1000s",
-                     *title ? title : "a game", event_summary);
-            snprintf(details, sizeof(details),
-                     "context=virtual; game_title=%.200s; session_id=%.150s; "
-                     "console_event_id=%lld; evidence_source=%.200s; in_game_details=%.2000s; "
-                     "This event occurred inside the game and does not change physical Reality.",
-                     title, session, (long long)id, evidence, event_details);
-            if (r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary,
-                             details, source) < 0)
-                continue;
-        }
-        if (r2_log_event_exists("virtual_game_event", source))
-            (void)shell_gameboy_ack_event(id);
-    }
-    json_object_put(root);
-}
-
 static int shell_gameboy(const char *arg)
 {
     const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
@@ -2411,7 +2283,8 @@ static int shell_gameboy(const char *arg)
     } else {
         /* The event-outbox read may reconcile an exited emulator, so sync it
            before comparing session IDs for Life Log start/end bookkeeping. */
-        shell_gameboy_sync_verified_events();
+        if (r2_sync_gameboy_verified_events(device) < 0)
+            printf("[Game Boy Advance] Verified event synchronization is incomplete.\n");
         if (shell_gameboy_read_status(&after)) {
             /* Compare persistent session IDs, not command names. This also closes
                Life Log activities when status/verify discovers an unexpected exit.

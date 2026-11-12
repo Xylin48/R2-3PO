@@ -53,11 +53,13 @@ def main() -> int:
         cartridges.mkdir(parents=True)
         emulator = Path(temp) / "fake-mgba"
         launch_args = Path(temp) / "mgba-arguments.json"
+        launch_pid = Path(temp) / "mgba-pid"
         emulator.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys, time\n"
             "from pathlib import Path\n"
             "Path(" + repr(str(launch_args)) + ").write_text(json.dumps(sys.argv[1:]))\n"
+            "Path(" + repr(str(launch_pid)) + ").write_text(str(os.getpid()))\n"
             "time.sleep(60)\n",
             encoding="utf-8",
         )
@@ -92,6 +94,26 @@ def main() -> int:
         assert verified["ok"] is True
         assert verified["checks"]["slot_rom_exists"] is True
         assert "TEST MARIO" in verified["message"]
+
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            state_db.execute(
+                "CREATE TRIGGER reject_game_start BEFORE INSERT ON console_events "
+                "WHEN NEW.event_type='game_session_started' BEGIN SELECT RAISE(IGNORE); END"
+            )
+            result = run(root, emulator, "power", "on", expect_ok=False)
+            assert result["power_state"] == "off" and result["emulator_pid"] is None
+            assert "game_session_started was not recorded" in result["message"]
+            assert state_db.execute(
+                "SELECT COUNT(*) FROM console_events WHERE event_type='console_powered_on'"
+            ).fetchone()[0] == 0
+            failed_pid = int(launch_pid.read_text(encoding="utf-8"))
+            try:
+                os.kill(failed_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError("mGBA survived a rejected launch transaction")
+            state_db.execute("DROP TRIGGER reject_game_start")
 
         result = run(root, emulator, "power", "on")
         assert result["power_state"] == "on"
