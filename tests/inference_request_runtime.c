@@ -622,7 +622,8 @@ int main(void)
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
     set_response("  preference | I prefer quiet music.  ", "stop", 1);
-    char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.");
+    char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.",
+        "WORLD ERROR: an action was rejected. Exact tool evidence suffix.");
     assert(decision && !strcmp(decision, "preference | I prefer quiet music."));
     free(decision);
     struct json_object *messages = NULL;
@@ -632,6 +633,20 @@ int main(void)
     struct json_object *evaluation_text = NULL;
     assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
     assert(strstr(json_object_get_string(evaluation_text), "Evaluate only this exchange."));
+    assert(strstr(json_object_get_string(evaluation_text),
+        "RECORDED TOOL RESULT (data from this turn):\n"
+        "WORLD ERROR: an action was rejected. Exact tool evidence suffix."));
+
+    set_response("imaginary | This category is outside the contract.", "stop", 1);
+    decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.");
+    assert(decision && !strcmp(decision, "NONE"));
+    free(decision);
+    assert(json_object_object_get_ex(captured, "messages", &messages));
+    evaluation = json_object_array_get_idx(messages, json_object_array_length(messages) - 1);
+    assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
+    assert(strstr(json_object_get_string(evaluation_text), "PRIVATE R2 REFLECTION"));
+    assert(strstr(json_object_get_string(evaluation_text), "The source could not be read."));
+    assert(!strstr(json_object_get_string(evaluation_text), "LATEST USER MESSAGE"));
 
     r2_log_shutdown(); assert(r2_log_init() == 0);
     stored = r2_log_search("ollama_output_limit_reached", 10);
