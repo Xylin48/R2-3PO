@@ -621,6 +621,21 @@ int main(void)
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
+    set_response("Valid JSON prefix", "stop", 1);
+    char *malformed = NULL;
+    assert(asprintf(&malformed, "%s trailing non-JSON", response_body) >= 0);
+    free(response_body);
+    response_body = malformed;
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    set_response("Malformed completion reason", "stop", 1);
+    struct json_object *bad_reason = json_tokener_parse(response_body);
+    assert(bad_reason);
+    assert(json_object_object_add(bad_reason, "done_reason", json_object_new_int(1)) == 0);
+    free(response_body);
+    response_body = strdup(json_object_to_json_string_ext(bad_reason, JSON_C_TO_STRING_PLAIN));
+    assert(response_body);
+    json_object_put(bad_reason);
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
     set_response("  preference | I prefer quiet music.  ", "stop", 1);
     char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.",
         "WORLD ERROR: an action was rejected. Exact tool evidence suffix.");

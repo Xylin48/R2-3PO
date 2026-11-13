@@ -3538,6 +3538,24 @@ static size_t r2_safe_prompt_prefix_length(const char *content,
 /* Ollama's non-streaming /api/chat contract must represent one complete
    assistant turn. Keep this predicate isolated so malformed-response cases
    can be exercised without a live model server. */
+static json_object *ollama_parse_complete_response(const char *text, size_t length)
+{
+    if (!text || length > INT_MAX || memchr(text, '\0', length)) return NULL;
+    struct json_tokener *parser = json_tokener_new();
+    if (!parser) return NULL;
+    json_tokener_set_flags(parser, JSON_TOKENER_STRICT | JSON_TOKENER_VALIDATE_UTF8);
+    json_object *response = json_tokener_parse_ex(parser, text, (int)length);
+    size_t end = json_tokener_get_parse_end(parser);
+    while (end < length && isspace((unsigned char)text[end])) ++end;
+    if (json_tokener_get_error(parser) != json_tokener_success || end != length ||
+        !json_object_is_type(response, json_type_object)) {
+        json_object_put(response);
+        response = NULL;
+    }
+    json_tokener_free(parser);
+    return response;
+}
+
 static int ollama_response_contract_valid(const char *role, int done)
 {
     return role && strcmp(role, "assistant") == 0 && done == 1;
@@ -4457,13 +4475,13 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
-    struct json_object *resp = json_tokener_parse(b.data);
+    struct json_object *resp = ollama_parse_complete_response(b.data, b.size);
     if (!resp) {
         fprintf(stderr, "[R2 Ollama] response was not valid JSON (%zu bytes).\n", b.size);
         if (r2_log_is_initialized())
             r2_log_event(R2_LOG_ERROR, "ollama_invalid_json",
                          "R2's text-model endpoint returned invalid JSON.",
-                         b.data, MODEL);
+                         "Invalid response rejected before reading any model channel.", MODEL);
         free(b.data);
         json_object_put(root);
         return NULL;
@@ -4487,7 +4505,8 @@ static char *ollama_chat_with_limit(
         if (json_object_object_get_ex(msg, "role", &role_obj) && role_obj &&
             json_object_is_type(role_obj, json_type_string)) {
             const char *role = json_object_get_string(role_obj);
-            if (role) response_role = role;
+            if (role && strlen(role) == (size_t)json_object_get_string_len(role_obj))
+                response_role = role;
         }
         if (json_object_object_get_ex(msg, "thinking", &thinking_obj) &&
             thinking_obj && json_object_is_type(thinking_obj, json_type_string)) {
@@ -4507,17 +4526,23 @@ static char *ollama_chat_with_limit(
                         fprintf(stderr, "[R2 Ollama] Could not archive escaped invalid final-channel evidence.\n");
                     json_object_put(resp); return NULL;
                 }
-                if (*text) result = xstrdup(text);
+                if (*text) result = strdup(text);
             }
         }
     }
     if (json_object_object_get_ex(resp, "done", &done_obj) && done_obj &&
         json_object_is_type(done_obj, json_type_boolean))
         response_done = json_object_get_boolean(done_obj) ? 1 : 0;
-    if (json_object_object_get_ex(resp, "done_reason", &done_reason_obj) &&
-        done_reason_obj) {
-        const char *reason = json_object_get_string(done_reason_obj);
-        if (reason && *reason) done_reason = reason;
+    if (json_object_object_get_ex(resp, "done_reason", &done_reason_obj)) {
+        const char *reason = json_object_is_type(done_reason_obj, json_type_string)
+            ? json_object_get_string(done_reason_obj) : NULL;
+        if (!reason || !*reason ||
+            strlen(reason) != (size_t)json_object_get_string_len(done_reason_obj)) {
+            free(result);
+            json_object_put(resp);
+            return NULL;
+        }
+        done_reason = reason;
     }
 
     struct json_object *metric = NULL;
