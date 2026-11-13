@@ -226,29 +226,29 @@ class OvernightServiceTests(unittest.TestCase):
         end = source.index("\n}", start) + 2
         fixture = r"""
 set -euo pipefail
-SECONDS=0
+fixture_seconds=0
 fixture_invocation=0123456789abcdef0123456789abcdef
 replacement=fedcba9876543210fedcba9876543210
 log() { printf '%s\n' "$*"; }
-sleep() { SECONDS=$((SECONDS + 100)); }
+sleep() { fixture_seconds=$((fixture_seconds + 100)); }
 root_run() {
     case "$1 $2" in
         'systemctl show')
             if [[ "$1 $2 $3 $4 $5 $6" != "systemctl show -p InvocationID --value r2-3po.service" ]]; then
                 exit 2
             fi
-            if [[ "$scenario" == restarted && "$SECONDS" -ge 200 ]]; then
+            if [[ "$scenario" == restarted && "$fixture_seconds" -ge 200 ]]; then
                 printf '%s\n' "$replacement"
             else
                 printf '%s\n' "$fixture_invocation"
             fi
             ;;
         'systemctl is-active')
-            [[ "$scenario" != failed || "$SECONDS" -lt 200 ]]
+            [[ "$scenario" != failed || "$fixture_seconds" -lt 200 ]]
             ;;
         'journalctl -u')
             [[ "$4" == "_SYSTEMD_INVOCATION_ID=$fixture_invocation" ]] || exit 2
-            if [[ "$scenario" == slow && "$SECONDS" -ge 400 ]]; then
+            if [[ "$scenario" == slow && "$fixture_seconds" -ge 400 ]]; then
                 printf '%s\n' "[R2 READY] Core initialized; entering shell."
             fi
             ;;
@@ -264,9 +264,9 @@ root_run() {
         ):
             with self.subTest(scenario=scenario):
                 result = subprocess.run(
-                    ["bash", "-c", source[start:end] + "\n" + fixture
+                    ["bash", "-c", source[start:end].replace("SECONDS", "fixture_seconds") + "\n" + fixture
                      + '\nscenario="$1"\nrc=0\nwait_for_core_ready || rc=$?'
-                     + '\nprintf "%s %s\n" "$rc" "$SECONDS"\n', "_", scenario],
+                     + '\nprintf "%s %s\n" "$rc" "$fixture_seconds"\n', "_", scenario],
                     capture_output=True, text=True, check=True, timeout=10,
                 )
                 self.assertEqual(result.stdout.splitlines()[-1], f"{status} {elapsed}")
