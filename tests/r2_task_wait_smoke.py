@@ -24,10 +24,11 @@ require("if (got < 0 && errno == EINTR)" in task,
         "transient signal interruptions retry task-output reads")
 require("if (got < 0) {\n            output_read_failed = 1;" in task,
         "real pipe read failures are recorded rather than treated as EOF")
-require("do {\n        waited = waitpid(pid, &status, 0);\n    } while (waited < 0 && errno == EINTR);" in task,
-        "child waits retry EINTR until the process status is actually collected")
-require("!output_read_failed && waited == pid && WIFEXITED(status)" in task,
-        "task success requires a valid wait result and successful output collection")
+require("waited = waitpid(pid, &status, WNOHANG);" in task
+        and "if (waited == pid || (waited < 0 && errno != EINTR)) break;" in task,
+        "child wait retries interruptions and stays cancellable after output closes")
+require("!output_read_failed && !shutdown_terminated_task && waited == pid && WIFEXITED(status)" in task,
+        "task success requires a valid exit, successful output collection and no shutdown cancellation")
 require("while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}" in task,
         "allocation-failure cleanup does not abandon a child on interrupted wait")
 

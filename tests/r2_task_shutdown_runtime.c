@@ -25,7 +25,7 @@ static double elapsed_seconds(struct timespec start, struct timespec end)
            (double)(end.tv_nsec - start.tv_nsec) / 1000000000.0;
 }
 
-int main(void)
+static void check_shutdown(const char *command)
 {
     pthread_t stopper;
     struct timespec start, end;
@@ -34,7 +34,7 @@ int main(void)
     assert(pthread_create(&stopper, NULL, request_shutdown_after_delay, NULL) == 0);
     assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
 
-    execute_task("shutdown", "printf started; sleep 30 & wait");
+    execute_task("shutdown", command);
 
     assert(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
     assert(pthread_join(stopper, NULL) == 0);
@@ -45,7 +45,18 @@ int main(void)
     assert(completed != NULL);
     assert(completed->output != NULL && strstr(completed->output, "started") != NULL);
     assert(completed->return_code == -1);
+    completed_head = NULL;
+    completed_tail = NULL;
     pthread_mutex_unlock(&tasks_lock);
+    free(completed->command);
+    free(completed->output);
+    free(completed);
+}
+
+int main(void)
+{
+    check_shutdown("printf started; sleep 30 & wait");
+    check_shutdown("printf started; exec >/dev/null 2>&1; sleep 30");
 
     puts("R2 active task shutdown cancellation smoke passed.");
     return 0;

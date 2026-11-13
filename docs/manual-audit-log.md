@@ -1522,3 +1522,14 @@ Manually inspect every line in every tracked source file, not merely signatures,
 
 - Read through the core's corrective reply prompt and context selection into associative history selection. The retry snapshot previously omitted the current action result, so a reply corrected for speaker confusion could lose evidence about whether the action worked. Retain the marked tool result and its explanatory request after the exact current user turn. Corrective retry does not run the action again.
 - The native inference fixture passed with a rejected action in the corrective retry and the existing oversized historical-review cases. The isolated headless core started and exited on SIGTERM across two runs using the same temporary databases. That local check excludes the TV socket due to sandbox restrictions. No actual model, device, or overnight host run was performed.
+
+### R2-AUD-2026-11-13-145 — Protect recent conversation roles and evidence ownership
+
+- Read the associative search, recent conversation, and dynamic context assembly paths through line 6475. Recent context now excludes synthetic action request prose, and matching the newest user message ignores an identically worded assistant or tool-result message. The dynamic conversation snapshot uses fallible allocations so its cleanup can return through the existing fallback.
+- Recent context, conversation recovery, and current-turn source checks passed locally. The manual repository pass remains at 118 full files. Core and other partial files require further review.
+
+### R2-AUD-2026-11-13-146 — Keep shutdown cancellable after a Hands task closes its output
+
+- Read core string parsing, Hands planning and subprocess lifecycle, task collection, and marker boundaries through line 7660. A command could close stdout and stderr while it was still running. The worker then unconditionally blocked on its child and no longer watched shutdown. Reap through a polling wait that remains cancellable after pipe EOF. Keep the planner's allocation base when stripping fenced output.
+- The native task fixture now exercises both a silent descendant keeping the pipe open and a silent command closing output before continuing. Both returned promptly on shutdown. The source-pattern task wait check also passed.
+- Hands still retains only the final 20,000 output bytes and currently lacks a durable full-output archive. The Game Boy bridge has separate blocking subprocess waits. These remain open alongside the larger review and target-host acceptance.

@@ -5967,7 +5967,8 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
         if (strcmp(m->role, "user") != 0 && strcmp(m->role, "assistant") != 0)
             continue;
         /* Skip only the newest matching turn, not every repeated identical message. */
-        if (skip_latest_match && strcmp(m->content, exclude_latest) == 0) {
+        if (skip_latest_match && !strcmp(m->role, "user") &&
+            !r2_is_internal_tool_result(m) && strcmp(m->content, exclude_latest) == 0) {
             skip_latest_match = 0;
             continue;
         }
@@ -5976,7 +5977,9 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
         if (r2_is_internal_tool_result(m))
             continue;
         if (strcmp(m->role, "assistant") == 0 &&
-            r2_recent_message_is_tool_payload(m->content))
+            (!strncmp(m->content, "[R2_INTERNAL_TOOL_REQUEST]\n",
+                      sizeof("[R2_INTERNAL_TOOL_REQUEST]\n") - 1) ||
+             r2_recent_message_is_tool_payload(m->content)))
             continue;
         selected[found++] = index;
     }
@@ -6264,12 +6267,12 @@ static char *chat_with_relevant_memories(
     ) {
 
         copy[i].role =
-            xstrdup(
+            strdup(
                 messages.items[i].role
             );
 
         copy[i].content =
-            xstrdup(
+            strdup(
                 messages.items[i].content
             );
 
@@ -6313,6 +6316,7 @@ static char *chat_with_relevant_memories(
             size_t index = i - 1;
 
             if (
+                !r2_is_internal_tool_result(&copy[index]) &&
                 !strcmp(
                     copy[index].role,
                     "user"
@@ -6628,8 +6632,8 @@ static char *plan_hand_request(
         return NULL;
     }
 
-    cmd =
-        strip_code_fence(cmd);
+    char *parsed = strip_code_fence(cmd);
+    if (parsed != cmd) memmove(cmd, parsed, strlen(parsed) + 1);
 
     if (!strcasecmp(cmd, "UNABLE")) {
 
@@ -7016,16 +7020,23 @@ static void execute_task(
 
     int status = 0;
     pid_t waited;
-    do {
-        waited = waitpid(pid, &status, 0);
-    } while (waited < 0 && errno == EINTR);
+    const struct timespec wait_pause = {.tv_nsec = 100000000L};
+    for (;;) {
+        if (shutting_down && !shutdown_terminated_task) {
+            (void)kill(-pid, SIGKILL);
+            shutdown_terminated_task = 1;
+        }
+        waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid || (waited < 0 && errno != EINTR)) break;
+        if (waited == 0) (void)nanosleep(&wait_pause, NULL);
+    }
 
     remove_running(id);
 
     /* A signal may interrupt either pipe reads or waitpid. Do not mistake an
        interrupted/failed wait (whose status may still be zero) for success. */
     c->return_code =
-        !output_read_failed && waited == pid && WIFEXITED(status)
+        !output_read_failed && !shutdown_terminated_task && waited == pid && WIFEXITED(status)
             ? WEXITSTATUS(status)
             : -1;
 
