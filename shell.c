@@ -2425,6 +2425,7 @@ static void shell_alternate(const char *argument)
             fields[count++] = cursor;
             char *separator = strchr(cursor, '|');
             if (!separator) break;
+            if (count == 6) break; /* Leave extra input visible to the arity check. */
             *separator = '\0';
             cursor = separator + 1;
         }

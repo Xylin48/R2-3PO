@@ -315,6 +315,23 @@ int main(void) {
     assert(r2_reality_init()==0);
     assert(bill_count(wallet)==5);
     ctx=money_context(); assert(strstr(ctx,"carried cash=$5.00")); free(ctx);
+    /* Reopen after rollback restored one bill and died before cleanup. */
+    simulate_interrupted_money_swap(wallet);
+    char transaction[1500], marker_path[1600], restored[1600], original[1700];
+    snprintf(transaction, sizeof(transaction), "%s/.r2-money-txn.crash-test", wallet);
+    snprintf(marker_path, sizeof(marker_path), "%s/phase", transaction);
+    snprintf(restored, sizeof(restored), "%s/money", wallet);
+    snprintf(original, sizeof(original), "%s/backup/money", transaction);
+    assert(unlink(restored) == 0);
+    assert(link(original, restored) == 0);
+    FILE *rollback_marker = fopen(marker_path, "w");
+    assert(rollback_marker);
+    assert(fputs("restoring\n", rollback_marker) >= 0);
+    assert(fclose(rollback_marker) == 0);
+    r2_reality_shutdown();
+    assert(r2_reality_init() == 0);
+    assert(bill_count(wallet) == 5);
+    assert(access(transaction, F_OK) != 0);
     simulate_interrupted_transfer(wallet,bank);
     r2_reality_shutdown();
     assert(r2_reality_init()==0);

@@ -1636,6 +1636,22 @@ int main(void)
         NULL, NULL, NULL) != SQLITE_OK)
         fail("could not seed old hunger semantics fixture");
     sqlite3_close(db);
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not open DB for fullness marker failure injection");
+    if (sqlite3_exec(db,
+        "CREATE TRIGGER ignore_hunger_marker BEFORE UPDATE ON r2_reality_meta "
+        "WHEN OLD.key='hunger_fullness_semantics_v2' "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not inject ignored fullness marker");
+    sqlite3_close(db);
+    if (r2_reality_init() == 0)
+        fail("ignored fullness marker must abort startup and roll back conversion");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen DB after fullness conversion rollback");
+    if (sqlite3_exec(db, "DROP TRIGGER ignore_hunger_marker", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not remove ignored fullness marker");
+    sqlite3_close(db);
     if (r2_reality_init() != 0) fail("hunger semantics migration restart failed");
     read_needs(&hunger, &sleepiness, &energy, &satisfaction, &since_meal);
     if (hunger < 79.9 || hunger > 80.1)
