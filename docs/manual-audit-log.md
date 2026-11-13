@@ -1517,3 +1517,8 @@ Manually inspect every line in every tracked source file, not merely signatures,
 
 - Read core request assembly, transport, response validation, and oversized historical context review through the start of the conversation snapshot loader. The text transport accepted a valid JSON prefix even with trailing garbage and converted non-string stop reasons into strings. It now consumes the complete UTF-8 JSON object, validates the exact role and explicit stop-reason types, and rejects malformed bodies before logging any raw model channel. Legacy responses with no stop reason remain supported.
 - The native request fixture passed with malformed trailing data and an invalid stop reason injected through the real transport callback. The prompt stays private in these error paths. Review of the full core source remains in progress.
+
+### R2-AUD-2026-11-13-144 — Keep the current tool outcome in corrective retries
+
+- Read through the core's corrective reply prompt and context selection into associative history selection. The retry snapshot previously omitted the current action result, so a reply corrected for speaker confusion could lose evidence about whether the action worked. Retain the marked tool result and its explanatory request after the exact current user turn. Corrective retry does not run the action again.
+- The native inference fixture passed with a rejected action in the corrective retry and the existing oversized historical-review cases. The isolated headless core started and exited on SIGTERM across two runs using the same temporary databases. That local check excludes the TV socket due to sandbox restrictions. No actual model, device, or overnight host run was performed.

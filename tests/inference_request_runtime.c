@@ -241,6 +241,16 @@ static void check_retry_and_isolated_inputs(void)
     assert(captured_contains(history) && captured_contains(query));
     free(answer);
 
+    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-RETRY-TOOL-RESULT";
+    Message action_turn[] = {
+        turn[0],
+        {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
+        {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
+    };
+    answer = r2_retry_direct_answer(action_turn, 3, query);
+    assert(answer && captured_contains(query) && captured_contains(tool_result));
+    free(answer);
+
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;

@@ -5425,6 +5425,7 @@ static char *r2_retry_direct_answer(Message *messages_copy,
         size_t index = i - 1;
         if (messages_copy[index].role &&
             strcmp(messages_copy[index].role, "user") == 0 &&
+            !r2_is_internal_tool_result(&messages_copy[index]) &&
             messages_copy[index].content &&
             strcmp(messages_copy[index].content, query) == 0) {
             user_index = index;
@@ -5440,7 +5441,7 @@ static char *r2_retry_direct_answer(Message *messages_copy,
             const char *end_marker = "----- END CURRENT USER MESSAGE -----";
             if (!messages_copy[index].role ||
                 strcmp(messages_copy[index].role, "user") != 0 ||
-                !content)
+                r2_is_internal_tool_result(&messages_copy[index]) || !content)
                 continue;
             const char *begin = strstr(content, begin_marker);
             const char *end = begin ? strstr(begin + strlen(begin_marker), end_marker) : NULL;
@@ -5492,7 +5493,17 @@ static char *r2_retry_direct_answer(Message *messages_copy,
     }
     free(recent_context);
 
-    Message compact_messages[5];
+    if (message_count > SIZE_MAX / sizeof(Message) - 2) {
+        free(recent_context_message);
+        free(retry_system_prompt);
+        return NULL;
+    }
+    Message *compact_messages = calloc(message_count + 2, sizeof(*compact_messages));
+    if (!compact_messages) {
+        free(recent_context_message);
+        free(retry_system_prompt);
+        return NULL;
+    }
     size_t compact_count = 0;
     for (size_t i = 0; i < message_count && compact_count < 3; ++i) {
         if (r2_is_retry_context_message(&messages_copy[i]))
@@ -5511,6 +5522,16 @@ static char *r2_retry_direct_answer(Message *messages_copy,
         .pinned = 0
     };
 
+    /* A retry after an action must retain the outcome from this turn.
+       The synthetic request is explanatory text and contains no raw commands. */
+    for (size_t i = user_index + 1; i < message_count; ++i) {
+        if (!r2_is_internal_tool_result(&messages_copy[i])) continue;
+        if (i > user_index + 1 && messages_copy[i - 1].role &&
+            !strcmp(messages_copy[i - 1].role, "assistant"))
+            compact_messages[compact_count++] = messages_copy[i - 1];
+        compact_messages[compact_count++] = messages_copy[i];
+    }
+
     fprintf(stderr,
             "[R2 Conversation] Correcting a nonresponsive turn with a compact current-message retry.\n");
     const char *previous_query = ollama_authoritative_user_query;
@@ -5523,6 +5544,7 @@ static char *r2_retry_direct_answer(Message *messages_copy,
         r2_conversation_timeout_seconds());
     ollama_authoritative_user_query = previous_query;
     ollama_audit_stage = previous_stage;
+    free(compact_messages);
     free(recent_context_message);
     free(retry_system_prompt);
     return retry;
