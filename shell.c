@@ -313,12 +313,24 @@ static void *tv_control_server(void *unused)
 
         size_t reply_len = strlen(reply);
         size_t reply_sent = 0;
-        while (reply_sent < reply_len) {
+        int reply_idle = 0;
+        while (reply_sent < reply_len && !atomic_load(&tv_control_stop)) {
+            struct pollfd output = {.fd = client, .events = POLLOUT};
+            int writable = poll(&output, 1, 250);
+            if (writable < 0 && errno == EINTR) continue;
+            if (writable < 0) break;
+            if (writable == 0) {
+                if (++reply_idle >= 8) break;
+                continue;
+            }
+            if (!(output.revents & POLLOUT)) break;
             ssize_t sent = send(client, reply + reply_sent,
-                                reply_len - reply_sent, MSG_NOSIGNAL);
+                                reply_len - reply_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
             if (sent < 0 && errno == EINTR) continue;
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (sent <= 0) break;
             reply_sent += (size_t)sent;
+            reply_idle = 0;
         }
         free(status);
         close(client);
@@ -357,8 +369,11 @@ static int tv_control_start(void)
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", tv_control_path);
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        chmod(tv_control_path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 4) != 0) {
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (chmod(tv_control_path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 4) != 0) {
         close(fd);
         unlink(tv_control_path);
         return -1;
@@ -2954,6 +2969,7 @@ int r2_shell_run(void)
         shell_watch_stop();
 
     tv_control_stop_server();
+    shell_running = 0;
     if (service_signals_blocked)
         (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
 
