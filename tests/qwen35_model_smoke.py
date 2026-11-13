@@ -393,7 +393,8 @@ tool_pair_start = core.find('const char tool_result_prefix[] = "[R2_INTERNAL_TOO
 tool_pair_end = core.find("reply = chat_with_relevant_memories(message);", tool_pair_start)
 require(
     tool_pair_start >= 0 and tool_pair_end > tool_pair_start
-    and "The result was: %.1200s." in core[tool_pair_start:tool_pair_end]
+    and "Here is the recorded result:\\n%s" in core[tool_pair_start:tool_pair_end]
+    and "reply = tools;" in core[tool_pair_start:tool_pair_end]
     and core.find("free(tools);", tool_pair_start) > core.find("if (pair_rc != 0)", tool_pair_start),
     "if tool-history persistence fails, R2 retains and reports the actual tool result without rerunning the action",
 )
