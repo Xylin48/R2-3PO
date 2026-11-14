@@ -554,6 +554,10 @@ static void verify_location_delivery_replay(void)
     if (r2_reality_transition_location("sample library", 0) == 0)
         fail("injected interruption after Reality commit reported success");
     unsetenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT");
+    /* A direct legacy state setter must not overwrite an unacknowledged
+       named movement in another database before startup can replay it. */
+    if (r2_reality_set_location(1) == 0)
+        fail("legacy location setter bypassed pending named delivery");
     if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
         sqlite3_prepare_v2(reality,
             "SELECT value,(SELECT COUNT(*) FROM r2_location_delivery) "

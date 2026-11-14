@@ -3534,9 +3534,24 @@ int r2_reality_transition_location(const char *location, int home)
 int r2_reality_set_location(int home)
 {
     if (!r2_reality_is_initialized()) return -1;
+    /* Legacy direct callers cannot bypass an outstanding named movement
+       delivery or race the two-store transition coordinator. Reject instead
+       of overwriting the authoritative location while its Life Log is pending. */
+    pthread_mutex_lock(&location_transition_lock);
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(reality_db,
+        "SELECT 1 FROM r2_location_delivery WHERE id=1", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (st && sqlite3_finalize(st) != SQLITE_OK) rc = SQLITE_ERROR;
+    st = NULL;
+    if (rc != SQLITE_DONE) {
+        pthread_mutex_unlock(&reality_lock);
+        pthread_mutex_unlock(&location_transition_lock);
+        return -1;
+    }
+
+    rc = sqlite3_prepare_v2(reality_db,
         "INSERT INTO r2_reality_meta(key,value) VALUES('current_location',?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", -1, &st, NULL);
     if (rc == SQLITE_OK) {
@@ -3545,9 +3560,10 @@ int r2_reality_set_location(int home)
     }
     if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
         rc = SQLITE_CONSTRAINT;
-    if (st) sqlite3_finalize(st);
+    if (st && sqlite3_finalize(st) != SQLITE_OK) rc = SQLITE_ERROR;
     if (rc == SQLITE_DONE) __atomic_store_n(&reality_home_state, home ? 1 : 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&reality_lock);
+    pthread_mutex_unlock(&location_transition_lock);
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
