@@ -125,6 +125,26 @@ def main() -> int:
         listed = run(root, emulator, "list")
         assert {item["filename"] for item in listed} == {"Mario.gba", "Second.gba"}
         assert all(item["location"] == "pockets" for item in listed)
+        # A legacy inventory row may predate the symlink-discovery fix. Keep
+        # its history while refusing to assert current file availability or
+        # record a physical movement of an external linked ROM.
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            state_db.execute(
+                "INSERT INTO cartridge_inventory(filename,title,location,discovered_at,updated_at) "
+                "VALUES(?,?,'pockets',?,?)",
+                ("External.gba", "historical linked cartridge",
+                 "2001-01-01T00:00:00Z", "2001-01-01T00:00:00Z"),
+            )
+        legacy_list = run(root, emulator, "list")
+        linked_entry = next(item for item in legacy_list
+                            if item["filename"] == "External.gba")
+        assert linked_entry["file_available"] is False
+        rejected = run(root, emulator, "move", "External.gba", "shelf", expect_ok=False)
+        assert "linked ROM" in rejected["message"]
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT location,updated_at FROM cartridge_inventory WHERE filename='External.gba'"
+            ).fetchone() == ("pockets", "2001-01-01T00:00:00Z")
         # Reading an unchanged inventory must not overwrite the last-change
         # timestamp. Previously every status/list call silently rewrote it.
         with sqlite3.connect(root / "State" / "console_state.db") as state_db:
