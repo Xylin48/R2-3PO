@@ -111,6 +111,16 @@ def main() -> int:
         rom[0xA0:0xAC] = b"TEST MARIO  "
         (cartridges / "Mario.gba").write_bytes(rom)
         (cartridges / "Second.gba").write_bytes(rom)
+        # Links are not physical loose cartridges, and inventory discovery
+        # must never read a target outside this device's cartridge folder.
+        outside_rom = Path(temp) / "external.gba"
+        outside_rom.write_bytes(rom)
+        (cartridges / "External.gba").symlink_to(outside_rom)
+        (cartridges / "Alias.gba").symlink_to(cartridges / "Mario.gba")
+        untrusted = run(root, emulator, "insert", "External.gba", expect_ok=False)
+        assert "symbolic links" in untrusted["message"]
+        alias = run(root, emulator, "insert", "Alias.gba", expect_ok=False)
+        assert "symbolic links" in alias["message"]
 
         listed = run(root, emulator, "list")
         assert {item["filename"] for item in listed} == {"Mario.gba", "Second.gba"}
