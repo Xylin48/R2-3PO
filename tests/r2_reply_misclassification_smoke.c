@@ -599,9 +599,9 @@ int main(void)
     ok &= check(pinned && too_large, "allocate live-history admission fixtures");
     if (pinned && too_large) {
         memset(pinned, 'P', pinned_length);
-        pinned[pinned_length] = '\\0';
+        pinned[pinned_length] = '\0';
         memset(too_large, 'N', 2048U);
-        too_large[2048U] = '\\0';
+        too_large[2048U] = '\0';
         int pinned_ok = message_add_pinned("system", pinned);
         int old_ok = pinned_ok == 0 && message_add("user", "surviving earlier turn") == 0;
         size_t original_count = messages.count;
