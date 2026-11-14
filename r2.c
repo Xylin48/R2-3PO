@@ -814,13 +814,11 @@ static char *xstrdup(const char *s)
 }
 
 
-static char *read_entire_file(const char *path)
+/* Consume an already opened regular file. Workspace readers acquire and
+ * validate the descriptor from their pinned directory before calling this. */
+static char *read_entire_open_file(FILE *f)
 {
-    FILE *f = fopen(path, "rb");
-
-    if (!f)
-        return NULL;
-
+    if (!f) return NULL;
     struct stat before;
     if (fstat(fileno(f), &before) != 0) {
         int saved = errno;
@@ -858,6 +856,11 @@ static char *read_entire_file(const char *path)
         return NULL;
     }
     return buf;
+}
+
+static char *read_entire_file(const char *path)
+{
+    return read_entire_open_file(fopen(path, "rb"));
 }
 
 
@@ -2351,23 +2354,52 @@ static int safe_path(
    FILE TOOLS
    ============================================================ */
 
+static int workspace_open_write_parent(char *parent);
+
 static char *workspace_read(const char *rel)
 {
-    char p[PATH_MAX];
-
-    if (safe_path(rel, p) != 0) {
+    char path[PATH_MAX];
+    if (safe_path(rel, path) != 0) {
         r2_log_file_event("read", rel ? rel : "(null)", "blocked_or_invalid_path", NULL);
         return NULL;
     }
 
-    struct stat st;
-
-    if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) {
+    char *slash = strrchr(path, '/');
+    if (!slash || !slash[1] || !strcmp(slash + 1, ".") ||
+        !strcmp(slash + 1, "..")) {
         r2_log_file_event("read", rel, "failed_not_regular_or_missing", NULL);
         return NULL;
     }
+    char parent[PATH_MAX];
+    size_t parent_length = (size_t)(slash - path);
+    memcpy(parent, path, parent_length);
+    parent[parent_length] = '\0';
+    const char *name = slash + 1;
 
-    char *content = read_entire_file(p);
+    /* Safe-path validation is not a lock: another process could replace a
+       validated file or directory with an out-of-workspace symlink. Descend
+       with O_NOFOLLOW from the workspace root, then read only the opened
+       regular-file descriptor. Never reopen the validated pathname. */
+    int dir = workspace_open_write_parent(parent);
+    int fd = dir >= 0 ? openat(dir, name, O_RDONLY | O_NOFOLLOW |
+                                           O_NONBLOCK | O_CLOEXEC) : -1;
+    int saved = errno;
+    if (dir >= 0) close(dir);
+    if (fd < 0) {
+        errno = saved;
+        r2_log_file_event("read", rel, "failed_not_regular_or_missing", NULL);
+        return NULL;
+    }
+    FILE *input = fdopen(fd, "rb");
+    if (!input) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        r2_log_file_event("read", rel, "failed", NULL);
+        return NULL;
+    }
+
+    char *content = read_entire_open_file(input);
     r2_log_file_event("read", rel, content ? "success" : "failed",
                       content ? "Workspace file content was read by R2." : "File read returned no content.");
     return content;
