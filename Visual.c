@@ -1169,25 +1169,38 @@ static int visual_managed_archive_path(const char *path, const R2VisionFrame *fr
     return strspn(suffix, "0123456789abcdef") == 16 && !strcmp(suffix + 16, ".jpg");
 }
 
-/* A pending row is evidence only when the complete, locked JPEG agrees. */
-static int visual_verify_pending_image(const char *path, const unsigned char *jpeg, size_t length)
+/* A pending row supplies the missing suffix of a verified interrupted
+ * prefix. A missing file can also indicate cancellation, so only resume an
+ * existing, nonempty prefix. Conflicting files and active claims stay intact. */
+static int visual_restore_pending_image(const char *path, const unsigned char *jpeg, size_t length)
 {
-    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    int flags = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
+    int fd = open(path, O_RDWR | flags);
+    int writable = fd >= 0;
+    if (fd < 0 && (errno == EACCES || errno == EROFS))
+        fd = open(path, O_RDONLY | flags);
     if (fd < 0) return -1;
     struct stat st;
     int valid = flock(fd, LOCK_EX | LOCK_NB) == 0 && fstat(fd, &st) == 0 &&
-        S_ISREG(st.st_mode) && st.st_size == (off_t)length;
-    for (size_t offset = 0; valid && offset < length;) {
+        S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_size > 0 &&
+        (uintmax_t)st.st_size <= length;
+    size_t present = valid ? (size_t)st.st_size : 0;
+    for (size_t offset = 0; valid && offset < present;) {
         unsigned char buffer[8192];
-        size_t chunk = length - offset < sizeof(buffer) ? length - offset : sizeof(buffer);
+        size_t chunk = present - offset < sizeof(buffer) ? present - offset : sizeof(buffer);
         ssize_t read_size = pread(fd, buffer, chunk, (off_t)offset);
         if (read_size < 0 && errno == EINTR) continue;
         valid = read_size > 0 && !memcmp(buffer, jpeg + offset, (size_t)read_size);
         if (valid) offset += (size_t)read_size;
     }
-    if (valid && visual_sync(fd) == 0 && visual_sync_directory(visual_directory) == 0) {
-        if (visual_archive_matches_claim(fd, path)) return fd;
+    if (valid && present < length) {
+        valid = writable && visual_archive_matches_claim(fd, path) &&
+            lseek(fd, (off_t)present, SEEK_SET) == (off_t)present &&
+            write_all(fd, jpeg + present, length - present) == 0;
     }
+    if (valid && visual_sync(fd) == 0 && visual_sync_directory(visual_directory) == 0 &&
+        visual_archive_matches_claim(fd, path))
+        return fd;
     close(fd);
     return -1;
 }
@@ -1234,7 +1247,7 @@ static void visual_retry_pending_archives(void)
         int fd = -1;
         if (valid && blob && length > 0 && (unsigned int)length <= R2_VISION_MAX_IMAGE_BYTES &&
             visual_managed_archive_path(fields[0], &frame))
-            fd = visual_verify_pending_image(fields[0], blob, (size_t)length);
+            fd = visual_restore_pending_image(fields[0], blob, (size_t)length);
         /* Release SQLite's read statement before taking the publication transaction. */
         sqlite3_finalize(st);
         if (fd >= 0) {
