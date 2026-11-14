@@ -22,6 +22,15 @@ ALLOWED_API_BASES = {
 }
 MODEL = "qwen3.5:9b"
 
+def _is_required_model(item: Any) -> bool:
+    """Match the requested Ollama model, not a similarly prefixed tag.
+
+    Names such as qwen3.5:9b-other are different models and must never
+    establish either model availability or GPU placement for qwen3.5:9b.
+    """
+    return isinstance(item, dict) and item.get("name") == MODEL
+
+
 
 def _adaptive_context_tokens() -> int:
     """Mirror r2_ollama_context_tokens() when no explicit context is set."""
@@ -180,11 +189,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         try:
             tags = _read_json(f"{api_base}/api/tags", timeout=min(4, max(1, timeout)))
             models = tags.get("models", [])
-            if any(
-                isinstance(item, dict)
-                and (item.get("name") == MODEL or str(item.get("name", "")).startswith(MODEL + "-"))
-                for item in models
-            ):
+            if isinstance(models, list) and any(_is_required_model(item) for item in models):
                 break
             last_error = RuntimeError(f"required local model {MODEL} is not installed")
         except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
@@ -376,10 +381,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     try:
         ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
         loaded = ps.get("models", [])
-        active = next((item for item in loaded
-                       if isinstance(item, dict)
-                       and (item.get("name") == MODEL
-                            or str(item.get("name", "")).startswith(MODEL + "-"))), None)
+        active = next((item for item in loaded if _is_required_model(item)), None) if isinstance(loaded, list) else None
         if active is None:
             print("GPU verification: model not present in /api/ps; placement remains unverified.")
         else:
