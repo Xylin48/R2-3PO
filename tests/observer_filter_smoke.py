@@ -83,10 +83,10 @@ with tempfile.TemporaryDirectory() as directory:
         cursor, _ = module.reconcile_activity_page(db, writer, cursor, 99, batch_size=2)
     contents = output.read_text(encoding="utf-8")
     for event_id in (1, 3, 4, 99):
-        assert contents.count(f"(event #{event_id})\\n") == 1
+        assert contents.count(f"(event #{event_id})\n") == 1
     assert "PRIVATE" not in contents
-    assert contents.index("(event #1)\\n") < contents.index("(event #3)\\n")
-    assert contents.index("(event #4)\\n") < contents.index("(event #99)\\n")
+    assert contents.index("(event #1)\n") < contents.index("(event #3)\n")
+    assert contents.index("(event #4)\n") < contents.index("(event #99)\n")
 
     # Simulate closing the popup with two more events written to the Life Log.
     db.execute("INSERT INTO r2_log_events VALUES(100,'2026-11-14','world','object_added','While popup closed')")
@@ -97,7 +97,7 @@ with tempfile.TemporaryDirectory() as directory:
         cursor, _ = module.reconcile_activity_page(db, writer, cursor, 101, batch_size=2)
     contents = output.read_text(encoding="utf-8")
     for event_id in (1, 3, 4, 99, 100):
-        assert contents.count(f"(event #{event_id})\\n") == 1
+        assert contents.count(f"(event #{event_id})\n") == 1
     assert "While popup closed" in contents and "PRIVATE DIALOGUE" not in contents
 
     # A crash after a partial line cannot cause the next record to overwrite
