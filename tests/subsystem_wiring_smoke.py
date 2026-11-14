@@ -143,11 +143,11 @@ for bind in (
         raise SystemExit(f"Persistent memory update ignores a SQLite binding result: {bind}")
 
 gameboy_link_start = core.find("static int64_t gameboy_find_life_event_for_console_event(")
-gameboy_link_end = core.find("\n/* Pull only adapter-verified virtual events", gameboy_link_start)
+gameboy_link_end = core.find("\nstatic int gameboy_sync_verified_event(", gameboy_link_start)
 if gameboy_link_start < 0 or gameboy_link_end < 0:
     raise SystemExit("Could not locate Game Boy Life Log deduplication lookup.")
 gameboy_link = core[gameboy_link_start:gameboy_link_end]
-if "lookup_rc = sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
+if "lookup_rc = sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
     raise SystemExit("Game Boy Life Log deduplication ignores the event lookup binding result.")
 
 reward_modifier_start = reward.find("int r2_reward_current_modifier(")

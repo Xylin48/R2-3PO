@@ -63,7 +63,7 @@ if "fullness REAL NOT NULL DEFAULT 100" in new_fridge_schema or "energy REAL NOT
     raise SystemExit("new fridge schema still assigns nutritious defaults to unspecified stock")
 
 legacy_migration_block = reality[
-    reality.find("static int fridge_migrate_schema(void)"):
+    reality.find("static int fridge_migrate_columns(void)"):
     reality.find("static int fridge_init(void)")
 ]
 if '"fullness", "REAL NOT NULL DEFAULT 100"' in legacy_migration_block:

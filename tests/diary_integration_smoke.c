@@ -5,8 +5,12 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +18,174 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Swap a validated file/parent for an outside-workspace symlink exactly
+ * when the diary filesystem tools begin their descriptor-based walk. */
+static int swap_diary_leaf = 0;
+static int swap_diary_parent = 0;
+static int fail_diary_readdir = 0;
+static int fail_diary_fread = 0;
+static int fail_diary_fgets = 0;
+static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
+static void maybe_swap_checked_workspace_open(const char *path, int flags)
+{
+    if (swap_diary_leaf && strcmp(path, "note.txt") == 0 &&
+        (flags & O_NOFOLLOW)) {
+        swap_diary_leaf = 0;
+        assert(unlink(R2_WORKSPACE "/workspace-race/note.txt") == 0);
+        assert(symlink(diary_outside, R2_WORKSPACE "/workspace-race/note.txt") == 0);
+    }
+    if (swap_diary_parent && strcmp(path, "workspace-race") == 0 &&
+        (flags & O_DIRECTORY) && (flags & O_NOFOLLOW)) {
+        swap_diary_parent = 0;
+        assert(rename(R2_WORKSPACE "/workspace-race",
+                      R2_WORKSPACE "/workspace-race-old") == 0);
+        assert(symlink("/tmp", R2_WORKSPACE "/workspace-race") == 0);
+    }
+}
+
+/* Some libc/compiler combinations target openat64 or the fortified
+ * __openat64_2 entry point instead of the unfortified openat symbol. */
+#define DEFINE_OPENAT_WRAPPER(symbol)                                             \
+    int __real_##symbol(int fd, const char *path, int flags, ...);                \
+    int __wrap_##symbol(int fd, const char *path, int flags, ...)                 \
+    {                                                                             \
+        maybe_swap_checked_workspace_open(path, flags);                           \
+        if (flags & O_CREAT) {                                                     \
+            va_list args;                                                         \
+            va_start(args, flags);                                                \
+            mode_t mode = va_arg(args, mode_t);                                    \
+            va_end(args);                                                         \
+            return __real_##symbol(fd, path, flags, mode);                        \
+        }                                                                         \
+        return __real_##symbol(fd, path, flags);                                  \
+    }
+DEFINE_OPENAT_WRAPPER(openat)
+DEFINE_OPENAT_WRAPPER(openat64)
+#undef DEFINE_OPENAT_WRAPPER
+int __real___openat64_2(int fd, const char *path, int flags);
+int __wrap___openat64_2(int fd, const char *path, int flags)
+{
+    maybe_swap_checked_workspace_open(path, flags);
+    return __real___openat64_2(fd, path, flags);
+}
+int __real___openat_2(int fd, const char *path, int flags);
+int __wrap___openat_2(int fd, const char *path, int flags)
+{
+    maybe_swap_checked_workspace_open(path, flags);
+    return __real___openat_2(fd, path, flags);
+}
+
+/* Inject real stdio/directory read errors, not merely short EOF reads.
+ * Returning a partial report on EIO makes lost data look like no matches. */
+struct dirent *__real_readdir(DIR *directory);
+struct dirent *__wrap_readdir(DIR *directory)
+{
+    if (fail_diary_readdir) {
+        fail_diary_readdir = 0;
+        errno = EIO;
+        return NULL;
+    }
+    return __real_readdir(directory);
+}
+
+size_t __real_fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
+size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+    if (fail_diary_fread) {
+        fail_diary_fread = 0;
+        assert(close(fileno(stream)) == 0);
+    }
+    return __real_fread(ptr, size, nmemb, stream);
+}
+
+char *__real_fgets(char *ptr, int size, FILE *stream);
+char *__wrap_fgets(char *ptr, int size, FILE *stream)
+{
+    if (fail_diary_fgets) {
+        fail_diary_fgets = 0;
+        assert(close(fileno(stream)) == 0);
+    }
+    return __real_fgets(ptr, size, stream);
+}
+
+static void verify_diary_workspace_path_swaps(void)
+{
+    const char *inside = R2_WORKSPACE "/workspace-race/note.txt";
+    FILE *file;
+    assert(mkdir(R2_WORKSPACE "/workspace-race", 0700) == 0);
+    file = fopen(diary_outside, "wb");
+    assert(file && fputs("OUTSIDE_PRIVATE_SENTINEL", file) >= 0 && fclose(file) == 0);
+
+    for (int operation = 0; operation < 3; ++operation) {
+        file = fopen(inside, "wb");
+        assert(file && fputs("inside fixture line\n", file) >= 0 && fclose(file) == 0);
+        size_t bytes_read = 0;
+        long next_offset = -1;
+        if (operation == 0) {
+            char *read = r2_workspace_read("workspace-race/note.txt", &bytes_read);
+            assert(read && strcmp(read, "inside fixture line\n") == 0);
+            free(read);
+        } else if (operation == 1) {
+            char *read = r2_workspace_read_chunk("workspace-race/note.txt", 0, 4096,
+                                                 &bytes_read, &next_offset);
+            assert(read && bytes_read == strlen("inside fixture line\n") &&
+                   next_offset == (long)bytes_read);
+            free(read);
+        } else {
+            char *result = r2_workspace_search("workspace-race/note.txt", "fixture");
+            assert(result && strstr(result, "inside fixture line"));
+            free(result);
+        }
+        swap_diary_leaf = 1;
+        char *outside_read = NULL;
+        if (operation == 0)
+            outside_read = r2_workspace_read("workspace-race/note.txt", NULL);
+        else if (operation == 1)
+            outside_read = r2_workspace_read_chunk("workspace-race/note.txt", 0,
+                                                   4096, NULL, NULL);
+        else
+            outside_read = r2_workspace_search("workspace-race/note.txt", "SENTINEL");
+        if (outside_read || swap_diary_leaf)
+            fprintf(stderr, "Diary race fixture: operation=%d, hook_remaining=%d, result=%s\\n",
+                    operation, swap_diary_leaf, outside_read ? outside_read : "(null)");
+        assert(!outside_read && !swap_diary_leaf);
+        free(outside_read);
+        assert(unlink(inside) == 0);
+    }
+
+    file = fopen(inside, "wb");
+    assert(file && fputs("inside list fixture", file) >= 0 && fclose(file) == 0);
+    char *listed = r2_workspace_list("workspace-race");
+    assert(listed && strstr(listed, "[FILE] note.txt"));
+    free(listed);
+
+    /* File and directory I/O failures must not be interpreted as success. */
+    fail_diary_fread = 1;
+    char *read_error = r2_workspace_read_chunk(
+        "workspace-race/note.txt", 0, 4096, NULL, NULL);
+    assert(!read_error && !fail_diary_fread);
+    free(read_error);
+
+    fail_diary_fgets = 1;
+    read_error = r2_workspace_search("workspace-race/note.txt", "fixture");
+    assert(!read_error && !fail_diary_fgets);
+    free(read_error);
+
+    fail_diary_readdir = 1;
+    listed = r2_workspace_list("workspace-race");
+    assert(!listed && !fail_diary_readdir);
+    free(listed);
+
+    swap_diary_parent = 1;
+    listed = r2_workspace_list("workspace-race");
+    assert(!listed && !swap_diary_parent);
+    free(listed);
+    assert(unlink(R2_WORKSPACE "/workspace-race") == 0);
+    assert(unlink(R2_WORKSPACE "/workspace-race-old/note.txt") == 0);
+    assert(rmdir(R2_WORKSPACE "/workspace-race-old") == 0);
+    assert(unlink(diary_outside) == 0);
+}
 
 static int log_ready = 0;
 
@@ -446,6 +618,61 @@ static void verify_mirror_flush_failure(void)
 
 }
 
+
+static void verify_mirror_symlink_is_not_followed(void)
+{
+    time_t now = time(NULL);
+    struct tm local;
+    char date[32], path[1024], backup[1024];
+    assert(localtime_r(&now, &local));
+    assert(strftime(date, sizeof(date), "%Y-%m-%d", &local));
+    int n = snprintf(path, sizeof(path), "%s/%s.md", R2_DIARY_DIR, date);
+    assert(n > 0 && (size_t)n < sizeof(path));
+    n = snprintf(backup, sizeof(backup), "%s.symlink-fixture-backup", path);
+    assert(n > 0 && (size_t)n < sizeof(backup));
+    int moved = rename(path, backup) == 0;
+    assert(moved || errno == ENOENT);
+
+    const char *outside = "/tmp/r2-diary-mirror-outside-sentinel";
+    const char original[] = "OUTSIDE_FILE_MUST_REMAIN_UNCHANGED";
+    int outside_fd = open(outside, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    assert(outside_fd >= 0);
+    assert(write(outside_fd, original, sizeof(original) - 1) ==
+           (ssize_t)(sizeof(original) - 1));
+    assert(close(outside_fd) == 0);
+    assert(symlink(outside, path) == 0);
+
+    int64_t diary_id = 0;
+    assert(r2_diary_write_with_id("mirror symlink guard fixture", &diary_id) == 0);
+    assert(diary_id > 0);
+    char query[256];
+    n = snprintf(query, sizeof(query),
+                 "SELECT COUNT(*) FROM r2_diary_pending_mirrors WHERE diary_entry_id=%" PRId64,
+                 diary_id);
+    assert(n > 0 && (size_t)n < sizeof(query));
+    assert(scalar_int(query) == 1);
+
+    outside_fd = open(outside, O_RDONLY | O_NOFOLLOW);
+    assert(outside_fd >= 0);
+    char actual[128];
+    ssize_t read_count = read(outside_fd, actual, sizeof(actual));
+    assert(read_count == (ssize_t)(sizeof(original) - 1));
+    assert(memcmp(actual, original, sizeof(original) - 1) == 0);
+    assert(close(outside_fd) == 0);
+
+    assert(unlink(path) == 0);
+    if (moved) assert(rename(backup, path) == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(scalar_int(query) == 0);
+    char relative[128];
+    n = snprintf(relative, sizeof(relative), "R2_Diary/%s.md", date);
+    assert(n > 0 && (size_t)n < sizeof(relative));
+    char *found = r2_workspace_search(relative, "mirror symlink guard fixture");
+    assert(found && strstr(found, "mirror symlink guard fixture"));
+    free(found);
+    assert(unlink(outside) == 0);
+}
+
 int main(void)
 {
     char *context;
@@ -588,9 +815,11 @@ int main(void)
     assert(reward_total() == before_legacy_probe + 1);
     assert(reward_scalar_int("SELECT COUNT(*) FROM pragma_table_info('reward_once_keys') "
                              "WHERE name='created_at';") == 1);
-    assert(reward_scalar_int("SELECT COUNT(*) FROM reward_once_keys "
-                             "WHERE target='legacy-key-target' AND source='legacy-key-source' "
-                             "AND created_at>0;") == 1);
+    assert(reward_scalar_int("SELECT COUNT(*) FROM reward_once_keys k "
+                             "JOIN reward_events e ON e.id=k.reward_event_id "
+                             "WHERE k.target='legacy-key-target' AND k.source='legacy-key-source' "
+                             "AND k.created_at=0 AND e.target=k.target AND e.source=k.source "
+                             "AND e.reason='Legacy idempotency migration probe';") == 1);
 
     /* A legacy backlog larger than the page size must be fully reconnected
        in a single pass. Previously, only the first LIMIT rows were visited. */
@@ -679,6 +908,8 @@ int main(void)
     assert(r2_diary_reconnect_history(1) == 0);
 
     verify_mirror_flush_failure();
+    verify_mirror_symlink_is_not_followed();
+    verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
     return 0;

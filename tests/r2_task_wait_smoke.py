@@ -24,12 +24,15 @@ require("if (got < 0 && errno == EINTR)" in task,
         "transient signal interruptions retry task-output reads")
 require("if (got < 0) {\n            output_read_failed = 1;" in task,
         "real pipe read failures are recorded rather than treated as EOF")
-require("do {\n        waited = waitpid(pid, &status, 0);\n    } while (waited < 0 && errno == EINTR);" in task,
-        "child waits retry EINTR until the process status is actually collected")
-require("!output_read_failed && waited == pid && WIFEXITED(status)" in task,
-        "task success requires a valid wait result and successful output collection")
-require("while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}" in task,
-        "allocation-failure cleanup does not abandon a child on interrupted wait")
+require("waited = waitpid(pid, &status, WNOHANG);" in task
+        and "if (waited == pid || (waited < 0 && errno != EINTR)) break;" in task,
+        "child wait retries interruptions and stays cancellable after output closes")
+require("!output_read_failed && !shutdown_terminated_task && waited == pid && WIFEXITED(status)" in task,
+        "task success requires a valid exit, successful output collection and no shutdown cancellation")
+require("char out[MAX_TASK_OUTPUT + 1];" in task
+        and "fwrite(buf, 1, got_size, archive)" in task
+        and "fsync(archive_fd)" in task,
+        "bounded previews coexist with a complete synced byte archive")
 
 start_background = core.find("static char *start_background_task(")
 end_background = core.find("/* ============================================================\n   COMPLETED TASKS", start_background)
@@ -48,7 +51,7 @@ require('c->command ? c->command : "[command unavailable]"' in core
         and 'c->output ? c->output : "[output unavailable]"' in core,
         "completed-task collection remains safe if diagnostic allocations fail")
 require("output_read_failed = 1;\n            (void)kill(-pid, SIGKILL);" in task,
-        "output-buffer allocation failure terminates the complete task process group")
+        "output capture failure terminates the complete task process group")
 require("if (setpgid(0, 0) != 0)" in task
         and "setpgid(pid, pid)" in task,
         "task commands and descendants share a cancellable process group")
@@ -70,21 +73,16 @@ console_bridge_end = core.find("static int gameboy_json_bool(", console_bridge_s
 if console_bridge_start < 0 or console_bridge_end <= console_bridge_start:
     raise SystemExit("FAIL: could not isolate run_gameboy_console()")
 console_bridge = core[console_bridge_start:console_bridge_end]
-require("while (waitpid(pid, &status, 0) < 0)" in console_bridge
+require("waitpid(pid, &status, WNOHANG)" in console_bridge
+        and "r2_is_shutting_down()" in console_bridge
         and "close(pipes[0]);" in console_bridge
         and "if (errno == EINTR) continue;" in console_bridge,
         "console bridge reaps its child after output errors and retries interrupted waits")
 
-shell = (ROOT / "shell.c").read_text(encoding="utf-8")
-capture_start = shell.find("static int shell_gameboy_capture_events(")
-capture_end = shell.find("static int shell_gameboy_ack_event(", capture_start)
-if capture_start < 0 or capture_end <= capture_start:
-    raise SystemExit("FAIL: could not isolate shell_gameboy_capture_events()")
-capture = shell[capture_start:capture_end]
-require("int read_failed = 0;" in capture
-        and "read_failed = 1;" in capture
-        and "return !read_failed && WIFEXITED(status)" in capture,
-        "shell does not accept partial Game Boy event JSON after a read error")
+require("fwrite(buffer, 1, (size_t)count, stream)" in console_bridge
+        and "if (fclose(stream) != 0) failed = 1;" in console_bridge
+        and "if (failed || !WIFEXITED(status)" in console_bridge,
+        "shared console reader rejects partial output after a read or allocation failure")
 
 completed_start = core.find("static char *collect_completed(void)")
 completed_end = core.find("MARKER EXTRACTION", completed_start)
@@ -93,12 +91,13 @@ if completed_start < 0 or completed_end <= completed_start:
 collect = core[completed_start:completed_end]
 initial_alloc_failure = collect.find("char *out =")
 initial_alloc_failure = collect.find("if (!out)", initial_alloc_failure)
-cleanup = collect.find("CompletedTask *remaining = head", initial_alloc_failure)
-require(initial_alloc_failure >= 0 and cleanup > initial_alloc_failure
-        and "free(remaining->command);" in collect[cleanup:]
-        and "free(remaining->output);" in collect[cleanup:]
-        and "free(remaining);" in collect[cleanup:]
-        and "return NULL;" in collect[cleanup:],
-        "completed task records are freed if the initial collection buffer allocation fails")
+requeue = collect.find("completed_requeue_front(head);", initial_alloc_failure)
+require(initial_alloc_failure >= 0 and requeue > initial_alloc_failure
+        and "return NULL;" in collect[requeue:]
+        and "completed_requeue_front(c);" in collect,
+        "undelivered completions survive initial and later allocation failures for retry")
+require("free(completed_pending_handoff);" in shutdown
+        and "completed_pending_handoff = NULL;" in shutdown,
+        "shutdown frees pending task evidence so it cannot leak into a later runtime")
 
 print("Task/subprocess I/O interruption smoke test passed.")

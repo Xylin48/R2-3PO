@@ -169,7 +169,7 @@ jobs:
 
       - name: Wake a truly blocked asynchronous Pulse read on stop
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_async_capture_cancel_runtime.c -o /tmp/r2-ears-async-cancel-test -lpulse -lpthread -Wl,--wrap=pa_threaded_mainloop_lock -Wl,--wrap=pa_threaded_mainloop_unlock -Wl,--wrap=pa_threaded_mainloop_wait -Wl,--wrap=pa_threaded_mainloop_signal -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_stream_get_state -Wl,--wrap=pa_stream_readable_size -Wl,--wrap=pa_stream_peek -Wl,--wrap=pa_stream_drop
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_async_capture_cancel_runtime.c -o /tmp/r2-ears-async-cancel-test -lpulse -lpthread -Wl,--wrap=pa_threaded_mainloop_lock -Wl,--wrap=pa_threaded_mainloop_unlock -Wl,--wrap=pa_threaded_mainloop_wait -Wl,--wrap=pa_threaded_mainloop_signal -Wl,--wrap=pa_context_get_state -Wl,--wrap=pa_stream_get_state -Wl,--wrap=pa_stream_readable_size -Wl,--wrap=pa_stream_peek -Wl,--wrap=pa_stream_drop -Wl,--wrap=pa_context_rttime_new -Wl,--wrap=pa_threaded_mainloop_get_api
           /tmp/r2-ears-async-cancel-test
 
       - name: Cancel stalled FFmpeg file reads and reap the exact decoder child
@@ -189,7 +189,7 @@ jobs:
 
       - name: Cancel supplementary output handshakes before joining Watch
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_discover_cancelable -Wl,--wrap=r2_audio_discover_selected
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_extra_connect_cancel_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-extra-connect-cancel -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_desktop_source_cancelable -Wl,--wrap=r2_audio_capture_connect -Wl,--wrap=r2_audio_capture_new -Wl,--wrap=r2_audio_capture_cancel -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_audio_capture_read -Wl,--wrap=r2_audio_capture_read_cancelable -Wl,--wrap=r2_audio_discover_cancelable -Wl,--wrap=r2_audio_discover_selected
           /tmp/r2-ears-extra-connect-cancel
 
       - name: Cancel a real libpulse handshake stalled on a silent local server
@@ -240,7 +240,7 @@ jobs:
 
       - name: Check live Watch ownership tokens against external capture takeover
         run: |
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_ears_open_desktop_cancelable
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_watch_ownership_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-watch-ownership -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_open_microphone -Wl,--wrap=r2_ears_open_microphone_source -Wl,--wrap=r2_ears_open_desktop -Wl,--wrap=r2_ears_open_desktop_source -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_ears_read_live_cancelable -Wl,--wrap=r2_ears_close -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_open_source_cancelable -Wl,--wrap=r2_ears_open_desktop_cancelable
           timeout -k 2s 30s /tmp/r2-ears-watch-ownership
 
       - name: Require source-specific raw hearing, deliberate attention, and shutdown
@@ -402,8 +402,16 @@ jobs:
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-reply-misclassification-smoke-test
+
+      - name: Reject workspace read and directory-list symlink swaps after path validation
+        run: |
+          ROOT=/tmp/r2-workspace-read-race
+          rm -rf "$ROOT" /tmp/r2-workspace-read-race-test /tmp/r2-workspace-read-outside-fixture /tmp/r2-workspace-list-outside-fixture
+          FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
+          cc $FLAGS tests/workspace_read_inode_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-workspace-read-race-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=openat
+          /tmp/r2-workspace-read-race-test
 
       - name: Guard against silent conversation failures
         run: python3 tests/silent_turn_regression.py
@@ -468,6 +476,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/reward_legacy_schema_smoke.c -o /tmp/r2-reward-legacy-schema-smoke-test -lsqlite3 -lpthread -lm
           /tmp/r2-reward-legacy-schema-smoke-test
 
+      - name: Exercise durable Reward-to-Addiction replay and exact one-time keys
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/reward_addiction_replay_runtime.c -o /tmp/r2-reward-addiction-replay-test -lsqlite3 -lpthread -lm
+          /tmp/r2-reward-addiction-replay-test
+
       - name: Exercise physical money wallet authority and restart behavior
         run: |
           ROOT=/tmp/r2-wallet-smoke
@@ -476,6 +489,11 @@ jobs:
           cc $FLAGS -Dmain=r2_program_main -c r2.c -o /tmp/r2-wallet-smoke-r2.o
           cc $FLAGS -DR2_MONEY_TEST_FAILURE_INJECTION tests/money_wallet_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-wallet-smoke-r2.o -o /tmp/r2-wallet-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-wallet-smoke-test
+
+      - name: Preserve unique creator money item names across same-second commands
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -ffunction-sections -fdata-sections tests/shell_creator_gift_identity_runtime.c -o /tmp/r2-shell-creator-gifts-test -Wl,--gc-sections -lpthread -lm
+          /tmp/r2-shell-creator-gifts-test
 
       - name: Exercise shared Ollama request-gate serialization
         run: |
@@ -525,7 +543,7 @@ jobs:
             -DR2_WORKSPACE='"/tmp/r2-diary-smoke"' \
             -DR2_DIARY_DATABASE='"/tmp/r2-diary-smoke/R2/r2_memory.db"' \
             -DR2_DIARY_DIR='"/tmp/r2-diary-smoke/R2_Diary"' \
-            tests/diary_integration_smoke.c r2_diary.c Reward.c -lsqlite3 -lpthread \
+            tests/diary_integration_smoke.c r2_diary.c Reward.c -lsqlite3 -lpthread -Wl,--wrap=openat -Wl,--wrap=readdir -Wl,--wrap=fread -Wl,--wrap=fgets -Wl,--wrap=openat64 -Wl,--wrap=__openat64_2 -Wl,--wrap=__openat_2 \
             -o /tmp/r2-diary-integration-smoke
           /tmp/r2-diary-integration-smoke
 
@@ -565,6 +583,11 @@ jobs:
           cc $FLAGS -Dmain=r2_program_main -c r2.c -o /tmp/r2-needs-smoke-r2.o
           cc $FLAGS tests/reality_needs_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-needs-smoke-r2.o -o /tmp/r2-needs-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-needs-smoke-test
+
+      - name: Preserve complete dream context without silent fixed-size clipping
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/dream_context_integrity_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-dream-context-integrity-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-dream-context-integrity-test
 
       - name: Check fridge context against real inventory semantics
         run: python3 tests/fridge_context_smoke.py
@@ -626,6 +649,7 @@ jobs:
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS -DR2_TEST_STARTUP_FAILURE_INJECTION -Dmain=r2_program_main -c r2.c -o /tmp/r2-startup-unwind-r2.o
           cc $FLAGS tests/startup_failure_unwind_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-startup-unwind-r2.o -o /tmp/r2-startup-unwind-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-startup-unwind-test locked
           /tmp/r2-startup-unwind-test hands
           rm -rf "$ROOT"
           /tmp/r2-startup-unwind-test diary

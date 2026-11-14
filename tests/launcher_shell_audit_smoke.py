@@ -61,6 +61,8 @@ if model_match:
 
 require('R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}"' in launcher,
         "launcher passes the configured long-running inference timeout")
+require('R2_OLLAMA_TRACE_PROMPTS="${R2_OLLAMA_TRACE_PROMPTS:-}"' in launcher,
+        "launcher forwards the opt-in prompt trace setting to the dedicated account")
 require('R2_FX_DIR="$R2_FX_DIR"' in launcher
         and 'R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"' in launcher,
         "launcher uses the canonical, overridable sound-effects directory")

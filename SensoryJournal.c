@@ -334,7 +334,7 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
 
-    const char *sql_recent =
+    const char *sql_select =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
         "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
@@ -344,24 +344,32 @@ static char *sj_query(const char *query, int limit)
         "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
-        "ORDER BY e.id DESC LIMIT ?;";
-    const char *sql_search =
-        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
-        "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
-        "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
-        "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
-        "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
-        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
-        "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
-        "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
-        "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
+        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id ";
+    const char *search =
+        "WHERE (e.summary LIKE ?1 ESCAPE '!' OR e.details LIKE ?1 ESCAPE '!' "
+        "OR e.event_type LIKE ?1 ESCAPE '!' OR j.journal_kind LIKE ?1 ESCAPE '!' "
+        "OR e.source LIKE ?1 ESCAPE '!'";
+    const char *archive_search =
+        " OR EXISTS (SELECT 1 FROM r2_log_conversations c WHERE c.event_id=e.id "
+        "AND (c.user_text LIKE ?1 ESCAPE '!' OR c.assistant_text LIKE ?1 ESCAPE '!'))";
+    int archive_available = 0;
+    if (query) {
+        int event_id = sj_column_exists("r2_log_conversations", "event_id");
+        int user_text = sj_column_exists("r2_log_conversations", "user_text");
+        int assistant_text = sj_column_exists("r2_log_conversations", "assistant_text");
+        if (event_id < 0 || user_text < 0 || assistant_text < 0) {
+            pthread_mutex_unlock(&sj_lock);
+            return NULL;
+        }
+        archive_available = event_id && user_text && assistant_text;
+    }
+    char *sql = sqlite3_mprintf("%s%s%s%s ORDER BY e.id DESC LIMIT %s;", sql_select,
+        query ? search : "", archive_available ? archive_search : "",
+        query ? ")" : "", query ? "?2" : "?1");
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(sj_db, query ? sql_search : sql_recent, -1, &st, NULL) != SQLITE_OK) {
+    int prepare_rc = sql ? sqlite3_prepare_v2(sj_db, sql, -1, &st, NULL) : SQLITE_NOMEM;
+    sqlite3_free(sql);
+    if (prepare_rc != SQLITE_OK) {
         pthread_mutex_unlock(&sj_lock);
         return NULL;
     }
@@ -385,10 +393,8 @@ static char *sj_query(const char *query, int limit)
         }
         pat[pat_len++] = '%';
         pat[pat_len] = '\0';
-        int bind_rc = SQLITE_OK;
-        for (int i = 1; i <= 5 && bind_rc == SQLITE_OK; ++i)
-            bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 6, limit);
+        int bind_rc = sqlite3_bind_text(st, 1, pat, -1, SQLITE_TRANSIENT);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 2, limit);
         free(pat);
         if (bind_rc != SQLITE_OK) {
             sqlite3_finalize(st);

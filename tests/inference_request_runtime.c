@@ -241,6 +241,16 @@ static void check_retry_and_isolated_inputs(void)
     assert(captured_contains(history) && captured_contains(query));
     free(answer);
 
+    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-RETRY-TOOL-RESULT";
+    Message action_turn[] = {
+        turn[0],
+        {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
+        {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
+    };
+    answer = r2_retry_direct_answer(action_turn, 3, query);
+    assert(answer && captured_contains(query) && captured_contains(tool_result));
+    free(answer);
+
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;
@@ -463,14 +473,149 @@ static void check_staged_imagination(void)
     db = NULL;
 }
 
+static void check_gameboy_delivery(void)
+{
+    char directory[] = R2_ROOT "/gameboy-delivery-XXXXXX";
+    assert(mkdtemp(directory));
+    char executable[sizeof(directory) + 16];
+    char event_path[sizeof(directory) + 16];
+    char ack_path[sizeof(directory) + 16];
+    snprintf(executable, sizeof(executable), "%s/console", directory);
+    snprintf(event_path, sizeof(event_path), "%s/events.json", directory);
+    snprintf(ack_path, sizeof(ack_path), "%s/ack-attempted", directory);
+
+    FILE *script = fopen(executable, "w");
+    assert(script);
+    assert(fputs("#!/bin/sh\n"
+                 "cd \"$(dirname \"$0\")\" || exit 1\n"
+                 "case \"$2\" in\n"
+                 "events) cat events.json ;;\n"
+                 "ack_event)\n"
+                 "  [ \"$3\" = 350001 ] || exit 1\n"
+                 "  if [ -e ack-attempted ]; then printf '%s\\n' '{\"ok\":true}';\n"
+                 "  else touch ack-attempted; printf '%s\\n' '{\"ok\":false}'; fi ;;\n"
+                 "*) exit 1 ;;\n"
+                 "esac\n", script) >= 0);
+    assert(fclose(script) == 0 && chmod(executable, 0700) == 0);
+
+    char *details = text(70000, 'd', "Complete adapter evidence ");
+    memcpy(details + 70000 - sizeof("VERIFIED-TAIL") + 1, "VERIFIED-TAIL", sizeof("VERIFIED-TAIL"));
+    FILE *events = fopen(event_path, "w");
+    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+                            "\"context\":\"virtual\",\"event_type\":\"life_lost\","
+                            "\"summary\":\"Lost a life\",\"game_title\":\"Fixture game\","
+                            "\"evidence_source\":\"adapter:fixture\",\"details\":\"%s\"}]\n",
+                            details) > 0);
+    assert(fclose(events) == 0);
+
+    assert(r2_reward_init() == 0);
+    sqlite3 *rewards = NULL;
+    assert(sqlite3_open(R2_HOME "/r2_rewards.db", &rewards) == SQLITE_OK);
+    assert(sqlite3_exec(rewards,
+        "CREATE TRIGGER reject_gameboy_reward BEFORE INSERT ON reward_events "
+        "WHEN NEW.source='game_event:350001' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
+    assert(access(ack_path, F_OK) != 0 && errno == ENOENT);
+    assert(sqlite3_exec(rewards, "DROP TRIGGER reject_gameboy_reward", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
+    assert(access(ack_path, F_OK) == 0);
+    assert(r2_sync_gameboy_verified_events(executable) == 1);
+
+    sqlite3_stmt *statement = NULL;
+    assert(sqlite3_prepare_v2(rewards,
+        "SELECT COUNT(*) FROM reward_events WHERE source='game_event:350001'",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1);
+    sqlite3_finalize(statement);
+    sqlite3_close(rewards);
+    r2_reward_shutdown();
+
+    sqlite3 *history = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &history) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(history,
+        "SELECT details FROM r2_log_events WHERE source='GameBoyAdvance.py:event:350001'",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW);
+    json_object *stored = gameboy_parse_response((const char *)sqlite3_column_text(statement, 0));
+    assert(stored && strcmp(gameboy_json_string(stored, "details", ""), details) == 0);
+    json_object_put(stored);
+    assert(sqlite3_step(statement) == SQLITE_DONE);
+    sqlite3_finalize(statement);
+    sqlite3_close(history);
+    free(details);
+    assert(unlink(executable) == 0 && unlink(event_path) == 0 && unlink(ack_path) == 0);
+    assert(rmdir(directory) == 0);
+}
+
+static void check_reflection_stop_and_long_visual_query(void)
+{
+    ollama_reflection_worker = 1;
+    atomic_store(&diary_running, 1);
+    assert(!ollama_progress(NULL, 0, 0, 0, 0));
+    assert(!r2_ollama_vision_request_should_abort());
+    assert(!r2_ears_action_cancelled(NULL));
+    atomic_store(&diary_running, 0);
+    assert(ollama_progress(NULL, 0, 0, 0, 0));
+    assert(r2_ollama_vision_request_should_abort());
+    assert(r2_ears_action_cancelled(NULL));
+    ollama_reflection_worker = 0;
+    assert(!ollama_progress(NULL, 0, 0, 0, 0));
+
+    char query[3017];
+    memset(query, 'x', 3000);
+    strcpy(query + 3000, " WHAT DO YOU SEE");
+    assert(query_requests_visual_context(query));
+}
+
+static void check_structured_report_evidence(void)
+{
+    const char *reply = "I feel curious. My project is open. Hypothetically, I could fly.";
+    const char *report =
+        "{\"states\":[{\"description\":\"curiosity\",\"evidence\":\"I feel curious.\"},"
+        "{\"description\":\"anger\",\"evidence\":\"I feel angry.\"},"
+        "{\"description\":\"spoof\",\"evidence\":\"I feel curious.\\u0000extra\"}],"
+        "\"beliefs\":[{\"key\":\"invented\",\"belief\":\"unsupported\",\"evidence\":\"made up\"}],"
+        "\"continuity\":[{\"key\":\"project\",\"title\":\"Project\",\"evidence\":\"My project is open.\"},"
+        "{\"key\":\"invented\",\"title\":\"Unsupported\"}],"
+        "\"hypotheticals\":[{\"scenario\":\"Flight\",\"evidence\":\"Hypothetically, I could fly.\"},"
+        "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    const char *sql =
+        "SELECT (SELECT COUNT(*) FROM r2_log_inner_states),"
+        "(SELECT COUNT(*) FROM r2_log_beliefs WHERE belief_key='invented'),"
+        "(SELECT COUNT(*) FROM r2_log_continuity WHERE item_key IN ('project','invented')),"
+        "(SELECT COUNT(*) FROM r2_log_hypotheticals WHERE scenario IN ('Flight','Unsupported'))";
+    for (int valid = 0; valid <= 1; ++valid) {
+        char *invalid = NULL;
+        if (!valid) assert(asprintf(&invalid, "%s trailing text", report) >= 0);
+        set_response(valid ? report : invalid, "stop", 1);
+        free(invalid);
+        log_structured_self_report(reply, 0);
+        sqlite3_stmt *st = NULL;
+        assert(sqlite3_prepare_v2(fixture, sql, -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_step(st) == SQLITE_ROW);
+        assert(sqlite3_column_int(st, 0) == valid);
+        assert(sqlite3_column_int(st, 1) == 0);
+        assert(sqlite3_column_int(st, 2) == valid);
+        assert(sqlite3_column_int(st, 3) == valid);
+        sqlite3_finalize(st);
+    }
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_log_init() == 0);
+    check_structured_report_evidence();
     check_boundaries();
+    check_reflection_stop_and_long_visual_query();
     check_retry_and_isolated_inputs();
     check_foreground_context_review();
+    check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
     char *query = text(1000, 'u', "ACTUAL CURRENT USER: ");
@@ -545,6 +690,48 @@ int main(void)
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
+    set_response("Valid JSON prefix", "stop", 1);
+    char *malformed = NULL;
+    assert(asprintf(&malformed, "%s trailing non-JSON", response_body) >= 0);
+    free(response_body);
+    response_body = malformed;
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    set_response("Malformed completion reason", "stop", 1);
+    struct json_object *bad_reason = json_tokener_parse(response_body);
+    assert(bad_reason);
+    assert(json_object_object_add(bad_reason, "done_reason", json_object_new_int(1)) == 0);
+    free(response_body);
+    response_body = strdup(json_object_to_json_string_ext(bad_reason, JSON_C_TO_STRING_PLAIN));
+    assert(response_body);
+    json_object_put(bad_reason);
+    assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
+    set_response("  preference | I prefer quiet music.  ", "stop", 1);
+    char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.",
+        "WORLD ERROR: an action was rejected. Exact tool evidence suffix.");
+    assert(decision && !strcmp(decision, "preference | I prefer quiet music."));
+    free(decision);
+    struct json_object *messages = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &messages));
+    struct json_object *evaluation = json_object_array_get_idx(messages,
+        json_object_array_length(messages) - 1);
+    struct json_object *evaluation_text = NULL;
+    assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
+    assert(strstr(json_object_get_string(evaluation_text), "Evaluate only this exchange."));
+    assert(strstr(json_object_get_string(evaluation_text),
+        "RECORDED TOOL RESULT (data from this turn):\n"
+        "WORLD ERROR: an action was rejected. Exact tool evidence suffix."));
+
+    set_response("imaginary | This category is outside the contract.", "stop", 1);
+    decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.");
+    assert(decision && !strcmp(decision, "NONE"));
+    free(decision);
+    assert(json_object_object_get_ex(captured, "messages", &messages));
+    evaluation = json_object_array_get_idx(messages, json_object_array_length(messages) - 1);
+    assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
+    assert(strstr(json_object_get_string(evaluation_text), "PRIVATE R2 REFLECTION"));
+    assert(strstr(json_object_get_string(evaluation_text), "The source could not be read."));
+    assert(!strstr(json_object_get_string(evaluation_text), "LATEST USER MESSAGE"));
+
     r2_log_shutdown(); assert(r2_log_init() == 0);
     stored = r2_log_search("ollama_output_limit_reached", 10);
     assert(stored && strstr(stored, partial)); free(stored);

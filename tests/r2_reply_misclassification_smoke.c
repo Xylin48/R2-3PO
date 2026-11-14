@@ -19,9 +19,66 @@ static int check(int condition, const char *label)
     return 1;
 }
 
+
+#ifdef R2_COMPLETED_FAILURE_TEST
+/* Test the actual completion drain, not a copy of its formatting helper.
+ * Every failure mode must leave the original nodes available for retry. */
+static CompletedTask *new_test_completion(const char *id)
+{
+    CompletedTask *task = calloc(1, sizeof(*task));
+    if (!task) return NULL;
+    snprintf(task->id, sizeof(task->id), "%s", id);
+    task->command = strdup("printf evidence");
+    task->output = strdup(id);
+    if (!task->command || !task->output) abort();
+    return task;
+}
+
+static int test_completed_retry(void)
+{
+    completed_push(new_test_completion("FIRST"));
+    completed_push(new_test_completion("SECOND"));
+    completed_push(new_test_completion("THIRD"));
+
+    completed_fail_initial = 1;
+    char *result = collect_completed();
+    int good = !result && completed_head && !strcmp(completed_head->id, "FIRST");
+    free(result);
+
+    completed_fail_block = 1;
+    result = collect_completed();
+    good = good && result && !*result &&
+           completed_head && !strcmp(completed_head->id, "FIRST");
+    free(result);
+
+    completed_fail_grow_after = 2;
+    result = collect_completed();
+    good = good && result && strstr(result, "Task ID: FIRST") &&
+           !strstr(result, "Task ID: SECOND") &&
+           completed_head && !strcmp(completed_head->id, "SECOND");
+    free(result);
+
+    completed_push(new_test_completion("FOURTH"));
+    result = collect_completed();
+    good = good && result &&
+           strstr(result, "Task ID: SECOND") &&
+           strstr(result, "Task ID: THIRD") &&
+           strstr(result, "Task ID: FOURTH") &&
+           strstr(result, "Task ID: SECOND") < strstr(result, "Task ID: THIRD") &&
+           strstr(result, "Task ID: THIRD") < strstr(result, "Task ID: FOURTH") &&
+           completed_head == NULL && completed_tail == NULL;
+    free(result);
+    return good;
+}
+#endif
+
 int main(void)
 {
     int ok = 1;
+#ifdef R2_COMPLETED_FAILURE_TEST
+    ok &= check(test_completed_retry(),
+        "Hands completion evidence survives three allocation failures in original order");
+#endif
 
     R2SystemContextBudget prompt_first_budget =
         r2_compute_system_context_budget(10000U, 5698U);
@@ -506,6 +563,67 @@ int main(void)
         free(completed->output);
         free(completed);
     }
+
+#ifdef R2_COMPLETED_FAILURE_TEST
+    /* The first handoff deliberately fails after the batch is drained.
+       Later retries must publish the original evidence exactly once. */
+    CompletedTask *retry_task = new_test_completion("RETRY_ME");
+    ok &= check(retry_task != NULL, "allocate durable Hands handoff fixture");
+    if (retry_task) {
+        completed_push(retry_task);
+        size_t before = messages.count;
+        completed_fail_handoff = 1;
+        handle_completed_messages();
+        ok &= check(completed_pending_handoff != NULL &&
+                        strstr(completed_pending_handoff, "Task ID: RETRY_ME") &&
+                        messages.count == before &&
+                        completed_head == NULL,
+                    "failed conversation publication retains exact task evidence");
+        handle_completed_messages();
+        ok &= check(!completed_pending_handoff &&
+                        messages.count == before + 2 &&
+                        strstr(messages.items[before + 1].content, "Task ID: RETRY_ME") &&
+                        messages.items[before + 1].internal_tool_result,
+                    "retry publishes original Hands evidence once as an internal result");
+    }
+#endif
+
+    /* Deliberately exceed the live byte cap while still having one
+       removable conversational message. The failed append must NOT evict
+       that message before discovering pinned context blocks admission. */
+    MessageList previous_messages = messages;
+    messages = (MessageList){0};
+    size_t pinned_length = MAX_LIVE_MESSAGE_BYTES - 1024U;
+    char *pinned = malloc(pinned_length + 1U);
+    char *too_large = malloc(2048U + 1U);
+    ok &= check(pinned && too_large, "allocate live-history admission fixtures");
+    if (pinned && too_large) {
+        memset(pinned, 'P', pinned_length);
+        pinned[pinned_length] = '\0';
+        memset(too_large, 'N', 2048U);
+        too_large[2048U] = '\0';
+        int pinned_ok = message_add_pinned("system", pinned);
+        int old_ok = pinned_ok == 0 && message_add("user", "surviving earlier turn") == 0;
+        size_t original_count = messages.count;
+        Message *original_pointer = messages.items;
+        int append_result = old_ok ? message_add("user", too_large) : 0;
+        ok &= check(old_ok && append_result != 0 &&
+                    messages.count == original_count &&
+                    messages.items == original_pointer &&
+                    messages.items[original_count - 1].content &&
+                    !strcmp(messages.items[original_count - 1].content,
+                            "surviving earlier turn") &&
+                    messages.items[0].pinned,
+                    "failed oversize live-history append does not evict original conversation");
+    }
+    free(pinned);
+    free(too_large);
+    for (size_t i = 0; i < messages.count; ++i) {
+        free(messages.items[i].role);
+        free(messages.items[i].content);
+    }
+    free(messages.items);
+    messages = previous_messages;
 
     for (size_t i = 0; i < messages.count; ++i) {
         free(messages.items[i].role);

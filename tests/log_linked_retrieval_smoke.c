@@ -108,6 +108,51 @@ int main(void)
     free(from_seed);
     free(from_relation);
 
+    char archived_user[6001], archived_reply[6001];
+    memset(archived_user, 'U', sizeof(archived_user) - 1);
+    memset(archived_reply, 'A', sizeof(archived_reply) - 1);
+    memcpy(archived_user + sizeof(archived_user) - sizeof("deep_archive%marker"),
+           "deep_archive%marker", sizeof("deep_archive%marker"));
+    memcpy(archived_reply + sizeof(archived_reply) - sizeof("assistant archive tail"),
+           "assistant archive tail", sizeof("assistant archive tail"));
+    int64_t archived = r2_log_conversation_turn(archived_user, archived_reply);
+    char *current_match = r2_log_search("assistant archive tail", 10);
+    int current_exact = current_match && strstr(current_match, archived_user) &&
+        strstr(current_match, archived_reply) && !strstr(current_match, "Archived conversation [");
+    free(current_match);
+
+    /* Simulate a conversation saved before the event included the full pair. */
+    sqlite3 *preview_db = NULL;
+    sqlite3_stmt *preview = NULL;
+    int preview_ok = sqlite3_open(R2_DIARY_DATABASE, &preview_db) == SQLITE_OK &&
+        sqlite3_prepare_v2(preview_db,
+            "UPDATE r2_log_events SET details='Legacy conversation preview' WHERE id=?",
+            -1, &preview, NULL) == SQLITE_OK &&
+        sqlite3_bind_int64(preview, 1, archived) == SQLITE_OK &&
+        sqlite3_step(preview) == SQLITE_DONE && sqlite3_changes(preview_db) == 1;
+    sqlite3_finalize(preview);
+    sqlite3_close(preview_db);
+
+    int64_t anchor = r2_log_event(R2_LOG_MEMORY, "archive_anchor",
+                                  "deep_archive%marker", "related pointer", "link-smoke");
+    R2LogRecordBatch records = {0};
+    int archive_ok = current_exact && preview_ok && archived > 0 && anchor > archived &&
+        r2_log_link(anchor, archived, "archive_evidence", NULL) == 0 &&
+        r2_log_search_records("deep_archive%marker", 10, &records) == 0 &&
+        records.count == 2 && strstr(records.text, archived_user) &&
+        strstr(records.text, archived_reply);
+    r2_log_release_records(&records);
+    char *literal_miss = r2_log_search("deepXarchive%marker", 10);
+    archive_ok = archive_ok && literal_miss &&
+        strstr(literal_miss, "No Life Log events matched");
+    free(literal_miss);
+    char *reply_match = r2_log_search("assistant archive tail", 10);
+    archive_ok = archive_ok && reply_match &&
+        strstr(reply_match, archived_user) && strstr(reply_match, archived_reply);
+    free(reply_match);
+    if (!archive_ok)
+        fprintf(stderr, "Life Log did not return the complete original archived turn.\n");
+
     /* Legacy rows can contain bytes that the text interface cannot render. */
     sqlite3 *legacy = NULL;
     int exact_ok = sqlite3_open(R2_DIARY_DATABASE, &legacy) == SQLITE_OK &&
@@ -179,7 +224,7 @@ int main(void)
     }
 
     r2_log_shutdown();
-    if (!ok || !memory_update_ok || !edge_ok || !exact_ok) return 1;
+    if (!ok || !memory_update_ok || !edge_ok || !exact_ok || !archive_ok) return 1;
     puts("Life Log linked retrieval and failed memory_saved bookkeeping are handled correctly.");
     return 0;
 }

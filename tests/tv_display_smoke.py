@@ -85,7 +85,7 @@ class TVDisplaySmoke(unittest.TestCase):
 
     def test_server_loops_until_full_control_reply_is_sent(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "shell.c").read_text(encoding="utf-8")
-        self.assertIn("while (reply_sent < reply_len)", source)
+        self.assertIn("while (reply_sent < reply_len && !atomic_load(&tv_control_stop))", source)
         self.assertIn("if (sent < 0 && errno == EINTR) continue", source)
         self.assertIn("MSG_NOSIGNAL", source)
 

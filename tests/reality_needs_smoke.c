@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "Reality.h"
+#include "Log.h"
 
 #include <sqlite3.h>
 #include <math.h>
@@ -539,6 +540,108 @@ static void verify_legacy_shared_reality_migration(void)
     sqlite3_close(db);
 }
 
+
+/* Both crash windows must replay a named move without inventing duplicate
+ * location_changed events or replacing an earlier persistent state. */
+static void verify_location_delivery_replay(void)
+{
+    sqlite3 *reality = NULL, *memory = NULL;
+    sqlite3_stmt *st = NULL;
+    if (r2_log_init() != 0)
+        fail("could not initialize the real Life Log for location recovery");
+    if (setenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT", "1", 1) != 0)
+        fail("could not inject interrupted location write");
+    if (r2_reality_transition_location("sample library", 0) == 0)
+        fail("injected interruption after Reality commit reported success");
+    unsetenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT");
+    /* A direct legacy state setter must not overwrite an unacknowledged
+       named movement in another database before startup can replay it. */
+    if (r2_reality_set_location(1) == 0)
+        fail("legacy location setter bypassed pending named delivery");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT value,(SELECT COUNT(*) FROM r2_location_delivery) "
+            "FROM r2_reality_meta WHERE key='current_location'",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "outside") ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("location crash did not preserve the atomic Reality intent");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(reality); reality = NULL;
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home"))
+        fail("location crash prematurely wrote the Life Log");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+
+    r2_reality_shutdown();
+    if (r2_reality_init() != 0)
+        fail("startup did not replay the interrupted location");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT COUNT(*) FROM r2_location_delivery",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_int(st, 0) != 0)
+        fail("successful named location replay did not clear its intent");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(reality); reality = NULL;
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location,is_home,"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed') "
+            "FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "sample library") ||
+        sqlite3_column_int(st, 1) != 0 ||
+        sqlite3_column_int(st, 2) != 1)
+        fail("replayed away transition did not match Life Log evidence");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+
+    if (setenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT", "1", 1) != 0)
+        fail("could not inject interrupted Life Log acknowledgement");
+    if (r2_reality_transition_location("home", 1) == 0)
+        fail("injected interruption after Life Log commit reported success");
+    unsetenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT");
+    r2_reality_shutdown();
+    if (r2_reality_init() != 0)
+        fail("startup failed to acknowledge an already recorded move");
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location,is_home,"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed'),"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='internal_notification') "
+            "FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
+        sqlite3_column_int(st, 1) != 1 ||
+        sqlite3_column_int(st, 2) != 2 ||
+        sqlite3_column_int(st, 3) != 1)
+        fail("replayed acknowledgement duplicated a movement or Welcome Home");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT value,(SELECT COUNT(*) FROM r2_location_delivery) "
+            "FROM r2_reality_meta WHERE key='current_location'",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
+        sqlite3_column_int(st, 1) != 0)
+        fail("replayed named movement did not reconcile Reality");
+    sqlite3_finalize(st);
+    sqlite3_close(reality);
+    r2_log_shutdown();
+}
+
 int main(void)
 {
     seed_legacy_fridge_schema();
@@ -773,6 +876,24 @@ int main(void)
         r2_fridge_add_item("inventory_crash_move", "Original fridge stack", 3,
                            12.0, 1.0, "old ingredients", "old taste") != 0)
         fail("could not seed interrupted move-to-fridge fixture");
+    sqlite3 *stage_db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &stage_db) != SQLITE_OK ||
+        sqlite3_exec(stage_db,
+            "CREATE TRIGGER ignore_transfer_stage BEFORE INSERT ON r2_inventory_transfer_journal "
+            "BEGIN SELECT RAISE(IGNORE); END;",
+            NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not block transfer journal staging");
+    if (r2_reality_move_item("inventory_crash_move", "fridge") == 0)
+        fail("an ignored transfer journal insert must reject the move");
+    if (sqlite3_exec(stage_db, "DROP TRIGGER ignore_transfer_stage",
+                     NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_close(stage_db) != SQLITE_OK)
+        fail("could not remove transfer journal stage trigger");
+    char *unchanged_stock = r2_fridge_list();
+    if (!unchanged_stock || !strstr(unchanged_stock, "Original fridge stack"))
+        fail("an ignored transfer journal insert must preserve the original stock");
+    free(unchanged_stock);
+
     if (setenv("R2_TEST_INVENTORY_CRASH_AFTER_FRIDGE_ADD", "1", 1) != 0)
         fail("could not enable move-to-fridge crash injection");
     if (r2_reality_move_item("inventory_crash_move", "fridge") == 0)
@@ -830,7 +951,10 @@ int main(void)
 
     /* Simulate a process crash after decrementing fridge stock but before the
        pocket addition. Restart must restore the fridge and keep pockets empty. */
-    if (r2_fridge_add_item("inventory_crash_take", "Original take stock", 2,
+    char transfer_description[6000];
+    memset(transfer_description, 'x', sizeof(transfer_description) - 1);
+    transfer_description[sizeof(transfer_description) - 1] = 0;
+    if (r2_fridge_add_item("inventory_crash_take", transfer_description, 2,
                            12.0, 1.0, "take ingredients", "take taste") != 0)
         fail("could not seed interrupted fridge-take fixture");
     if (setenv("R2_TEST_INVENTORY_CRASH_AFTER_FRIDGE_TAKE", "1", 1) != 0)
@@ -869,14 +993,19 @@ int main(void)
         "SELECT description,quantity FROM r2_fridge_items WHERE name='inventory_crash_take'",
         -1, &transfer_st, NULL) != SQLITE_OK ||
         sqlite3_step(transfer_st) != SQLITE_ROW ||
-        strcmp((const char *)sqlite3_column_text(transfer_st, 0), "Original take stock") != 0 ||
+        strcmp((const char *)sqlite3_column_text(transfer_st, 0), transfer_description) != 0 ||
         sqlite3_column_int(transfer_st, 1) != 2)
         fail("restart did not restore the original fridge stock after interrupted take");
     sqlite3_finalize(transfer_st);
     sqlite3_close(transfer_db);
     if (r2_fridge_take("inventory_crash_take") != 0 ||
-        r2_fridge_take("inventory_crash_take") != 0 ||
-        r2_reality_remove_item("inventory_crash_take") != 0)
+        r2_fridge_take("inventory_crash_take") != 0)
+        fail("could not take recovered fridge stock");
+    char *transferred_pockets = r2_reality_list("pockets");
+    if (!transferred_pockets || !strstr(transferred_pockets, transfer_description))
+        fail("fridge take must preserve the complete stored description in pockets");
+    free(transferred_pockets);
+    if (r2_reality_remove_item("inventory_crash_take") != 0)
         fail("could not clean up recovered fridge-take fixture");
 
     /* A crash after fridge stock is decremented but before the meal transaction
@@ -1618,6 +1747,22 @@ int main(void)
         NULL, NULL, NULL) != SQLITE_OK)
         fail("could not seed old hunger semantics fixture");
     sqlite3_close(db);
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not open DB for fullness marker failure injection");
+    if (sqlite3_exec(db,
+        "CREATE TRIGGER ignore_hunger_marker BEFORE UPDATE ON r2_reality_meta "
+        "WHEN OLD.key='hunger_fullness_semantics_v2' "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not inject ignored fullness marker");
+    sqlite3_close(db);
+    if (r2_reality_init() == 0)
+        fail("ignored fullness marker must abort startup and roll back conversion");
+    if (sqlite3_open(path, &db) != SQLITE_OK)
+        fail("could not reopen DB after fullness conversion rollback");
+    if (sqlite3_exec(db, "DROP TRIGGER ignore_hunger_marker", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not remove ignored fullness marker");
+    sqlite3_close(db);
     if (r2_reality_init() != 0) fail("hunger semantics migration restart failed");
     read_needs(&hunger, &sleepiness, &energy, &satisfaction, &since_meal);
     if (hunger < 79.9 || hunger > 80.1)
@@ -1627,6 +1772,7 @@ int main(void)
     read_needs(&hunger, &sleepiness, &energy, &satisfaction, &since_meal);
     if (hunger < 79.9 || hunger > 80.1)
         fail("hunger semantics migration must not invert state again on later restarts");
+    verify_location_delivery_replay();
     r2_reality_shutdown();
 
     puts("reality needs smoke passed");

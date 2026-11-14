@@ -2726,10 +2726,47 @@ static int log_record_span(R2LogRecordBatch *batch, int64_t id,
     return 0;
 }
 
+/* Retain the original pair for an archive match, including when a related
+ * event has already supplied the record's position in the result. */
+static int append_matching_conversation(sqlite3_stmt *archive, int64_t event_id,
+                                        const char *details, char **out,
+                                        size_t *length, size_t *capacity)
+{
+    if (!archive) return 0;
+    int rc = sqlite3_reset(archive);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(archive, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(archive);
+    if (rc == SQLITE_DONE) return 0;
+    if (rc != SQLITE_ROW) return -1;
+    const char *fields[2];
+    if (log_read_text_fields(archive, 0, 2, fields) != 0 || !fields[0] || !fields[1])
+        return -1;
+    /* Current turns already put the complete pair in event details. Legacy
+       turns may only have a preview, so compare the actual stored bytes. */
+    static const char user_prefix[] = "USER SAID:\n";
+    static const char reply_prefix[] = "\nR2 REPLIED:\n";
+    if (details && strncmp(details, user_prefix, sizeof(user_prefix) - 1) == 0) {
+        const char *user = details + sizeof(user_prefix) - 1;
+        size_t user_length = strlen(fields[0]);
+        if (strncmp(user, fields[0], user_length) == 0) {
+            const char *reply = user + user_length;
+            if (strncmp(reply, reply_prefix, sizeof(reply_prefix) - 1) == 0 &&
+                strcmp(reply + sizeof(reply_prefix) - 1, fields[1]) == 0)
+                return 0;
+        }
+    }
+    return append_text(out, length, capacity,
+        "  Archived conversation [%" PRId64 "] (historical dialogue):\n"
+        "    Original user message: %s\n"
+        "    Original R2 response: %s\n",
+        event_id, fields[0], fields[1]);
+}
+
 static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
 {
     sqlite3_stmt *statement = NULL;
     sqlite3_stmt *link_statement = NULL;
+    sqlite3_stmt *archive = NULL;
     char *output = NULL;
     size_t length = 0;
     size_t capacity = 0;
@@ -2755,10 +2792,12 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     const char *sql_search =
         "SELECT id, utc_time, local_time, category, event_type, summary, "
         "details, source, memory_saved FROM r2_log_events "
-        "WHERE summary LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' "
-        "OR event_type LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' "
-        "OR source LIKE ? ESCAPE '\\' "
-        "ORDER BY id DESC LIMIT ?;";
+        "WHERE summary LIKE ?1 ESCAPE '\\' OR details LIKE ?1 ESCAPE '\\' "
+        "OR event_type LIKE ?1 ESCAPE '\\' OR category LIKE ?1 ESCAPE '\\' "
+        "OR source LIKE ?1 ESCAPE '\\' "
+        "OR EXISTS (SELECT 1 FROM r2_log_conversations c WHERE c.event_id=r2_log_events.id "
+        "AND (c.user_text LIKE ?1 ESCAPE '\\' OR c.assistant_text LIKE ?1 ESCAPE '\\')) "
+        "ORDER BY id DESC LIMIT ?2;";
 
     rc = sqlite3_prepare_v2(
         log_db, query ? sql_search : sql_recent, -1, &statement, NULL
@@ -2798,13 +2837,18 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
         pattern[p++] = '%';
         pattern[p] = '\0';
 
-        for (int i = 1; i <= 5 && rc == SQLITE_OK; ++i)
-            rc = sqlite3_bind_text(statement, i, pattern, -1, SQLITE_TRANSIENT);
-
+        rc = sqlite3_bind_text(statement, 1, pattern, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
         if (rc == SQLITE_OK)
-            rc = sqlite3_bind_int(statement, 6, limit);
+            rc = sqlite3_prepare_v2(log_db,
+                "SELECT user_text,assistant_text FROM r2_log_conversations "
+                "WHERE event_id=?1 AND "
+                "(user_text LIKE ?2 ESCAPE '\\' OR assistant_text LIKE ?2 ESCAPE '\\');",
+                -1, &archive, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(archive, 2, pattern, -1, SQLITE_TRANSIENT);
         free(pattern);
         if (rc != SQLITE_OK) {
+            sqlite3_finalize(archive);
             sqlite3_finalize(statement);
             pthread_mutex_unlock(&log_lock);
             return NULL;
@@ -2830,6 +2874,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
         if (rc != SQLITE_OK) {
             sqlite3_finalize(statement);
             sqlite3_finalize(link_statement);
+            sqlite3_finalize(archive);
             pthread_mutex_unlock(&log_lock);
             return NULL;
         }
@@ -2839,6 +2884,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     if (!output) {
         sqlite3_finalize(statement);
         sqlite3_finalize(link_statement);
+        sqlite3_finalize(archive);
         pthread_mutex_unlock(&log_lock);
         return NULL;
     }
@@ -2884,7 +2930,8 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
             }
         }
 
-        if (append_text(&output, &length, &capacity, "\n") != 0) {
+        if (append_matching_conversation(archive, id, fields[5], &output, &length, &capacity) != 0 ||
+            append_text(&output, &length, &capacity, "\n") != 0) {
             free(output);
             output = NULL;
             break;
@@ -2954,7 +3001,9 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
                     output = NULL;
                     break;
                 }
-                if (append_text(&output, &length, &capacity, "\n") != 0) {
+                if (append_matching_conversation(archive, linked_id, linked_fields[3],
+                                                 &output, &length, &capacity) != 0 ||
+                    append_text(&output, &length, &capacity, "\n") != 0) {
                     free(output);
                     output = NULL;
                     break;
@@ -2987,6 +3036,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     }
     sqlite3_finalize(statement);
     sqlite3_finalize(link_statement);
+    sqlite3_finalize(archive);
     pthread_mutex_unlock(&log_lock);
     return output;
 }

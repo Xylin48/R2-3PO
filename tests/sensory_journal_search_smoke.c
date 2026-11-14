@@ -177,6 +177,25 @@ int main(void)
     assert(found && strstr(found, "No Sensory Journal entries matched."));
     free(found);
 
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db,
+        "CREATE TABLE r2_log_conversations (event_id INTEGER PRIMARY KEY,"
+        "user_text TEXT NOT NULL,assistant_text TEXT NOT NULL);"
+        "INSERT INTO r2_log_conversations SELECT id,"
+        "printf('%.*c',3000,'x') || 'archive_tail%literal',"
+        "'assistant!suffix' FROM r2_log_events WHERE summary='Saw bang!mark';") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+
+    found = r2_sj_search("archive_tail%literal", 20);
+    assert(found && strstr(found, "Saw bang!mark"));
+    free(found);
+    found = r2_sj_search("assistant!suffix", 20);
+    assert(found && strstr(found, "Saw bang!mark"));
+    free(found);
+    found = r2_sj_search("archiveXtail%literal", 20);
+    assert(found && strstr(found, "No Sensory Journal entries matched."));
+    free(found);
+
     /* New diary-writing events must be indexed and linked immediately, not
        only discovered during the next journal initialization. */
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);

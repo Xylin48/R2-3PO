@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Static safety/regression checks for R2's unattended overnight service."""
 from pathlib import Path
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -215,8 +216,60 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("did not reach active state", source)
         self.assertIn('local restore_exec="${R2_ROOT}/r2.restore.${BASHPID}"', source)
         self.assertIn("wait_for_core_ready()", source)
-        self.assertIn('grep -Fq "[R2 READY] Core initialized; entering shell."', source)
+        self.assertIn('grep -Fx "[R2 READY] Core initialized; entering shell."', source)
         self.assertNotIn('grep -Fq "Starting R2 with private clock"', source)
+
+
+    def test_readiness_waits_for_the_current_invocation(self):
+        source = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")
+        start = source.index("wait_for_core_ready() {")
+        end = source.index("\n}", start) + 2
+        fixture = r"""
+set -euo pipefail
+fixture_seconds=0
+fixture_invocation=0123456789abcdef0123456789abcdef
+replacement=fedcba9876543210fedcba9876543210
+log() { printf '%s\n' "$*"; }
+sleep() { fixture_seconds=$((fixture_seconds + 100)); }
+root_run() {
+    case "$1 $2" in
+        'systemctl show')
+            if [[ "$1 $2 $3 $4 $5 $6" != "systemctl show -p InvocationID --value r2-3po.service" ]]; then
+                exit 2
+            fi
+            if [[ "$scenario" == restarted && "$fixture_seconds" -ge 200 ]]; then
+                printf '%s\n' "$replacement"
+            else
+                printf '%s\n' "$fixture_invocation"
+            fi
+            ;;
+        'systemctl is-active')
+            [[ "$scenario" != failed || "$fixture_seconds" -lt 200 ]]
+            ;;
+        'journalctl -u')
+            [[ "$4" == "_SYSTEMD_INVOCATION_ID=$fixture_invocation" ]] || exit 2
+            if [[ "$scenario" == slow && "$fixture_seconds" -ge 400 ]]; then
+                printf '%s\n' "[R2 READY] Core initialized; entering shell."
+            fi
+            ;;
+        *) exit 2 ;;
+    esac
+}
+"""
+        for scenario, status, elapsed in (
+            ("slow", 0, 400),
+            ("failed", 1, 200),
+            ("restarted", 1, 200),
+            ("timeout", 1, 5400),
+        ):
+            with self.subTest(scenario=scenario):
+                result = subprocess.run(
+                    ["bash", "-c", source[start:end].replace("SECONDS", "fixture_seconds") + "\n" + fixture
+                     + '\nscenario="$1"\nrc=0\nwait_for_core_ready || rc=$?'
+                     + '\nprintf "%s %s\n" "$rc" "$fixture_seconds"\n', "_", scenario],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+                self.assertEqual(result.stdout.splitlines()[-1], f"{status} {elapsed}")
 
 
     def test_installer_restores_private_ollama_state_after_early_failure(self):

@@ -461,6 +461,55 @@ static int r2_workspace_path(
     return 0;
 }
 
+/* Revalidate the canonical workspace boundary, then pin every component.
+ * Merely calling realpath() before fopen()/opendir() permits a symlink swap
+ * during the gap and may disclose an outside-workspace file. */
+static int r2_workspace_open_checked(const char *relative, int want_directory)
+{
+    char canonical[R2_MAX_PATH], root[R2_MAX_PATH];
+    if (r2_workspace_path(relative, canonical, sizeof(canonical)) != 0 ||
+        !realpath(R2_WORKSPACE, root))
+        return -1;
+    size_t root_len = strlen(root);
+    if (strncmp(canonical, root, root_len) != 0 ||
+        (canonical[root_len] != '\0' && canonical[root_len] != '/')) {
+        errno = EACCES;
+        return -1;
+    }
+
+    int fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    const char *cursor = canonical + root_len;
+    if (*cursor == '/') ++cursor;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t count = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (!count || count > NAME_MAX) {
+            close(fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        char component[NAME_MAX + 1];
+        memcpy(component, cursor, count);
+        component[count] = '\0';
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+        if (slash || want_directory) flags |= O_DIRECTORY;
+        int child = openat(fd, component, flags);
+        close(fd);
+        if (child < 0) return -1;
+        fd = child;
+        cursor = slash ? slash + 1 : cursor + count;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        (want_directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    return fd;
+}
+
 
 /* ============================================================
  * DATABASE INITIALIZATION
@@ -1191,15 +1240,31 @@ static int mirror_reserve(int64_t id, int fd, off_t *start)
 
 static int mirror_append(int64_t id, const char *path, const char *record, size_t length)
 {
-    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_NONBLOCK | O_CLOEXEC, 0666);
-    if (fd < 0) return -1;
+    /* A diary mirror has a trusted daily basename. Pin the directory first
+     * and never follow a replaced daily file or parent directory symlink. */
+    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory < 0) return -1;
+    const size_t prefix_length = strlen(R2_DIARY_DIR);
+    if (strncmp(path, R2_DIARY_DIR, prefix_length) != 0 ||
+        path[prefix_length] != '/' || !path[prefix_length + 1] ||
+        strchr(path + prefix_length + 1, '/')) {
+        close(directory);
+        errno = EINVAL;
+        return -1;
+    }
+    const char *filename = path + prefix_length + 1;
+    int fd = openat(directory, filename,
+                    O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                    0666);
+    if (fd < 0) {
+        int error = errno;
+        close(directory);
+        errno = error;
+        return -1;
+    }
     int result = -1;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) goto done;
-    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) goto done;
-    int sync_error = fsync(directory) == 0 ? 0 : errno;
-    if (close(directory) != 0 && !sync_error) sync_error = errno;
-    if (sync_error) { errno = sync_error; goto done; }
+    if (fsync(directory) != 0) goto done;
     off_t start;
     int reserved = mirror_reserve(id, fd, &start);
     if (reserved != 0) {
@@ -1221,8 +1286,11 @@ static int mirror_append(int64_t id, const char *path, const char *record, size_
         goto done;
     if (present != length) { errno = ESTALE; goto done; }
     struct stat open_file, named_file;
-    if (fstat(fd, &open_file) != 0 || stat(path, &named_file) != 0) goto done;
-    if (open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
+    if (fstat(fd, &open_file) != 0 ||
+        fstatat(directory, filename, &named_file, AT_SYMLINK_NOFOLLOW) != 0)
+        goto done;
+    if (!S_ISREG(named_file.st_mode) ||
+        open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
         errno = ESTALE;
         goto done;
     }
@@ -1249,6 +1317,7 @@ done:
     {
         int error = errno;
         (void)close(fd);
+        (void)close(directory);
         errno = error;
     }
     return result;
@@ -1729,7 +1798,7 @@ char *r2_workspace_list(
     const char *relative_directory
 )
 {
-    char path[R2_MAX_PATH];
+    int directory_fd;
 
     DIR *directory;
 
@@ -1749,23 +1818,11 @@ char *r2_workspace_list(
         relative_directory = ".";
     }
 
-    if (
-        r2_workspace_path(
-            relative_directory,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    directory = opendir(
-        path
-    );
-
-    if (!directory)
-    {
+    directory_fd = r2_workspace_open_checked(relative_directory, 1);
+    if (directory_fd < 0) return NULL;
+    directory = fdopendir(directory_fd);
+    if (!directory) {
+        close(directory_fd);
         return NULL;
     }
 
@@ -1781,13 +1838,11 @@ char *r2_workspace_list(
 
     result[0] = '\0';
 
-    while (
-        (entry = readdir(directory))
-        != NULL
-    )
-    {
-        char full_path[R2_MAX_PATH];
-
+    for (;;) {
+        /* errno from fstatat() must not masquerade as a readdir() failure. */
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) break;
         struct stat st;
 
         size_t required;
@@ -1801,32 +1856,9 @@ char *r2_workspace_list(
             continue;
         }
 
-        int path_written = snprintf(
-            full_path,
-            sizeof(full_path),
-            "%s/%s",
-            path,
-            entry->d_name
-        );
-
-        if (
-            path_written < 0
-            ||
-            (size_t)path_written >= sizeof(full_path)
-        )
-        {
+        /* Classification is also anchored to the opened directory. */
+        if (fstatat(dirfd(directory), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
             continue;
-        }
-
-        if (
-            stat(
-                full_path,
-                &st
-            ) != 0
-        )
-        {
-            continue;
-        }
 
         required =
             strlen(entry->d_name)
@@ -1911,9 +1943,13 @@ char *r2_workspace_list(
         }
     }
 
-    closedir(
-        directory
-    );
+    int read_error = errno;
+    closedir(directory);
+    if (read_error) {
+        free(result);
+        errno = read_error;
+        return NULL;
+    }
 
     if (length == 0)
     {
@@ -1947,7 +1983,7 @@ char *r2_workspace_read(
     size_t *file_size
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -1964,24 +2000,11 @@ char *r2_workspace_read(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2083,7 +2106,7 @@ char *r2_workspace_read_chunk(
     long *next_offset
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2115,24 +2138,11 @@ char *r2_workspace_read_chunk(
         length = R2_MAX_CHUNK_SIZE;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2165,6 +2175,13 @@ char *r2_workspace_read_chunk(
         file
     );
 
+    /* Report read errors, not a falsely successful shortened file chunk. */
+    if (ferror(file) || actual > (size_t)(LONG_MAX - offset)) {
+        fclose(file);
+        free(buffer);
+        errno = EIO;
+        return NULL;
+    }
     buffer[actual] = '\0';
 
     fclose(file);
@@ -2203,7 +2220,7 @@ char *r2_workspace_search(
     const char *term
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2227,24 +2244,11 @@ char *r2_workspace_search(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "r"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "r");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2333,9 +2337,14 @@ char *r2_workspace_search(
         );
     }
 
-    fclose(
-        file
-    );
+    /* Do not report a partially searched file as a complete result. */
+    if (ferror(file)) {
+        fclose(file);
+        free(result);
+        errno = EIO;
+        return NULL;
+    }
+    fclose(file);
 
     if (length == 0)
     {

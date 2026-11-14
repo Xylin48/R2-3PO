@@ -8,11 +8,11 @@ poll_start = source_text.index("    def poll():")
 poll_end = source_text.index("    def close():", poll_start)
 poll = source_text[poll_start:poll_end]
 assert "if not tree.exists(item_id):" in poll, "retries must not insert duplicate UI rows"
-assert "last_id = event_id" in poll and "if all_rows_persisted:" in poll, (
-    "the Life Log cursor must not skip an event when Activity.txt append fails"
+assert "last_id = 0" in poll and "reconcile_activity_page(" in poll and "last_id = next_cursor" in poll, (
+    "the Activity file replays historical approved rows and only advances after full-page persistence"
 )
-assert "all_rows_persisted = False" in poll and "break" in poll, (
-    "failed Activity.txt writes must be retried before later events advance the cursor"
+assert "except OSError as exc:" in poll and "activity_file_error = True" in poll, (
+    "a failed Activity.txt append leaves its page eligible for retry"
 )
 assert "/home/x/R2_Home/R2_Log/Activity.txt" in source_text
 assert "/home/x/R2_Home/R2_Diary/Activity.txt" not in source_text
@@ -58,3 +58,59 @@ with tempfile.TemporaryDirectory() as directory:
     assert "[2026-10-09 09:16:00] R2 picked up a book. (event #18)" in contents
     assert contents.index("R2 moved to kitchen") < contents.index("R2 picked up a book")
 print("Activity.txt append smoke test passed.")
+
+import sqlite3
+
+# A closed Observer does not imply its existing Life Log events vanish. Replay
+# every permitted event without exposing private entries or rewriting lines.
+with tempfile.TemporaryDirectory() as directory:
+    output = Path(directory) / "R2_Log" / "Activity.txt"
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE r2_log_events "
+               "(id INTEGER PRIMARY KEY,local_time TEXT,category TEXT,event_type TEXT,summary TEXT)")
+    db.executemany("INSERT INTO r2_log_events VALUES(?,?,?,?,?)", [
+        (1, "2026-11-14", "world", "object_added", "First public event"),
+        (2, "2026-11-14", "thinking", "thought", "PRIVATE THOUGHT"),
+        (3, "2026-11-14", "world", "object_moved", "Second public event"),
+        (4, "2026-11-14", "world", "object_added", "Summary quotes (event #99) but is event four"),
+        (5, "2026-11-14", "world", "internal_notification", "PRIVATE NOTIFICATION"),
+        (99, "2026-11-14", "media", "activity_ended", "Independent event ninety-nine"),
+    ])
+    writer = module.ActivityWriter(output)
+    cursor = 0
+    while cursor < 99:
+        cursor, _ = module.reconcile_activity_page(db, writer, cursor, 99, batch_size=2)
+    contents = output.read_text(encoding="utf-8")
+    for event_id in (1, 3, 4, 99):
+        assert contents.count(f"(event #{event_id})\n") == 1
+    assert "PRIVATE" not in contents
+    assert contents.index("(event #1)\n") < contents.index("(event #3)\n")
+    assert contents.index("(event #4)\n") < contents.index("(event #99)\n")
+
+    # Simulate closing the popup with two more events written to the Life Log.
+    db.execute("INSERT INTO r2_log_events VALUES(100,'2026-11-14','world','object_added','While popup closed')")
+    db.execute("INSERT INTO r2_log_events VALUES(101,'2026-11-14','conversation','conversation_turn','PRIVATE DIALOGUE')")
+    writer = module.ActivityWriter(output)
+    cursor = 0
+    while cursor < 101:
+        cursor, _ = module.reconcile_activity_page(db, writer, cursor, 101, batch_size=2)
+    contents = output.read_text(encoding="utf-8")
+    for event_id in (1, 3, 4, 99, 100):
+        assert contents.count(f"(event #{event_id})\n") == 1
+    assert "While popup closed" in contents and "PRIVATE DIALOGUE" not in contents
+
+    # A crash after a partial line cannot cause the next record to overwrite
+    # the torn bytes, misidentify its event ID, or invent a repaired record.
+    with output.open("ab") as stream:
+        stream.write(b"[partial unsynced event ")
+    before = output.read_bytes()
+    try:
+        writer.append("2026-11-14", "must not publish over incomplete history", 102)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("a partial final Activity line was accepted")
+    assert output.read_bytes() == before
+    db.close()
+print("Observer restart backfill, full-file dedupe, and torn-log refusal passed.")

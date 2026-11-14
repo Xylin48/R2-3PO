@@ -313,12 +313,24 @@ static void *tv_control_server(void *unused)
 
         size_t reply_len = strlen(reply);
         size_t reply_sent = 0;
-        while (reply_sent < reply_len) {
+        int reply_idle = 0;
+        while (reply_sent < reply_len && !atomic_load(&tv_control_stop)) {
+            struct pollfd output = {.fd = client, .events = POLLOUT};
+            int writable = poll(&output, 1, 250);
+            if (writable < 0 && errno == EINTR) continue;
+            if (writable < 0) break;
+            if (writable == 0) {
+                if (++reply_idle >= 8) break;
+                continue;
+            }
+            if (!(output.revents & POLLOUT)) break;
             ssize_t sent = send(client, reply + reply_sent,
-                                reply_len - reply_sent, MSG_NOSIGNAL);
+                                reply_len - reply_sent, MSG_NOSIGNAL | MSG_DONTWAIT);
             if (sent < 0 && errno == EINTR) continue;
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (sent <= 0) break;
             reply_sent += (size_t)sent;
+            reply_idle = 0;
         }
         free(status);
         close(client);
@@ -357,8 +369,11 @@ static int tv_control_start(void)
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", tv_control_path);
-    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        chmod(tv_control_path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 4) != 0) {
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (chmod(tv_control_path, S_IRUSR | S_IWUSR) != 0 || listen(fd, 4) != 0) {
         close(fd);
         unlink(tv_control_path);
         return -1;
@@ -1241,6 +1256,12 @@ static void shell_vision(const char *argument)
    EARS
    ============================================================ */
 
+static int shell_ears_listen_cancelled(void *unused)
+{
+    (void)unused;
+    return atomic_load(&shell_shutdown) || r2_is_shutting_down();
+}
+
 static void shell_ears(const char *argument)
 {
     /* An explicit sensory decision is valid even while Watch discovers sources.
@@ -1297,9 +1318,15 @@ static void shell_ears(const char *argument)
         char *captured_source = NULL;
         int64_t speech_event_id = 0;
         char *transcript = r2_ears_listen_source_cancelable(
-            seconds, NULL, NULL, &captured_source, &speech_event_id);
+            seconds, shell_ears_listen_cancelled, NULL, &captured_source, &speech_event_id);
         if (!transcript) {
+            free(captured_source);
             printf("[Ears] No transcript produced. Check the microphone, whisper-cli, and R2_WHISPER_MODEL.\n");
+            return;
+        }
+        if (shell_ears_listen_cancelled(NULL)) {
+            free(captured_source);
+            free(transcript);
             return;
         }
         printf("[Ears] Heard: %s\n", transcript);
@@ -1755,6 +1782,23 @@ static char *reality_trim(char *text)
 
 static int shell_parse_amount(const char *text, double *value);
 
+/* Preserve empty optional fields and reject excess fields before dispatch. */
+static int shell_split_pipe_fields(char *text, char **fields, int capacity)
+{
+    int count = 0;
+    while (text && count < capacity)
+        fields[count++] = shell_trim(strsep(&text, "|"));
+    return text ? -1 : count;
+}
+
+static int shell_move_item(const char *name, const char *container)
+{
+    int rc = *name && *container && r2_reality_is_initialized()
+        ? r2_reality_move_item(name, container) : -1;
+    printf(rc == 0 ? "[R2 Reality] Item moved.\n" : "[R2 Reality] Move failed; check the item name and destination.\n");
+    return 1;
+}
+
 static void shell_tv(const char *argument)
 {
     if (!r2_reality_is_initialized()) {
@@ -1798,9 +1842,8 @@ static void shell_tv(const char *argument)
     if (shell_starts_with(argument, "connect ")) {
         char *copy = strdup(argument + 8);
         if (!copy) return;
-        char *parts[3] = {0}; int count = 0; char *save = NULL;
-        for (char *p = strtok_r(copy, "|", &save); p && count < 3; p = strtok_r(NULL, "|", &save))
-            parts[count++] = reality_trim(p);
+        char *parts[3] = {0};
+        int count = shell_split_pipe_fields(copy, parts, 3);
         int port = 0, valid_port = 0;
         if (count == 3) {
             char *end = NULL;
@@ -1868,14 +1911,11 @@ static int shell_reality(const char *argument)
         char *copy = strdup(argument + 4);
         if (!copy) return 1;
         char *parts[4] = {0};
-        int n = 0;
-        char *save = NULL;
-        for (char *p = strtok_r(copy, "|", &save); p && n < 4; p = strtok_r(NULL, "|", &save))
-            parts[n++] = reality_trim(p);
+        int n = shell_split_pipe_fields(copy, parts, 4);
         if (n < 1 || !*parts[0]) {
             printf("Usage: room add <name> | <description> | <container> | <quantity>\n");
         } else {
-            const char *desc = n >= 2 ? parts[1] : "An object in R2's persistent room.";
+            const char *desc = n >= 2 && *parts[1] ? parts[1] : "An object in R2's persistent room.";
             const char *container = n >= 3 && *parts[2] ? parts[2] : "room";
             int quantity = 1, quantity_valid = 1;
             if (n >= 4) {
@@ -1889,10 +1929,10 @@ static int shell_reality(const char *argument)
                     quantity = (int)parsed;
             }
             if (!quantity_valid) {
-                printf("[R2 Reality] Quantity must be a positive whole number.\\n");
+                printf("[R2 Reality] Quantity must be a positive whole number.\n");
             } else {
                 int rc = r2_reality_add_item(parts[0], desc, container, quantity);
-                printf(rc == 0 ? "[R2 Reality] Item recorded.\\n" : "[R2 Reality] Item could not be recorded.\\n");
+                printf(rc == 0 ? "[R2 Reality] Item recorded.\n" : "[R2 Reality] Item could not be recorded.\n");
             }
         }
         free(copy);
@@ -1901,16 +1941,11 @@ static int shell_reality(const char *argument)
     if (shell_starts_with(argument, "move ")) {
         char *copy = strdup(argument + 5);
         if (!copy) return 1;
-        char *sep = strchr(copy, '|');
-        if (!sep) {
+        char *fields[2] = {0};
+        if (shell_split_pipe_fields(copy, fields, 2) != 2)
             printf("Usage: room move <name> | <container>\n");
-        } else {
-            *sep = '\0';
-            char *name = reality_trim(copy);
-            char *container = reality_trim(sep + 1);
-            int rc = r2_reality_move_item(name, container);
-            printf(rc == 0 ? "[R2 Reality] Item moved.\n" : "[R2 Reality] Move failed; check the item name.\n");
-        }
+        else
+            shell_move_item(fields[0], fields[1]);
         free(copy);
         return 1;
     }
@@ -1940,27 +1975,21 @@ static int shell_pockets(const char *argument)
 {
     if (!argument || !*argument) return shell_reality("pockets");
     if (!strcasecmp(argument, "wallet")) return shell_reality("wallet");
-    if (shell_starts_with(argument, "put ")) {
-        char command[8192];
-        snprintf(command, sizeof(command), "move %s | pockets", argument + 4);
-        return shell_reality(command);
-    }
-    if (shell_starts_with(argument, "wallet ")) {
-        char command[8192];
-        snprintf(command, sizeof(command), "move %s | wallet", argument + 7);
-        return shell_reality(command);
-    }
+    if (shell_starts_with(argument, "put "))
+        return shell_move_item(shell_trim((char *)argument + 4), "pockets");
+    if (shell_starts_with(argument, "wallet "))
+        return shell_move_item(shell_trim((char *)argument + 7), "wallet");
     if (shell_starts_with(argument, "take ")) {
         char *copy = strdup(argument + 5);
         if (!copy) return 1;
-        char *sep = strchr(copy, '|');
-        if (sep) *sep++ = '\0';
-        char command[8192];
-        snprintf(command, sizeof(command), "move %s | %s", reality_trim(copy),
-                 sep && *reality_trim(sep) ? reality_trim(sep) : "room");
-        int rc = shell_reality(command);
+        char *fields[2] = {0};
+        int count = shell_split_pipe_fields(copy, fields, 2);
+        if (count < 1)
+            printf("Usage: pockets take <name> [| container]\n");
+        else
+            shell_move_item(fields[0], count == 2 && *fields[1] ? fields[1] : "room");
         free(copy);
-        return rc;
+        return 1;
     }
     printf("Usage: pockets [wallet|put <name>|wallet <name>|take <name> [| container]]\n");
     return 1;
@@ -2004,6 +2033,10 @@ static int shell_fridge(const char *argument)
 
 static int shell_parse_amount(const char *text, double *value);
 
+/* Every creator gift is a separate physical object. A batch ordinal alone
+ * repeats on the next command, so carry a process-lifetime sequence too. */
+static atomic_uint_fast64_t shell_money_gift_sequence = ATOMIC_VAR_INIT(0);
+
 static int shell_give(const char *arg)
 {
     if (!arg || !*arg) {
@@ -2017,14 +2050,14 @@ static int shell_give(const char *arg)
         return 1;
     }
     char *fields[3] = {0};
-    int count = 0;
-    char *save = NULL;
-    for (char *part = strtok_r(copy, "|", &save);
-         part && count < 3;
-         part = strtok_r(NULL, "|", &save))
-        fields[count++] = shell_trim(part);
+    int count = shell_split_pipe_fields(copy, fields, 3);
+    if (count < 1) {
+        printf("Usage: give <item> <quantity> [| description | container]\n");
+        free(copy);
+        return 1;
+    }
 
-    char *head = fields[0] ? fields[0] : copy;
+    char *head = fields[0];
     char *space = strrchr(head, ' ');
     if (!space || space == head || !space[1]) {
         printf("Usage: give <item> <quantity> [| description | container]\n");
@@ -2057,8 +2090,15 @@ static int shell_give(const char *arg)
            as dollars or collapse separate money pieces into one stack. */
         for (int i = 1; i <= (int)amount; ++i) {
             char item_name[96], item_description[512];
-            snprintf(item_name, sizeof(item_name), "money gift %ld %ld %d",
-                     (long)time(NULL), (long)getpid(), i);
+            uint_fast64_t serial = atomic_fetch_add(&shell_money_gift_sequence, 1) + 1;
+            int name_length = snprintf(item_name, sizeof(item_name),
+                    "money gift %ld %ld %llu", (long)time(NULL), (long)getpid(),
+                    (unsigned long long)serial);
+            if (!serial || name_length < 0 || (size_t)name_length >= sizeof(item_name)) {
+                fprintf(stderr, "[Creator] Cannot assign a unique money item name; gift stopped.\n");
+                rc = -1;
+                break;
+            }
             snprintf(item_description, sizeof(item_description),
                      "Individual physical money item created by the user; denomination unspecified. Gift batch quantity=%d.",
                      (int)amount);
@@ -2219,134 +2259,6 @@ static void shell_gameboy_log_session_end(const ShellGameboyStatus *state,
 }
 
 
-static const char *shell_gameboy_json_string(json_object *object, const char *key)
-{
-    json_object *value = NULL;
-    if (!object || !json_object_object_get_ex(object, key, &value) ||
-        !value || !json_object_is_type(value, json_type_string))
-        return "";
-    const char *text_value = json_object_get_string(value);
-    return text_value ? text_value : "";
-}
-
-static int shell_gameboy_capture_events(char *output, size_t capacity)
-{
-    const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-    const char *device = configured && *configured
-        ? configured : "/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance";
-    int pipefd[2], status = 0;
-    size_t used = 0;
-    pid_t child;
-    if (!output || capacity < 2 || pipe(pipefd) != 0) return 0;
-    output[0] = '\0';
-    int read_failed = 0;
-    child = fork();
-    if (child < 0) {
-        close(pipefd[0]); close(pipefd[1]);
-        return 0;
-    }
-    if (child == 0) {
-        close(pipefd[0]);
-        if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
-        close(pipefd[1]);
-        execl(device, device, "--json", "events", (char *)NULL);
-        _exit(127);
-    }
-    close(pipefd[1]);
-    while (used + 1 < capacity) {
-        ssize_t n = read(pipefd[0], output + used, capacity - used - 1);
-        if (n > 0) used += (size_t)n;
-        else if (n == 0) break;
-        else if (errno != EINTR) {
-            read_failed = 1;
-            break;
-        }
-    }
-    close(pipefd[0]);
-    output[used] = '\0';
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 0;
-    }
-    return !read_failed && WIFEXITED(status) &&
-           WEXITSTATUS(status) == 0 && used > 0;
-}
-
-static int shell_gameboy_ack_event(int64_t event_id)
-{
-    const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-    const char *device = configured && *configured
-        ? configured : "/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance";
-    char id[32];
-    pid_t child;
-    int status = 0;
-    snprintf(id, sizeof(id), "%lld", (long long)event_id);
-    child = fork();
-    if (child < 0) return 0;
-    if (child == 0) {
-        if (!freopen("/dev/null", "w", stdout)) _exit(126);
-        execl(device, device, "--json", "ack_event", id, (char *)NULL);
-        _exit(127);
-    }
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return 0;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
-/* Verified game-world events use an outbox in the console DB. Copy them into
-   the Life Log as explicitly virtual events, then acknowledge only after the
-   durable Life Log record exists. A stable source key makes retries idempotent. */
-static void shell_gameboy_sync_verified_events(void)
-{
-    char output[65536];
-    if (!shell_gameboy_capture_events(output, sizeof(output))) return;
-    json_object *root = json_tokener_parse(output);
-    if (!root || !json_object_is_type(root, json_type_array)) {
-        if (root) json_object_put(root);
-        return;
-    }
-    size_t count = json_object_array_length(root);
-    for (size_t i = 0; i < count; ++i) {
-        json_object *item = json_object_array_get_idx(root, i);
-        json_object *id_value = NULL, *verified_value = NULL;
-        if (!item || !json_object_is_type(item, json_type_object) ||
-            !json_object_object_get_ex(item, "event_id", &id_value) ||
-            !json_object_object_get_ex(item, "verified", &verified_value) ||
-            !json_object_get_boolean(verified_value) ||
-            strcmp(shell_gameboy_json_string(item, "context"), "virtual") != 0)
-            continue;
-
-        int64_t id = json_object_get_int64(id_value);
-        const char *event_summary = shell_gameboy_json_string(item, "summary");
-        const char *event_details = shell_gameboy_json_string(item, "details");
-        const char *title = shell_gameboy_json_string(item, "game_title");
-        const char *session = shell_gameboy_json_string(item, "session_id");
-        const char *evidence = shell_gameboy_json_string(item, "evidence_source");
-        char source[256], summary[1800], details[3600];
-        if (id <= 0 || !*event_summary || strncmp(evidence, "adapter:", 8) != 0)
-            continue;
-        snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)id);
-        if (!r2_log_event_exists("virtual_game_event", source)) {
-            snprintf(summary, sizeof(summary),
-                     "While playing %.200s, R2 encountered a virtual game event: %.1000s",
-                     *title ? title : "a game", event_summary);
-            snprintf(details, sizeof(details),
-                     "context=virtual; game_title=%.200s; session_id=%.150s; "
-                     "console_event_id=%lld; evidence_source=%.200s; in_game_details=%.2000s; "
-                     "This event occurred inside the game and does not change physical Reality.",
-                     title, session, (long long)id, evidence, event_details);
-            if (r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary,
-                             details, source) < 0)
-                continue;
-        }
-        if (r2_log_event_exists("virtual_game_event", source))
-            (void)shell_gameboy_ack_event(id);
-    }
-    json_object_put(root);
-}
-
 static int shell_gameboy(const char *arg)
 {
     const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
@@ -2399,19 +2311,31 @@ static int shell_gameboy(const char *arg)
         _exit(127);
     }
     int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        perror("[Game Boy Advance] waitpid");
-        free(copy);
-        return 1;
+    int cancelled = 0;
+    const struct timespec wait_pause = {.tv_nsec = 100000000L};
+    for (;;) {
+        if (!cancelled && (atomic_load(&shell_shutdown) || r2_is_shutting_down())) {
+            cancelled = 1;
+            (void)kill(child, SIGKILL);
+        }
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            perror("[Game Boy Advance] waitpid");
+            free(copy);
+            return 1;
+        }
+        (void)nanosleep(&wait_pause, NULL);
     }
-    int command_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    int command_ok = !cancelled && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (!command_ok) {
         printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
     } else {
         /* The event-outbox read may reconcile an exited emulator, so sync it
            before comparing session IDs for Life Log start/end bookkeeping. */
-        shell_gameboy_sync_verified_events();
+        if (r2_sync_gameboy_verified_events(device) < 0)
+            printf("[Game Boy Advance] Verified event synchronization is incomplete.\n");
         if (shell_gameboy_read_status(&after)) {
             /* Compare persistent session IDs, not command names. This also closes
                Life Log activities when status/verify discovers an unexpected exit.
@@ -2448,10 +2372,26 @@ static int shell_money(const char *arg)
     if(shell_starts_with(arg,"receive ")){double a=0.0;int rc=shell_parse_amount(arg+8,&a)?r2_reality_money_receive(a):-1;printf(rc==0?"Recorded $%.2f received as cash.\n":"Could not record money received; enter a valid positive amount.\n",a);return 1;}
     if(shell_starts_with(arg,"deposit ")){double a=0.0;int rc=shell_parse_amount(arg+8,&a)?r2_reality_money_deposit(a):-1;printf(rc==0?"Deposited $%.2f into piggybank.\n":"Deposit failed; enter a valid amount and check cash.\n",a);return 1;}
     if(shell_starts_with(arg,"withdraw ")){double a=0.0;int rc=shell_parse_amount(arg+9,&a)?r2_reality_money_withdraw(a):-1;printf(rc==0?"Withdrew $%.2f into cash.\n":"Withdrawal failed; enter a valid amount and check bank balance.\n",a);return 1;}
-    if(shell_starts_with(arg,"buy ")){char *copy=strdup(arg+4);if(!copy)return 1;char *p[4]={0};int n=0;char *save=NULL;
-        for(char *t=strtok_r(copy,"|",&save);t&&n<4;t=strtok_r(NULL,"|",&save))p[n++]=shell_trim(t);
-        if(n<2||!*p[0]||!*p[1])printf("Usage: money buy <item> | <price> | <description> | <container>\n");
-        else{double price=0.0;int parsed=shell_parse_amount(p[1],&price);int rc=parsed?r2_reality_buy_item(p[0],n>=3&&*p[2]?p[2]:"Purchased item",price,n>=4&&*p[3]?p[3]:"pockets"):-1;printf(rc==0?"Purchased %s for $%.2f.\n":"Purchase failed; enter a valid price and check funds/destination.\n",p[0],price);}free(copy);return 1;}
+    if (shell_starts_with(arg, "buy ")) {
+        char *copy = strdup(arg + 4);
+        if (!copy) return 1;
+        char *fields[4] = {0};
+        int count = shell_split_pipe_fields(copy, fields, 4);
+        if (count < 2 || !*fields[0] || !*fields[1]) {
+            printf("Usage: money buy <item> | <price> | <description> | <container>\n");
+        } else {
+            const char *description = count >= 3 && *fields[2] ? fields[2] : "Purchased item";
+            const char *destination = count >= 4 && *fields[3] ? fields[3] : "pockets";
+            double price = 0.0;
+            int rc = shell_parse_amount(fields[1], &price)
+                ? r2_reality_buy_item(fields[0], description, price, destination) : -1;
+            printf(rc == 0 ? "Purchased %s for $%.2f.\n"
+                           : "Purchase failed; enter a valid price and check funds/destination.\n",
+                   fields[0], price);
+        }
+        free(copy);
+        return 1;
+    }
     printf("Usage: money [status|deposit <amount>|withdraw <amount>|buy <item> | <price> | <description> | <container>]\n");return 1;
 }
 
@@ -2552,6 +2492,7 @@ static void shell_alternate(const char *argument)
             fields[count++] = cursor;
             char *separator = strchr(cursor, '|');
             if (!separator) break;
+            if (count == 6) break; /* Leave extra input visible to the arity check. */
             *separator = '\0';
             cursor = separator + 1;
         }
@@ -3080,6 +3021,7 @@ int r2_shell_run(void)
         shell_watch_stop();
 
     tv_control_stop_server();
+    shell_running = 0;
     if (service_signals_blocked)
         (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
 
