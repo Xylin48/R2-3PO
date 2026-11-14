@@ -37,7 +37,7 @@ def is_observer_event(category: str, event_type: str) -> bool:
 # Activity.txt is a separate file from the authoritative SQLite Life Log.
 # Rebuild the exact event-ID index from complete, newline-terminated records
 # rather than guessing from a 4096-byte suffix or an in-memory session cursor.
-ACTIVITY_EVENT_MARKER = re.compile(rb" \\(event #([1-9][0-9]*)\\)\\n$")
+ACTIVITY_EVENT_MARKER = re.compile(rb" \(event #([1-9][0-9]*)\)\n$")
 
 
 class ActivityWriter:
@@ -66,7 +66,7 @@ class ActivityWriter:
                 line = stream.readline()
                 if not line:
                     break
-                if not line.endswith(b"\\n"):
+                if not line.endswith(b"\n"):
                     # An interrupted append is preserved exactly for repair,
                     # not combined with a later line or silently discarded.
                     raise OSError(errno.EIO, "Activity.txt ends with an incomplete line")
@@ -81,12 +81,12 @@ class ActivityWriter:
             if event_id in self._saved_ids:
                 return
             if self._offset == 0:
-                stream.write(b"R2-3PO Activity Log\\n")
-                stream.write(b"Factual observer events only; private thoughts and notifications excluded.\\n")
-                stream.write(("-" * 72 + "\\n").encode("utf-8"))
+                stream.write(b"R2-3PO Activity Log\n")
+                stream.write(b"Factual observer events only; private thoughts and notifications excluded.\n")
+                stream.write(("-" * 72 + "\n").encode("utf-8"))
             clean_time = " ".join((local_time or "time unavailable").split())
             clean_summary = " ".join((summary or "").split())
-            stream.write(f"[{clean_time}] {clean_summary} (event #{event_id})\\n".encode("utf-8"))
+            stream.write(f"[{clean_time}] {clean_summary} (event #{event_id})\n".encode("utf-8"))
             stream.flush()
             # Mark an event complete only after its entire record is durable.
             # A failed fsync leaves it discoverable in the next full/delta scan.
