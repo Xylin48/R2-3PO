@@ -40,6 +40,7 @@ static pthread_mutex_t location_transition_lock = PTHREAD_MUTEX_INITIALIZER;
 static int reality_ready = 0;
 static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override, const char *fridge_ingredients);
 static int purchase_journal_recover(void);
+static int location_delivery_replay(void);
 static int reality_add_item_internal(const char *name, const char *description,
                                      const char *container, int quantity);
 static int reality_remove_item_internal(const char *name);
