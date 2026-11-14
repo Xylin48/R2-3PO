@@ -34,6 +34,8 @@ static pthread_mutex_t reality_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fridge_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Serializes a purchase from durable intent through inventory commit, including all other money mutations. */
 static pthread_mutex_t purchase_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Serialize staged location delivery across the two persistent databases. */
+static pthread_mutex_t location_transition_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int reality_ready = 0;
 static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override, const char *fridge_ingredients);
@@ -3071,6 +3073,7 @@ int r2_reality_init(void)
         "CREATE TABLE IF NOT EXISTS r2_reality_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
         "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('world_elapsed_seconds','0');"
         "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('current_location','home');"
+        "CREATE TABLE IF NOT EXISTS r2_location_delivery (id INTEGER PRIMARY KEY CHECK(id=1),location TEXT NOT NULL,is_home INTEGER NOT NULL CHECK(is_home IN (0,1)));"
         "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('initial_cash_seeded','0');"
         "CREATE TABLE IF NOT EXISTS r2_reality_item_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT NOT NULL COLLATE NOCASE, description TEXT, exact_quantity INTEGER, approximate_quantity INTEGER, precision TEXT NOT NULL DEFAULT 'exact' CHECK(precision IN ('exact','approximate','vague')), collected_at INTEGER NOT NULL, last_decay_at INTEGER NOT NULL);"
         "CREATE INDEX IF NOT EXISTS r2_reality_item_memory_age_idx ON r2_reality_item_memory(collected_at);"
@@ -3350,6 +3353,13 @@ int r2_reality_init(void)
         r2_reality_shutdown();
         return -1;
     }
+    /* Life Log is initialized by the core before Reality. Do not expose a
+       ready world with an unapplied named location change after a crash. */
+    if (location_delivery_replay() != 0) {
+        fprintf(stderr, "[R2 Reality] Named location delivery is pending; refusing inconsistent startup.\n");
+        r2_reality_shutdown();
+        return -1;
+    }
     sync_room_mirrors();
 
     sqlite3_int64 carried_cash = 0, bank_cash = 0;
@@ -3392,6 +3402,134 @@ int r2_reality_is_initialized(void)
     pthread_mutex_unlock(&reality_lock);
     return ready;
 }
+/* The Reality location and its delivery intent are committed together. Life Log
+ * lives in a different SQLite file: replay the intent until its idempotent
+ * location transition is durable, and only then delete the intent. This is
+ * deliberately called without reality_lock while entering Life Log. */
+static int location_delivery_replay_locked(void)
+{
+    sqlite3_stmt *st = NULL;
+    char *location = NULL;
+    int home = 0;
+    pthread_mutex_lock(&reality_lock);
+    int rc = reality_ready && reality_db
+        ? sqlite3_prepare_v2(reality_db,
+            "SELECT location,is_home FROM r2_location_delivery WHERE id=1",
+            -1, &st, NULL) : SQLITE_MISUSE;
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            const char *value = (const char *)sqlite3_column_text(st, 0);
+            int length = sqlite3_column_bytes(st, 0);
+            home = sqlite3_column_int(st, 1);
+            if (!value || length < 1 || length > 256 ||
+                strlen(value) != (size_t)length ||
+                sqlite3_column_type(st, 1) != SQLITE_INTEGER ||
+                (home != 0 && home != 1))
+                rc = SQLITE_MISMATCH;
+            else {
+                location = strdup(value);
+                rc = location ? SQLITE_OK : SQLITE_NOMEM;
+            }
+        }
+    }
+    if (st && sqlite3_finalize(st) != SQLITE_OK && rc == SQLITE_DONE)
+        rc = SQLITE_ERROR;
+    pthread_mutex_unlock(&reality_lock);
+    if (rc == SQLITE_DONE) return 0;
+    if (rc != SQLITE_OK) {
+        free(location);
+        return -1;
+    }
+    int delivered = r2_log_location_transition(location, home);
+    free(location);
+    if (delivered != 0) return -1;
+
+#ifdef R2_INVENTORY_TEST_FAILURE_INJECTION
+    if (getenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT"))
+        return -1;
+#endif
+    pthread_mutex_lock(&reality_lock);
+    rc = sqlite3_exec(reality_db,
+        "DELETE FROM r2_location_delivery WHERE id=1", NULL, NULL, NULL);
+    if (rc == SQLITE_OK && sqlite3_changes(reality_db) != 1)
+        rc = SQLITE_CONSTRAINT;
+    pthread_mutex_unlock(&reality_lock);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
+static int location_delivery_replay(void)
+{
+    pthread_mutex_lock(&location_transition_lock);
+    int rc = location_delivery_replay_locked();
+    pthread_mutex_unlock(&location_transition_lock);
+    return rc;
+}
+
+/* Stage a named movement and its effective home/away status atomically in
+ * Reality. A crash in either of the following windows will replay the exact
+ * name and classification at startup without duplicating the Life Log event. */
+int r2_reality_transition_location(const char *location, int home)
+{
+    if (!location || !*location || strlen(location) > 256 ||
+        (home != 0 && home != 1))
+        return -1;
+    pthread_mutex_lock(&location_transition_lock);
+    int result = location_delivery_replay_locked();
+    if (result != 0) {
+        pthread_mutex_unlock(&location_transition_lock);
+        return -1;
+    }
+    pthread_mutex_lock(&reality_lock);
+    int rc = reality_ready && reality_db
+        ? sqlite3_exec(reality_db, "BEGIN IMMEDIATE", NULL, NULL, NULL)
+        : SQLITE_MISUSE;
+    int transaction_started = rc == SQLITE_OK;
+    sqlite3_stmt *st = NULL;
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(reality_db,
+            "INSERT INTO r2_location_delivery(id,location,is_home) VALUES(1,?,?)",
+            -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 1, location, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, home);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (st) sqlite3_finalize(st);
+    st = NULL;
+    if (rc == SQLITE_DONE)
+        rc = sqlite3_prepare_v2(reality_db,
+            "INSERT INTO r2_reality_meta(key,value) VALUES('current_location',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(st, 1, home ? "home" : "outside",
+                               -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
+        rc = SQLITE_CONSTRAINT;
+    if (st) sqlite3_finalize(st);
+    if (rc == SQLITE_DONE)
+        rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK && transaction_started)
+        (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+    if (rc == SQLITE_OK)
+        __atomic_store_n(&reality_home_state, home, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&reality_lock);
+    if (rc != SQLITE_OK) {
+        pthread_mutex_unlock(&location_transition_lock);
+        return -1;
+    }
+#ifdef R2_INVENTORY_TEST_FAILURE_INJECTION
+    if (getenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT")) {
+        pthread_mutex_unlock(&location_transition_lock);
+        return -1;
+    }
+#endif
+    result = location_delivery_replay_locked();
+    pthread_mutex_unlock(&location_transition_lock);
+    return result;
+}
+
 int r2_reality_set_location(int home)
 {
     if (!r2_reality_is_initialized()) return -1;

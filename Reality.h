@@ -24,7 +24,8 @@ extern "C" {
 int r2_reality_init(void);
 void r2_reality_shutdown(void);
 int r2_reality_is_initialized(void);
-int r2_reality_set_location(int home); /* 1=home, 0=away; persistent physical location. */
+int r2_reality_set_location(int home); /* Low-level legacy status setter (no named Life Log event). */
+int r2_reality_transition_location(const char *location, int home); /* Durable named movement; replays across restart. */
 int r2_reality_tick(void);
 
 /* Caller frees all returned strings. */

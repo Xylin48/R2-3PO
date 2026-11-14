@@ -539,6 +539,104 @@ static void verify_legacy_shared_reality_migration(void)
     sqlite3_close(db);
 }
 
+
+/* Both crash windows must replay a named move without inventing duplicate
+ * location_changed events or replacing an earlier persistent state. */
+static void verify_location_delivery_replay(void)
+{
+    sqlite3 *reality = NULL, *memory = NULL;
+    sqlite3_stmt *st = NULL;
+    if (r2_log_init() != 0)
+        fail("could not initialize the real Life Log for location recovery");
+    if (setenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT", "1", 1) != 0)
+        fail("could not inject interrupted location write");
+    if (r2_reality_transition_location("Mansfield library", 0) == 0)
+        fail("injected interruption after Reality commit reported success");
+    unsetenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT value,(SELECT COUNT(*) FROM r2_location_delivery) "
+            "FROM r2_reality_meta WHERE key='current_location'",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "outside") ||
+        sqlite3_column_int(st, 1) != 1)
+        fail("location crash did not preserve the atomic Reality intent");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(reality); reality = NULL;
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home"))
+        fail("location crash prematurely wrote the Life Log");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+
+    r2_reality_shutdown();
+    if (r2_reality_init() != 0)
+        fail("startup did not replay the interrupted location");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT COUNT(*) FROM r2_location_delivery",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        sqlite3_column_int(st, 0) != 0)
+        fail("successful named location replay did not clear its intent");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(reality); reality = NULL;
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location,is_home,"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed') "
+            "FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "Mansfield library") ||
+        sqlite3_column_int(st, 1) != 0 ||
+        sqlite3_column_int(st, 2) != 1)
+        fail("replayed away transition did not match Life Log evidence");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+
+    if (setenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT", "1", 1) != 0)
+        fail("could not inject interrupted Life Log acknowledgement");
+    if (r2_reality_transition_location("home", 1) == 0)
+        fail("injected interruption after Life Log commit reported success");
+    unsetenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT");
+    r2_reality_shutdown();
+    if (r2_reality_init() != 0)
+        fail("startup failed to acknowledge an already recorded move");
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
+        sqlite3_prepare_v2(memory,
+            "SELECT current_location,is_home,"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed'),"
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='internal_notification') "
+            "FROM r2_log_location_state WHERE id=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
+        sqlite3_column_int(st, 1) != 1 ||
+        sqlite3_column_int(st, 2) != 2 ||
+        sqlite3_column_int(st, 3) != 1)
+        fail("replayed acknowledgement duplicated a movement or Welcome Home");
+    sqlite3_finalize(st); st = NULL;
+    sqlite3_close(memory); memory = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_prepare_v2(reality,
+            "SELECT value,(SELECT COUNT(*) FROM r2_location_delivery) "
+            "FROM r2_reality_meta WHERE key='current_location'",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
+        sqlite3_column_int(st, 1) != 0)
+        fail("replayed named movement did not reconcile Reality");
+    sqlite3_finalize(st);
+    sqlite3_close(reality);
+    r2_log_shutdown();
+}
+
 int main(void)
 {
     seed_legacy_fridge_schema();
@@ -1669,6 +1767,7 @@ int main(void)
     read_needs(&hunger, &sleepiness, &energy, &satisfaction, &since_meal);
     if (hunger < 79.9 || hunger > 80.1)
         fail("hunger semantics migration must not invert state again on later restarts");
+    verify_location_delivery_replay();
     r2_reality_shutdown();
 
     puts("reality needs smoke passed");
