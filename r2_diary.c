@@ -461,6 +461,55 @@ static int r2_workspace_path(
     return 0;
 }
 
+/* Revalidate the canonical workspace boundary, then pin every component.
+ * Merely calling realpath() before fopen()/opendir() permits a symlink swap
+ * during the gap and may disclose an outside-workspace file. */
+static int r2_workspace_open_checked(const char *relative, int want_directory)
+{
+    char canonical[R2_MAX_PATH], root[R2_MAX_PATH];
+    if (r2_workspace_path(relative, canonical, sizeof(canonical)) != 0 ||
+        !realpath(R2_WORKSPACE, root))
+        return -1;
+    size_t root_len = strlen(root);
+    if (strncmp(canonical, root, root_len) != 0 ||
+        (canonical[root_len] != '\0' && canonical[root_len] != '/')) {
+        errno = EACCES;
+        return -1;
+    }
+
+    int fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    const char *cursor = canonical + root_len;
+    if (*cursor == '/') ++cursor;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t count = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (!count || count > NAME_MAX) {
+            close(fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        char component[NAME_MAX + 1];
+        memcpy(component, cursor, count);
+        component[count] = '\0';
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+        if (slash || want_directory) flags |= O_DIRECTORY;
+        int child = openat(fd, component, flags);
+        close(fd);
+        if (child < 0) return -1;
+        fd = child;
+        cursor = slash ? slash + 1 : cursor + count;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        (want_directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    return fd;
+}
+
 
 /* ============================================================
  * DATABASE INITIALIZATION
@@ -1729,7 +1778,7 @@ char *r2_workspace_list(
     const char *relative_directory
 )
 {
-    char path[R2_MAX_PATH];
+    int directory_fd;
 
     DIR *directory;
 
@@ -1749,23 +1798,11 @@ char *r2_workspace_list(
         relative_directory = ".";
     }
 
-    if (
-        r2_workspace_path(
-            relative_directory,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    directory = opendir(
-        path
-    );
-
-    if (!directory)
-    {
+    directory_fd = r2_workspace_open_checked(relative_directory, 1);
+    if (directory_fd < 0) return NULL;
+    directory = fdopendir(directory_fd);
+    if (!directory) {
+        close(directory_fd);
         return NULL;
     }
 
@@ -1786,8 +1823,6 @@ char *r2_workspace_list(
         != NULL
     )
     {
-        char full_path[R2_MAX_PATH];
-
         struct stat st;
 
         size_t required;
@@ -1801,32 +1836,9 @@ char *r2_workspace_list(
             continue;
         }
 
-        int path_written = snprintf(
-            full_path,
-            sizeof(full_path),
-            "%s/%s",
-            path,
-            entry->d_name
-        );
-
-        if (
-            path_written < 0
-            ||
-            (size_t)path_written >= sizeof(full_path)
-        )
-        {
+        /* Classification is also anchored to the opened directory. */
+        if (fstatat(dirfd(directory), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
             continue;
-        }
-
-        if (
-            stat(
-                full_path,
-                &st
-            ) != 0
-        )
-        {
-            continue;
-        }
 
         required =
             strlen(entry->d_name)
@@ -1947,7 +1959,7 @@ char *r2_workspace_read(
     size_t *file_size
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -1964,24 +1976,11 @@ char *r2_workspace_read(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2083,7 +2082,7 @@ char *r2_workspace_read_chunk(
     long *next_offset
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2115,24 +2114,11 @@ char *r2_workspace_read_chunk(
         length = R2_MAX_CHUNK_SIZE;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2203,7 +2189,7 @@ char *r2_workspace_search(
     const char *term
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2227,24 +2213,11 @@ char *r2_workspace_search(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "r"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "r");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
