@@ -1256,6 +1256,12 @@ static void shell_vision(const char *argument)
    EARS
    ============================================================ */
 
+static int shell_ears_listen_cancelled(void *unused)
+{
+    (void)unused;
+    return atomic_load(&shell_shutdown) || r2_is_shutting_down();
+}
+
 static void shell_ears(const char *argument)
 {
     /* An explicit sensory decision is valid even while Watch discovers sources.
@@ -1312,9 +1318,15 @@ static void shell_ears(const char *argument)
         char *captured_source = NULL;
         int64_t speech_event_id = 0;
         char *transcript = r2_ears_listen_source_cancelable(
-            seconds, NULL, NULL, &captured_source, &speech_event_id);
+            seconds, shell_ears_listen_cancelled, NULL, &captured_source, &speech_event_id);
         if (!transcript) {
+            free(captured_source);
             printf("[Ears] No transcript produced. Check the microphone, whisper-cli, and R2_WHISPER_MODEL.\n");
+            return;
+        }
+        if (shell_ears_listen_cancelled(NULL)) {
+            free(captured_source);
+            free(transcript);
             return;
         }
         printf("[Ears] Heard: %s\n", transcript);

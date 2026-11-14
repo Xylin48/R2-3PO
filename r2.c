@@ -9323,8 +9323,10 @@ static char *process_tools_with_status(
                 ? (size_t)(e - p)
                 : strlen(p);
 
-        if (n > MAX_COMMAND)
-            n = MAX_COMMAND;
+        if (n > MAX_COMMAND) {
+            APPEND("REAL HAND ERROR: command exceeds the length limit; no task was queued.\n");
+            return results;
+        }
 
         memcpy(
             cmd,
@@ -9569,7 +9571,10 @@ static void *autonomous_thinking(void *arg)
         /* Autonomous reflection can deliberately use the SAME sensor decision,
            media attention or listening tools as the conversation brain. Raw
            variation alone never forces a visual description or transcription. */
-        if (reflection) {
+        if (reflection && !shutting_down && atomic_load(&diary_running) &&
+            atomic_load(&last_conversation_activity_ms) == reflection_activity_ms &&
+            atomic_load(&foreground_conversation_waiting) == 0 &&
+            atomic_load(&foreground_ollama_waiting) == 0) {
             size_t sense_pos = 0, focus_pos = 0, media_pos = 0, ears_pos = 0, sources_pos = 0;
             char *sense_request = extract_marker(reflection, "[SENSE]", "\n", &sense_pos);
             char *focus_request = extract_marker(reflection, "[MEDIA_FOCUS]", "\n", &focus_pos);
@@ -10167,16 +10172,20 @@ static void learn_food_reaction(const char *food)
     char *reply = ollama_chat(&m, 1, system);
     free(context);
     if (!reply) return;
-    char *score_line = strcasestr(reply, "SCORE:");
-    char *reason_line = strcasestr(reply, "REASON:");
-    if (score_line) {
-        score_line += 6;
-        while (*score_line && isspace((unsigned char)*score_line)) score_line++;
+    char *score_line = trim(reply);
+    char *reason_line = strchr(score_line, '\n');
+    if (reason_line && strncasecmp(score_line, "SCORE:", 6) == 0) {
+        *reason_line++ = '\0';
+        reason_line = trim(reason_line);
+        score_line = trim(score_line + 6);
+        errno = 0;
         char *end = NULL;
         long score = strtol(score_line, &end, 10);
-        if (end != score_line && score >= -2 && score <= 2) {
-            char *reason = reason_line ? trim(reason_line + 7) : "No reason supplied";
-            (void)r2_reality_rate_food(food, (int)score, reason);
+        if (!errno && end != score_line && !*trim(end) &&
+            score >= -2 && score <= 2 && strncasecmp(reason_line, "REASON:", 7) == 0) {
+            char *reason = trim(reason_line + 7);
+            if (*reason && !strchr(reason, '\n'))
+                (void)r2_reality_rate_food(food, (int)score, reason);
         }
     }
     free(reply);

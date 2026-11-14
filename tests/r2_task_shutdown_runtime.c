@@ -118,6 +118,14 @@ static void check_workspace_path_with_spaces(void)
     assert(access(link_path, F_OK) != 0 && access(target, F_OK) == 0);
     assert(unlink(target) == 0);
 
+    char command[MAX_COMMAND + 32];
+    memcpy(command, "[HAND] ", 7);
+    memset(command + 7, 'x', MAX_COMMAND + 1);
+    command[MAX_COMMAND + 8] = '\0';
+    result = process_tools(command);
+    assert(result && strstr(result, "no task was queued") && !task_head);
+    free(result);
+
     result = process_tools("[WORLD] buy|item|1.00|description|pockets|extra");
     assert(result && strstr(result, "too many fields; no action was taken"));
     free(result);
