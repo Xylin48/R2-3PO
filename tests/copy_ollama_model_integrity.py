@@ -36,6 +36,31 @@ class CopyOllamaModelIntegrityTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return blob_paths
 
+    def test_overlapping_stores_are_rejected_without_changing_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            source = Path(temporary) / "source"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            manifest = source / copier.model_manifest_relative("qwen3.5:9b")
+            original = manifest.read_bytes()
+            original_mode = manifest.stat().st_mode
+            # A mistaken --destination-root must not chown/chmod, overwrite,
+            # or create files anywhere inside the source model store.
+            for destination in (source, source / "nested", source.parent):
+                with self.subTest(destination=destination):
+                    with self.assertRaisesRegex(ValueError, "must not overlap"):
+                        copier.copy_model(source, destination, "qwen3.5:9b", "")
+                    self.assertEqual(manifest.read_bytes(), original)
+                    self.assertEqual(manifest.stat().st_mode, original_mode)
+                    self.assertFalse((source / "nested").exists())
+
+    def test_overlapping_stores_detected_after_parent_normalization(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            source = Path(temporary) / "source"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            destination = source.parent / "source" / ".." / "source"
+            with self.assertRaisesRegex(ValueError, "must not overlap"):
+                copier.copy_model(source, destination, "qwen3.5:9b", "")
+
     def test_same_size_corrupt_destination_is_repaired(self) -> None:
         with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
             base = Path(temporary)
