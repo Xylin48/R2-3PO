@@ -1818,11 +1818,11 @@ char *r2_workspace_list(
 
     result[0] = '\0';
 
-    while (
-        (entry = readdir(directory))
-        != NULL
-    )
-    {
+    for (;;) {
+        /* errno from fstatat() must not masquerade as a readdir() failure. */
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) break;
         struct stat st;
 
         size_t required;
@@ -1923,9 +1923,13 @@ char *r2_workspace_list(
         }
     }
 
-    closedir(
-        directory
-    );
+    int read_error = errno;
+    closedir(directory);
+    if (read_error) {
+        free(result);
+        errno = read_error;
+        return NULL;
+    }
 
     if (length == 0)
     {
@@ -2151,6 +2155,13 @@ char *r2_workspace_read_chunk(
         file
     );
 
+    /* Report read errors, not a falsely successful shortened file chunk. */
+    if (ferror(file) || actual > (size_t)(LONG_MAX - offset)) {
+        fclose(file);
+        free(buffer);
+        errno = EIO;
+        return NULL;
+    }
     buffer[actual] = '\0';
 
     fclose(file);
@@ -2306,9 +2317,14 @@ char *r2_workspace_search(
         );
     }
 
-    fclose(
-        file
-    );
+    /* Do not report a partially searched file as a complete result. */
+    if (ferror(file)) {
+        fclose(file);
+        free(result);
+        errno = EIO;
+        return NULL;
+    }
+    fclose(file);
 
     if (length == 0)
     {
