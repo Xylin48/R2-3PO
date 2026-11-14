@@ -506,6 +506,8 @@ def move_cartridge(db: sqlite3.Connection, filename: str, location: str) -> dict
     current = db.execute("SELECT location,title FROM cartridge_inventory WHERE filename=? COLLATE NOCASE", (filename,)).fetchone()
     if current is None:
         return {"ok": False, "message": f"No known cartridge named '{filename}'.", **status_data(db)}
+    if (CARTRIDGES / filename).is_symlink():
+        return {"ok": False, "message": "A linked ROM is not a physical loose cartridge; its historical inventory record remains preserved.", **status_data(db)}
     slot = db.execute("SELECT rom_path FROM cartridge.cartridge_slot WHERE id=1").fetchone()
     if slot and slot["rom_path"] and Path(slot["rom_path"]).name.casefold() == filename.casefold():
         return {"ok": False, "message": "That cartridge is inserted. Eject it before moving it.", **status_data(db)}
@@ -816,7 +818,7 @@ def eject_cartridge(db: sqlite3.Connection) -> dict[str, Any]:
 def list_cartridges(db: sqlite3.Connection) -> list[dict[str, Any]]:
     sync_cartridge_inventory(db)
     rows = db.execute("SELECT filename,title,location FROM cartridge_inventory ORDER BY filename COLLATE NOCASE").fetchall()
-    return [{"filename": row["filename"], "title": row["title"], "location": row["location"], "file_available": (CARTRIDGES / row["filename"]).is_file()} for row in rows]
+    return [{"filename": row["filename"], "title": row["title"], "location": row["location"], "file_available": ((CARTRIDGES / row["filename"]).is_file() and not (CARTRIDGES / row["filename"]).is_symlink())} for row in rows]
 
 
 def press_button(db: sqlite3.Connection, button: str, duration_ms: int) -> dict[str, Any]:
