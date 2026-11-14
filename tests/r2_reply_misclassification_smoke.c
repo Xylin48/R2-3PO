@@ -588,6 +588,43 @@ int main(void)
     }
 #endif
 
+    /* Deliberately exceed the live byte cap while still having one
+       removable conversational message. The failed append must NOT evict
+       that message before discovering pinned context blocks admission. */
+    MessageList previous_messages = messages;
+    messages = (MessageList){0};
+    size_t pinned_length = MAX_LIVE_MESSAGE_BYTES - 1024U;
+    char *pinned = malloc(pinned_length + 1U);
+    char *too_large = malloc(2048U + 1U);
+    ok &= check(pinned && too_large, "allocate live-history admission fixtures");
+    if (pinned && too_large) {
+        memset(pinned, 'P', pinned_length);
+        pinned[pinned_length] = '\\0';
+        memset(too_large, 'N', 2048U);
+        too_large[2048U] = '\\0';
+        int pinned_ok = message_add_pinned("system", pinned);
+        int old_ok = pinned_ok == 0 && message_add("user", "surviving earlier turn") == 0;
+        size_t original_count = messages.count;
+        Message *original_pointer = messages.items;
+        int append_result = old_ok ? message_add("user", too_large) : 0;
+        ok &= check(old_ok && append_result != 0 &&
+                    messages.count == original_count &&
+                    messages.items == original_pointer &&
+                    messages.items[original_count - 1].content &&
+                    !strcmp(messages.items[original_count - 1].content,
+                            "surviving earlier turn") &&
+                    messages.items[0].pinned,
+                    "failed oversize live-history append does not evict original conversation");
+    }
+    free(pinned);
+    free(too_large);
+    for (size_t i = 0; i < messages.count; ++i) {
+        free(messages.items[i].role);
+        free(messages.items[i].content);
+    }
+    free(messages.items);
+    messages = previous_messages;
+
     for (size_t i = 0; i < messages.count; ++i) {
         free(messages.items[i].role);
         free(messages.items[i].content);

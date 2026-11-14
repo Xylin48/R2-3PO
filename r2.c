@@ -961,83 +961,78 @@ static int message_add_ex(
     }
 
     /*
-       Bound live in-process history by both count and bytes. Pinned core
-       instructions/archive/memory are protected; old conversational turns
-       are evicted because the durable Life Log and persistent memory remain
-       the long-term record. This prevents large outputs from growing RAM
-       without bound over an overnight session.
-    */
+     * Plan evictions without changing the conversation. If pinned context
+     * prevents the append or the required capacity cannot be reserved,
+     * retain every original message, including transient conversation.
+     * A failed new message is never permission to delete older evidence.
+     */
     size_t live_bytes = 0;
     for (size_t i = 0; i < messages.count; ++i) {
         live_bytes += strlen(messages.items[i].role ? messages.items[i].role : "") + 1;
         live_bytes += strlen(messages.items[i].content ? messages.items[i].content : "") + 1;
     }
-    size_t new_bytes = role_length + content_length + 2;
-    if (new_bytes > MAX_LIVE_MESSAGE_BYTES) {
-        free(role_copy);
-        free(content_copy);
-        fprintf(stderr, "[R2 memory] Refusing a single live message larger than the %u-byte RAM guard.\n",
-                (unsigned)MAX_LIVE_MESSAGE_BYTES);
-        return -1;
-    }
-
-    while (messages.count >= MAX_MESSAGES ||
-           live_bytes > MAX_LIVE_MESSAGE_BYTES - new_bytes) {
+    const size_t new_bytes = role_length + content_length + 2;
+    unsigned char evict[MAX_MESSAGES] = {0};
+    size_t kept_count = messages.count;
+    size_t kept_bytes = live_bytes;
+    while (kept_count >= MAX_MESSAGES ||
+           kept_bytes > MAX_LIVE_MESSAGE_BYTES - new_bytes) {
         size_t remove_index = SIZE_MAX;
         for (size_t i = 0; i < messages.count; ++i) {
-            if (!messages.items[i].pinned) {
+            if (!evict[i] && !messages.items[i].pinned) {
                 remove_index = i;
                 break;
             }
         }
-
-        /* Never evict architectural context to satisfy a memory cap. */
         if (remove_index == SIZE_MAX) {
             free(role_copy);
             free(content_copy);
-            fprintf(stderr, "[R2 memory] Pinned context already occupies the live-history budget; refusing another message.\n");
+            fprintf(stderr, "[R2 memory] Pinned context prevents an atomic live-history append.\\n");
             return -1;
         }
-
-        live_bytes -= strlen(messages.items[remove_index].role ?
+        evict[remove_index] = 1;
+        kept_count--;
+        kept_bytes -= strlen(messages.items[remove_index].role ?
                              messages.items[remove_index].role : "") + 1;
-        live_bytes -= strlen(messages.items[remove_index].content ?
+        kept_bytes -= strlen(messages.items[remove_index].content ?
                              messages.items[remove_index].content : "") + 1;
-        free(messages.items[remove_index].role);
-        free(messages.items[remove_index].content);
-        if (remove_index + 1 < messages.count) {
-            memmove(messages.items + remove_index,
-                    messages.items + remove_index + 1,
-                    (messages.count - remove_index - 1) * sizeof(Message));
-        }
-        messages.count--;
     }
 
-    if (messages.count == messages.capacity) {
-
-        size_t nc =
-            messages.capacity
-                ? messages.capacity * 2
-                : 64;
-
-        if (nc > MAX_MESSAGES)
-            nc = MAX_MESSAGES;
-
-        Message *p =
-            realloc(
-                messages.items,
-                nc * sizeof(*p)
-            );
-
-        if (!p) {
+    const size_t needed = kept_count + 1;
+    if (needed > messages.capacity) {
+        size_t nc = messages.capacity ? messages.capacity : 64;
+        while (nc < needed && nc < MAX_MESSAGES) {
+            size_t next = nc * 2;
+            nc = next > MAX_MESSAGES ? MAX_MESSAGES : next;
+        }
+        if (nc < needed) {
             free(role_copy);
             free(content_copy);
             return -1;
         }
-
-        messages.items = p;
+        Message *grown = realloc(messages.items, nc * sizeof(*grown));
+        if (!grown) {
+            free(role_copy);
+            free(content_copy);
+            return -1;
+        }
+        messages.items = grown;
         messages.capacity = nc;
     }
+
+    /* The append is now guaranteed to fit: only here may history be evicted. */
+    size_t write_index = 0;
+    for (size_t i = 0; i < messages.count; ++i) {
+        if (evict[i]) {
+            free(messages.items[i].role);
+            free(messages.items[i].content);
+            continue;
+        }
+        if (write_index != i)
+            messages.items[write_index] = messages.items[i];
+        write_index++;
+    }
+    messages.count = write_index;
 
     messages.items[messages.count].role = role_copy;
     messages.items[messages.count].content = content_copy;
