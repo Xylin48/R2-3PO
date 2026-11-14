@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <stdint.h>
@@ -21,6 +22,9 @@
  * when the diary filesystem tools begin their descriptor-based walk. */
 static int swap_diary_leaf = 0;
 static int swap_diary_parent = 0;
+static int fail_diary_readdir = 0;
+static int fail_diary_fread = 0;
+static int fail_diary_fgets = 0;
 static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
 int __real_openat(int dirfd, const char *path, int flags, ...);
 int __wrap_openat(int dirfd, const char *path, int flags, ...)
@@ -46,6 +50,39 @@ int __wrap_openat(int dirfd, const char *path, int flags, ...)
         return __real_openat(dirfd, path, flags, mode);
     }
     return __real_openat(dirfd, path, flags);
+}
+
+/* Inject real stdio/directory read errors, not merely short EOF reads.
+ * Returning a partial report on EIO makes lost data look like no matches. */
+struct dirent *__real_readdir(DIR *directory);
+struct dirent *__wrap_readdir(DIR *directory)
+{
+    if (fail_diary_readdir) {
+        fail_diary_readdir = 0;
+        errno = EIO;
+        return NULL;
+    }
+    return __real_readdir(directory);
+}
+
+size_t __real_fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
+size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+    if (fail_diary_fread) {
+        fail_diary_fread = 0;
+        assert(close(fileno(stream)) == 0);
+    }
+    return __real_fread(ptr, size, nmemb, stream);
+}
+
+char *__real_fgets(char *ptr, int size, FILE *stream);
+char *__wrap_fgets(char *ptr, int size, FILE *stream)
+{
+    if (fail_diary_fgets) {
+        fail_diary_fgets = 0;
+        assert(close(fileno(stream)) == 0);
+    }
+    return __real_fgets(ptr, size, stream);
 }
 
 static void verify_diary_workspace_path_swaps(void)
@@ -94,6 +131,23 @@ static void verify_diary_workspace_path_swaps(void)
     assert(file && fputs("inside list fixture", file) >= 0 && fclose(file) == 0);
     char *listed = r2_workspace_list("workspace-race");
     assert(listed && strstr(listed, "[FILE] note.txt"));
+    free(listed);
+
+    /* File and directory I/O failures must not be interpreted as success. */
+    fail_diary_fread = 1;
+    char *read_error = r2_workspace_read_chunk(
+        "workspace-race/note.txt", 0, 4096, NULL, NULL);
+    assert(!read_error && !fail_diary_fread);
+    free(read_error);
+
+    fail_diary_fgets = 1;
+    read_error = r2_workspace_search("workspace-race/note.txt", "fixture");
+    assert(!read_error && !fail_diary_fgets);
+    free(read_error);
+
+    fail_diary_readdir = 1;
+    listed = r2_workspace_list("workspace-race");
+    assert(!listed && !fail_diary_readdir);
     free(listed);
 
     swap_diary_parent = 1;
