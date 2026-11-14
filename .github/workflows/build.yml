@@ -677,6 +677,11 @@ jobs:
           python3 -m py_compile tools/copy_ollama_model.py tests/copy_ollama_model_integrity.py
           python3 tests/copy_ollama_model_integrity.py
 
+      - name: Exercise offline typed conversations and persisted history across restart
+        run: |
+          python3 -m py_compile tests/r2_offline_conversation_integration.py
+          python3 tests/r2_offline_conversation_integration.py
+
       - name: Run isolated overnight SIGTERM lifecycle integration
         run: |
           python3 -m py_compile tests/r2_service_signal_integration.py
