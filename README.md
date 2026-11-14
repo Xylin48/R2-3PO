@@ -47,37 +47,11 @@ relevant memories/perceptions. A separate intent-summary inference is not used a
 intermediate replacement for the answer. Build and smoke tests do not replace a live
 test with the locally installed Ollama model and actual Eyes/TV setup.
 
-You can also compile directly with the same source list and libraries:
-
-```sh
-gcc -std=c11 -Wall -Wextra -Werror -O2 \
-  r2.c shell.c r2_diary.c Log.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c Eyes.c R2Sounds.c R2Reply.c \
-  -o r2 \
-  -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
-```
-
 ## Compilation source inventory
 
-The build requires these thirteen C translation units:
+The Makefile lists all 18 C translation units and their headers. The core and shell own startup, shutdown and interaction. The Diary, Life Log, Sensory Journal, Reality, Reward, Addiction, Alternate-Self and Imagination modules own their respective state. Eyes and Visual handle frames and interpretation. Ears uses Audio Discovery, Audio Capture and Audio File for independent PCM sources. R2Sounds and R2Reply handle local sound effects and reply cleanup.
 
-- `r2.c` — core
-- `shell.c` — command shell
-- `r2_diary.c` — diary subsystem
-- `Log.c` — factual Life Log chronology
-- `Reality.c` — persistent self-continuity, world state, room objects, needs, and inventory containers
-- `Addiction.c` — persistent enjoyment history and behavior-derived repeated-interest/addiction labels
-- `Reward.c` — experience/reward bookkeeping shared by memory and learning
-- `AlternateSelf.c` — persistent, explicitly hypothetical Choice Lab branches
-- `Visual.c` — vision-model integration
-- `Ears.c` — audio input
-- `Eyes.c` — visual input
-- `V-Webcam.py` — display-only mirror of Eyes frames with a model-reported focus overlay; it does not open a second camera or control VLC.
-- `R2Sounds.c` — state-aware local sound-effect selection and playback
-- `R2Reply.c` — strips private control/reasoning markers from user-facing replies
-
-When an Eyes source opens in an interactive session, the display-only V-Webcam window mirrors that existing frame stream. Visual inference can publish a normalized focus region for an overlay; the window never opens a second capture device or feeds frames back into perception.
-
-Their matching headers are included in the repository: `r2.h`, `shell.h`, `r2_diary.h`, `Log.h`, `Reality.h`, `Addiction.h`, `Reward.h`, `AlternateSelf.h`, `Visual.h`, `Ears.h`, `Eyes.h`, `R2Sounds.h`, and `R2Reply.h`.
+In an interactive session, the display-only `V-Webcam.py` window mirrors the existing Eyes frame stream. Visual inference can publish a normalized focus region for the overlay. The viewer uses the already captured frames.
 
 GitHub Actions checks shell-script syntax and compiles this source set on pushes to the audit branch and the configured main branches. It also runs isolated smoke tests for file-authoritative money (seed, deletion, restart, deposit/withdrawal, purchase rollback, and cents) and the GBA launcher/lifecycle. These tests do not exercise Ollama, live audio/video devices, or the user's actual graphical desktop.
 
@@ -192,7 +166,7 @@ R2 can operate the device through verified [WORLD] actions:
 Controller injection uses xdotool; install it (sudo apt install xdotool) to enable software button presses. The emulator window must be visible in the same desktop session. The Life Log records separate physical console-operation and virtual game-session activities, linked by the console's game title in event details. The console itself records inputs sent, but inputs are not misreported as in-game achievements. Coin pickups, flagpoles, item collections, level completion, and similar events require a separately verified game-specific adapter and are not implemented by this initial device layer. No game is assumed to be installed or owned; the cartridge library begins empty.
 
  
-Verified-game-event adapter contract: future game-specific adapters may call the private Python API record_verified_game_event() only after independently detecting a state change. The API requires an active emulator session, an allowlisted event type, and an evidence source prefixed with adapter:. These events are stored as virtual-context events in State/console_state.db, then the R2 bridge copies them into the authoritative Life Log and acknowledges them only after the Life Log insert succeeds. Observer/Activity.txt displays the resulting public game-event summaries. The current build provides this event pipeline but does not yet ship a Mario, Zelda, Metroid, or other game-specific detector; it never infers a pickup or victory from controller input alone.
+Verified-game-event adapter contract: future game-specific adapters may call the private Python API record_verified_game_event() only after independently detecting a state change. The API requires an active emulator session, an allowlisted event type, and an evidence source prefixed with adapter:. These events are stored as virtual-context events in State/console_state.db, then the R2 bridge copies them into the authoritative Life Log and acknowledges them after the Life Log record and idempotent reward both succeed. Observer/Activity.txt displays the resulting public game-event summaries. The current build provides this event pipeline but does not yet ship a Mario, Zelda, Metroid, or other game-specific detector; it never infers a pickup or victory from controller input alone.
 
 
 ## Virtual Game Boy Advance and physical cartridge handling
@@ -248,7 +222,7 @@ R2 keeps a bounded, short-lived RAM cache of persistent-memory retrieval results
 
 Ollama requests are serialized. Foreground conversations take priority over opportunistic vision and background model calls; an in-flight background request checks the foreground wait queue and yields when possible. The C application, SQLite, prompt construction, scheduling, and cache still use the CPU. System RAM holds the model/runtime working set and cached context; it cannot execute model layers itself. A supported GPU backend is required for actual GPU inference.
 
-If the text model returns a recognizable failure that labels an ordinary typed message as unintelligible audio/noise instead of answering it, R2 makes one bounded corrective attempt with the original conversation, retrieved context, and exact active user turn retained. Normal replies do not incur an extra model call. The retry is a targeted safeguard, not a general semantic guarantee. If the retry fails or repeats the same recognizable misclassification, R2 discards that draft and asks an honest clarification; real-world response quality must still be checked on the host.
+If the text model returns a recognizable failure that labels an ordinary typed message as unintelligible audio/noise instead of answering it, R2 makes one bounded corrective attempt with the original conversation, retrieved context, and exact active user turn retained. Normal replies do not incur an extra model call. The retry is a targeted safeguard, not a general semantic guarantee. The conversation-quality checklist covers both the initial reply and the outcome of a corrective retry on the installed model.
 
 Foreground conversation and its corrective retry allow up to six hours per request by default. Qwen's reasoning channel is enabled for those foreground answer calls, while structured/background helper calls remain in non-thinking mode; the private reasoning field is never shown as R2's reply. Foreground generation budgets are larger (up to 8,192 output tokens when context allows) so reasoning is less likely to consume the entire output allowance before a final answer. Set `R2_OLLAMA_TIMEOUT_SECONDS` before launching R2 to choose a timeout from 30 seconds up to 6 hours; for example, `export R2_OLLAMA_TIMEOUT_SECONDS=2700` sets a 45-minute limit. Invalid values fall back to the six-hour default. This changes the wait limit, not model speed, and shutdown can still interrupt an in-flight request.
 
@@ -262,11 +236,10 @@ Before installing, make sure the local Ollama installation has the required mode
 ollama pull qwen3.5:9b
 ```
 
-Then, from the repository directory:
+Follow the [overnight service guide](docs/overnight-service.md) to verify and install the root-owned bootstrap, then run it from its installed location:
 
 ```sh
-cd /home/x/R2_Home/R2
-bash tools/install_r2_overnight.sh
+sudo /usr/local/sbin/r2-3po-install
 ```
 
 The installer refuses to rebuild while an R2 process is already running, prepares missing data-only folders as the `r2` account, then creates a private, consistent snapshot of all five SQLite databases and requires their integrity audit to pass before activation. It also checks existing database-file permissions. Only then does it compile the current source to a process-specific temporary executable, preserve the previous binary, install `r2-3po.service`, and request immediate startup. If activation or core initialization fails, it attempts to restore and restart the previous executable; if no previous binary exists, it stops the failed service and reports that rollback is unavailable.
@@ -281,7 +254,7 @@ sudo systemctl start r2-3po.service
 sudo systemctl disable r2-3po.service
 ```
 
-The supervisor restarts unexpected exits, waits up to 60 seconds for the local Ollama API/model, then performs one real `qwen3.5:9b` chat completion with a bounded 180-second timeout before starting the core. The installer waits for a readiness marker emitted after core initialization—not merely the runner's dependency-check log—and applies the same readiness check when rolling back. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
+The supervisor restarts unexpected exits. The service runner checks the local Ollama API and completes real text and image probes with `qwen3.5:9b` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for a readiness marker emitted after core initialization—not merely the runner's dependency-check log—and applies the same readiness check when rolling back. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
 
 Sound assets remain host-local at `/home/x/R2_Home/R2_sounds/FX`. Service startup checks core prerequisites but does not prove speaker playback, camera permissions, microphone capture, or GUI/VLC integration. Verify those against the actual desktop/audio session after startup. Use `R2_Launch_Code.sh` for the existing interactive desktop shell and Observer window.
 

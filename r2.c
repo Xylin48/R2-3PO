@@ -70,6 +70,7 @@
 #include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <dirent.h>
@@ -371,6 +372,7 @@ static atomic_int diary_thread_started = ATOMIC_VAR_INIT(0);
 static int core_initialized = 0;
 /* Covers partial initialization even when manual cleanup has nulled core handles. */
 static int init_attempt_active = 0;
+static int core_storage_lock = -1;
 /* curl_global_cleanup is valid only after a successful global initialization. */
 static int curl_global_initialized = 0;
 static int startup_memory_loaded = 0;
@@ -14609,15 +14611,28 @@ int r2_init(void)
        DIRECTORIES
        -------------------------------------------------------- */
 
-    if (
-        mkdir_p(R2_HOME) != 0 ||
-        mkdir_p(DIARY_DIR) != 0
-    ) {
+    if (mkdir_p(R2_HOME) != 0)
+        R2_INIT_FAIL("could not create the persistent data directory");
 
-        R2_INIT_FAIL(
-            "could not create required directories"
-        );
+    /* Lock the directory inode for the whole core lifetime. No lock file
+       can be replaced independently of the databases it protects. */
+    core_storage_lock = open(R2_HOME, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (core_storage_lock < 0)
+        R2_INIT_FAIL("could not open persistent data directory: %s", strerror(errno));
+    int lock_rc;
+    do {
+        lock_rc = flock(core_storage_lock, LOCK_EX | LOCK_NB);
+    } while (lock_rc < 0 && errno == EINTR);
+    if (lock_rc < 0) {
+        int lock_error = errno;
+        close(core_storage_lock);
+        core_storage_lock = -1;
+        if (lock_error == EWOULDBLOCK)
+            R2_INIT_FAIL("another R2 core is using %s", R2_HOME);
+        R2_INIT_FAIL("could not lock persistent data directory: %s", strerror(lock_error));
     }
+    if (mkdir_p(DIARY_DIR) != 0)
+        R2_INIT_FAIL("could not create the diary directory");
 
     /* --------------------------------------------------------
        SQLITE MEMORY DATABASE
@@ -15233,6 +15248,11 @@ void r2_shutdown(void)
         curl_global_initialized = 0;
     }
     message_free_all();
+    if (core_storage_lock >= 0) {
+        (void)flock(core_storage_lock, LOCK_UN);
+        close(core_storage_lock);
+        core_storage_lock = -1;
+    }
 
     core_initialized = 0;
     init_attempt_active = 0;
