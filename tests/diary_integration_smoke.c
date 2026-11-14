@@ -26,8 +26,7 @@ static int fail_diary_readdir = 0;
 static int fail_diary_fread = 0;
 static int fail_diary_fgets = 0;
 static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
-int __real_openat(int dirfd, const char *path, int flags, ...);
-int __wrap_openat(int dirfd, const char *path, int flags, ...)
+static void maybe_swap_checked_workspace_open(const char *path, int flags)
 {
     if (swap_diary_leaf && strcmp(path, "note.txt") == 0 &&
         (flags & O_NOFOLLOW)) {
@@ -42,14 +41,38 @@ int __wrap_openat(int dirfd, const char *path, int flags, ...)
                       R2_WORKSPACE "/workspace-race-old") == 0);
         assert(symlink("/tmp", R2_WORKSPACE "/workspace-race") == 0);
     }
-    if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode_t mode = va_arg(args, mode_t);
-        va_end(args);
-        return __real_openat(dirfd, path, flags, mode);
+}
+
+/* Some libc/compiler combinations target openat64 or the fortified
+ * __openat64_2 entry point instead of the unfortified openat symbol. */
+#define DEFINE_OPENAT_WRAPPER(symbol)                                             \
+    int __real_##symbol(int fd, const char *path, int flags, ...);                \
+    int __wrap_##symbol(int fd, const char *path, int flags, ...)                 \
+    {                                                                             \
+        maybe_swap_checked_workspace_open(path, flags);                           \
+        if (flags & O_CREAT) {                                                     \
+            va_list args;                                                         \
+            va_start(args, flags);                                                \
+            mode_t mode = va_arg(args, mode_t);                                    \
+            va_end(args);                                                         \
+            return __real_##symbol(fd, path, flags, mode);                        \
+        }                                                                         \
+        return __real_##symbol(fd, path, flags);                                  \
     }
-    return __real_openat(dirfd, path, flags);
+DEFINE_OPENAT_WRAPPER(openat)
+DEFINE_OPENAT_WRAPPER(openat64)
+#undef DEFINE_OPENAT_WRAPPER
+int __real___openat64_2(int fd, const char *path, int flags);
+int __wrap___openat64_2(int fd, const char *path, int flags)
+{
+    maybe_swap_checked_workspace_open(path, flags);
+    return __real___openat64_2(fd, path, flags);
+}
+int __real___openat_2(int fd, const char *path, int flags);
+int __wrap___openat_2(int fd, const char *path, int flags)
+{
+    maybe_swap_checked_workspace_open(path, flags);
+    return __real___openat_2(fd, path, flags);
 }
 
 /* Inject real stdio/directory read errors, not merely short EOF reads.
