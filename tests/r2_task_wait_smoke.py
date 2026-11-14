@@ -91,12 +91,13 @@ if completed_start < 0 or completed_end <= completed_start:
 collect = core[completed_start:completed_end]
 initial_alloc_failure = collect.find("char *out =")
 initial_alloc_failure = collect.find("if (!out)", initial_alloc_failure)
-cleanup = collect.find("CompletedTask *remaining = head", initial_alloc_failure)
-require(initial_alloc_failure >= 0 and cleanup > initial_alloc_failure
-        and "free(remaining->command);" in collect[cleanup:]
-        and "free(remaining->output);" in collect[cleanup:]
-        and "free(remaining);" in collect[cleanup:]
-        and "return NULL;" in collect[cleanup:],
-        "completed task records are freed if the initial collection buffer allocation fails")
+requeue = collect.find("completed_requeue_front(head);", initial_alloc_failure)
+require(initial_alloc_failure >= 0 and requeue > initial_alloc_failure
+        and "return NULL;" in collect[requeue:]
+        and "completed_requeue_front(c);" in collect,
+        "undelivered completions survive initial and later allocation failures for retry")
+require("free(completed_pending_handoff);" in shutdown
+        and "completed_pending_handoff = NULL;" in shutdown,
+        "shutdown frees pending task evidence so it cannot leak into a later runtime")
 
 print("Task/subprocess I/O interruption smoke test passed.")

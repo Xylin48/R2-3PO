@@ -15233,6 +15233,12 @@ void r2_shutdown(void)
         free(remaining_running);
         remaining_running = next;
     }
+    /* A failed conversation publication may own formatted Hands evidence.
+       This is no longer safe to inject after the current runtime exits. */
+    pthread_mutex_lock(&completed_handoff_lock);
+    free(completed_pending_handoff);
+    completed_pending_handoff = NULL;
+    pthread_mutex_unlock(&completed_handoff_lock);
 
     /* Stop background post-turn Ollama/DB work before closing persistent stores. */
     pthread_mutex_lock(&post_turn_lock);
