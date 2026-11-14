@@ -1240,15 +1240,31 @@ static int mirror_reserve(int64_t id, int fd, off_t *start)
 
 static int mirror_append(int64_t id, const char *path, const char *record, size_t length)
 {
-    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_NONBLOCK | O_CLOEXEC, 0666);
-    if (fd < 0) return -1;
+    /* A diary mirror has a trusted daily basename. Pin the directory first
+     * and never follow a replaced daily file or parent directory symlink. */
+    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory < 0) return -1;
+    const size_t prefix_length = strlen(R2_DIARY_DIR);
+    if (strncmp(path, R2_DIARY_DIR, prefix_length) != 0 ||
+        path[prefix_length] != '/' || !path[prefix_length + 1] ||
+        strchr(path + prefix_length + 1, '/')) {
+        close(directory);
+        errno = EINVAL;
+        return -1;
+    }
+    const char *filename = path + prefix_length + 1;
+    int fd = openat(directory, filename,
+                    O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                    0666);
+    if (fd < 0) {
+        int error = errno;
+        close(directory);
+        errno = error;
+        return -1;
+    }
     int result = -1;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) goto done;
-    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) goto done;
-    int sync_error = fsync(directory) == 0 ? 0 : errno;
-    if (close(directory) != 0 && !sync_error) sync_error = errno;
-    if (sync_error) { errno = sync_error; goto done; }
+    if (fsync(directory) != 0) goto done;
     off_t start;
     int reserved = mirror_reserve(id, fd, &start);
     if (reserved != 0) {
@@ -1270,8 +1286,11 @@ static int mirror_append(int64_t id, const char *path, const char *record, size_
         goto done;
     if (present != length) { errno = ESTALE; goto done; }
     struct stat open_file, named_file;
-    if (fstat(fd, &open_file) != 0 || stat(path, &named_file) != 0) goto done;
-    if (open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
+    if (fstat(fd, &open_file) != 0 ||
+        fstatat(directory, filename, &named_file, AT_SYMLINK_NOFOLLOW) != 0)
+        goto done;
+    if (!S_ISREG(named_file.st_mode) ||
+        open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
         errno = ESTALE;
         goto done;
     }
@@ -1298,6 +1317,7 @@ done:
     {
         int error = errno;
         (void)close(fd);
+        (void)close(directory);
         errno = error;
     }
     return result;
