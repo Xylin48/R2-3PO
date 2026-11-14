@@ -405,10 +405,10 @@ jobs:
           cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-reply-misclassification-smoke-test
 
-      - name: Reject workspace read symlink swaps after path validation
+      - name: Reject workspace read and directory-list symlink swaps after path validation
         run: |
           ROOT=/tmp/r2-workspace-read-race
-          rm -rf "$ROOT" /tmp/r2-workspace-read-race-test /tmp/r2-workspace-read-outside-fixture
+          rm -rf "$ROOT" /tmp/r2-workspace-read-race-test /tmp/r2-workspace-read-outside-fixture /tmp/r2-workspace-list-outside-fixture
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS tests/workspace_read_inode_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-workspace-read-race-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=openat
           /tmp/r2-workspace-read-race-test

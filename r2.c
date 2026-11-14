@@ -2420,8 +2420,13 @@ static char *workspace_list(const char *rel)
         r2_log_file_event("list", rel, "blocked_or_invalid_path", NULL);
         return NULL;
     }
-    DIR *dir = opendir(path);
+    /* The validated pathname is not a lock. Descend from the fixed
+     * workspace directory with O_NOFOLLOW and use the resulting inode for
+     * all readdir/fstatat calls, even if another process swaps a parent. */
+    int directory_fd = workspace_open_write_parent(path);
+    DIR *dir = directory_fd >= 0 ? fdopendir(directory_fd) : NULL;
     if (!dir) {
+        if (directory_fd >= 0) close(directory_fd);
         r2_log_file_event("list", rel, "failed_to_open_directory", NULL);
         return NULL;
     }
