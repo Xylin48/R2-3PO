@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Read-only desktop observer for R2's factual public event summaries."""
 from __future__ import annotations
+import errno
+import fcntl
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -31,30 +34,71 @@ PUBLIC_EVENT_TYPES = frozenset({
 def is_observer_event(category: str, event_type: str) -> bool:
     """True only for explicitly approved factual event types/categories."""
     return event_type in PUBLIC_EVENT_TYPES and category in {"world", "media"}
-def append_activity_line(path: Path, local_time: str, summary: str, event_id: int) -> None:
-    """Append one public event idempotently; never overwrite activity history."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as stream:
-        stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        # Binary mode permits a bounded tail read by byte offset. The observer
-        # retries events in order, so the latest complete marker detects a
-        # write that reached the file before a later flush error.
-        if size:
-            stream.seek(max(0, size - 4096), os.SEEK_SET)
-            tail = stream.read().decode("utf-8", errors="replace")
-            if f"(event #{event_id})" in tail:
+# Activity.txt is a separate file from the authoritative SQLite Life Log.
+# Rebuild the exact event-ID index from complete, newline-terminated records
+# rather than guessing from a 4096-byte suffix or an in-memory session cursor.
+ACTIVITY_EVENT_MARKER = re.compile(rb" \\(event #([1-9][0-9]*)\\)\\n$")
+
+
+class ActivityWriter:
+    def __init__(self, path: Path):
+        self.path = path
+        self._identity = None
+        self._offset = 0
+        self._saved_ids = set()
+
+    def append(self, local_time: str, summary: str, event_id: int) -> None:
+        if event_id <= 0:
+            raise ValueError("Activity event ID must be positive")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            stat = os.fstat(stream.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            if identity != self._identity or stat.st_size < self._offset:
+                # An operator may rotate or truncate the log. Never reuse an
+                # index from a different file or earlier generation.
+                self._identity = identity
+                self._offset = 0
+                self._saved_ids.clear()
+            stream.seek(self._offset)
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                if not line.endswith(b"\\n"):
+                    # An interrupted append is preserved exactly for repair,
+                    # not combined with a later line or silently discarded.
+                    raise OSError(errno.EIO, "Activity.txt ends with an incomplete line")
+                try:
+                    line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise OSError(errno.EILSEQ, "Activity.txt contains invalid UTF-8") from exc
+                marker = ACTIVITY_EVENT_MARKER.search(line)
+                if marker:
+                    self._saved_ids.add(int(marker.group(1)))
+            self._offset = stream.tell()
+            if event_id in self._saved_ids:
                 return
-            stream.seek(0, os.SEEK_END)
-        if size == 0:
-            stream.write(b"R2-3PO Activity Log\n")
-            stream.write(b"Factual observer events only; private thoughts and notifications excluded.\n")
-            stream.write(("-" * 72 + "\n").encode("utf-8"))
-        clean_time = " ".join((local_time or "time unavailable").split())
-        clean_summary = " ".join((summary or "").split())
-        line = f"[{clean_time}] {clean_summary} (event #{event_id})\n"
-        stream.write(line.encode("utf-8"))
-        stream.flush()
+            if self._offset == 0:
+                stream.write(b"R2-3PO Activity Log\\n")
+                stream.write(b"Factual observer events only; private thoughts and notifications excluded.\\n")
+                stream.write(("-" * 72 + "\\n").encode("utf-8"))
+            clean_time = " ".join((local_time or "time unavailable").split())
+            clean_summary = " ".join((summary or "").split())
+            stream.write(f"[{clean_time}] {clean_summary} (event #{event_id})\\n".encode("utf-8"))
+            stream.flush()
+            # Mark an event complete only after its entire record is durable.
+            # A failed fsync leaves it discoverable in the next full/delta scan.
+            os.fsync(stream.fileno())
+            self._offset = stream.tell()
+            self._saved_ids.add(event_id)
+
+
+def append_activity_line(path: Path, local_time: str, summary: str, event_id: int) -> None:
+    """Standalone append helper; the GUI reuses one indexed writer for speed."""
+    ActivityWriter(path).append(local_time, summary, event_id)
+
 
 def open_database():
     # The window cannot create or mutate the private Life Log database.
@@ -63,6 +107,26 @@ def open_database():
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     return connection
+def reconcile_activity_page(connection, writer: ActivityWriter, cursor: int,
+                            latest: int, batch_size: int = MAX_ROWS):
+    """Replay permitted public records in bounded, exact-ID order.
+
+    The Life Log remains query-only. A failed append never advances the
+    cursor; the file index makes replay after an uncertain flush idempotent.
+    """
+    allowed_types = tuple(sorted(PUBLIC_EVENT_TYPES))
+    placeholders = ",".join("?" for _ in allowed_types)
+    rows = connection.execute(
+        "SELECT id,local_time,category,event_type,summary FROM r2_log_events "
+        "WHERE id>? AND id<=? AND category IN ('world','media') "
+        f"AND event_type IN ({placeholders}) ORDER BY id ASC LIMIT ?",
+        (cursor, latest, *allowed_types, batch_size),
+    ).fetchall()
+    for row in rows:
+        writer.append(row["local_time"], row["summary"], int(row["id"]))
+    return (latest if len(rows) < batch_size else int(rows[-1]["id"])), rows
+
+
 def main() -> int:
     try:
         import tkinter as tk
@@ -93,13 +157,15 @@ def main() -> int:
     status = tk.StringVar(value="Waiting for R2's Life Log…")
     ttk.Label(root, textvariable=status, anchor="w", padding=(12, 4)).pack(fill="x")
     last_id = None
+    display_cutoff = None
+    activity_writer = ActivityWriter(ACTIVITY_FILE)
     connection = None
     last_open_attempt = 0.0
     activity_file_error = False
     allowed_types = tuple(sorted(PUBLIC_EVENT_TYPES))
     allowed_placeholders = ",".join("?" for _ in allowed_types)
     def poll():
-        nonlocal last_id, connection, last_open_attempt, activity_file_error
+        nonlocal last_id, display_cutoff, connection, last_open_attempt, activity_file_error
         try:
             if connection is None and time.monotonic() - last_open_attempt >= 2.0:
                 last_open_attempt = time.monotonic()
@@ -112,9 +178,9 @@ def main() -> int:
                 latest = connection.execute(
                     "SELECT COALESCE(MAX(id), 0) FROM r2_log_events"
                 ).fetchone()[0]
-                # Populate the window with recent approved history on first connect.
-                # Historical rows are not appended again to Activity.txt; only new live
-                # events are appended, so reopening the observer never duplicates history.
+                # The popup initially shows the latest approved summaries.
+                # Activity.txt independently catches up from the first ID,
+                # including events created while this popup was closed.
                 if last_id is None:
                     rows = connection.execute(
                         "SELECT id, local_time, category, event_type, summary "
@@ -128,42 +194,28 @@ def main() -> int:
                         local_time = row["local_time"] or "time unavailable"
                         tree.insert("", "end", iid=str(row["id"]),
                                     values=(local_time, summary))
-                    last_id = int(latest)
+                    last_id = 0
+                    display_cutoff = int(latest)
+                try:
+                    next_cursor, rows = reconcile_activity_page(
+                        connection, activity_writer, last_id, int(latest))
+                except OSError as exc:
+                    # Retry the same batch. Exact-ID indexing prevents a
+                    # duplicate if the full line reached disk before failure.
+                    activity_file_error = True
+                    status.set(f"Live window · Activity.txt write failed: {exc}")
                 else:
-                    # Read only newly added approved summaries; private text never enters the UI.
-                    rows = connection.execute(
-                        "SELECT id, local_time, category, event_type, summary "
-                        "FROM r2_log_events WHERE id > ? AND id <= ? "
-                        "AND category IN ('world','media') "
-                        f"AND event_type IN ({allowed_placeholders}) ORDER BY id ASC",
-                        (last_id, latest, *allowed_types),
-                    ).fetchall()
-                    all_rows_persisted = True
                     for row in rows:
                         event_id = int(row["id"])
-                        summary = " ".join((row["summary"] or "").split())
-                        local_time = row["local_time"] or "time unavailable"
+                        if event_id <= display_cutoff:
+                            continue
                         item_id = str(event_id)
                         if not tree.exists(item_id):
+                            summary = " ".join((row["summary"] or "").split())
                             tree.insert("", "end", iid=item_id,
-                                        values=(local_time, summary))
-                        try:
-                            append_activity_line(ACTIVITY_FILE, local_time, summary, event_id)
-                            activity_file_error = False
-                            last_id = event_id
-                        except OSError as exc:
-                            # Leave the cursor at the last persisted event. The
-                            # next poll retries this event and all later events;
-                            # already displayed rows are not inserted twice.
-                            activity_file_error = True
-                            all_rows_persisted = False
-                            status.set(f"Live window · Activity.txt write failed: {exc}")
-                            break
-                    if all_rows_persisted:
-                        # Advance over event ids that are intentionally excluded
-                        # by the public-event query, as well as successfully
-                        # persisted rows, without repeatedly scanning old ids.
-                        last_id = int(latest)
+                                        values=(row["local_time"] or "time unavailable", summary))
+                    last_id = next_cursor
+                    activity_file_error = False
                 children = tree.get_children()
                 if len(children) > MAX_ROWS:
                     for item in children[:len(children) - MAX_ROWS]:
