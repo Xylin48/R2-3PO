@@ -206,7 +206,13 @@ def copy_model(source_root: Path, destination_root: Path, model: str, owner: str
         # Every source blob was hashed before destination changes began.
         # Verify existing destination content independently; when repair is
         # needed, the copied temporary file is hashed before atomic replacement.
-        if dst.is_symlink() or not dst.is_file() or _sha256_file(dst) != expected_sha256:
+        # An existing correct-hash blob may still be a hard link into the
+        # source store or another directory. Changing its owner or mode would
+        # change that other file too. Replace shared inodes before metadata
+        # updates so ownership of the private store stays independent.
+        if (dst.is_symlink() or not dst.is_file()
+                or dst.stat().st_nlink != 1
+                or _sha256_file(dst) != expected_sha256):
             # Create the temporary file exclusively in the destination directory.
             # A predictable PID-based name could already be a symlink and redirect
             # shutil.copyfile() outside the model store.
