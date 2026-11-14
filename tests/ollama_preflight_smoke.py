@@ -215,6 +215,28 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertIn("image-bearing chat failed", errors.getvalue())
         self.assertIn("CUDA out of memory", errors.getvalue())
 
+    def test_similarly_prefixed_model_is_not_the_installed_required_model(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", return_value={
+            "models": [{"name": "qwen3.5:9b-custom"}, {"name": "qwen3.5:9b-other"}]
+        }) as read, contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(wait_seconds=0, timeout=1))
+        self.assertEqual(read.call_count, 1)
+        self.assertIn("required local model qwen3.5:9b is not installed", errors.getvalue())
+
+    def test_similarly_prefixed_running_model_cannot_satisfy_gpu_offload(self) -> None:
+        errors = io.StringIO()
+        with patch.object(probe, "_read_json", side_effect=[
+            {"models": [{"name": "qwen3.5:9b"}]},
+            {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}},
+            {"models": [{"name": "qwen3.5:9b-other",
+                         "size": 500000, "size_vram": 123456}]},
+        ]) as read, contextlib.redirect_stderr(errors):
+            self.assertFalse(probe.preflight(timeout=1, require_gpu_offload=True))
+        self.assertEqual(read.call_count, 4)
+        self.assertIn("mixed CPU/GPU placement was required", errors.getvalue())
+
     def test_missing_model_fails_without_waiting_or_network(self) -> None:
         errors = io.StringIO()
         with patch.object(probe, "_read_json", return_value={"models": []}) as read:
