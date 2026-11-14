@@ -19,6 +19,7 @@ from pathlib import Path
 from r2_service_signal_integration import REPO, SOURCES, LIBS
 
 FIRST = "R2_OFFLINE_SESSION_ONE_73628"
+FOLLOWUP = "R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
 REPLY = "I received your message and can respond in this conversation."
 
@@ -93,7 +94,7 @@ def compile_core(base: Path) -> Path:
     return binary
 
 
-def conversation(binary: Path, workspace: Path, url: str, marker: str) -> str:
+def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ...]) -> str:
     env = os.environ.copy()
     env.pop("R2_SERVICE_MODE", None)
     env["R2_OLLAMA_BASE_URL"] = url
@@ -104,13 +105,14 @@ def conversation(binary: Path, workspace: Path, url: str, marker: str) -> str:
     env["DISPLAY"] = ""
     output = subprocess.run(
         [str(binary)], cwd=workspace, env=env,
-        input=f"talk {marker}\nexit\n",
+        input="".join(f"talk {marker}\n" for marker in markers) + "exit\n",
         text=True, capture_output=True, timeout=100,
     )
     combined = output.stdout + "\n" + output.stderr
-    if output.returncode or REPLY not in combined or "[R2-3PO shut down.]" not in combined:
+    if (output.returncode or combined.count("R2-3PO: " + REPLY) != len(markers)
+            or "[R2-3PO shut down.]" not in combined):
         raise AssertionError(
-            f"Typed conversation failed for {marker}: exit={output.returncode}\n"
+            f"Typed conversation failed for {markers}: exit={output.returncode}\n"
             + combined[-16000:]
         )
     return combined
@@ -125,29 +127,33 @@ def main() -> int:
         server, thread = serve()
         try:
             url = f"http://127.0.0.1:{server.server_port}"
-            conversation(binary, workspace, url, FIRST)
-            conversation(binary, workspace, url, SECOND)
+            conversation(binary, workspace, url, (FIRST, FOLLOWUP))
+            conversation(binary, workspace, url, (SECOND,))
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=3)
         requests = LocalOllama.requests
-        if len(requests) < 2:
+        if len(requests) < 3:
             raise AssertionError(f"Expected real chat HTTP requests in both sessions; got {len(requests)}")
-        for marker in (FIRST, SECOND):
-            if not any(marker in json.dumps(request, ensure_ascii=False) for request in requests):
+        for marker in (FIRST, FOLLOWUP, SECOND):
+            if not any(marker in str(item.get("content", ""))
+                       for request in requests
+                       for item in request.get("messages", [])
+                       if isinstance(item, dict) and item.get("role") == "user"):
                 raise AssertionError(f"Active user turn {marker} never reached the Ollama request")
         memory_db = workspace / "R2" / "r2_memory.db"
         with sqlite3.connect(f"file:{memory_db}?mode=ro", uri=True) as db:
             rows = db.execute(
                 "SELECT user_text,assistant_text FROM r2_log_conversations "
-                "WHERE user_text IN (?,?) ORDER BY event_id", (FIRST, SECOND),
+                "WHERE user_text IN (?,?,?) ORDER BY event_id",
+                (FIRST, FOLLOWUP, SECOND),
             ).fetchall()
-            if len(rows) != 2 or [row[0] for row in rows] != [FIRST, SECOND]:
+            if len(rows) != 3 or [row[0] for row in rows] != [FIRST, FOLLOWUP, SECOND]:
                 raise AssertionError(f"Typed conversation history lost after restart: {rows!r}")
-            if any(not row[1].strip() for row in rows):
-                raise AssertionError("Persisted conversation contains an empty assistant turn")
-    print("PASS: production core completed and retained two real typed turns across restart without peripherals.")
+            if any(row[1] != REPLY for row in rows):
+                raise AssertionError("Persisted assistant reply differs from the generated answer")
+    print("PASS: production core retained three exact typed turns and replies across a peripheral-free restart.")
     return 0
 
 
