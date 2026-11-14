@@ -9161,9 +9161,12 @@ static char *process_tools_with_status(
                 if (!count) APPEND("No supported cartridges found.\n");
                 for (size_t i = 0; i < count; ++i) {
                     struct json_object *item = json_object_array_get_idx(console_json, i);
-                    APPEND("- %s — %s\n",
+                    APPEND("- %s — %s; recorded location: %s; ROM file: %s\n",
                            gameboy_json_string(item, "filename", "unknown filename"),
-                           gameboy_json_string(item, "title", "unknown title"));
+                           gameboy_json_string(item, "title", "unknown title"),
+                           gameboy_json_string(item, "location", "unknown"),
+                           gameboy_json_bool(item, "file_available", 0)
+                               ? "available" : "unavailable");
                 }
             } else {
                 APPEND("GAME BOY CONSOLE: %s\n",
