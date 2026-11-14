@@ -5,6 +5,8 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +16,95 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Swap a validated file/parent for an outside-workspace symlink exactly
+ * when the diary filesystem tools begin their descriptor-based walk. */
+static int swap_diary_leaf = 0;
+static int swap_diary_parent = 0;
+static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
+int __real_openat(int dirfd, const char *path, int flags, ...);
+int __wrap_openat(int dirfd, const char *path, int flags, ...)
+{
+    if (swap_diary_leaf && strcmp(path, "note.txt") == 0 &&
+        (flags & O_NOFOLLOW)) {
+        swap_diary_leaf = 0;
+        assert(unlink(R2_WORKSPACE "/workspace-race/note.txt") == 0);
+        assert(symlink(diary_outside, R2_WORKSPACE "/workspace-race/note.txt") == 0);
+    }
+    if (swap_diary_parent && strcmp(path, "workspace-race") == 0 &&
+        (flags & O_DIRECTORY) && (flags & O_NOFOLLOW)) {
+        swap_diary_parent = 0;
+        assert(rename(R2_WORKSPACE "/workspace-race",
+                      R2_WORKSPACE "/workspace-race-old") == 0);
+        assert(symlink("/tmp", R2_WORKSPACE "/workspace-race") == 0);
+    }
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode_t mode = va_arg(args, mode_t);
+        va_end(args);
+        return __real_openat(dirfd, path, flags, mode);
+    }
+    return __real_openat(dirfd, path, flags);
+}
+
+static void verify_diary_workspace_path_swaps(void)
+{
+    const char *inside = R2_WORKSPACE "/workspace-race/note.txt";
+    FILE *file;
+    assert(mkdir(R2_WORKSPACE "/workspace-race", 0700) == 0);
+    file = fopen(diary_outside, "wb");
+    assert(file && fputs("OUTSIDE_PRIVATE_SENTINEL", file) >= 0 && fclose(file) == 0);
+
+    for (int operation = 0; operation < 3; ++operation) {
+        file = fopen(inside, "wb");
+        assert(file && fputs("inside fixture line\n", file) >= 0 && fclose(file) == 0);
+        size_t bytes_read = 0;
+        long next_offset = -1;
+        if (operation == 0) {
+            char *read = r2_workspace_read("workspace-race/note.txt", &bytes_read);
+            assert(read && strcmp(read, "inside fixture line\n") == 0);
+            free(read);
+        } else if (operation == 1) {
+            char *read = r2_workspace_read_chunk("workspace-race/note.txt", 0, 4096,
+                                                 &bytes_read, &next_offset);
+            assert(read && bytes_read == strlen("inside fixture line\n") &&
+                   next_offset == (long)bytes_read);
+            free(read);
+        } else {
+            char *result = r2_workspace_search("workspace-race/note.txt", "fixture");
+            assert(result && strstr(result, "inside fixture line"));
+            free(result);
+        }
+        swap_diary_leaf = 1;
+        char *outside_read = NULL;
+        if (operation == 0)
+            outside_read = r2_workspace_read("workspace-race/note.txt", NULL);
+        else if (operation == 1)
+            outside_read = r2_workspace_read_chunk("workspace-race/note.txt", 0,
+                                                   4096, NULL, NULL);
+        else
+            outside_read = r2_workspace_search("workspace-race/note.txt", "SENTINEL");
+        assert(!outside_read && !swap_diary_leaf);
+        free(outside_read);
+        assert(unlink(inside) == 0);
+    }
+
+    file = fopen(inside, "wb");
+    assert(file && fputs("inside list fixture", file) >= 0 && fclose(file) == 0);
+    char *listed = r2_workspace_list("workspace-race");
+    assert(listed && strstr(listed, "[FILE] note.txt"));
+    free(listed);
+
+    swap_diary_parent = 1;
+    listed = r2_workspace_list("workspace-race");
+    assert(!listed && !swap_diary_parent);
+    free(listed);
+    assert(unlink(R2_WORKSPACE "/workspace-race") == 0);
+    assert(unlink(R2_WORKSPACE "/workspace-race-old/note.txt") == 0);
+    assert(rmdir(R2_WORKSPACE "/workspace-race-old") == 0);
+    assert(unlink(diary_outside) == 0);
+}
 
 static int log_ready = 0;
 
@@ -681,6 +772,7 @@ int main(void)
     assert(r2_diary_reconnect_history(1) == 0);
 
     verify_mirror_flush_failure();
+    verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
     return 0;
