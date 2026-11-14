@@ -13938,7 +13938,7 @@ static int reply_has_visible_text(const char *text)
         "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]", "[ALTERNATE_COMPARE]",
         "[ALTERNATE_RETAIN]", "[ALTERNATE_DISCARD]", "[READ_DIARY]",
         "[READ]", "[LIST]", "[DELETE]", "[SENSORY_JOURNAL]", "[WORLD]",
-        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]",
+        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]", "[EARS_SOURCES]",
         "[HAND]", "[END ALTERNATE_CREATE]", "[END DIARY]", "[END WRITE]",
         "[END HAND_REQUEST]", "[END RUN]", "[END IMAGINE]",
         "[END IMAGINE_FEEDBACK]"
@@ -13963,13 +13963,17 @@ static int reply_has_visible_text(const char *text)
         for (size_t i = 0; i < sizeof(control_blocks) / sizeof(control_blocks[0]); ++i) {
             size_t open_len = strlen(control_blocks[i].open);
             if ((size_t)(line_end - first) < open_len ||
-                memcmp(first, control_blocks[i].open, open_len) != 0)
+                memcmp(first, control_blocks[i].open, open_len) != 0 ||
+                find_control_marker_line(text, control_blocks[i].open,
+                                         (size_t)(first - text)) != first)
                 continue;
 
-            const char *close = strstr(first + open_len, control_blocks[i].close);
+            const char *close = find_control_marker_line(text, control_blocks[i].close,
+                                                        (size_t)(first + open_len - text));
             if (!close)
                 return 0; /* Malformed control output is never user-facing text. */
-            p = close + strlen(control_blocks[i].close);
+            const char *close_end = strchr(close, '\n');
+            p = close_end ? close_end + 1 : close + strlen(close);
             skipped = 1;
             break;
         }
@@ -13979,7 +13983,9 @@ static int reply_has_visible_text(const char *text)
         for (size_t i = 0; i < sizeof(control_lines) / sizeof(control_lines[0]); ++i) {
             size_t marker_len = strlen(control_lines[i]);
             if ((size_t)(line_end - first) >= marker_len &&
-                memcmp(first, control_lines[i], marker_len) == 0) {
+                memcmp(first, control_lines[i], marker_len) == 0 &&
+                find_control_marker_line(text, control_lines[i],
+                                         (size_t)(first - text)) == first) {
                 p = *line_end ? line_end + 1 : line_end;
                 skipped = 1;
                 break;

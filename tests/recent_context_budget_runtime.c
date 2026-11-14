@@ -85,6 +85,10 @@ int main(void)
     assert(!reply_has_visible_text("[DIARY] diary entry\n[END DIARY]"));
     assert(!reply_has_visible_text("[RUN] echo unsafe")); /* unterminated controls fail closed */
     assert(reply_has_visible_text("I can do that.\n[WORLD] activity_start|session|details"));
+    assert(!reply_has_visible_text("[EARS_SOURCES]"));
+    assert(!reply_has_visible_text("[DIARY]\n```text\n[END DIARY]\n```\nbody\n[END DIARY]"));
+    assert(reply_has_visible_text("[WORLD]building is a word, not a control."));
+    assert(reply_has_visible_text("    [WORLD] read-only indentation example"));
     assert(reply_has_visible_text("Ordinary conversational text."));
 
     /* Model-generated Alternate-Self IDs must reject scanf-style overflow. */
