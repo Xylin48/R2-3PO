@@ -46,6 +46,33 @@ def run(root: Path, emulator: Path, *args: str, expect_ok: bool = True) -> dict:
     return result
 
 
+def reject_event_and_run(root: Path, emulator: Path, event_type: str,
+                         *args: str) -> None:
+    """Inject a failed event insert and assert no device change survives it."""
+    assert event_type.isidentifier()
+    state_path = root / "State" / "console_state.db"
+    with sqlite3.connect(state_path) as state_db:
+        state_db.execute(
+            "CREATE TRIGGER reject_event BEFORE INSERT ON console_events "
+            f"WHEN NEW.event_type='{event_type}' BEGIN SELECT RAISE(IGNORE); END"
+        )
+    try:
+        env = os.environ.copy()
+        env["R2_GAMEBOY_ROOT"] = str(root)
+        env["R2_MGBA_EXECUTABLE"] = str(emulator)
+        rejected = subprocess.run(
+            [sys.executable, str(CONSOLE), "--json", *args],
+            text=True, capture_output=True, env=env, timeout=10,
+        )
+        assert rejected.returncode != 0, (event_type, rejected.stdout)
+        assert f"Console event {event_type} was not recorded" in rejected.stderr, (
+            event_type, rejected.stdout, rejected.stderr
+        )
+    finally:
+        with sqlite3.connect(state_path) as state_db:
+            state_db.execute("DROP TRIGGER reject_event")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="r2-gameboy-test-") as temp:
         root = Path(temp) / "device"
@@ -71,6 +98,13 @@ def main() -> int:
         assert result["cartridge_inserted"] is False
         assert result["emulator_pid"] is None
         run(root, emulator, "power", "off")
+        # An event failure must not leave the empty console powered on.
+        reject_event_and_run(root, emulator, "console_powered_on_empty",
+                             "power", "on")
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT power_state FROM console_state WHERE id=1"
+            ).fetchone()[0] == "off"
 
         # Make a small valid-looking loose GBA ROM with a title in its header.
         rom = bytearray(0x200)
@@ -81,11 +115,42 @@ def main() -> int:
         listed = run(root, emulator, "list")
         assert {item["filename"] for item in listed} == {"Mario.gba", "Second.gba"}
         assert all(item["location"] == "pockets" for item in listed)
+        # Reading an unchanged inventory must not overwrite the last-change
+        # timestamp. Previously every status/list call silently rewrote it.
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            state_db.execute(
+                "UPDATE cartridge_inventory SET updated_at=? WHERE filename=?",
+                ("2001-01-01T00:00:00Z", "Mario.gba"),
+            )
+        run(root, emulator, "status")
+        run(root, emulator, "list")
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT updated_at FROM cartridge_inventory WHERE filename='Mario.gba'"
+            ).fetchone()[0] == "2001-01-01T00:00:00Z"
+        # Failed event admission rolls the physical move back.
+        reject_event_and_run(root, emulator, "cartridge_moved",
+                             "move", "Mario.gba", "shelf")
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
+            ).fetchone()[0] == "pockets"
         moved = run(root, emulator, "move", "Mario.gba", "shelf")
         assert moved["ok"] is True
         result = run(root, emulator, "insert", "Mario.gba", expect_ok=False)
         assert "Retrieve it first" in result["message"]
         run(root, emulator, "move", "Mario.gba", "pockets")
+        # The two SQLite files and the event log must all reject a failed insert.
+        reject_event_and_run(root, emulator, "cartridge_inserted",
+                             "insert", "Mario.gba")
+        with sqlite3.connect(root / "gameboy.db") as cartridge_db:
+            assert cartridge_db.execute(
+                "SELECT rom_path FROM cartridge_slot WHERE id=1"
+            ).fetchone()[0] is None
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
+            ).fetchone()[0] == "pockets"
         result = run(root, emulator, "insert", "Mario.gba")
         assert result["cartridge_inserted"] is True
         assert result["cartridge_title"].strip() == "TEST MARIO"
@@ -167,6 +232,15 @@ def main() -> int:
         assert "No in-game save command or save state" in result["message"]
         result = run(root, emulator, "insert", "Second.gba", expect_ok=False)
         assert "Eject it before inserting another game" in result["message"]
+        reject_event_and_run(root, emulator, "cartridge_ejected", "eject")
+        with sqlite3.connect(root / "gameboy.db") as cartridge_db:
+            assert cartridge_db.execute(
+                "SELECT rom_path FROM cartridge_slot WHERE id=1"
+            ).fetchone()[0] == str(cartridges / "Mario.gba")
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            assert state_db.execute(
+                "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
+            ).fetchone()[0] == "slot"
         run(root, emulator, "eject")
         result = run(root, emulator, "status")
         assert result["power_state"] == "off"
