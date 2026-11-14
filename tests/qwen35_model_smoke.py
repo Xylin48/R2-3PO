@@ -371,7 +371,8 @@ require(
     "static void handle_completed_messages(void)" in core
     and '"[R2_INTERNAL_TOOL_RESULT]\\n"' in core
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
-    and "it was not inserted as user speech" in core,
+    and "its exact evidence is retained for retry" in core
+    and "completed_pending_handoff = result;" in core,
     "completed background tasks enter chat as explicitly marked internal results, not unmarked user turns",
 )
 
