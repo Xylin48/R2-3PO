@@ -84,9 +84,15 @@ def compile_core(base: Path) -> Path:
         f'-DR2_DIARY_DATABASE="{home / "r2_memory.db"}"',
         f'-DR2_DIARY_DIR="{workspace / "R2_Diary"}"',
     ]
+    # Opt in to both sanitizers for the same real compiled-core integration
+    # path. The regular run remains unchanged to preserve baseline coverage.
+    sanitizer_flags = (
+        ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+        if os.environ.get("R2_TEST_SANITIZERS") == "1" else []
+    )
     subprocess.run(
         ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1",
-         "-I", str(REPO), *macros,
+         *sanitizer_flags, "-I", str(REPO), *macros,
          *(str(REPO / source) for source in SOURCES),
          "-o", str(binary), *LIBS],
         cwd=REPO, check=True, timeout=120,
