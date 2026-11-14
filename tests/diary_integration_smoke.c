@@ -617,6 +617,61 @@ static void verify_mirror_flush_failure(void)
 
 }
 
+
+static void verify_mirror_symlink_is_not_followed(void)
+{
+    time_t now = time(NULL);
+    struct tm local;
+    char date[32], path[1024], backup[1024];
+    assert(localtime_r(&now, &local));
+    assert(strftime(date, sizeof(date), "%Y-%m-%d", &local));
+    int n = snprintf(path, sizeof(path), "%s/%s.md", R2_DIARY_DIR, date);
+    assert(n > 0 && (size_t)n < sizeof(path));
+    n = snprintf(backup, sizeof(backup), "%s.symlink-fixture-backup", path);
+    assert(n > 0 && (size_t)n < sizeof(backup));
+    int moved = rename(path, backup) == 0;
+    assert(moved || errno == ENOENT);
+
+    const char *outside = "/tmp/r2-diary-mirror-outside-sentinel";
+    const char original[] = "OUTSIDE_FILE_MUST_REMAIN_UNCHANGED";
+    int outside_fd = open(outside, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    assert(outside_fd >= 0);
+    assert(write(outside_fd, original, sizeof(original) - 1) ==
+           (ssize_t)(sizeof(original) - 1));
+    assert(close(outside_fd) == 0);
+    assert(symlink(outside, path) == 0);
+
+    int64_t diary_id = 0;
+    assert(r2_diary_write_with_id("mirror symlink guard fixture", &diary_id) == 0);
+    assert(diary_id > 0);
+    char query[256];
+    n = snprintf(query, sizeof(query),
+                 "SELECT COUNT(*) FROM r2_diary_pending_mirrors WHERE diary_entry_id=%" PRId64,
+                 diary_id);
+    assert(n > 0 && (size_t)n < sizeof(query));
+    assert(scalar_int(query) == 1);
+
+    outside_fd = open(outside, O_RDONLY | O_NOFOLLOW);
+    assert(outside_fd >= 0);
+    char actual[128];
+    ssize_t read_count = read(outside_fd, actual, sizeof(actual));
+    assert(read_count == (ssize_t)(sizeof(original) - 1));
+    assert(memcmp(actual, original, sizeof(original) - 1) == 0);
+    assert(close(outside_fd) == 0);
+
+    assert(unlink(path) == 0);
+    if (moved) assert(rename(backup, path) == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(scalar_int(query) == 0);
+    char relative[128];
+    n = snprintf(relative, sizeof(relative), "R2_Diary/%s.md", date);
+    assert(n > 0 && (size_t)n < sizeof(relative));
+    char *found = r2_workspace_search(relative, "mirror symlink guard fixture");
+    assert(found && strstr(found, "mirror symlink guard fixture"));
+    free(found);
+    assert(unlink(outside) == 0);
+}
+
 int main(void)
 {
     char *context;
@@ -852,6 +907,7 @@ int main(void)
     assert(r2_diary_reconnect_history(1) == 0);
 
     verify_mirror_flush_failure();
+    verify_mirror_symlink_is_not_followed();
     verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
