@@ -56,6 +56,14 @@ ssize_t r2_audio_capture_read(R2AudioCapture *handle, void *data, size_t bytes)
     return (ssize_t)bytes;
 }
 
+ssize_t r2_audio_capture_read_cancelable(R2AudioCapture *handle, void *data,
+                                        size_t bytes, int (*cancelled)(void *),
+                                        void *userdata)
+{
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+    return r2_audio_capture_read(handle, data, bytes);
+}
+
 void r2_audio_capture_cancel(R2AudioCapture *handle)
 {
     if (handle) ((FakeCapture *)handle)->cancelled = 1;

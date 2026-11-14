@@ -93,7 +93,7 @@ assert "r2_ears_read(" in ears and "ssize_t r2_ears_read(" in ears_header
 read_start = ears.index("ssize_t r2_ears_read_live_cancelable(")
 read_end = ears.index("int r2_ears_get_event(", read_start)
 read_impl = ears[read_start:read_end]
-live_error_start = read_impl.index("if (r2_audio_capture_read_cancelable(")
+live_error_start = read_impl.index("if (bytes_read < 0)", read_impl.index("r2_audio_capture_read_cancelable("))
 live_error_end = read_impl.index("uint64_t sample_time =", live_error_start)
 live_error = read_impl[live_error_start:live_error_end]
 assert "atomic_store(&ears->open, 0);" in live_error, (

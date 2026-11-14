@@ -768,8 +768,11 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
 
     if (ears->pulse_stream)
     {
-        if (r2_audio_capture_read_cancelable(ears->pulse_stream, buffer, buffer_size,
-                                             cancelled, userdata) < 0) {
+        ssize_t bytes_read = cancelled
+            ? r2_audio_capture_read_cancelable(ears->pulse_stream, buffer, buffer_size,
+                                               cancelled, userdata)
+            : r2_audio_capture_read(ears->pulse_stream, buffer, buffer_size);
+        if (bytes_read < 0) {
             int read_errno = errno;
             if (read_errno != ECANCELED) {
                 r2_log_sensory("audio_read_failed",
