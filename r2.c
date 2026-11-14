@@ -162,6 +162,7 @@ static atomic_int foreground_conversation_waiting = ATOMIC_VAR_INIT(0);
 /* Monotonic elapsed time of the most recent foreground user turn. */
 static atomic_uint_fast64_t last_conversation_activity_ms = ATOMIC_VAR_INIT(0);
 static _Thread_local int ollama_background_mode = 0;
+static _Thread_local int ollama_reflection_worker = 0;
 /* Nested model calls made by the foreground turn itself are not background work. */
 static _Thread_local int ollama_foreground_turn_mode = 0;
 /* Monotonic timestamps let long foreground inference report that it is still active. */
@@ -2912,6 +2913,7 @@ static int ollama_progress(void *userdata,
     }
 
     return shutting_down ||
+           (ollama_reflection_worker && !atomic_load(&diary_running)) ||
            (ollama_background_mode &&
             (atomic_load(&foreground_ollama_waiting) > 0 ||
              (atomic_load(&foreground_conversation_waiting) > 0 &&
@@ -2952,7 +2954,9 @@ static int r2_vision_request_source_changed(void)
 
 int r2_ollama_vision_request_should_abort(void)
 {
-    return shutting_down || r2_vision_request_source_changed() || atomic_load(&foreground_ollama_waiting) > 0 ||
+    return shutting_down ||
+        (ollama_reflection_worker && !atomic_load(&diary_running)) ||
+        r2_vision_request_source_changed() || atomic_load(&foreground_ollama_waiting) > 0 ||
            (atomic_load(&foreground_conversation_waiting) > 0 &&
             !ollama_foreground_turn_mode) ||
            (vision_watch_worker_context && !atomic_load(&vision_watch_running));
@@ -7993,6 +7997,7 @@ static int r2_ears_action_cancelled(void *unused)
 {
     (void)unused;
     return shutting_down ||
+           (ollama_reflection_worker && !atomic_load(&diary_running)) ||
            (ollama_background_mode &&
             (atomic_load(&foreground_conversation_waiting) > 0 ||
              atomic_load(&foreground_ollama_waiting) > 0));
@@ -9423,6 +9428,7 @@ static void *autonomous_thinking(void *arg)
     /* Every model call made by this worker is background work and must yield
        to live conversation. */
     ollama_background_mode = 1;
+    ollama_reflection_worker = 1;
 
     const uint64_t interval_ms = (uint64_t)THINK_INTERVAL * 1000U;
     uint64_t last_periodic_check_ms = 0;
@@ -10505,14 +10511,8 @@ static int query_requests_visual_context(const char *query)
         "describe the video", "in this picture", "in this image",
         "in the video", "in the movie", "camera", "visually", "vision"
     };
-    char lower[2048];
-    size_t n = strlen(query);
-    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
-    for (size_t i = 0; i < n; ++i)
-        lower[i] = (char)tolower((unsigned char)query[i]);
-    lower[n] = '\0';
-    for (size_t i = 0; i < sizeof(terms)/sizeof(terms[0]); ++i)
-        if (strstr(lower, terms[i])) return 1;
+    for (size_t i = 0; i < sizeof(terms) / sizeof(terms[0]); ++i)
+        if (strcasestr(query, terms[i])) return 1;
     return 0;
 }
 

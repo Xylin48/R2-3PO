@@ -548,12 +548,33 @@ static void check_gameboy_delivery(void)
     assert(rmdir(directory) == 0);
 }
 
+static void check_reflection_stop_and_long_visual_query(void)
+{
+    ollama_reflection_worker = 1;
+    atomic_store(&diary_running, 1);
+    assert(!ollama_progress(NULL, 0, 0, 0, 0));
+    assert(!r2_ollama_vision_request_should_abort());
+    assert(!r2_ears_action_cancelled(NULL));
+    atomic_store(&diary_running, 0);
+    assert(ollama_progress(NULL, 0, 0, 0, 0));
+    assert(r2_ollama_vision_request_should_abort());
+    assert(r2_ears_action_cancelled(NULL));
+    ollama_reflection_worker = 0;
+    assert(!ollama_progress(NULL, 0, 0, 0, 0));
+
+    char query[3017];
+    memset(query, 'x', 3000);
+    strcpy(query + 3000, " WHAT DO YOU SEE");
+    assert(query_requests_visual_context(query));
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_log_init() == 0);
     check_boundaries();
+    check_reflection_stop_and_long_visual_query();
     check_retry_and_isolated_inputs();
     check_foreground_context_review();
     check_gameboy_delivery();
