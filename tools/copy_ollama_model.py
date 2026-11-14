@@ -110,6 +110,16 @@ def _sha256_file(path: Path) -> str:
 
 def copy_model(source_root: Path, destination_root: Path, model: str, owner: str) -> None:
     rel = model_manifest_relative(model)
+    # This tool must never change the original model store. In addition to
+    # replacing destination files, the copier changes their ownership and
+    # permissions. An accidentally identical or nested source/destination
+    # would therefore mutate the authoritative source even on a clean copy.
+    source_canonical = source_root.resolve()
+    destination_canonical = destination_root.resolve()
+    if (source_canonical == destination_canonical
+            or source_canonical in destination_canonical.parents
+            or destination_canonical in source_canonical.parents):
+        raise ValueError("source and destination model stores must not overlap")
     source_manifest = source_root / rel
     # The source model store is read by a privileged installer. Refuse symlinked
     # path components and leaf files so a modified store cannot redirect reads
