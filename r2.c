@@ -987,7 +987,7 @@ static int message_add_ex(
         if (remove_index == SIZE_MAX) {
             free(role_copy);
             free(content_copy);
-            fprintf(stderr, "[R2 memory] Pinned context prevents an atomic live-history append.\\n");
+            fprintf(stderr, "[R2 memory] Pinned context prevents an atomic live-history append.\n");
             return -1;
         }
         evict[remove_index] = 1;
