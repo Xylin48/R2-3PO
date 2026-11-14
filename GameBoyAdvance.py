@@ -178,10 +178,29 @@ def connect() -> sqlite3.Connection:
     db = sqlite3.connect(STATE_DB_PATH, timeout=5.0)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
-    db.execute("PRAGMA journal_mode=WAL")
+    # Cartridge insertion/ejection updates the attached gameboy.db and the
+    # console event/inventory tables in console_state.db in one transaction.
+    # WAL guarantees rollback on SQL errors, but SQLite explicitly does not
+    # guarantee multi-file atomicity after a power loss in WAL mode. Use the
+    # rollback super-journal for both files and refuse to operate if an older
+    # WAL database cannot be safely switched (for example, active readers).
+    main_mode = db.execute("PRAGMA main.journal_mode=DELETE").fetchone()[0]
+    if main_mode.lower() != "delete":
+        db.close()
+        raise sqlite3.OperationalError(
+            f"Console state journal remains {main_mode}; cross-file commit is unsafe"
+        )
     # gameboy.db may be an older combined database. Its legacy state tables are
     # imported transactionally below; the original tables remain untouched.
     db.execute("ATTACH DATABASE ? AS cartridge", (str(DB_PATH),))
+    cartridge_mode = db.execute("PRAGMA cartridge.journal_mode=DELETE").fetchone()[0]
+    if cartridge_mode.lower() != "delete":
+        db.close()
+        raise sqlite3.OperationalError(
+            f"Cartridge journal remains {cartridge_mode}; cross-file commit is unsafe"
+        )
+    db.execute("PRAGMA main.synchronous=FULL")
+    db.execute("PRAGMA cartridge.synchronous=FULL")
     db.executescript("""
         CREATE TABLE IF NOT EXISTS cartridge.cartridge_slot (
             id INTEGER PRIMARY KEY CHECK (id = 1),
