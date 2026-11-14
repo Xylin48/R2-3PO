@@ -2033,6 +2033,10 @@ static int shell_fridge(const char *argument)
 
 static int shell_parse_amount(const char *text, double *value);
 
+/* Every creator gift is a separate physical object. A batch ordinal alone
+ * repeats on the next command, so carry a process-lifetime sequence too. */
+static atomic_uint_fast64_t shell_money_gift_sequence = ATOMIC_VAR_INIT(0);
+
 static int shell_give(const char *arg)
 {
     if (!arg || !*arg) {
@@ -2086,8 +2090,15 @@ static int shell_give(const char *arg)
            as dollars or collapse separate money pieces into one stack. */
         for (int i = 1; i <= (int)amount; ++i) {
             char item_name[96], item_description[512];
-            snprintf(item_name, sizeof(item_name), "money gift %ld %ld %d",
-                     (long)time(NULL), (long)getpid(), i);
+            uint_fast64_t serial = atomic_fetch_add(&shell_money_gift_sequence, 1) + 1;
+            int name_length = snprintf(item_name, sizeof(item_name),
+                    "money gift %ld %ld %llu", (long)time(NULL), (long)getpid(),
+                    (unsigned long long)serial);
+            if (!serial || name_length < 0 || (size_t)name_length >= sizeof(item_name)) {
+                fprintf(stderr, "[Creator] Cannot assign a unique money item name; gift stopped.\n");
+                rc = -1;
+                break;
+            }
             snprintf(item_description, sizeof(item_description),
                      "Individual physical money item created by the user; denomination unspecified. Gift batch quantity=%d.",
                      (int)amount);
