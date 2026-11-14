@@ -209,6 +209,15 @@ def main() -> int:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         device_db = module.connect()
+        # The physical slot and event/inventory databases must be committed
+        # through a SQLite rollback super-journal even after power failure.
+        for schema in ("main", "cartridge"):
+            assert device_db.execute(
+                f"PRAGMA {schema}.journal_mode"
+            ).fetchone()[0].lower() == "delete"
+            assert device_db.execute(
+                f"PRAGMA {schema}.synchronous"
+            ).fetchone()[0] == 2
         event_id = module.record_verified_game_event(
             device_db, "coin_collected", "Mario collected a coin.",
             "Observed coin counter increase from 12 to 13.",
@@ -282,6 +291,11 @@ def main() -> int:
             );
             INSERT INTO cartridge_slot(id,rom_path,rom_title) VALUES(1,NULL,NULL);
         """)
+        # Preserve existing files created by earlier versions in WAL mode;
+        # the first new connection must checkpoint/convert, not recreate.
+        assert legacy_cartridge.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0].lower() == "wal"
         legacy_cartridge.close()
         legacy_state = sqlite3.connect(
             legacy_root / "State" / "console_state.db"
@@ -313,6 +327,9 @@ def main() -> int:
             INSERT INTO cartridge_inventory(filename,title)
                 VALUES('Old.gba','Old Game');
         """)
+        assert legacy_state.execute(
+            "PRAGMA journal_mode=WAL"
+        ).fetchone()[0].lower() == "wal"
         legacy_state.close()
 
         result = run(legacy_root, emulator, "status")
@@ -326,6 +343,10 @@ def main() -> int:
         legacy_module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(legacy_module)
         legacy_db = legacy_module.connect()
+        for schema in ("main", "cartridge"):
+            assert legacy_db.execute(
+                f"PRAGMA {schema}.journal_mode"
+            ).fetchone()[0].lower() == "delete"
         slot_columns = {
             row[1] for row in legacy_db.execute(
                 "PRAGMA cartridge.table_info(cartridge_slot)"
