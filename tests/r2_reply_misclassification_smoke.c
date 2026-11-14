@@ -19,9 +19,66 @@ static int check(int condition, const char *label)
     return 1;
 }
 
+
+#ifdef R2_COMPLETED_FAILURE_TEST
+/* Test the actual completion drain, not a copy of its formatting helper.
+ * Every failure mode must leave the original nodes available for retry. */
+static CompletedTask *new_test_completion(const char *id)
+{
+    CompletedTask *task = calloc(1, sizeof(*task));
+    if (!task) return NULL;
+    snprintf(task->id, sizeof(task->id), "%s", id);
+    task->command = strdup("printf evidence");
+    task->output = strdup(id);
+    if (!task->command || !task->output) abort();
+    return task;
+}
+
+static int test_completed_retry(void)
+{
+    completed_push(new_test_completion("FIRST"));
+    completed_push(new_test_completion("SECOND"));
+    completed_push(new_test_completion("THIRD"));
+
+    completed_fail_initial = 1;
+    char *result = collect_completed();
+    int good = !result && completed_head && !strcmp(completed_head->id, "FIRST");
+    free(result);
+
+    completed_fail_block = 1;
+    result = collect_completed();
+    good = good && result && !*result &&
+           completed_head && !strcmp(completed_head->id, "FIRST");
+    free(result);
+
+    completed_fail_grow_after = 2;
+    result = collect_completed();
+    good = good && result && strstr(result, "Task ID: FIRST") &&
+           !strstr(result, "Task ID: SECOND") &&
+           completed_head && !strcmp(completed_head->id, "SECOND");
+    free(result);
+
+    completed_push(new_test_completion("FOURTH"));
+    result = collect_completed();
+    good = good && result &&
+           strstr(result, "Task ID: SECOND") &&
+           strstr(result, "Task ID: THIRD") &&
+           strstr(result, "Task ID: FOURTH") &&
+           strstr(result, "Task ID: SECOND") < strstr(result, "Task ID: THIRD") &&
+           strstr(result, "Task ID: THIRD") < strstr(result, "Task ID: FOURTH") &&
+           completed_head == NULL && completed_tail == NULL;
+    free(result);
+    return good;
+}
+#endif
+
 int main(void)
 {
     int ok = 1;
+#ifdef R2_COMPLETED_FAILURE_TEST
+    ok &= check(test_completed_retry(),
+        "Hands completion evidence survives three allocation failures in original order");
+#endif
 
     R2SystemContextBudget prompt_first_budget =
         r2_compute_system_context_budget(10000U, 5698U);

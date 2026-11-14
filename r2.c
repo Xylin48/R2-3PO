@@ -7248,6 +7248,27 @@ static char *start_background_task(
    COMPLETED TASKS
    ============================================================ */
 
+/* A transient allocation failure must not consume undelivered evidence.
+ * Prepend detached completions in original order, ahead of tasks that may
+ * have finished while the current batch was being formatted. */
+static void completed_requeue_front(CompletedTask *first)
+{
+    if (!first) return;
+    CompletedTask *last = first;
+    while (last->next) last = last->next;
+    pthread_mutex_lock(&tasks_lock);
+    last->next = completed_head;
+    completed_head = first;
+    if (!completed_tail) completed_tail = last;
+    pthread_mutex_unlock(&tasks_lock);
+}
+
+#ifdef R2_COMPLETED_FAILURE_TEST
+static int completed_fail_initial;
+static int completed_fail_block;
+static int completed_fail_grow_after;
+#endif
+
 static char *collect_completed(void)
 {
     pthread_mutex_lock(
@@ -7269,18 +7290,15 @@ static char *collect_completed(void)
 
     char *out =
         malloc(1);
-
+#ifdef R2_COMPLETED_FAILURE_TEST
+    if (completed_fail_initial) {
+        completed_fail_initial = 0;
+        free(out);
+        out = NULL;
+    }
+#endif
     if (!out) {
-        /* The queue was detached above, so an allocation failure here must
-           still release every result node or they become unreachable leaks. */
-        CompletedTask *remaining = head;
-        while (remaining) {
-            CompletedTask *next = remaining->next;
-            free(remaining->command);
-            free(remaining->output);
-            free(remaining);
-            remaining = next;
-        }
+        completed_requeue_front(head);
         return NULL;
     }
 
@@ -7304,18 +7322,15 @@ static char *collect_completed(void)
 
         char *block =
             malloc(needed);
-
+#ifdef R2_COMPLETED_FAILURE_TEST
+        if (completed_fail_block) {
+            completed_fail_block = 0;
+            free(block);
+            block = NULL;
+        }
+#endif
         if (!block) {
-            CompletedTask *remaining = c;
-
-            while (remaining) {
-                CompletedTask *next = remaining->next;
-                free(remaining->command);
-                free(remaining->output);
-                free(remaining);
-                remaining = next;
-            }
-
+            completed_requeue_front(c);
             break;
         }
 
@@ -7346,26 +7361,19 @@ static char *collect_completed(void)
             )
                 cap *= 2;
 
-            char *grown =
-                realloc(
-                    out,
-                    cap
-                );
-
+            char *grown = NULL;
+#ifdef R2_COMPLETED_FAILURE_TEST
+            if (completed_fail_grow_after > 0 &&
+                --completed_fail_grow_after == 0) {
+                grown = NULL;
+            } else
+#endif
+            {
+                grown = realloc(out, cap);
+            }
             if (!grown) {
-
                 free(block);
-
-                CompletedTask *remaining = c;
-
-                while (remaining) {
-                    CompletedTask *next = remaining->next;
-                    free(remaining->command);
-                    free(remaining->output);
-                    free(remaining);
-                    remaining = next;
-                }
-
+                completed_requeue_front(c);
                 break;
             }
 
