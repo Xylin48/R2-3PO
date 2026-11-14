@@ -232,6 +232,11 @@ def main() -> int:
         assert module.acknowledge_verified_event(device_db, event_id) is True
         assert module.pending_verified_events(device_db) == []
         device_db.close()
+        # A duplicate/unknown acknowledgement must not claim that a pending
+        # factual event was changed. The CLI contract is what the C bridge sees.
+        refused_ack = run(root, emulator, "ack_event", str(event_id), expect_ok=False)
+        assert refused_ack["ok"] is False
+        assert refused_ack["message"] == "No matching pending verified event was acknowledged."
 
         # Power off ends the emulator session but does not eject the cartridge.
         result = run(root, emulator, "power", "off")
