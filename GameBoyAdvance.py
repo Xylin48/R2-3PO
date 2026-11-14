@@ -386,17 +386,19 @@ def reconcile(db: sqlite3.Connection) -> sqlite3.Row:
     ):
         title = row["cartridge_title"] or "unknown game"
         session_id = row["session_id"]
-        db.execute(
-            "UPDATE console_state SET power_state='off', emulator_pid=NULL, "
-            "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
-        )
-        record_event(
-            db, "system", "emulator_exited",
-            f"The emulator for {title} is no longer running.",
-            "Detected by checking the stored process ID and Linux process start time.",
-            title, session_id,
-        )
-        db.commit()
+        # The restart reconciliation event is part of the state transition.
+        # If its insert fails, retain the previous row for a later retry.
+        with db:
+            db.execute(
+                "UPDATE console_state SET power_state='off', emulator_pid=NULL, "
+                "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
+            )
+            record_event(
+                db, "system", "emulator_exited",
+                f"The emulator for {title} is no longer running.",
+                "Detected by checking the stored process ID and Linux process start time.",
+                title, session_id, commit=False,
+            )
     return state_row(db)
 
 
@@ -444,7 +446,8 @@ def sync_cartridge_inventory(db: sqlite3.Connection) -> None:
         db.execute(
             "INSERT INTO cartridge_inventory(filename,title,location,discovered_at,updated_at) "
             "VALUES(?,?,'pockets',?,?) ON CONFLICT(filename) DO UPDATE SET "
-            "title=excluded.title,updated_at=excluded.updated_at",
+            "title=excluded.title,updated_at=excluded.updated_at "
+            "WHERE cartridge_inventory.title IS NOT excluded.title",
             (path.name, title, now, now),
         )
     slot = db.execute("SELECT rom_path,rom_title FROM cartridge.cartridge_slot WHERE id=1").fetchone()
@@ -454,7 +457,9 @@ def sync_cartridge_inventory(db: sqlite3.Connection) -> None:
         db.execute(
             "INSERT INTO cartridge_inventory(filename,title,location,discovered_at,updated_at) "
             "VALUES(?,?,'slot',?,?) ON CONFLICT(filename) DO UPDATE SET "
-            "title=excluded.title,location='slot',updated_at=excluded.updated_at",
+            "title=excluded.title,location='slot',updated_at=excluded.updated_at "
+            "WHERE cartridge_inventory.title IS NOT excluded.title "
+            "OR cartridge_inventory.location != 'slot'",
             (filename, title, now, now),
         )
     db.commit()
@@ -477,9 +482,9 @@ def move_cartridge(db: sqlite3.Connection, filename: str, location: str) -> dict
     slot = db.execute("SELECT rom_path FROM cartridge.cartridge_slot WHERE id=1").fetchone()
     if slot and slot["rom_path"] and Path(slot["rom_path"]).name.casefold() == filename.casefold():
         return {"ok": False, "message": "That cartridge is inserted. Eject it before moving it.", **status_data(db)}
-    db.execute("UPDATE cartridge_inventory SET location=?,updated_at=? WHERE filename=? COLLATE NOCASE", (destination, utc_now(), filename))
-    db.commit()
-    record_event(db, "physical", "cartridge_moved", f"R2 put the {current['title']} cartridge in {destination}.", f"Filename={filename}; destination={destination}.", current["title"])
+    with db:
+        db.execute("UPDATE cartridge_inventory SET location=?,updated_at=? WHERE filename=? COLLATE NOCASE", (destination, utc_now(), filename))
+        record_event(db, "physical", "cartridge_moved", f"R2 put the {current['title']} cartridge in {destination}.", f"Filename={filename}; destination={destination}.", current["title"], commit=False)
     return {"ok": True, "message": f"Moved {current['title']} cartridge to {destination}.", **status_data(db)}
 
 
@@ -588,13 +593,14 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
         return {"ok": False, "message": "The console is already powered on.", **status_data(db)}
     cartridge = row["cartridge_path"]
     if not cartridge:
-        db.execute(
-            "UPDATE console_state SET power_state='on', emulator_pid=NULL, "
-            "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
-        )
-        db.commit()
-        record_event(db, "physical", "console_powered_on_empty",
-                     "R2 powered on the Game Boy Advance with no cartridge inserted.")
+        with db:
+            db.execute(
+                "UPDATE console_state SET power_state='on', emulator_pid=NULL, "
+                "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
+            )
+            record_event(db, "physical", "console_powered_on_empty",
+                         "R2 powered on the Game Boy Advance with no cartridge inserted.",
+                         commit=False)
         return {"ok": True, "message": "Console powered on. The cartridge slot is empty; no emulator was launched.",
                 **status_data(db)}
     proc = None
@@ -709,22 +715,23 @@ def power_off(db: sqlite3.Connection) -> dict[str, Any]:
         except PermissionError:
             return {"ok": False, "message": "Permission denied while powering off the emulator.",
                     **status_data(db)}
-    db.execute(
-        "UPDATE console_state SET power_state='off', emulator_pid=NULL, "
-        "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
-    )
-    db.commit()
-    record_event(
-        db, "physical", "console_powered_off",
-        "R2 powered off the Game Boy Advance.",
-        "Power-off does not create a save state or invoke an in-game save. Unsaved progress may be lost.",
-        title, session_id,
-    )
-    if session_id:
-        record_event(db, "virtual", "game_session_interrupted",
-                     f"The emulated session for {title} ended when the console was powered off.",
-                     "The console did not issue an in-game save command.",
-                     title, session_id)
+    # Never publish an off state without its physical and virtual history.
+    with db:
+        db.execute(
+            "UPDATE console_state SET power_state='off', emulator_pid=NULL, "
+            "emulator_start_ticks=NULL, game_started_at=NULL, session_id=NULL WHERE id=1"
+        )
+        record_event(
+            db, "physical", "console_powered_off",
+            "R2 powered off the Game Boy Advance.",
+            "Power-off does not create a save state or invoke an in-game save. Unsaved progress may be lost.",
+            title, session_id, commit=False,
+        )
+        if session_id:
+            record_event(db, "virtual", "game_session_interrupted",
+                         f"The emulated session for {title} ended when the console was powered off.",
+                         "The console did not issue an in-game save command.",
+                         title, session_id, commit=False)
     return {"ok": True, "message": "Console powered off. No in-game save command or save state was issued.",
             **status_data(db)}
 
@@ -748,15 +755,15 @@ def insert_cartridge(db: sqlite3.Connection, name: str) -> dict[str, Any]:
     if inventory["location"] != "pockets":
         return {"ok": False, "message": f"The {read_rom_title(path)} cartridge is in {inventory['location']}, not R2's pockets. Retrieve it first.", **status_data(db)}
     title = read_rom_title(path)
-    db.execute(
-        "UPDATE cartridge.cartridge_slot SET rom_path=?, rom_title=?, inserted_at=? WHERE id=1",
-        (str(path), title, utc_now()),
-    )
-    db.execute("UPDATE cartridge_inventory SET location='slot',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), path.name))
-    db.commit()
-    record_event(db, "physical", "cartridge_inserted",
-                 f"R2 inserted the {title} cartridge.",
-                 f"ROM filename: {path.name}", title)
+    with db:
+        db.execute(
+            "UPDATE cartridge.cartridge_slot SET rom_path=?, rom_title=?, inserted_at=? WHERE id=1",
+            (str(path), title, utc_now()),
+        )
+        db.execute("UPDATE cartridge_inventory SET location='slot',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), path.name))
+        record_event(db, "physical", "cartridge_inserted",
+                     f"R2 inserted the {title} cartridge.",
+                     f"ROM filename: {path.name}", title, commit=False)
     return {"ok": True, "message": f"Inserted cartridge: {title}.",
             **status_data(db)}
 
@@ -771,10 +778,10 @@ def eject_cartridge(db: sqlite3.Connection) -> dict[str, Any]:
     if not row["cartridge_path"]:
         return {"ok": False, "message": "The cartridge slot is already empty.", **status_data(db)}
     filename = Path(row["cartridge_path"]).name
-    db.execute("UPDATE cartridge.cartridge_slot SET rom_path=NULL, rom_title=NULL, inserted_at=NULL WHERE id=1")
-    db.execute("UPDATE cartridge_inventory SET location='pockets',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), filename))
-    db.commit()
-    record_event(db, "physical", "cartridge_ejected", f"R2 removed the {title} cartridge and is carrying it in his pockets.", f"Filename={filename}; destination=pockets.", title)
+    with db:
+        db.execute("UPDATE cartridge.cartridge_slot SET rom_path=NULL, rom_title=NULL, inserted_at=NULL WHERE id=1")
+        db.execute("UPDATE cartridge_inventory SET location='pockets',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), filename))
+        record_event(db, "physical", "cartridge_ejected", f"R2 removed the {title} cartridge and is carrying it in his pockets.", f"Filename={filename}; destination=pockets.", title, commit=False)
     return {"ok": True, "message": f"Ejected {title}. The cartridge slot is now empty.",
             **status_data(db)}
 
