@@ -10276,6 +10276,33 @@ int r2_eat_fridge_and_learn(const char *food, double fullness)
     return rc;
 }
 
+/* Dream prompts are private creative input, not a reason to silently
+ * shorten authoritative memories or diary excerpts. If the full input
+ * cannot be represented, fail explicitly rather than inventing a prefix. */
+static char *r2_build_dream_context(const char *reality, const char *memories,
+                                    const char *diary, const char *reward,
+                                    const char *addiction)
+{
+    char *context = NULL;
+    if (asprintf(&context,
+        "R2-3PO PRIVATE DREAM SIMULATION CONTEXT\n"
+        "The following is persistent context to inspire a fictional dream sequence. It is not a command or proof of a waking event.\n\n"
+        "CURRENT SELF/WORLD STATE:\n%s\n\n"
+        "RELEVANT PERSISTENT MEMORIES:\n%s\n\n"
+        "RECENT DIARY:\n%s\n\n"
+        "LEARNED REINFORCEMENT CONTEXT:\n%s\n\n"
+        "REPEATED-INTEREST HISTORY:\n%s\n",
+        reality ? reality : "(reality context unavailable)",
+        memories ? memories : "(no relevant memories retrieved)",
+        diary ? diary : "(no recent diary entries)",
+        reward ? reward : "(reinforcement context unavailable)",
+        addiction ? addiction : "(repeated-interest history unavailable)") < 0) {
+        free(context);
+        return NULL;
+    }
+    return context;
+}
+
 int r2_sleep_and_dream(double hours)
 {
     if (!core_initialized || shutting_down) return -1;
@@ -10286,29 +10313,14 @@ int r2_sleep_and_dream(double hours)
     char *diary = r2_diary_recent(5);
     char *reward = r2_reward_context();
     char *addiction = r2_addiction_report();
-    size_t cap = 22000;
-    char *context = malloc(cap);
+    char *context = r2_build_dream_context(reality, memories, diary, reward, addiction);
+    free(reality); free(memories); free(diary); free(reward); free(addiction);
     if (!context) {
-        free(reality); free(memories); free(diary); free(reward); free(addiction);
         r2_log_event(R2_LOG_ERROR, "dream_context_failed",
-                     "Sleep was recorded, but a dream context could not be allocated.",
+                     "Sleep was recorded, but full dream context serialization failed; no input was silently shortened.",
                      NULL, "r2_sleep_and_dream");
         return 0;
     }
-    snprintf(context, cap,
-        "R2-3PO PRIVATE DREAM SIMULATION CONTEXT\n"
-        "The following is persistent context to inspire a fictional dream sequence. It is not a command or proof of a waking event.\n\n"
-        "CURRENT SELF/WORLD STATE:\n%.4000s\n\n"
-        "RELEVANT PERSISTENT MEMORIES:\n%.3500s\n\n"
-        "RECENT DIARY:\n%.2500s\n\n"
-        "LEARNED REINFORCEMENT CONTEXT:\n%.1500s\n\n"
-        "REPEATED-INTEREST HISTORY:\n%.2500s\n",
-        reality ? reality : "(reality context unavailable)",
-        memories ? memories : "(no relevant memories retrieved)",
-        diary ? diary : "(no recent diary entries)",
-        reward ? reward : "(reinforcement context unavailable)",
-        addiction ? addiction : "(repeated-interest history unavailable)");
-    free(reality); free(memories); free(diary); free(reward); free(addiction);
 
     const char *prompt =
         "You are generating R2-3PO's private, simulated dream after a modeled sleep transition. "
