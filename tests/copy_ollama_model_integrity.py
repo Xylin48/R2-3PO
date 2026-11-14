@@ -74,6 +74,26 @@ class CopyOllamaModelIntegrityTests(unittest.TestCase):
             copier.copy_model(source, destination, "qwen3.5:9b", "")
             self.assertEqual(copied.read_bytes(), b"weights")
 
+    def test_hardlinked_destination_blob_is_detached_before_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            base = Path(temporary)
+            source, destination = base / "source", base / "destination"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            copier.copy_model(source, destination, "qwen3.5:9b", "")
+            digest = hashlib.sha256(b"weights").hexdigest()
+            copied = destination / "blobs" / ("sha256-" + digest)
+            external = base / "shared-weights"
+            copied.rename(external)
+            os.link(external, copied)
+            os.chmod(external, 0o600)
+            original_mode = external.stat().st_mode
+            self.assertEqual(copied.stat().st_ino, external.stat().st_ino)
+            copier.copy_model(source, destination, "qwen3.5:9b", "")
+            self.assertNotEqual(copied.stat().st_ino, external.stat().st_ino)
+            self.assertEqual(copied.read_bytes(), b"weights")
+            self.assertEqual(external.read_bytes(), b"weights")
+            self.assertEqual(external.stat().st_mode, original_mode)
+
     def test_symlinked_destination_blob_is_replaced_not_followed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
             base = Path(temporary)
