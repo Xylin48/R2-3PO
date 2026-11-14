@@ -122,6 +122,9 @@ static void verify_diary_workspace_path_swaps(void)
                                                    4096, NULL, NULL);
         else
             outside_read = r2_workspace_search("workspace-race/note.txt", "SENTINEL");
+        if (outside_read || swap_diary_leaf)
+            fprintf(stderr, "Diary race fixture: operation=%d, hook_remaining=%d, result=%s\\n",
+                    operation, swap_diary_leaf, outside_read ? outside_read : "(null)");
         assert(!outside_read && !swap_diary_leaf);
         free(outside_read);
         assert(unlink(inside) == 0);
