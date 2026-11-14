@@ -761,6 +761,7 @@ typedef struct CompletedTask {
     char id[9];
     char *command;
     char *output;
+    char archive_path[PATH_MAX];
     int return_code;
     char started[32];
     char finished[32];
@@ -2623,23 +2624,28 @@ static int workspace_delete(
         !strcmp(resolved, R2_WORKSPACE))
         return -1;
 
-    /*
-     * safe_path resolves the target to verify containment. For deletion,
-     * however, operate on the directory entry the caller named: otherwise
-     * deleting an in-workspace symlink would delete its target instead.
-     */
+    /* Pin the validated parent and remove the named entry, including an
+       in-workspace symlink itself, without reopening a mutable full path. */
     char entry_path[PATH_MAX];
     int written = snprintf(entry_path, sizeof(entry_path), "%s/%s",
                            R2_WORKSPACE, rel);
     if (written < 0 || (size_t)written >= sizeof(entry_path))
         return -1;
+    char *name = strrchr(entry_path, '/');
+    if (!name || !name[1] || !strcmp(name + 1, ".") || !strcmp(name + 1, ".."))
+        return -1;
+    *name++ = '\0';
+    char parent[PATH_MAX];
+    if (!realpath(entry_path, parent)) return -1;
+    int dir = workspace_open_write_parent(parent);
+    if (dir < 0) return -1;
 
     struct stat st;
-    if (lstat(entry_path, &st) != 0 ||
-        (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)))
-        return -1;
-
-    if (unlink(entry_path) != 0) {
+    int removed = fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) &&
+        unlinkat(dir, name, 0) == 0;
+    close(dir);
+    if (!removed) {
         r2_log_file_event("delete", rel, "failed", NULL);
         return -1;
     }
@@ -6764,21 +6770,6 @@ static void completed_push(
 }
 
 
-static char *limit_output(
-    const char *src)
-{
-    size_t n =
-        strlen(src);
-
-    if (n <= MAX_TASK_OUTPUT)
-        return xstrdup(src);
-
-    return xstrdup(
-        src + n - MAX_TASK_OUTPUT
-    );
-}
-
-
 /* ============================================================
    EXECUTE TASK
    ============================================================ */
@@ -6803,7 +6794,7 @@ static void execute_task(
         id
     );
 
-    c->command = xstrdup(command);
+    c->command = strdup(command);
     if (!c->command) {
         free(c);
         return;
@@ -6811,14 +6802,37 @@ static void execute_task(
 
     now_iso(c->started);
 
+    int archive_name_length = snprintf(c->archive_path, sizeof(c->archive_path),
+        R2_HOME "/hand-output-%s-XXXXXX", id);
+    int archive_fd = archive_name_length >= 0 &&
+        (size_t)archive_name_length < sizeof(c->archive_path)
+        ? mkostemp(c->archive_path, O_CLOEXEC) : -1;
+    FILE *archive = archive_fd >= 0 ? fdopen(archive_fd, "wb") : NULL;
+    if (!archive) {
+        if (archive_fd >= 0) {
+            close(archive_fd);
+            unlink(c->archive_path);
+        }
+        c->archive_path[0] = '\0';
+        c->return_code = -1;
+        c->output = strdup("Task was not run because its output archive could not be opened.");
+        now_iso(c->finished);
+        completed_push(c);
+        return;
+    }
+
     int pipefd[2];
 
     if (pipe(pipefd) != 0) {
+        int error = errno;
+        fclose(archive);
+        unlink(c->archive_path);
+        c->archive_path[0] = '\0';
 
         c->return_code = -1;
 
         c->output =
-            xstrdup(strerror(errno));
+            strdup(strerror(error));
 
         now_iso(c->finished);
 
@@ -6865,6 +6879,10 @@ static void execute_task(
     }
 
     if (pid < 0) {
+        int error = errno;
+        fclose(archive);
+        unlink(c->archive_path);
+        c->archive_path[0] = '\0';
 
         close(pipefd[0]);
         close(pipefd[1]);
@@ -6872,7 +6890,7 @@ static void execute_task(
         c->return_code = -1;
 
         c->output =
-            xstrdup(strerror(errno));
+            strdup(strerror(error));
 
         now_iso(c->finished);
 
@@ -6895,18 +6913,7 @@ static void execute_task(
         pid
     );
 
-    char *out =
-        malloc(1);
-
-    if (!out) {
-        close(pipefd[0]);
-        kill(-pid, SIGKILL);
-        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        remove_running(id);
-        free(c->command);
-        free(c);
-        return;
-    }
+    char out[MAX_TASK_OUTPUT + 1];
 
     out[0] = '\0';
 
@@ -6917,6 +6924,9 @@ static void execute_task(
     ssize_t got;
 
     int output_read_failed = 0;
+    int preview_incomplete = 0;
+    int archive_failed = 0;
+    int binary_output = 0;
     int shutdown_terminated_task = 0;
     for (;;) {
         /* A task can otherwise hold shutdown forever by waiting silently or
@@ -6952,6 +6962,16 @@ static void execute_task(
         if (got == 0)
             break;
         size_t got_size = (size_t)got;
+        if (fwrite(buf, 1, got_size, archive) != got_size) {
+            archive_failed = 1;
+            output_read_failed = 1;
+            (void)kill(-pid, SIGKILL);
+            break;
+        }
+        if (memchr(buf, '\0', got_size)) binary_output = 1;
+        if (got_size > MAX_TASK_OUTPUT - len || binary_output)
+            preview_incomplete = 1;
+
 
         size_t keep =
             got_size > MAX_TASK_OUTPUT
@@ -6968,20 +6988,6 @@ static void execute_task(
             total > keep
                 ? total - keep
                 : 0;
-
-        char *p =
-            realloc(
-                out,
-                total + 1
-            );
-
-        if (!p) {
-            output_read_failed = 1;
-            (void)kill(-pid, SIGKILL);
-            break;
-        }
-
-        out = p;
 
         if (existing_to_keep < len) {
 
@@ -7040,12 +7046,36 @@ static void execute_task(
             ? WEXITSTATUS(status)
             : -1;
 
-    c->output =
-        limit_output(
-            out ? out : ""
-        );
+    if (fflush(archive) != 0 || fsync(archive_fd) != 0) archive_failed = 1;
+    if (fclose(archive) != 0) archive_failed = 1;
+    int archive_dir = open(R2_HOME, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (archive_dir < 0) {
+        archive_failed = 1;
+    } else {
+        if (fsync(archive_dir) != 0) archive_failed = 1;
+        if (close(archive_dir) != 0) archive_failed = 1;
+    }
+    if (archive_failed) c->return_code = -1;
+    if (archive_failed || output_read_failed || shutdown_terminated_task ||
+        c->return_code < 0 || preview_incomplete) {
+        if (asprintf(&c->output,
+                     "%s\n%s",
+                     archive_failed || output_read_failed || shutdown_terminated_task || c->return_code < 0
+                        ? "Task output may be incomplete."
+                        : "Full task output was saved to the archive.",
+                     binary_output ? "[binary output; use the archive]" : out) < 0)
+            c->output = NULL;
+    } else {
+        c->output = strdup(out);
+    }
 
-    free(out);
+    char *details = NULL;
+    if (asprintf(&details, "Task ID: %s\nExit code: %d\nCommand: %s",
+                 c->id, c->return_code, c->command) >= 0) {
+        (void)r2_log_file_event("hands_output_archive", c->archive_path,
+            c->return_code < 0 ? "capture_incomplete" : "capture_complete", details);
+        free(details);
+    }
 
     now_iso(c->finished);
 
@@ -7265,6 +7295,7 @@ static char *collect_completed(void)
             strlen(c->id) +
             strlen(task_command) +
             strlen(task_output) +
+            strlen(c->archive_path) +
             128;
 
         char *block =
@@ -7292,10 +7323,12 @@ static char *collect_completed(void)
                 "Task ID: %s\n"
                 "Command: %s\n"
                 "Exit code: %d\n"
+                "Output archive: %s\n"
                 "Output:\n%s\n",
                 c->id,
                 task_command,
                 c->return_code,
+                c->archive_path[0] ? c->archive_path : "(unavailable)",
                 task_output
             );
 
@@ -7611,7 +7644,7 @@ static int run_gameboy_console(const char *path, const char *subcommand,
     *output = NULL;
     FILE *stream = open_memstream(&response, &length);
     if (!stream) return -1;
-    if (pipe(pipes) != 0) {
+    if (pipe2(pipes, O_CLOEXEC) != 0) {
         fclose(stream);
         free(response);
         return -1;
@@ -7650,6 +7683,18 @@ static int run_gameboy_console(const char *path, const char *subcommand,
     close(pipes[1]);
     int failed = 0;
     for (;;) {
+        if (r2_is_shutting_down()) {
+            failed = 1;
+            break;
+        }
+        struct pollfd output = {.fd = pipes[0], .events = POLLIN};
+        int ready = poll(&output, 1, 250);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0 || (output.revents & (POLLERR | POLLNVAL))) {
+            failed = 1;
+            break;
+        }
+        if (ready == 0) continue;
         char buffer[4096];
         ssize_t count = read(pipes[0], buffer, sizeof(buffer));
         if (count == 0) break;
@@ -7661,10 +7706,20 @@ static int run_gameboy_console(const char *path, const char *subcommand,
     }
     close(pipes[0]);
     if (fclose(stream) != 0) failed = 1;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        failed = 1;
-        break;
+    const struct timespec wait_pause = {.tv_nsec = 100000000L};
+    for (;;) {
+        if (failed || r2_is_shutting_down()) {
+            failed = 1;
+            (void)kill(pid, SIGKILL);
+        }
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) break;
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            failed = 1;
+            break;
+        }
+        (void)nanosleep(&wait_pause, NULL);
     }
     if (failed || !WIFEXITED(status) || !response || memchr(response, '\0', length)) {
         free(response);
@@ -8339,18 +8394,12 @@ static char *process_tools_with_status(
         free(entry);
     }
 
-    const char *m =
-        find_control_marker_line(reply, "[READ]", 0);
+    size_t read_pos = 0;
+    char *read_path = extract_marker(reply, "[READ]", "\n", &read_pos);
 
-    if (m) {
+    if (read_path) {
 
-        char path[PATH_MAX] = {0};
-
-        sscanf(
-            m + 6,
-            "%4095s",
-            path
-        );
+        const char *path = read_path;
 
         char *c =
             workspace_read(path);
@@ -8375,23 +8424,17 @@ static char *process_tools_with_status(
                 path
             );
         }
+        free(read_path);
     }
 
-    m =
-        find_control_marker_line(reply, "[LIST]", 0);
+    size_t list_pos = 0;
+    char *list_path = extract_marker(reply, "[LIST]", "\n", &list_pos);
 
-    if (m) {
+    if (list_path) {
 
-        char path[PATH_MAX] = {0};
+        const char *path = list_path;
 
-        sscanf(
-            m + 6,
-            "%4095s",
-            path
-        );
-
-        if (!*path)
-            strcpy(path, ".");
+        if (!*path) path = ".";
 
         char *l =
             workspace_list(path);
@@ -8416,21 +8459,16 @@ static char *process_tools_with_status(
                 path
             );
         }
+        free(list_path);
     }
 
-    m =
-        find_control_marker_line(reply, "[DELETE]", 0);
+    size_t delete_pos = 0;
+    char *delete_path = extract_marker(reply, "[DELETE]", "\n", &delete_pos);
 
-    if (m) {
+    if (delete_path) {
 
-        char path[PATH_MAX] = {0};
         char deleted[PATH_MAX];
-
-        sscanf(
-            m + 8,
-            "%4095s",
-            path
-        );
+        const char *path = delete_path;
 
         if (
             workspace_delete(
@@ -8453,10 +8491,10 @@ static char *process_tools_with_status(
                 path
             );
         }
+        free(delete_path);
     }
 
-    m =
-        find_control_marker_line(reply, "[WRITE]", 0);
+    const char *m = find_control_marker_line(reply, "[WRITE]", 0);
 
     if (m) {
 
@@ -8653,10 +8691,10 @@ static char *process_tools_with_status(
                 if (id) {
                     APPEND(
                         "REAL HAND RESULT:\n"
-                        "Background task successfully started.\n"
+                        "Background task was queued.\n"
                         "Task ID: %s\n"
                         "Command: %s\n"
-                        "The task is running independently.\n",
+                        "Execution and its result will be reported separately.\n",
                         id,
                         cmd
                     );
@@ -8743,10 +8781,10 @@ static char *process_tools_with_status(
                     if (id) {
                         APPEND(
                             "REAL HAND RESULT:\n"
-                            "Background task successfully started.\n"
+                            "Background task was queued.\n"
                             "Task ID: %s\n"
                             "Command: %s\n"
-                            "The task is running independently.\n",
+                            "Execution and its result will be reported separately.\n",
                             id,
                             t
                         );
@@ -8956,15 +8994,15 @@ static char *process_tools_with_status(
         char *request = extract_marker(reply, "[WORLD]", "\n", &pos);
         if (!request) break;
         char *fields[5] = {0};
-        char *saveptr = NULL;
+        char *part = request;
         int nf = 0;
-        for (char *part = strtok_r(request, "|", &saveptr);
-             part && nf < 5;
-             part = strtok_r(NULL, "|", &saveptr)) {
-            while (*part && isspace((unsigned char)*part)) part++;
-            char *end = part + strlen(part);
-            while (end > part && isspace((unsigned char)end[-1])) *--end = '\0';
-            fields[nf++] = part;
+        while (part && nf < (int)(sizeof(fields) / sizeof(fields[0]))) {
+            fields[nf++] = trim(strsep(&part, "|"));
+        }
+        if (part) {
+            free(request);
+            APPEND("WORLD ERROR: too many fields; no action was taken.\n");
+            continue;
         }
         if (nf >= 3 && !strcasecmp(fields[0], "activity_start")) {
             int64_t id = r2_log_activity_start(fields[1], fields[2], nf >= 4 ? fields[3] : NULL);
@@ -9314,10 +9352,10 @@ static char *process_tools_with_status(
             if (id) {
                 APPEND(
                     "REAL HAND RESULT:\n"
-                    "Background task successfully started.\n"
+                    "Background task was queued.\n"
                     "Task ID: %s\n"
                     "Command: %s\n"
-                    "The task is running independently.\n",
+                    "Execution and its result will be reported separately.\n",
                     id,
                     cmd
                 );

@@ -2286,13 +2286,24 @@ static int shell_gameboy(const char *arg)
         _exit(127);
     }
     int status = 0;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        perror("[Game Boy Advance] waitpid");
-        free(copy);
-        return 1;
+    int cancelled = 0;
+    const struct timespec wait_pause = {.tv_nsec = 100000000L};
+    for (;;) {
+        if (!cancelled && (atomic_load(&shell_shutdown) || r2_is_shutting_down())) {
+            cancelled = 1;
+            (void)kill(child, SIGKILL);
+        }
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0) {
+            if (errno == EINTR) continue;
+            perror("[Game Boy Advance] waitpid");
+            free(copy);
+            return 1;
+        }
+        (void)nanosleep(&wait_pause, NULL);
     }
-    int command_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    int command_ok = !cancelled && WIFEXITED(status) && WEXITSTATUS(status) == 0;
     if (!command_ok) {
         printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
     } else {

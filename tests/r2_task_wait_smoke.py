@@ -29,8 +29,10 @@ require("waited = waitpid(pid, &status, WNOHANG);" in task
         "child wait retries interruptions and stays cancellable after output closes")
 require("!output_read_failed && !shutdown_terminated_task && waited == pid && WIFEXITED(status)" in task,
         "task success requires a valid exit, successful output collection and no shutdown cancellation")
-require("while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}" in task,
-        "allocation-failure cleanup does not abandon a child on interrupted wait")
+require("char out[MAX_TASK_OUTPUT + 1];" in task
+        and "fwrite(buf, 1, got_size, archive)" in task
+        and "fsync(archive_fd)" in task,
+        "bounded previews coexist with a complete synced byte archive")
 
 start_background = core.find("static char *start_background_task(")
 end_background = core.find("/* ============================================================\n   COMPLETED TASKS", start_background)
@@ -49,7 +51,7 @@ require('c->command ? c->command : "[command unavailable]"' in core
         and 'c->output ? c->output : "[output unavailable]"' in core,
         "completed-task collection remains safe if diagnostic allocations fail")
 require("output_read_failed = 1;\n            (void)kill(-pid, SIGKILL);" in task,
-        "output-buffer allocation failure terminates the complete task process group")
+        "output capture failure terminates the complete task process group")
 require("if (setpgid(0, 0) != 0)" in task
         and "setpgid(pid, pid)" in task,
         "task commands and descendants share a cancellable process group")
@@ -71,7 +73,8 @@ console_bridge_end = core.find("static int gameboy_json_bool(", console_bridge_s
 if console_bridge_start < 0 or console_bridge_end <= console_bridge_start:
     raise SystemExit("FAIL: could not isolate run_gameboy_console()")
 console_bridge = core[console_bridge_start:console_bridge_end]
-require("while (waitpid(pid, &status, 0) < 0)" in console_bridge
+require("waitpid(pid, &status, WNOHANG)" in console_bridge
+        and "r2_is_shutting_down()" in console_bridge
         and "close(pipes[0]);" in console_bridge
         and "if (errno == EINTR) continue;" in console_bridge,
         "console bridge reaps its child after output errors and retries interrupted waits")
