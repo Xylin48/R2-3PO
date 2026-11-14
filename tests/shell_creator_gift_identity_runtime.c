@@ -2,12 +2,12 @@
  * command in the same second must not overwrite or merge earlier money items.
  * Other shell subsystems are discarded by --gc-sections for this fixture. */
 #define _GNU_SOURCE
+#include "../shell.c"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
-#include "../shell.c"
 
 static char gift_names[12][96];
 static int gifts = 0;
