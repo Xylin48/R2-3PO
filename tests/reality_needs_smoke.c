@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "Reality.h"
+#include "Log.h"
 
 #include <sqlite3.h>
 #include <math.h>
@@ -550,7 +551,7 @@ static void verify_location_delivery_replay(void)
         fail("could not initialize the real Life Log for location recovery");
     if (setenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT", "1", 1) != 0)
         fail("could not inject interrupted location write");
-    if (r2_reality_transition_location("Mansfield library", 0) == 0)
+    if (r2_reality_transition_location("sample library", 0) == 0)
         fail("injected interruption after Reality commit reported success");
     unsetenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT");
     if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
@@ -593,7 +594,7 @@ static void verify_location_delivery_replay(void)
             "FROM r2_log_location_state WHERE id=1",
             -1, &st, NULL) != SQLITE_OK ||
         sqlite3_step(st) != SQLITE_ROW ||
-        strcmp((const char *)sqlite3_column_text(st, 0), "Mansfield library") ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "sample library") ||
         sqlite3_column_int(st, 1) != 0 ||
         sqlite3_column_int(st, 2) != 1)
         fail("replayed away transition did not match Life Log evidence");
