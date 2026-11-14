@@ -26,4 +26,14 @@ assert "command_rc == 0" in dispatch and "response_is_success_object" in dispatc
     "a zero process exit alone must not imply a successful command"
 )
 
+# Inventory JSON is authoritative about both recorded physical location and
+# whether a ROM file is currently present. Do not turn a legacy linked-file row
+# into an apparently available cartridge when R2 reads the list.
+list_start = source.index('APPEND("GAME BOY CARTRIDGES:')
+list_end = source.index('} else {', list_start)
+list_bridge = source[list_start:list_end]
+assert 'gameboy_json_string(item, "location", "unknown")' in list_bridge
+assert 'gameboy_json_bool(item, "file_available", 0)' in list_bridge
+assert '"available" : "unavailable"' in list_bridge
+
 print("Game Boy command success requires a valid documented JSON response.")
