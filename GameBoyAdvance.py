@@ -442,6 +442,10 @@ def safe_cartridge(name: str) -> Path:
     # Cartridge insertion accepts a loose filename, never an arbitrary path.
     if not name or Path(name).name != name or name in {".", ".."}:
         raise ValueError("Specify a cartridge filename from the Cartridges folder, not a path.")
+    # A linked entry is not an independently stored loose cartridge. Reject
+    # it before resolution so a symlink cannot fabricate physical inventory.
+    if (CARTRIDGES / name).is_symlink():
+        raise ValueError("Cartridge files must be regular files, not symbolic links.")
     path = (CARTRIDGES / name).resolve()
     if path.parent != CARTRIDGES.resolve():
         raise ValueError("Cartridge must be inside the console's Cartridges folder.")
@@ -459,7 +463,11 @@ def sync_cartridge_inventory(db: sqlite3.Connection) -> None:
     ensure_dirs()
     now = utc_now()
     for path in sorted(CARTRIDGES.iterdir(), key=lambda p: p.name.casefold()):
-        if not path.is_file() or path.suffix.lower() not in ROM_EXTENSIONS:
+        # Do not follow linked files during inventory discovery. Otherwise a
+        # linked external ROM can appear in R2's physical possessions even
+        # though the insertion path cannot legitimately load it.
+        if (path.is_symlink() or not path.is_file()
+                or path.suffix.lower() not in ROM_EXTENSIONS):
             continue
         title = read_rom_title(path)
         db.execute(
