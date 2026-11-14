@@ -156,7 +156,77 @@ def main() -> int:
             raise AssertionError(
                 "R2 exited without its clean-shutdown marker.\n" + final_log[-12000:]
             )
-        print("PASS: R2 reached ONLINE, logged a media event, and shut down cleanly on SIGTERM.")
+        # Start the same production core a second time against the original
+        # databases with no camera/microphone/TV hardware attached. This checks
+        # real cross-process persistence and restart readiness, not merely that
+        # a database query succeeded before the first core shut down.
+        restart_log = base / "r2-service-restart.log"
+        with restart_log.open("w", encoding="utf-8") as log:
+            restarted = subprocess.Popen(
+                [str(binary)], cwd=workspace, env=env,
+                stdout=log, stderr=subprocess.STDOUT,
+            )
+            restart_rc = None
+            try:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if restarted.poll() is not None:
+                        break
+                    if "R2-3PO ONLINE" in restart_log.read_text(
+                        encoding="utf-8", errors="replace"
+                    ):
+                        break
+                    time.sleep(0.1)
+                if "R2-3PO ONLINE" not in restart_log.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    raise AssertionError(
+                        "R2 could not restart with persisted databases.\n"
+                        + restart_log.read_text(encoding="utf-8", errors="replace")[-12000:]
+                    )
+                with sqlite3.connect(
+                    f"file:{home / 'r2_reality.db'}?mode=ro", uri=True, timeout=5.0
+                ) as db:
+                    positions_after = dict(db.execute(
+                        "SELECT media_path,position_seconds FROM r2_tv_vcr_tapes"
+                    ))
+                    cassette_after = db.execute(
+                        "SELECT cassette_path FROM r2_tv_vcr_state WHERE id=1"
+                    ).fetchone()
+                if (positions_after != {str(first): 62.125, str(second): 0.0}
+                        or cassette_after != (str(second),)):
+                    raise AssertionError("R2 restart lost the exact persisted VCR state.")
+                with sqlite3.connect(
+                    f"file:{memory_db}?mode=ro", uri=True, timeout=5.0
+                ) as db:
+                    history = db.execute(
+                        "SELECT COUNT(*) FROM r2_log_events "
+                        "WHERE event_type=? AND summary IN (?,?)",
+                        ("vcr_playback_started",
+                         "vcr_playback_started media: /tmp/audit-film.mp4",
+                         f"vcr_playback_started media: {first}"),
+                    ).fetchone()[0]
+                if history != 2:
+                    raise AssertionError("R2 restart lost or duplicated playback history.")
+            finally:
+                if restarted.poll() is None:
+                    restarted.send_signal(signal.SIGTERM)
+                try:
+                    restart_rc = restarted.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    restarted.kill()
+                    restarted.wait(timeout=5)
+                    raise AssertionError("R2 second shutdown hung after restart.")
+
+        if restart_rc != 0 or "[R2-3PO shut down.]" not in restart_log.read_text(
+            encoding="utf-8", errors="replace"
+        ):
+            raise AssertionError(
+                "R2 did not shut down cleanly after restart.\n"
+                + restart_log.read_text(encoding="utf-8", errors="replace")[-12000:]
+            )
+        print("PASS: R2 reached ONLINE with no peripherals, persisted media facts, "
+              "restarted with exact state/history, and shut down cleanly twice.")
     return 0
 
 
