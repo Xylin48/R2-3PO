@@ -564,6 +564,30 @@ int main(void)
         free(completed);
     }
 
+#ifdef R2_COMPLETED_FAILURE_TEST
+    /* The first handoff deliberately fails after the batch is drained.
+       Later retries must publish the original evidence exactly once. */
+    CompletedTask *retry_task = new_test_completion("RETRY_ME");
+    ok &= check(retry_task != NULL, "allocate durable Hands handoff fixture");
+    if (retry_task) {
+        completed_push(retry_task);
+        size_t before = messages.count;
+        completed_fail_handoff = 1;
+        handle_completed_messages();
+        ok &= check(completed_pending_handoff != NULL &&
+                        strstr(completed_pending_handoff, "Task ID: RETRY_ME") &&
+                        messages.count == before &&
+                        completed_head == NULL,
+                    "failed conversation publication retains exact task evidence");
+        handle_completed_messages();
+        ok &= check(!completed_pending_handoff &&
+                        messages.count == before + 2 &&
+                        strstr(messages.items[before + 1].content, "Task ID: RETRY_ME") &&
+                        messages.items[before + 1].internal_tool_result,
+                    "retry publishes original Hands evidence once as an internal result");
+    }
+#endif
+
     for (size_t i = 0; i < messages.count; ++i) {
         free(messages.items[i].role);
         free(messages.items[i].content);

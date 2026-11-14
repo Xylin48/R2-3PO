@@ -9964,11 +9964,24 @@ static char *memory_decision(
    COMPLETED TASK MESSAGE HANDLING
    ============================================================ */
 
+/* Keep the exact formatted task evidence on transient conversation
+ * publication failure. A result is consumed only after both paired messages
+ * have been accepted, so allocation failure cannot silently drop it. */
+static pthread_mutex_t completed_handoff_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *completed_pending_handoff = NULL;
+#ifdef R2_COMPLETED_FAILURE_TEST
+static int completed_fail_handoff;
+#endif
+
 static void handle_completed_messages(void)
 {
-    char *result = collect_completed();
+    pthread_mutex_lock(&completed_handoff_lock);
+    char *result = completed_pending_handoff;
+    completed_pending_handoff = NULL;
+    if (!result) result = collect_completed();
     if (!result || !*result) {
         free(result);
+        pthread_mutex_unlock(&completed_handoff_lock);
         return;
     }
 
@@ -9987,7 +10000,8 @@ static void handle_completed_messages(void)
     size_t result_length = strlen(result);
     if (result_length > SIZE_MAX - sizeof(result_prefix)) {
         fprintf(stderr, "[R2] Completed task result was too large to tag safely.\n");
-        free(result);
+        completed_pending_handoff = result;
+        pthread_mutex_unlock(&completed_handoff_lock);
         return;
     }
 
@@ -9995,26 +10009,37 @@ static void handle_completed_messages(void)
     char *tagged_result = malloc(tagged_length + 1);
     if (!tagged_result) {
         fprintf(stderr, "[R2] Could not allocate internal completed-task result context.\n");
-        free(result);
+        completed_pending_handoff = result;
+        pthread_mutex_unlock(&completed_handoff_lock);
         return;
     }
     memcpy(tagged_result, result_prefix, sizeof(result_prefix) - 1);
     memcpy(tagged_result + sizeof(result_prefix) - 1, result, result_length + 1);
 
     pthread_mutex_lock(&messages_lock);
-    int rc = message_add_pair_locked(
+    int rc;
+#ifdef R2_COMPLETED_FAILURE_TEST
+    if (completed_fail_handoff) {
+        completed_fail_handoff = 0;
+        rc = -1;
+    } else
+#endif
+    rc = message_add_pair_locked(
         "assistant", request_context, "user", tagged_result);
     if (rc == 0 && messages.count > 0)
         messages.items[messages.count - 1].internal_tool_result = 1;
     pthread_mutex_unlock(&messages_lock);
 
-    if (rc != 0)
+    if (rc != 0) {
         fprintf(stderr,
                 "[R2] Failed to add completed task as an internal result; "
-                "it was not inserted as user speech.\n");
-
+                "its exact evidence is retained for retry.\n");
+        completed_pending_handoff = result;
+    } else {
+        free(result);
+    }
     free(tagged_result);
-    free(result);
+    pthread_mutex_unlock(&completed_handoff_lock);
 }
 
 /* ============================================================
