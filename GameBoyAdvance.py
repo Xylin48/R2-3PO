@@ -945,8 +945,12 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "events":
             result = pending_verified_events(db)
         elif command == "ack_event":
-            result = {"ok": acknowledge_verified_event(db, args.event_id),
-                      "message": "Verified event acknowledged."}
+            acknowledged = acknowledge_verified_event(db, args.event_id)
+            result = {
+                "ok": acknowledged,
+                "message": ("Verified event acknowledged." if acknowledged else
+                            "No matching pending verified event was acknowledged."),
+            }
         elif command == "power":
             result = power_on(db) if state == "on" else power_off(db)
         else:
