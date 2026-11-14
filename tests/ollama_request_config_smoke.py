@@ -61,7 +61,7 @@ require("CLOCK_MONOTONIC" in progress
         and "ollama_progress_clock_valid = 0;" in function,
         "long foreground inference reports bounded progress while background requests remain quiet")
 
-response_start = source.find("struct json_object *resp = ollama_parse_complete_response(b.data, b.size);")
+response_start = source.find("struct json_object *resp = r2_parse_complete_json_object(b.data, b.size);")
 response_end = source.find("static char *ollama_chat(", response_start)
 if response_start < 0 or response_end <= response_start:
     raise SystemExit("FAIL: could not isolate Ollama response contract validation")

@@ -15,7 +15,7 @@ start = core.index("char *r2_ears_listen_source_cancelable(unsigned seconds,")
 end = core.index("int r2_ears_start(void)", start)
 bridge = core[start:end]
 
-assert "r2_ears_read(ears, pcm, wanted)" in bridge
+assert "r2_ears_read_live_cancelable(ears, pcm, wanted," in bridge
 assert "r2_ears_write_recent_audio(total_bytes, start_total, generation, wav, cancelled, userdata)" in bridge
 capture_start = core.index("static void *r2_ears_capture_worker(void *unused)")
 capture_end = core.index("static int r2_ears_write_recent_audio(", capture_start)
@@ -90,10 +90,10 @@ assert 'R2_WHISPER_CLI="${R2_WHISPER_CLI:-}"' in launcher
 assert "Local Whisper is not configured" in launcher
 assert "docs/local-speech-input.md" in launcher
 assert "r2_ears_read(" in ears and "ssize_t r2_ears_read(" in ears_header
-read_start = ears.index("ssize_t r2_ears_read(")
+read_start = ears.index("ssize_t r2_ears_read_live_cancelable(")
 read_end = ears.index("int r2_ears_get_event(", read_start)
 read_impl = ears[read_start:read_end]
-live_error_start = read_impl.index("if (r2_audio_capture_read(")
+live_error_start = read_impl.index("if (r2_audio_capture_read_cancelable(")
 live_error_end = read_impl.index("uint64_t sample_time =", live_error_start)
 live_error = read_impl[live_error_start:live_error_end]
 assert "atomic_store(&ears->open, 0);" in live_error, (

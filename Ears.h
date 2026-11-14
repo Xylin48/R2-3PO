@@ -262,6 +262,11 @@ ssize_t r2_ears_read(
     size_t buffer_size
 );
 
+/* Wait for live PCM while observing a caller's cancellation predicate. */
+ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
+                                    size_t buffer_size, int (*cancelled)(void *),
+                                    void *userdata);
+
 
 /*
  * Retrieve information about the current hearing event.

@@ -568,11 +568,49 @@ static void check_reflection_stop_and_long_visual_query(void)
     assert(query_requests_visual_context(query));
 }
 
+static void check_structured_report_evidence(void)
+{
+    const char *reply = "I feel curious. My project is open. Hypothetically, I could fly.";
+    const char *report =
+        "{\"states\":[{\"description\":\"curiosity\",\"evidence\":\"I feel curious.\"},"
+        "{\"description\":\"anger\",\"evidence\":\"I feel angry.\"},"
+        "{\"description\":\"spoof\",\"evidence\":\"I feel curious.\\u0000extra\"}],"
+        "\"beliefs\":[{\"key\":\"invented\",\"belief\":\"unsupported\",\"evidence\":\"made up\"}],"
+        "\"continuity\":[{\"key\":\"project\",\"title\":\"Project\",\"evidence\":\"My project is open.\"},"
+        "{\"key\":\"invented\",\"title\":\"Unsupported\"}],"
+        "\"hypotheticals\":[{\"scenario\":\"Flight\",\"evidence\":\"Hypothetically, I could fly.\"},"
+        "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    const char *sql =
+        "SELECT (SELECT COUNT(*) FROM r2_log_inner_states),"
+        "(SELECT COUNT(*) FROM r2_log_beliefs WHERE belief_key='invented'),"
+        "(SELECT COUNT(*) FROM r2_log_continuity WHERE item_key IN ('project','invented')),"
+        "(SELECT COUNT(*) FROM r2_log_hypotheticals WHERE scenario IN ('Flight','Unsupported'))";
+    for (int valid = 0; valid <= 1; ++valid) {
+        char *invalid = NULL;
+        if (!valid) assert(asprintf(&invalid, "%s trailing text", report) >= 0);
+        set_response(valid ? report : invalid, "stop", 1);
+        free(invalid);
+        log_structured_self_report(reply, 0);
+        sqlite3_stmt *st = NULL;
+        assert(sqlite3_prepare_v2(fixture, sql, -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_step(st) == SQLITE_ROW);
+        assert(sqlite3_column_int(st, 0) == valid);
+        assert(sqlite3_column_int(st, 1) == 0);
+        assert(sqlite3_column_int(st, 2) == valid);
+        assert(sqlite3_column_int(st, 3) == valid);
+        sqlite3_finalize(st);
+    }
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_log_init() == 0);
+    check_structured_report_evidence();
     check_boundaries();
     check_reflection_stop_and_long_visual_query();
     check_retry_and_isolated_inputs();

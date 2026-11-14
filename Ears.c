@@ -697,11 +697,9 @@ int r2_ears_open_file(
  * Read PCM audio
  * --------------------------------------------------------- */
 
-ssize_t r2_ears_read(
-    R2Ears *ears,
-    void *buffer,
-    size_t buffer_size
-)
+ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
+                                    size_t buffer_size, int (*cancelled)(void *),
+                                    void *userdata)
 {
     if (!ears ||
         !buffer ||
@@ -724,6 +722,7 @@ ssize_t r2_ears_read(
 
     if (ears->using_file)
     {
+        if (cancelled) { errno = EINVAL; return -1; }
         if (!ears->file_stream) { errno = EBADF; return -1; }
         ssize_t bytes_read = r2_audio_file_read(ears->file_stream, buffer,
                                                  buffer_size);
@@ -769,7 +768,8 @@ ssize_t r2_ears_read(
 
     if (ears->pulse_stream)
     {
-        if (r2_audio_capture_read(ears->pulse_stream, buffer, buffer_size) < 0) {
+        if (r2_audio_capture_read_cancelable(ears->pulse_stream, buffer, buffer_size,
+                                             cancelled, userdata) < 0) {
             int read_errno = errno;
             if (read_errno != ECANCELED) {
                 r2_log_sensory("audio_read_failed",
@@ -814,6 +814,11 @@ ssize_t r2_ears_read(
     return -1;
 }
 
+
+ssize_t r2_ears_read(R2Ears *ears, void *buffer, size_t buffer_size)
+{
+    return r2_ears_read_live_cancelable(ears, buffer, buffer_size, NULL, NULL);
+}
 
 /* ---------------------------------------------------------
  * Event information

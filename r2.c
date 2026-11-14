@@ -3545,10 +3545,8 @@ static size_t r2_safe_prompt_prefix_length(const char *content,
     return r2_utf8_safe_prefix_length(content, cap);
 }
 
-/* Ollama's non-streaming /api/chat contract must represent one complete
-   assistant turn. Keep this predicate isolated so malformed-response cases
-   can be exercised without a live model server. */
-static json_object *ollama_parse_complete_response(const char *text, size_t length)
+/* Responses used for durable decisions must contain one complete JSON object. */
+static json_object *r2_parse_complete_json_object(const char *text, size_t length)
 {
     if (!text || length > INT_MAX || memchr(text, '\0', length)) return NULL;
     struct json_tokener *parser = json_tokener_new();
@@ -4485,7 +4483,7 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
-    struct json_object *resp = ollama_parse_complete_response(b.data, b.size);
+    struct json_object *resp = r2_parse_complete_json_object(b.data, b.size);
     if (!resp) {
         fprintf(stderr, "[R2 Ollama] response was not valid JSON (%zu bytes).\n", b.size);
         if (r2_log_is_initialized())
@@ -12837,7 +12835,8 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
                !(cancelled && cancelled(userdata))) {
             size_t wanted = total_bytes - captured_bytes;
             if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
-            ssize_t got = r2_ears_read(ears, pcm, wanted);
+            ssize_t got = r2_ears_read_live_cancelable(ears, pcm, wanted,
+                                                      r2_ears_open_cancelled, &request);
             if (got <= 0 || ((size_t)got % 4U) != 0U) {
                 fprintf(stderr, "[Ears] Microphone capture ended early or returned invalid PCM.\n");
                 break;
@@ -12950,7 +12949,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
         if (start != transcript) memmove(transcript, start, strlen(start) + 1U);
         if (!*transcript) { free(transcript); transcript = NULL; }
     }
-    if (cancelled && cancelled(userdata)) {
+    if (shutting_down || (cancelled && cancelled(userdata))) {
         free(transcript);
         transcript = NULL;
         goto cleanup;
@@ -13497,6 +13496,22 @@ void r2_diagnostics(void)
  * visible response: expressed emotion, motivation, uncertainty, beliefs,
  * and continuity items. It does not claim access to hidden model reasoning.
  */
+static const char *structured_report_evidence(json_object *item, const char *reply)
+{
+    json_object *value = NULL;
+    if (!json_object_object_get_ex(item, "evidence", &value) ||
+        !json_object_is_type(value, json_type_string))
+        return NULL;
+    const char *quote = json_object_get_string(value);
+    size_t length = (size_t)json_object_get_string_len(value);
+    if (length == 0 || strlen(quote) != length)
+        return NULL;
+    for (size_t i = 0; i < length; ++i)
+        if (!isspace((unsigned char)quote[i]))
+            return strstr(reply, quote) ? quote : NULL;
+    return NULL;
+}
+
 static void log_structured_self_report(const char *reply, int64_t parent_event_id)
 {
     if (!reply || !*reply || !r2_log_is_initialized())
@@ -13515,9 +13530,9 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
         "\"evidence\":\"exact quote\",\"confidence\":0.0,\"status\":\"tentative|supported|disputed|revised|rejected\"}],"
         "\"continuity\":[{\"key\":\"short-stable-key\",\"type\":\"project|task|question|goal|relationship|routine\","
         "\"title\":\"...\",\"description\":\"...\",\"status\":\"open|in_progress|paused|blocked|completed|closed\","
-        "\"next_action\":\"...\"}],"
+        "\"next_action\":\"...\",\"evidence\":\"exact quote\"}],"
         "\"hypotheticals\":[{\"scenario\":\"...\",\"assumptions\":\"...\","
-        "\"predicted_outcome\":\"...\",\"conclusion\":\"...\"}]}. "
+        "\"predicted_outcome\":\"...\",\"conclusion\":\"...\",\"evidence\":\"exact quote explicitly marking the scenario as hypothetical\"}]}. "
         "Use empty arrays when there is no evidence. Include hypotheticals only when R2 explicitly labels a scenario as hypothetical or counterfactual. Confidence is evidence "
         "strength, not a measure of consciousness. Never invent exact quotes.\n\n"
         "R2 visible response:\n";
@@ -13548,10 +13563,9 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
         return;
     }
 
-    struct json_object *root = json_tokener_parse(json_text);
+    struct json_object *root = r2_parse_complete_json_object(json_text, strlen(json_text));
     free(json_text);
-    if (!root || !json_object_is_type(root, json_type_object)) {
-        if (root) json_object_put(root);
+    if (!root) {
         r2_log_event(R2_LOG_ERROR, "self_state_json_invalid",
                      "Structured self-state extraction returned invalid JSON.",
                      NULL, "log_structured_self_report");
@@ -13562,22 +13576,20 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     if (json_object_object_get_ex(root, "states", &arr) &&
         json_object_is_type(arr, json_type_array)) {
         size_t count = json_object_array_length(arr);
-        if (count > 12) count = 12;
         for (size_t i = 0; i < count; ++i) {
             item = json_object_array_get_idx(arr, i);
             const char *kind = "self_assessment";
-            const char *description = NULL, *evidence = NULL;
+            const char *description = NULL;
+            const char *evidence = structured_report_evidence(item, reply);
             double confidence = -1.0;
             if (json_object_object_get_ex(item, "kind", &v) &&
                 json_object_is_type(v, json_type_string)) kind = json_object_get_string(v);
             if (json_object_object_get_ex(item, "description", &v) &&
                 json_object_is_type(v, json_type_string)) description = json_object_get_string(v);
-            if (json_object_object_get_ex(item, "evidence", &v) &&
-                json_object_is_type(v, json_type_string)) evidence = json_object_get_string(v);
             if (json_object_object_get_ex(item, "confidence", &v) &&
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
-            if (description && *description && evidence && *evidence) {
+            if (description && *description && evidence) {
                 int64_t child = r2_log_inner_state(kind, description, evidence, confidence,
                                    "explicit R2 response; model-extracted with quoted evidence");
                 if (parent_event_id > 0 && child > 0)
@@ -13589,24 +13601,22 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     if (json_object_object_get_ex(root, "beliefs", &arr) &&
         json_object_is_type(arr, json_type_array)) {
         size_t count = json_object_array_length(arr);
-        if (count > 12) count = 12;
         for (size_t i = 0; i < count; ++i) {
             item = json_object_array_get_idx(arr, i);
-            const char *key = NULL, *belief = NULL, *evidence = NULL;
+            const char *key = NULL, *belief = NULL;
+            const char *evidence = structured_report_evidence(item, reply);
             const char *status = "tentative";
             double confidence = -1.0;
             if (json_object_object_get_ex(item, "key", &v) &&
                 json_object_is_type(v, json_type_string)) key = json_object_get_string(v);
             if (json_object_object_get_ex(item, "belief", &v) &&
                 json_object_is_type(v, json_type_string)) belief = json_object_get_string(v);
-            if (json_object_object_get_ex(item, "evidence", &v) &&
-                json_object_is_type(v, json_type_string)) evidence = json_object_get_string(v);
             if (json_object_object_get_ex(item, "status", &v) &&
                 json_object_is_type(v, json_type_string)) status = json_object_get_string(v);
             if (json_object_object_get_ex(item, "confidence", &v) &&
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
-            if (key && *key && belief && *belief && evidence && *evidence) {
+            if (key && *key && belief && *belief && evidence) {
                 int64_t child = r2_log_belief(key, belief, evidence, confidence, status,
                               "explicit R2 response; model-extracted with quoted evidence");
                 if (parent_event_id > 0 && child > 0)
@@ -13618,7 +13628,6 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     if (json_object_object_get_ex(root, "continuity", &arr) &&
         json_object_is_type(arr, json_type_array)) {
         size_t count = json_object_array_length(arr);
-        if (count > 8) count = 8;
         for (size_t i = 0; i < count; ++i) {
             item = json_object_array_get_idx(arr, i);
             const char *key = NULL, *type = "task", *title = NULL;
@@ -13635,12 +13644,13 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 json_object_is_type(v, json_type_string)) status = json_object_get_string(v);
             if (json_object_object_get_ex(item, "next_action", &v) &&
                 json_object_is_type(v, json_type_string)) next_action = json_object_get_string(v);
-            if (key && *key && title && *title) {
+            const char *evidence = structured_report_evidence(item, reply);
+            if (key && *key && title && *title && evidence) {
                 int64_t child = r2_log_continuity(key, type, title, description, status,
                                   next_action,
                                   "explicit R2 response; model-extracted");
                 if (parent_event_id > 0 && child > 0)
-                    r2_log_link(parent_event_id, child, "updates_continuity", title);
+                    r2_log_link(parent_event_id, child, "updates_continuity", evidence);
             }
         }
     }
@@ -13649,7 +13659,6 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     if (json_object_object_get_ex(root, "hypotheticals", &arr) &&
         json_object_is_type(arr, json_type_array)) {
         size_t count = json_object_array_length(arr);
-        if (count > 8) count = 8;
         for (size_t i = 0; i < count; ++i) {
             item = json_object_array_get_idx(arr, i);
             const char *scenario = NULL, *assumptions = NULL;
@@ -13667,7 +13676,8 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 json_object_is_type(v, json_type_string))
                 conclusion = json_object_get_string(v);
 
-            if (scenario && *scenario) {
+            const char *evidence = structured_report_evidence(item, reply);
+            if (scenario && *scenario && evidence) {
                 int64_t child = r2_log_hypothetical(
                     scenario, assumptions, predicted, conclusion,
                     "explicit R2 response; model-extracted");
@@ -13676,7 +13686,7 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                         scenario, assumptions, predicted, conclusion, child, 0);
                 if (parent_event_id > 0 && child > 0)
                     r2_log_link(parent_event_id, child,
-                                "contains_hypothetical", scenario);
+                                "contains_hypothetical", evidence);
             }
         }
     }

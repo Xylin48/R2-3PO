@@ -198,7 +198,34 @@ failed:
 
 /* Never hold the threaded-mainloop lock over the caller's main lifecycle
  * lock. The wait releases it, so a stop can signal even if no PCM arrives. */
-ssize_t r2_audio_capture_read(R2AudioCapture *capture, void *buffer, size_t bytes)
+static void r2_capture_read_wake(pa_mainloop_api *api, pa_time_event *event,
+                                 const struct timeval *time, void *userdata)
+{
+    (void)api;
+    (void)event;
+    (void)time;
+    R2AudioCapture *capture = userdata;
+    r2_capture_wake(capture->mainloop);
+}
+
+static int r2_capture_wait_for_samples(R2AudioCapture *capture,
+                                      int (*cancelled)(void *))
+{
+    if (!cancelled) {
+        pa_threaded_mainloop_wait(capture->mainloop);
+        return 0;
+    }
+    pa_time_event *timer = pa_context_rttime_new(capture->context,
+        pa_rtclock_now() + 100000U, r2_capture_read_wake, capture);
+    if (!timer) return -1;
+    pa_threaded_mainloop_wait(capture->mainloop);
+    pa_threaded_mainloop_get_api(capture->mainloop)->time_free(timer);
+    return 0;
+}
+
+ssize_t r2_audio_capture_read_cancelable(R2AudioCapture *capture, void *buffer,
+                                        size_t bytes, int (*cancelled)(void *),
+                                        void *userdata)
 {
     if (!capture || !buffer || !bytes || bytes > SSIZE_MAX ||
         !capture->stream || !capture->mainloop_started) {
@@ -209,6 +236,12 @@ ssize_t r2_audio_capture_read(R2AudioCapture *capture, void *buffer, size_t byte
     size_t copied = 0;
     int error = EIO;
     while (copied < bytes) {
+        if (cancelled) {
+            pa_threaded_mainloop_unlock(capture->mainloop);
+            int stopped = cancelled(userdata);
+            pa_threaded_mainloop_lock(capture->mainloop);
+            if (stopped) { error = ECANCELED; goto failed; }
+        }
         if (atomic_load(&capture->cancelled)) { error = ECANCELED; goto failed; }
         if (capture->stream_moved) { error = ENODEV; goto failed; }
         if (pa_context_get_state(capture->context) != PA_CONTEXT_READY ||
@@ -220,13 +253,13 @@ ssize_t r2_audio_capture_read(R2AudioCapture *capture, void *buffer, size_t byte
             size_t readable = pa_stream_readable_size(capture->stream);
             if (readable == (size_t)-1) goto failed;
             if (!readable) {
-                pa_threaded_mainloop_wait(capture->mainloop);
+                if (r2_capture_wait_for_samples(capture, cancelled) != 0) goto failed;
                 continue;
             }
             if (pa_stream_peek(capture->stream, &capture->fragment,
                                &capture->fragment_size) < 0) goto failed;
             if (!capture->fragment_size) {
-                pa_threaded_mainloop_wait(capture->mainloop);
+                if (r2_capture_wait_for_samples(capture, cancelled) != 0) goto failed;
                 continue;
             }
         }
@@ -252,6 +285,11 @@ failed:
     pa_threaded_mainloop_unlock(capture->mainloop);
     errno = error;
     return -1;
+}
+
+ssize_t r2_audio_capture_read(R2AudioCapture *capture, void *buffer, size_t bytes)
+{
+    return r2_audio_capture_read_cancelable(capture, buffer, bytes, NULL, NULL);
 }
 
 void r2_audio_capture_cancel(R2AudioCapture *capture)

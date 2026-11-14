@@ -20,6 +20,9 @@ static atomic_int waiting = ATOMIC_VAR_INIT(0);
 static atomic_int wakeups = ATOMIC_VAR_INIT(0);
 static atomic_int dropped = ATOMIC_VAR_INIT(0);
 static atomic_int readable = ATOMIC_VAR_INIT(0);
+static pa_time_event_cb_t timer_callback;
+static void *timer_userdata;
+static int timer_fired;
 static unsigned char fragment[8] = {11, 12, 13, 14, 15, 16, 17, 18};
 
 void __wrap_pa_threaded_mainloop_lock(pa_threaded_mainloop *loop)
@@ -36,6 +39,11 @@ void __wrap_pa_threaded_mainloop_wait(pa_threaded_mainloop *loop)
 {
     assert((uintptr_t)loop == 1);
     atomic_store(&waiting, 1);
+    if (timer_callback) {
+        timer_fired = 1;
+        timer_callback(NULL, (pa_time_event *)(uintptr_t)4, NULL, timer_userdata);
+        return;
+    }
     assert(pthread_cond_wait(&event_changed, &event_lock) == 0);
 }
 void __wrap_pa_threaded_mainloop_signal(pa_threaded_mainloop *loop, int wait_for_accept)
@@ -43,6 +51,36 @@ void __wrap_pa_threaded_mainloop_signal(pa_threaded_mainloop *loop, int wait_for
     assert((uintptr_t)loop == 1 && !wait_for_accept);
     atomic_fetch_add(&wakeups, 1);
     assert(pthread_cond_broadcast(&event_changed) == 0);
+}
+
+static void free_timer(pa_time_event *event)
+{
+    assert((uintptr_t)event == 4);
+    timer_callback = NULL;
+}
+
+pa_mainloop_api *__wrap_pa_threaded_mainloop_get_api(pa_threaded_mainloop *loop)
+{
+    assert((uintptr_t)loop == 1);
+    static pa_mainloop_api api = {.time_free = free_timer};
+    return &api;
+}
+
+pa_time_event *__wrap_pa_context_rttime_new(pa_context *context, pa_usec_t deadline,
+                                          pa_time_event_cb_t callback, void *userdata)
+{
+    assert((uintptr_t)context == 2 && deadline > 0 && !timer_callback);
+    timer_callback = callback;
+    timer_userdata = userdata;
+    return (pa_time_event *)(uintptr_t)4;
+}
+
+static int cancelled_after_timer(void *userdata)
+{
+    (void)userdata;
+    assert(pthread_mutex_trylock(&event_lock) == 0);
+    assert(pthread_mutex_unlock(&event_lock) == 0);
+    return timer_fired;
 }
 
 pa_context_state_t __wrap_pa_context_get_state(const pa_context *ctx)
@@ -131,6 +169,12 @@ int main(void)
     assert(reader.got == -1 && reader.saved_errno == ECANCELED);
     assert(atomic_load(&wakeups) >= 1);
     assert(seconds_between(before, after) < 1.0);
+
+    /* Caller cancellation must wake even when the source and server stay ready. */
+    atomic_store(&capture.cancelled, 0);
+    assert(r2_audio_capture_read_cancelable(&capture, head, sizeof(head),
+                                            cancelled_after_timer, NULL) == -1);
+    assert(errno == ECANCELED && timer_fired && !timer_callback);
 
     /* A moved stream wakes its reader and cannot supply old or new PCM
      * under the original source label, even when a fragment is retained. */
