@@ -6,21 +6,31 @@
 #undef main
 #include <assert.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 static int swap_after_validation = 0;
 static const char *const outside = "/tmp/r2-workspace-read-outside-fixture";
 
-char *__real_realpath(const char *path, char *resolved);
-char *__wrap_realpath(const char *path, char *resolved)
+/* Hook the final descriptor open, after safe_path() has returned, so a
+ * linker/stdlib realpath alias cannot make the race fixture a false pass. */
+int __real_openat(int dirfd, const char *path, int flags, ...);
+int __wrap_openat(int dirfd, const char *path, int flags, ...)
 {
-    char *result = __real_realpath(path, resolved);
-    if (result && swap_after_validation &&
-        strcmp(path, R2_WORKSPACE "/allowed.txt") == 0) {
+    if (swap_after_validation && !strcmp(path, "allowed.txt") &&
+        (flags & O_NOFOLLOW)) {
         swap_after_validation = 0;
-        if (unlink(path) != 0 || symlink(outside, path) != 0)
+        if (unlink(R2_WORKSPACE "/allowed.txt") != 0 ||
+            symlink(outside, R2_WORKSPACE "/allowed.txt") != 0)
             abort();
     }
-    return result;
+    if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+        va_list args;
+        va_start(args, flags);
+        mode_t mode = va_arg(args, mode_t);
+        va_end(args);
+        return __real_openat(dirfd, path, flags, mode);
+    }
+    return __real_openat(dirfd, path, flags);
 }
 
 int main(void)
