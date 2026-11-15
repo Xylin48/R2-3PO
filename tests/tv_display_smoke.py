@@ -77,6 +77,30 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertEqual(TV.CRTDisplay.read_state(object.__new__(TV.CRTDisplay)),
                          (1, "input", 1, None))
 
+    def test_read_only_database_uris_escape_question_and_fragment_characters(self) -> None:
+        # A raw "file:" URI misparses '#' as a fragment and '?' as options.
+        # Both display readers must open this exact database, never a
+        # similarly prefixed path or an implicitly created replacement.
+        unusual = Path(self.tempdir.name) / "VCR?archive#2026.db"
+        with sqlite3.connect(unusual) as db:
+            db.executescript("""
+                CREATE TABLE r2_tv_state (
+                    id INTEGER PRIMARY KEY, power INTEGER NOT NULL,
+                    source_kind TEXT NOT NULL, source_value INTEGER NOT NULL);
+                CREATE TABLE r2_tv_vcr_state (
+                    id INTEGER PRIMARY KEY, cassette_path TEXT, transport TEXT NOT NULL);
+                CREATE TABLE r2_tv_vcr_tapes (
+                    media_path TEXT PRIMARY KEY, position_seconds REAL NOT NULL);
+                INSERT INTO r2_tv_state VALUES(1,0,'input',1);
+                INSERT INTO r2_tv_vcr_state VALUES(1,NULL,'stop');
+            """)
+        before = unusual.read_bytes()
+        with patch.object(TV, "DB_PATH", unusual):
+            display = object.__new__(TV.CRTDisplay)
+            self.assertEqual(display.read_state(), (0, "input", 1, None))
+            self.assertEqual(display.read_vcr_state(), (None, "stop", 0.0))
+        self.assertEqual(unusual.read_bytes(), before)
+
     def test_reader_does_not_mutate_reality_database(self) -> None:
         self.set_state(0, "input", 1)
         before = self.db_path.read_bytes()
