@@ -14849,11 +14849,8 @@ int r2_conversation(void)
     if (!core_initialized)
         return -1;
 
-    char *line = malloc((size_t)OLLAMA_MAX_MESSAGE_CHARS + 2U);
-    if (!line) {
-        fprintf(stderr, "[R2] Could not allocate bounded conversation input buffer.\n");
-        return -1;
-    }
+    char *line = NULL;
+    size_t line_capacity = 0;
 
     while (!shutting_down) {
         handle_completed_messages();
@@ -14864,8 +14861,8 @@ int r2_conversation(void)
         errno = 0;
         size_t input_bytes = 0;
         R2InputLineStatus input_status =
-            r2_read_bounded_line(stdin, line, OLLAMA_MAX_MESSAGE_CHARS,
-                                 &input_bytes);
+            r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES,
+                                  &input_bytes);
         if (input_status == R2_INPUT_LINE_EOF)
             break;
         if (input_status == R2_INPUT_LINE_IO_ERROR) {
@@ -14878,11 +14875,11 @@ int r2_conversation(void)
         }
         if (input_status == R2_INPUT_LINE_TOO_LONG) {
             fprintf(stderr,
-                    "[R2] Direct conversation input exceeded the %d-byte limit.\n",
-                    OLLAMA_MAX_MESSAGE_CHARS);
-            printf("\nR2-3PO: That message is too long for one turn (%d-byte limit). "
+                    "[R2] Direct conversation input exceeded the %u-byte limit.\n",
+                    R2_MAX_TURN_INPUT_BYTES);
+            printf("\nR2-3PO: That message is too long for one turn (%u-byte limit). "
                    "Nothing from it was sent; please split it into smaller messages.\n\n",
-                   OLLAMA_MAX_MESSAGE_CHARS);
+                   R2_MAX_TURN_INPUT_BYTES);
             fflush(stdout);
             continue;
         }

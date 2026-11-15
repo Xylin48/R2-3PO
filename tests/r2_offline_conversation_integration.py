@@ -33,8 +33,10 @@ RATING_REASON = "I liked the ginger in this particular modeled meal."
 DREAM = "In the dream I watched a paper moon drift across the room."
 WRITE_REQUEST = "Write the audit fixture R2_OFFLINE_WRITE_36139"
 LARGE_READ = "Read the large audit fixture R2_OFFLINE_READ_64529"
-LONG_USER = "A long user message begins here. " + ("Exact line record é 🐈. " * 265) + "Which token was blue?"
+LONG_USER = "  A long user message begins here. " + ("Exact line record é 🐈. " * 1300) + "Which token was blue?  \t"
 LONG_USER_REVIEW = "The user asks which token was blue."
+LONG_READ = LONG_USER.replace("Which token was blue?", "Please read the combined fixture.")
+LONG_READ_REVIEW = "The user asks to read the combined fixture."
 LARGE_FILE = "Start of exact file." + ("\nExact record é 🐈." * 850) + "\nEnd of exact file.\n"
 EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal: literal file line  \n\n"
 
@@ -91,7 +93,9 @@ class LocalOllama(BaseHTTPRequestHandler):
             if any("Review the completed action result" in message for message in user_messages):
                 reply = "The requested action returned file data. The archived evidence is the original."
             elif any("Read the current user's message" in message for message in user_messages):
-                reply = LONG_USER_REVIEW
+                reply = (LONG_READ_REVIEW if any("Please read the combined fixture." in message
+                                                 or LONG_READ_REVIEW in message for message in user_messages)
+                         else LONG_USER_REVIEW)
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
         elif "private first-person diary reflection" in system:
@@ -104,6 +108,11 @@ class LocalOllama(BaseHTTPRequestHandler):
             for message in user_messages
         ):
             reply = "SCORE: 1\nREASON: " + RATING_REASON
+        if (current_index >= 0 and user_messages[current_index].startswith(
+                "MODEL REVIEW OF THE EXACT CURRENT USER TURN, archive #")
+                and LONG_READ_REVIEW in user_messages[current_index]):
+            reply = (REPLY if has_tool_result else
+                     "I will read it.\n[READ] large-fixture.txt")
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
             "message": {"role": "assistant", "content": reply},
@@ -359,6 +368,24 @@ def oversized_action_result(binary: Path, workspace: Path, url: str) -> None:
     print("PASS: 2048-token foreground turn used the complete archived result of a large file read.")
 
 
+def oversized_user_and_action(binary: Path, workspace: Path, url: str) -> None:
+    conversation(binary, workspace, url, (LONG_READ,), 2048)
+    exact = ("REAL READ RESULT:\nPath: large-fixture.txt\nContent:\n" + LARGE_FILE + "\n")
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        reviewed = db.execute(
+            "SELECT r.original_context,e.details FROM r2_log_context_reviews r "
+            "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
+            "JOIN r2_log_events e ON e.id=c.event_id WHERE c.user_text=? ORDER BY r.id",
+            (LONG_READ,),
+        ).fetchall()
+    assert len(reviewed) == 3, len(reviewed)
+    assert [item[0] for item in reviewed] == [
+        LONG_READ, LONG_READ, "[R2_INTERNAL_TOOL_RESULT]\n" + exact,
+    ]
+    assert reviewed[-1][1].endswith(exact)
+    print("PASS: 2048-token follow-up preserved both an oversized typed request and its large file result.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -391,6 +418,7 @@ def main() -> int:
                 ).fetchone() == (0,)
             oversized_typed_turn(binary, workspace, url)
             oversized_action_result(binary, workspace, url)
+            oversized_user_and_action(binary, workspace, url)
             autonomous_cycle(binary, workspace, url)
         finally:
             server.shutdown()

@@ -64,7 +64,6 @@
    SHELL CONFIGURATION
    ============================================================ */
 
-#define SHELL_INPUT_MAX       12000
 #define SHELL_PROMPT          "R2> "
 
 #define WATCH_POLL_INTERVAL   2
@@ -2571,11 +2570,16 @@ static int shell_needs(const char *command)
 
 static int shell_dispatch(char *input)
 {
-    char *command =
-        shell_trim(input);
+    if (!input) return 1;
+    char *command = input;
+    while (isspace((unsigned char)*command)) ++command;
+    if (!*command) return 1;
 
-    if (!command || !*command)
-        return 1;
+    /* Trim for command recognition while retaining exact conversation input. */
+    char *end = command + strlen(command);
+    while (end > command && isspace((unsigned char)end[-1])) --end;
+    char trailing = *end;
+    *end = '\0';
 
 
     /* --------------------------------------------------------
@@ -2828,9 +2832,8 @@ static int shell_dispatch(char *input)
 
     if (shell_starts_with(command, "talk ")) {
 
-        shell_talk(
-            shell_trim(command + 5)
-        );
+        *end = trailing;
+        shell_talk(command + 5);
 
         return 1;
     }
@@ -2898,7 +2901,8 @@ static int shell_dispatch(char *input)
      *
      * Treat it as ordinary conversation with R2.
      */
-    shell_conversation(command);
+    *end = trailing;
+    shell_conversation(input);
 
     return 1;
 }
@@ -2915,9 +2919,8 @@ int r2_shell_run(void)
         return -1;
     }
 
-    /* Fixed-size input prevents a pasted or redirected line from forcing
-       dynamic line allocation before we can reject it. */
-    char line[SHELL_INPUT_MAX + 2];
+    char *line = NULL;
+    size_t line_capacity = 0;
     sigset_t service_signals, original_mask, wait_mask;
     int service_signals_blocked = 0;
 
@@ -2974,7 +2977,7 @@ int r2_shell_run(void)
         errno = 0;
         size_t input_bytes = 0;
         R2InputLineStatus input_status =
-            r2_read_bounded_line(stdin, line, SHELL_INPUT_MAX, &input_bytes);
+            r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES, &input_bytes);
         if (input_status == R2_INPUT_LINE_EOF) {
             printf("\n[R2 Shell] End of input.\n");
             break;
@@ -2988,9 +2991,9 @@ int r2_shell_run(void)
             break;
         }
         if (input_status == R2_INPUT_LINE_TOO_LONG) {
-            printf("[R2 Shell] Input exceeds the %d-byte limit. "
+            printf("[R2 Shell] Input exceeds the %u-byte limit. "
                    "Nothing from this line was sent to R2.\n",
-                   SHELL_INPUT_MAX);
+                   R2_MAX_TURN_INPUT_BYTES);
             fflush(stdout);
             continue;
         }
@@ -3005,13 +3008,7 @@ int r2_shell_run(void)
         if (shell_shutdown || r2_is_shutting_down())
             break;
 
-        char *input =
-            shell_trim(line);
-
-        if (!input || !*input)
-            continue;
-
-        shell_dispatch(input);
+        shell_dispatch(line);
     }
 
     /*
@@ -3021,6 +3018,7 @@ int r2_shell_run(void)
         shell_watch_stop();
 
     tv_control_stop_server();
+    free(line);
     shell_running = 0;
     if (service_signals_blocked)
         (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);

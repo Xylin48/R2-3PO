@@ -20,10 +20,9 @@ if start < 0 or end <= start:
     raise SystemExit("FAIL: could not isolate r2_shell_run()")
 loop = shell[start:end]
 
-require("#define SHELL_INPUT_MAX       12000" in shell
-        and "char line[SHELL_INPUT_MAX + 2];" in loop,
-        "terminal input uses a fixed 12,000-byte input buffer")
-require("r2_read_bounded_line(stdin, line, SHELL_INPUT_MAX, &input_bytes)" in loop
+require("char *line = NULL;" in loop and "R2_MAX_TURN_INPUT_BYTES" in loop,
+        "terminal input grows only to the shared live turn limit")
+require("r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES, &input_bytes)" in loop
         and "getline(" not in loop,
         "interactive input uses the shared bounded reader, not unbounded getline allocation")
 require("if (input_status == R2_INPUT_LINE_TOO_LONG)" in loop
