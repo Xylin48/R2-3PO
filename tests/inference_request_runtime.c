@@ -22,6 +22,7 @@ static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
 static int foreground_after_response;
+static int completed_turn_after_response;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -98,6 +99,10 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     if (foreground_after_response) {
         foreground_after_response = 0;
         atomic_store(&foreground_conversation_waiting, 1);
+    }
+    if (completed_turn_after_response) {
+        completed_turn_after_response = 0;
+        atomic_fetch_add(&last_conversation_activity_ms, 1);
     }
     return CURLE_OK;
 }
@@ -466,6 +471,22 @@ static int memory_fixture_count(const char *query)
     int count = sqlite3_column_int(statement, 0);
     sqlite3_finalize(statement);
     return count;
+}
+
+static void check_stale_needs_decision(void)
+{
+    assert(init_db() == 0 && r2_reality_init() == 0);
+    int before = memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                      "WHERE event_type='autonomous_needs_yielded_to_conversation';");
+    set_response("[WORLD] sleep|8", "stop", 1);
+    completed_turn_after_response = 1;
+    autonomous_needs_check();
+    assert(!completed_turn_after_response);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                "WHERE event_type='autonomous_needs_yielded_to_conversation';") == before + 1);
+    r2_reality_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
 }
 
 static void check_evaluated_memory_atomicity(void)
@@ -853,6 +874,7 @@ int main(void)
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
     check_staged_imagination();
+    check_stale_needs_decision();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);

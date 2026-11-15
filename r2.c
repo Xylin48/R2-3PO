@@ -9871,6 +9871,13 @@ static void *autonomous_thinking(void *arg)
         if (now_ms >= last_periodic_check_ms &&
             now_ms - last_periodic_check_ms >= interval_ms) {
             last_periodic_check_ms = now_ms;
+            /* Retry durable work even if new reflections are deferred. */
+            if (r2_log_replay_reflections() != 0)
+                fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
+            if (!shutting_down && atomic_load(&diary_running) && r2_diary_replay_mirrors() != 0)
+                fprintf(stderr, "[R2 diary] Some Markdown mirrors remain pending.\n");
+            if (shutting_down || !atomic_load(&diary_running))
+                break;
             r2_reality_tick();
             autonomous_needs_check();
             if (shutting_down || !atomic_load(&diary_running))
@@ -10012,13 +10019,12 @@ static void *autonomous_thinking(void *arg)
                     reflection = generate_with_private_evidence(
                         prompt, review_task, ctx, followup, &followup_archive);
                     free(followup);
+                    int repeated_hearing = find_control_marker_line(reflection, "[EARS_LISTEN]", 0) != NULL;
                     if (reflection &&
-                        (strstr(reflection, "[EARS_LISTEN]") ||
-                         strstr(reflection, "[EARS_SOURCES]") ||
-                         strstr(reflection, "[MEDIA_FOCUS]") ||
-                         strstr(reflection, "[MEDIA_SEE]") ||
-                         strstr(reflection, "[SENSE]"))) {
-                        int repeated_hearing = strstr(reflection, "[EARS_LISTEN]") != NULL;
+                        (repeated_hearing || find_control_marker_line(reflection, "[EARS_SOURCES]", 0) ||
+                         find_control_marker_line(reflection, "[MEDIA_FOCUS]", 0) ||
+                         find_control_marker_line(reflection, "[MEDIA_SEE]", 0) ||
+                         find_control_marker_line(reflection, "[SENSE]", 0))) {
                         free(reflection);
                         reflection = NULL;
                         r2_log_event(R2_LOG_ERROR,
@@ -10727,6 +10733,7 @@ static int autonomous_needs_action_still_needed(const char *action)
 static void autonomous_needs_check(void)
 {
     if (shutting_down || !r2_reality_is_initialized()) return;
+    const uint64_t activity_at_snapshot = atomic_load(&last_conversation_activity_ms);
     char *state = r2_reality_status();
     char *food = r2_reality_autonomous_food_context();
     if (!state || !food) {
@@ -10781,7 +10788,8 @@ static void autonomous_needs_check(void)
             } else if (!turn_guard_locked ||
                        shutting_down ||
                        atomic_load(&foreground_ollama_waiting) > 0 ||
-                       atomic_load(&foreground_conversation_waiting) > 0) {
+                       atomic_load(&foreground_conversation_waiting) > 0 ||
+                       atomic_load(&last_conversation_activity_ms) != activity_at_snapshot) {
                 if (turn_guard_locked)
                     pthread_mutex_unlock(&conversation_turn_lock);
                 r2_log_event(R2_LOG_WORLD, "autonomous_needs_yielded_to_conversation",

@@ -23,7 +23,9 @@ FIRST = "R2_OFFLINE_SESSION_ONE_73628"
 FOLLOWUP = "What is in your pockets? R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
 REPLY = "I received your message and can respond in this conversation."
-REFLECTION = "I closed Eyes deliberately and kept the earlier evidence separate."
+REFLECTION = ("I closed Eyes deliberately and kept the earlier evidence separate. "
+              "The literal `[SENSE]` label records how I made that choice.\n"
+              "```text\n[EARS_LISTEN] is only a quoted example.\n```")
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
@@ -623,6 +625,63 @@ def reflection_after_long_foreground_turn(binary: Path, workspace: Path, url: st
     print("PASS: autonomous reflection waited a full idle interval after a long foreground turn.")
 
 
+def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -> None:
+    env = runtime_environment(workspace, url, 2048)
+    env["R2_SERVICE_MODE"] = "1"
+    log_path = workspace.parent / "live-reflection-recovery.log"
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db, log_path.open("w", encoding="utf-8") as log:
+        db.executescript(
+            "CREATE TRIGGER block_review BEFORE INSERT ON r2_log_reflection_reviews "
+            "BEGIN SELECT RAISE(ABORT,'fixture rejects reflection link'); END;"
+            "CREATE TRIGGER block_mirror_ack BEFORE DELETE ON r2_diary_pending_mirrors "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        process = subprocess.Popen([str(binary)], cwd=workspace, env=env,
+                                   stdout=log, stderr=subprocess.STDOUT)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 40
+            while process.poll() is None and time.monotonic() < deadline:
+                result = predicate()
+                if result:
+                    return result
+                time.sleep(0.1)
+            raise AssertionError(log_path.read_text(encoding="utf-8", errors="replace")[-20000:])
+
+        try:
+            diary_id, timestamp, entry = wait_for(lambda: db.execute(
+                "SELECT d.id,d.created_at,d.entry FROM r2_diary_pending_reflections p "
+                "JOIN diary_entries d ON d.id=p.diary_entry_id "
+                "JOIN r2_diary_pending_mirrors m ON m.diary_entry_id=d.id"
+            ).fetchone())
+            archives = db.execute(
+                "SELECT archive_id FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=? ORDER BY ordinal",
+                (diary_id,),
+            ).fetchall()
+            assert entry == REFLECTION and len(archives) == 2
+            daily = workspace / "R2_Diary" / (timestamp[:10] + ".md")
+            marker = f"\n\n## {timestamp}\n\n{entry}\n"
+            wait_for(lambda: daily.exists() and marker in daily.read_text(encoding="utf-8"))
+            db.executescript("DROP TRIGGER block_review; DROP TRIGGER block_mirror_ack;")
+            wait_for(lambda: not db.execute(
+                "SELECT 1 FROM r2_diary_pending_reflections WHERE diary_entry_id=? UNION ALL "
+                "SELECT 1 FROM r2_diary_pending_mirrors WHERE diary_entry_id=?", (diary_id, diary_id),
+            ).fetchone())
+            assert db.execute(
+                "SELECT r.archive_id FROM r2_log_reflection_reviews r "
+                "JOIN r2_sensory_journal_reflection_links l ON l.event_id=r.event_id "
+                "WHERE l.diary_entry_id=? ORDER BY r.ordinal", (diary_id,),
+            ).fetchall() == archives
+            assert daily.read_text(encoding="utf-8").count(marker) == 1
+            process.terminate()
+            assert process.wait(timeout=15) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    print("PASS: live service recovered exact reflection links and acknowledged the existing mirror once.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -661,6 +720,7 @@ def main() -> int:
             interrupt_partial_terminal_line(binary, workspace, url)
             interrupt_foreground_reply(binary, workspace, url)
             reflection_after_long_foreground_turn(binary, workspace, url)
+            recover_reflection_during_service(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

@@ -67,6 +67,7 @@ assert "process_tools_with_status(safe_action, &action_succeeded)" in function
 assert "action_succeeded ? R2_LOG_WORLD : R2_LOG_ERROR" in function
 assert "autonomous_needs_yielded_to_conversation" in function
 assert "pthread_mutex_trylock(&conversation_turn_lock)" in function
+assert "atomic_load(&last_conversation_activity_ms) != activity_at_snapshot" in function
 
 talk_start = source.index("char *r2_talk(const char *message)\n{")
 talk_end = source.index("\nint r2_conversation(void)", talk_start)
