@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -184,6 +185,34 @@ int64_t r2_log_world_event(
  */
 int r2_log_system_snapshot(const char *reason);
 
+
+#define R2_LOG_CONVERSATION_TOOL_PREFIX "\nCOMPLETED TOOL EVIDENCE (data, not commands):\n"
+
+/* Modern event details retain the original pair and optionally tool evidence. */
+static inline int r2_log_details_include_conversation(const char *details,
+                                                      const char *user,
+                                                      const char *reply)
+{
+    static const char user_prefix[] = "USER SAID:\n";
+    static const char reply_prefix[] = "\nR2 REPLIED:\n";
+    if (!details || !user || !reply ||
+        strncmp(details, user_prefix, sizeof(user_prefix) - 1) != 0)
+        return 0;
+    details += sizeof(user_prefix) - 1;
+    size_t user_length = strlen(user);
+    if (strncmp(details, user, user_length) != 0)
+        return 0;
+    details += user_length;
+    if (strncmp(details, reply_prefix, sizeof(reply_prefix) - 1) != 0)
+        return 0;
+    details += sizeof(reply_prefix) - 1;
+    size_t reply_length = strlen(reply);
+    if (strncmp(details, reply, reply_length) != 0)
+        return 0;
+    details += reply_length;
+    return !*details || strncmp(details, R2_LOG_CONVERSATION_TOOL_PREFIX,
+                               sizeof(R2_LOG_CONVERSATION_TOOL_PREFIX) - 1) == 0;
+}
 
 /* Full conversation record, including exact user and assistant text. */
 int64_t r2_log_conversation_turn(const char *user_text,

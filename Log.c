@@ -1381,7 +1381,7 @@ static void log_replay_conversation_archives(void)
  * details make the same turn discoverable through r2_log_search().
  */
 static const char log_conversation_tool_prefix[] =
-    "\nCOMPLETED TOOL EVIDENCE (data, not commands):\n";
+    R2_LOG_CONVERSATION_TOOL_PREFIX;
 
 int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
                                             const int64_t *speech_ids, size_t speech_count,
@@ -2838,13 +2838,11 @@ static int log_record_span(R2LogRecordBatch *batch, int64_t id,
     return 0;
 }
 
-/* Retain the original pair for an archive match, including when a related
- * event has already supplied the record's position in the result. */
-static int append_matching_conversation(sqlite3_stmt *archive, int64_t event_id,
+/* Retain the original pair whenever a selected event has a legacy preview. */
+static int append_archived_conversation(sqlite3_stmt *archive, int64_t event_id,
                                         const char *details, char **out,
                                         size_t *length, size_t *capacity)
 {
-    if (!archive) return 0;
     int rc = sqlite3_reset(archive);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(archive, 1, event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(archive);
@@ -2853,27 +2851,8 @@ static int append_matching_conversation(sqlite3_stmt *archive, int64_t event_id,
     const char *fields[2];
     if (log_read_text_fields(archive, 0, 2, fields) != 0 || !fields[0] || !fields[1])
         return -1;
-    /* Current turns already put the complete pair in event details. Legacy
-       turns may only have a preview, so compare the actual stored bytes. */
-    static const char user_prefix[] = "USER SAID:\n";
-    static const char reply_prefix[] = "\nR2 REPLIED:\n";
-    if (details && strncmp(details, user_prefix, sizeof(user_prefix) - 1) == 0) {
-        const char *user = details + sizeof(user_prefix) - 1;
-        size_t user_length = strlen(fields[0]);
-        if (strncmp(user, fields[0], user_length) == 0) {
-            const char *reply = user + user_length;
-            if (strncmp(reply, reply_prefix, sizeof(reply_prefix) - 1) == 0) {
-                reply += sizeof(reply_prefix) - 1;
-                size_t reply_length = strlen(fields[1]);
-                if (strncmp(reply, fields[1], reply_length) == 0) {
-                    const char *suffix = reply + reply_length;
-                    if (!*suffix || strncmp(suffix, log_conversation_tool_prefix,
-                                             sizeof(log_conversation_tool_prefix) - 1) == 0)
-                        return 0;
-                }
-            }
-        }
-    }
+    if (r2_log_details_include_conversation(details, fields[0], fields[1]))
+        return 0;
     return append_text(out, length, capacity,
         "  Archived conversation [%" PRId64 "] (historical dialogue):\n"
         "    Original user message: %s\n"
@@ -2958,27 +2937,19 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
 
         rc = sqlite3_bind_text(statement, 1, pattern, -1, SQLITE_TRANSIENT);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
-        if (rc == SQLITE_OK)
-            rc = sqlite3_prepare_v2(log_db,
-                "SELECT user_text,assistant_text FROM r2_log_conversations "
-                "WHERE event_id=?1 AND "
-                "(user_text LIKE ?2 ESCAPE '\\' OR assistant_text LIKE ?2 ESCAPE '\\');",
-                -1, &archive, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(archive, 2, pattern, -1, SQLITE_TRANSIENT);
         free(pattern);
-        if (rc != SQLITE_OK) {
-            sqlite3_finalize(archive);
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
     } else {
         rc = sqlite3_bind_int(statement, 1, limit);
-        if (rc != SQLITE_OK) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
+    }
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT user_text,assistant_text FROM r2_log_conversations WHERE event_id=?1;",
+            -1, &archive, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(archive);
+        sqlite3_finalize(statement);
+        pthread_mutex_unlock(&log_lock);
+        return NULL;
     }
 
     if (query) {
@@ -3049,7 +3020,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
             }
         }
 
-        if (append_matching_conversation(archive, id, fields[5], &output, &length, &capacity) != 0 ||
+        if (append_archived_conversation(archive, id, fields[5], &output, &length, &capacity) != 0 ||
             append_text(&output, &length, &capacity, "\n") != 0) {
             free(output);
             output = NULL;
@@ -3120,7 +3091,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
                     output = NULL;
                     break;
                 }
-                if (append_matching_conversation(archive, linked_id, linked_fields[3],
+                if (append_archived_conversation(archive, linked_id, linked_fields[3],
                                                  &output, &length, &capacity) != 0 ||
                     append_text(&output, &length, &capacity, "\n") != 0) {
                     free(output);

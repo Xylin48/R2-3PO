@@ -4129,7 +4129,9 @@ char *r2_reality_age_context(void)
     if (origin < 0) return strdup(unavailable);
     if (origin == 0) {
         struct statx sx = {0};
-        if (statx(AT_FDCWD, original, AT_STATX_SYNC_AS_STAT, STATX_BTIME | STATX_TYPE, &sx) != 0) {
+        /* libfaketime can also shift timestamps returned by libc statx. */
+        if (syscall(SYS_statx, AT_FDCWD, original, AT_STATX_SYNC_AS_STAT,
+                    STATX_BTIME | STATX_TYPE, &sx) != 0) {
             if (errno == ENOENT)
                 return strdup("AGE: original conversation file is not present yet; age is not established.");
             return strdup("AGE: the original conversation file cannot be inspected; age is not guessed.");

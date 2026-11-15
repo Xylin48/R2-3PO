@@ -134,7 +134,7 @@ int main(void)
     sqlite3_close(preview_db);
 
     int64_t anchor = r2_log_event(R2_LOG_MEMORY, "archive_anchor",
-                                  "deep_archive%marker", "related pointer", "link-smoke");
+                                  "deep_archive%marker", "unique related pointer", "link-smoke");
     R2LogRecordBatch records = {0};
     int archive_ok = current_exact && preview_ok && archived > 0 && anchor > archived &&
         r2_log_link(anchor, archived, "archive_evidence", NULL) == 0 &&
@@ -150,6 +150,17 @@ int main(void)
     archive_ok = archive_ok && reply_match &&
         strstr(reply_match, archived_user) && strstr(reply_match, archived_reply);
     free(reply_match);
+    char *linked_match = r2_log_search("unique related pointer", 10);
+    archive_ok = archive_ok && linked_match && strstr(linked_match, "Linked event [") &&
+        strstr(linked_match, archived_user) && strstr(linked_match, archived_reply);
+    free(linked_match);
+    char *preview_match = r2_log_search("Legacy conversation preview", 10);
+    archive_ok = archive_ok && preview_match &&
+        strstr(preview_match, archived_user) && strstr(preview_match, archived_reply);
+    free(preview_match);
+    char *recent = r2_log_recent(10);
+    archive_ok = archive_ok && recent && strstr(recent, archived_user) && strstr(recent, archived_reply);
+    free(recent);
     if (!archive_ok)
         fprintf(stderr, "Life Log did not return the complete original archived turn.\n");
 
