@@ -176,8 +176,8 @@ require(
     "retrieval breadth is selected from the user's actual request",
 )
 
-history_filter_start = core.find("static int r2_keyword_is_low_signal(")
-history_filter_end = core.find("\nstatic int r2_query_explicitly_requests_recall(", history_filter_start)
+history_filter_start = core.find("static int r2_keyword_is_low_signal(const char *word)\n{")
+history_filter_end = core.find("\nstatic int r2_query_explicitly_requests_recall(const char *query)\n{", history_filter_start)
 require(
     history_filter_start >= 0 and history_filter_end > history_filter_start,
     "memory and Life Log retrieval share a low-signal keyword filter",

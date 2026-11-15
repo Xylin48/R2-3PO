@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
-prompt = core[core.index("static const char *SYSTEM_PROMPT ="):core.index("static const char r2_conversation_system_prompt[]")]
+prompt = core[core.index("static const char *SYSTEM_PROMPT ="):core.index("static const char r2_conversation_system_prompt[] =")]
 helper_start = core.index("static char *r2_process_ears_listen_request(const char *request)")
 helper_end = core.index("static char *process_tools_with_status(", helper_start)
 ears_helper = core[helper_start:helper_end]

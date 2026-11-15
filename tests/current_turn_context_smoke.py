@@ -6,7 +6,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
 
-recall_start = core.find("static int r2_query_explicitly_requests_recall(")
+recall_start = core.find("static int r2_query_explicitly_requests_recall(const char *query)\n{")
 recall_end = core.find("\n}\n", recall_start)
 if recall_start < 0 or recall_end < 0:
     raise SystemExit("Could not isolate the explicit-recall detector.")
@@ -85,7 +85,7 @@ require(
     and "r2_query_matches_specific_capability(query) ? 4 : 3" in priority_logic,
     "the active user request selects the relevant capability section ahead of generic capability guidance",
 )
-system_start = core.find("static const char r2_conversation_system_prompt[]")
+system_start = core.find("static const char r2_conversation_system_prompt[] =")
 system_end = core.find("\nstatic char *r2_build_retry_system_prompt(", system_start)
 if system_start < 0 or system_end < 0:
     raise SystemExit("Could not isolate the shared conversation system prompt.")
