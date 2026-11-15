@@ -7,6 +7,7 @@ state changes to the running R2 shell over its private Unix socket.
 """
 from __future__ import annotations
 
+import math
 import os
 import socket
 import sqlite3
@@ -272,7 +273,13 @@ class CRTDisplay:
                     (path,),
                 ).fetchone()
                 if tape:
-                    position = max(0.0, float(tape[0]))
+                    try:
+                        saved_position = float(tape[0])
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError("Saved VCR position is invalid") from exc
+                    if not math.isfinite(saved_position):
+                        raise ValueError("Saved VCR position is not finite")
+                    position = max(0.0, saved_position)
             return path, transport, position
 
     def _ensure_player(self) -> bool:
@@ -320,7 +327,7 @@ class CRTDisplay:
             try:
                 current_path, current_transport, current_position = self.read_vcr_state()
                 power, kind, value, _device = self.read_state()
-            except (sqlite3.Error, OSError, RuntimeError, ValueError):
+            except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError):
                 self._player.audio_set_mute(True)
                 self._player.set_pause(1)
                 self.root.after(500, seek_and_apply)
@@ -522,7 +529,7 @@ class CRTDisplay:
                      + f"   |   VCR: {tape_name} [{transport}]"
                      + "   |   Reality-linked controls"
             )
-        except (sqlite3.Error, OSError, RuntimeError) as exc:
+        except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError) as exc:
             self._publish_renderer(None)
             self.picture.lift()
             self.picture.configure(text="TV STATE UNAVAILABLE", fg="#b8c0b2")
