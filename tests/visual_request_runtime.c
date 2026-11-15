@@ -335,6 +335,18 @@ int main(void)
     assert(snprintf(symlink_with_slash, sizeof(symlink_with_slash), "%s/",
                     symlink_library) < (int)sizeof(symlink_with_slash));
     assert(r2_visual_init(database, symlink_with_slash) != 0);
+    char symlink_with_dot[PATH_MAX];
+    assert(snprintf(symlink_with_dot, sizeof(symlink_with_dot), "%s/.",
+                    symlink_library) < (int)sizeof(symlink_with_dot));
+    assert(r2_visual_init(database, symlink_with_dot) != 0);
+    char symlink_with_parent[PATH_MAX];
+    assert(snprintf(symlink_with_parent, sizeof(symlink_with_parent), "%s/..",
+                    symlink_library) < (int)sizeof(symlink_with_parent));
+    assert(r2_visual_init(database, symlink_with_parent) != 0);
+    char symlink_nested[PATH_MAX];
+    assert(snprintf(symlink_nested, sizeof(symlink_nested), "%s/Visual_Library",
+                    symlink_library) < (int)sizeof(symlink_nested));
+    assert(r2_visual_init(database, symlink_nested) != 0);
     assert(unlink(symlink_library) == 0);
     assert(r2_visual_init(database, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
