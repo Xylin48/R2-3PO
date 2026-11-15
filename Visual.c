@@ -1311,6 +1311,11 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     if (visual_initialized) { pthread_mutex_unlock(&visual_lock); return 0; }
     if (visual_generation == UINT64_MAX) { pthread_mutex_unlock(&visual_lock); errno = EOVERFLOW; return -1; }
     snprintf(visual_directory, sizeof(visual_directory), "%s", library_directory);
+    /* lstat("dir/") follows the final link on Linux. Remove trailing
+       separators before checking the final component for symlinks. */
+    size_t library_length = strlen(visual_directory);
+    while (library_length > 1 && visual_directory[library_length - 1] == '/')
+        visual_directory[--library_length] = '\\0';
     const char *configured = getenv("R2_VISION_MODEL");
     if (configured && *configured &&
         strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0) {
