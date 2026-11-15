@@ -10241,7 +10241,7 @@ static char *memory_decision(
     char *separator = strchr(text, '|');
     if (!separator) {
         free(res);
-        return strdup("NONE");
+        return NULL;
     }
     *separator = '\0';
     const char *category = trim(text);
@@ -10259,7 +10259,7 @@ static char *memory_decision(
     }
     if (!canonical_category || !*memory) {
         free(res);
-        return strdup("NONE");
+        return NULL;
     }
 
     if (!strcmp(canonical_category, "self")) {

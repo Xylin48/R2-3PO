@@ -883,14 +883,22 @@ int main(void)
 
     set_response("imaginary | This category is outside the contract.", "stop", 1);
     decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.", 0, NULL);
-    assert(decision && !strcmp(decision, "NONE"));
-    free(decision);
+    assert(!decision);
     assert(json_object_object_get_ex(captured, "messages", &messages));
     evaluation = json_object_array_get_idx(messages, json_object_array_length(messages) - 1);
     assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
     assert(strstr(json_object_get_string(evaluation_text), "PRIVATE R2 REFLECTION"));
     assert(strstr(json_object_get_string(evaluation_text), "The source could not be read."));
     assert(!strstr(json_object_get_string(evaluation_text), "LATEST USER MESSAGE"));
+
+    set_response("I found something but omitted the category.", "stop", 1);
+    assert(!memory_decision("What did you find?", "I can check.", NULL, 0, NULL));
+    set_response("knowledge |   ", "stop", 1);
+    assert(!memory_decision("What did you find?", "I can check.", NULL, 0, NULL));
+    set_response("NONE", "stop", 1);
+    decision = memory_decision("What did you find?", "I can check.", NULL, 0, NULL);
+    assert(decision && !strcmp(decision, "NONE"));
+    free(decision);
 
     char *long_memory = text(5200, 'q', "self | I can check my saved work. ");
     strcpy(long_memory + 5189, "EXACT-TAIL");
