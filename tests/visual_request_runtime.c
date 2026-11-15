@@ -331,6 +331,10 @@ int main(void)
     snprintf(symlink_library, sizeof(symlink_library), "%s/symlink-library", R2_HOME);
     assert(symlink(R2_HOME, symlink_library) == 0);
     assert(r2_visual_init(database, symlink_library) != 0);
+    char symlink_with_slash[PATH_MAX];
+    assert(snprintf(symlink_with_slash, sizeof(symlink_with_slash), "%s/",
+                    symlink_library) < (int)sizeof(symlink_with_slash));
+    assert(r2_visual_init(database, symlink_with_slash) != 0);
     assert(unlink(symlink_library) == 0);
     assert(r2_visual_init(database, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
