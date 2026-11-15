@@ -513,6 +513,10 @@ static int ensure_tables(void)
         " target_id INTEGER NOT NULL CHECK(target_id>0),"
         " PRIMARY KEY(event_id,kind,target_id)"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_pending_learning ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " user_text TEXT NOT NULL, assistant_text TEXT NOT NULL, tool_result TEXT"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_inner_states ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -1073,6 +1077,34 @@ int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char
     return 0;
 }
 
+static int log_ack_learning_locked(int64_t event_id)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "DELETE FROM r2_log_pending_learning WHERE event_id=?;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+    rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_pending_learning WHERE event_id=?;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int r2_log_ack_learning(int64_t event_id)
+{
+    if (event_id <= 0) return -1;
+    pthread_mutex_lock(&log_lock);
+    int result = -1;
+    if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0)
+        result = log_finish_write(log_ack_learning_locked(event_id) == 0);
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
 int r2_log_save_learning(sqlite3 *peer, const char *memory, const char *category,
                          int64_t source_event_id,
                          int (*save)(sqlite3 *, const char *, const char *))
@@ -1095,7 +1127,8 @@ int r2_log_save_learning(sqlite3 *peer, const char *memory, const char *category
     int saved = learning > 0 &&
         (source_event_id <= 0 || log_link_locked(learning, source_event_id,
             "memory_learned_from", "evidence evaluation") == 0) &&
-        save(log_db, memory, category) == 0;
+        save(log_db, memory, category) == 0 &&
+        (source_event_id <= 0 || log_ack_learning_locked(source_event_id) == 0);
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
     return result;
@@ -1383,18 +1416,10 @@ static void log_replay_conversation_archives(void)
 static const char log_conversation_tool_prefix[] =
     R2_LOG_CONVERSATION_TOOL_PREFIX;
 
-int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
-                                            const int64_t *speech_ids, size_t speech_count,
-                                            const int64_t *review_ids, size_t review_count)
-{
-    return r2_log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids,
-                                                   speech_count, review_ids, review_count, NULL);
-}
-
-int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
-                                               const int64_t *speech_ids, size_t speech_count,
-                                               const int64_t *review_ids, size_t review_count,
-                                               const char *tool_result)
+static int64_t log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
+                                                    const int64_t *speech_ids, size_t speech_count,
+                                                    const int64_t *review_ids, size_t review_count,
+                                                    const char *tool_result, int stage_learning)
 {
     if (!valid_text(user_text) || !valid_text(assistant_text) ||
         (speech_count && !speech_ids) || (review_count && !review_ids))
@@ -1457,6 +1482,19 @@ int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    if (saved && stage_learning) {
+        statement = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_pending_learning(event_id,user_text,assistant_text,tool_result) VALUES(?,?,?,?);",
+            -1, &statement, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, user_text, user_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 3, assistant_text, assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = bind_optional_text(statement, 4, tool_result);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(statement);
+    }
     saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
                     log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
@@ -1469,6 +1507,32 @@ int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char
     if (result != 0) return -1;
     r2_sj_index_event(event_id, "conversation", "conversation_turn", "r2_talk");
     return event_id;
+}
+
+int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result)
+{
+    return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
+                                               review_ids, review_count, tool_result, 0);
+}
+
+int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char *assistant_text,
+                                              const int64_t *speech_ids, size_t speech_count,
+                                              const int64_t *review_ids, size_t review_count,
+                                              const char *tool_result)
+{
+    return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
+                                               review_ids, review_count, tool_result, 1);
+}
+
+int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
+                                            const int64_t *speech_ids, size_t speech_count,
+                                            const int64_t *review_ids, size_t review_count)
+{
+    return r2_log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids,
+                                                  speech_count, review_ids, review_count, NULL);
 }
 
 int64_t r2_log_conversation_turn(const char *user_text, const char *assistant_text)

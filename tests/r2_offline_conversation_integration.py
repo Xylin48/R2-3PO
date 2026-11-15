@@ -46,6 +46,8 @@ EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal:
 
 STOPPED_REQUEST = "R2_OFFLINE_INTERRUPT_ACTIVE_81842"
 LONG_FOREGROUND_REQUEST = "R2_OFFLINE_LONG_FOREGROUND_24126"
+LEARNING_RESTART_REQUEST = "Remember that the bridge fixture uses copper. R2_LEARNING_RESTART_71412"
+RESTART_MEMORY = "The bridge fixture uses copper."
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
 
@@ -121,6 +123,8 @@ class LocalOllama(BaseHTTPRequestHandler):
         elif "memory-evaluation system" in system:
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
+            if any(LEARNING_RESTART_REQUEST in message for message in user_messages):
+                reply = "knowledge | " + RESTART_MEMORY
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -682,6 +686,63 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
     print("PASS: live service recovered exact reflection links and acknowledged the existing mirror once.")
 
 
+def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        db.executescript(
+            "CREATE TRIGGER ignore_learning_ack BEFORE DELETE ON r2_log_pending_learning "
+            "WHEN OLD.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        for phase in ("blocked", "restart"):
+            log_path = workspace.parent / f"learning-{phase}.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                process = subprocess.Popen(
+                    [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                    stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+                )
+                assert process.stdin is not None
+                try:
+                    if phase == "blocked":
+                        process.stdin.write(f"talk {LEARNING_RESTART_REQUEST}\n")
+                        process.stdin.flush()
+                    deadline = time.monotonic() + 30
+                    while process.poll() is None and time.monotonic() < deadline:
+                        if phase == "blocked" and "Persistent memory transaction failed" in log_path.read_text(errors="replace"):
+                            break
+                        if phase == "restart" and db.execute(
+                            "SELECT 1 FROM memories WHERE memory=?", (RESTART_MEMORY,),
+                        ).fetchone():
+                            break
+                        time.sleep(0.1)
+                    else:
+                        raise AssertionError(log_path.read_text(errors="replace")[-20000:])
+                    pending = db.execute(
+                        "SELECT event_id,assistant_text FROM r2_log_pending_learning WHERE user_text=?",
+                        (LEARNING_RESTART_REQUEST,),
+                    ).fetchall()
+                    stored = db.execute("SELECT count(*) FROM memories WHERE memory=?", (RESTART_MEMORY,)).fetchone()
+                    if phase == "blocked":
+                        assert len(pending) == 1 and pending[0][1] == REPLY, pending
+                        source = pending[0][0]
+                        assert stored == (0,), stored
+                    else:
+                        assert pending == [] and stored == (1,)
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_log_links l JOIN r2_log_events e ON e.id=l.from_event_id "
+                            "WHERE l.relationship='memory_learned_from' AND l.to_event_id=? AND e.details=?",
+                            (source, RESTART_MEMORY),
+                        ).fetchone() == (1,)
+                    process.terminate()
+                    assert process.wait(timeout=15) == 0
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    process.stdin.close()
+            if phase == "blocked":
+                db.executescript("DROP TRIGGER ignore_learning_ack;")
+    print("PASS: restart resumed exact pending learning and saved one memory with its source link.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -721,6 +782,7 @@ def main() -> int:
             interrupt_foreground_reply(binary, workspace, url)
             reflection_after_long_foreground_turn(binary, workspace, url)
             recover_reflection_during_service(binary, workspace, url)
+            recover_learning_after_restart(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

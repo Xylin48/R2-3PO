@@ -14132,6 +14132,10 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                                details, "preserve_evidence_memory");
         } else {
             char *p = trim(decision);
+            if (user && source_event_id > 0 && !shutting_down && !strcasecmp(p, "NONE") &&
+                r2_log_ack_learning(source_event_id) != 0)
+                fprintf(stderr, "[R2 Post-turn] Could not acknowledge the memory decision for event %lld.\n",
+                        (long long)source_event_id);
             if (strcasecmp(p, "NONE") && strchr(p, '|')) {
                 char *sep = strchr(p, '|');
                 *sep = '\0';
@@ -14163,10 +14167,8 @@ static void preserve_evidence_memory(const char *user, const char *reply,
     }
 }
 
-static void *post_turn_worker(void *opaque)
+static void run_post_turn_job(R2PostTurnJob *job, int first_stage)
 {
-    R2PostTurnJob *job = (R2PostTurnJob *)opaque;
-    if (!job) return NULL;
     ollama_background_mode = 1;
 
     /* The worker is launched before r2_talk() returns. Wait until that turn
@@ -14175,7 +14177,7 @@ static void *post_turn_worker(void *opaque)
     const struct timespec post_turn_pause = { .tv_sec = 0, .tv_nsec = 100000000L };
     int deferred = 0;
     post_turn_deferred = &deferred;
-    for (int stage = 0; stage < 2 && !shutting_down;) {
+    for (int stage = first_stage; stage < 2 && !shutting_down;) {
         if (deferred || atomic_load(&foreground_conversation_waiting) > 0)
             nanosleep(&post_turn_pause, NULL);
         if (shutting_down) break;
@@ -14193,12 +14195,22 @@ static void *post_turn_worker(void *opaque)
     free(job->user);
     free(job->reply);
     free(job->tool_result);
-    free(job);
+}
 
+static void finish_post_turn_worker(void)
+{
     pthread_mutex_lock(&post_turn_lock);
     if (post_turn_active > 0) post_turn_active--;
     pthread_cond_broadcast(&post_turn_cond);
     pthread_mutex_unlock(&post_turn_lock);
+}
+
+static void *post_turn_worker(void *opaque)
+{
+    R2PostTurnJob *job = opaque;
+    run_post_turn_job(job, 0);
+    free(job);
+    finish_post_turn_worker();
     return NULL;
 }
 
@@ -14216,6 +14228,84 @@ static void log_post_turn_start_failure(const char *stage, int64_t event_id)
     (void)r2_log_event(R2_LOG_ERROR, "post_turn_worker_start_failed",
                        "Post-turn introspection and memory learning could not be scheduled.",
                        details, "schedule_post_turn_processing");
+}
+
+static int start_post_turn_worker(void *(*worker)(void *), void *context)
+{
+    pthread_mutex_lock(&post_turn_lock);
+    post_turn_active++;
+    pthread_mutex_unlock(&post_turn_lock);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, worker, context) != 0) {
+        finish_post_turn_worker();
+        return -1;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+
+static void *replay_pending_learning(void *opaque)
+{
+    int64_t through = *(int64_t *)opaque;
+    free(opaque);
+    int64_t after = 0;
+    while (!shutting_down && after < through) {
+        R2PostTurnJob job = {0};
+        sqlite3_stmt *st = NULL;
+        pthread_mutex_lock(&db_lock);
+        int rc = sqlite3_prepare_v2(db,
+            "SELECT event_id,user_text,assistant_text,tool_result FROM r2_log_pending_learning "
+            "WHERE event_id>?1 AND event_id<=?2 ORDER BY event_id LIMIT 1;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, through);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            after = job.event_id = sqlite3_column_int64(st, 0);
+            const char *fields[3];
+            if (memory_read_fields(st, 1, 3, fields) == 0 && fields[0] && fields[1]) {
+                job.user = strdup(fields[0]);
+                job.reply = strdup(fields[1]);
+                if (fields[2] && !(job.tool_result = strdup(fields[2]))) {
+                    free(job.user);
+                    job.user = NULL;
+                }
+            }
+        }
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&db_lock);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW || !job.user || !job.reply) {
+            free(job.user); free(job.reply); free(job.tool_result);
+            fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay.\n");
+            if (rc != SQLITE_ROW) break;
+            continue;
+        }
+        run_post_turn_job(&job, 1);
+    }
+    finish_post_turn_worker();
+    return NULL;
+}
+
+static void resume_post_turn_learning(void)
+{
+    /* Take the cutoff before the shell can accept new turns. Those turns
+       have their own workers and must not also be picked up by startup. */
+    sqlite3_stmt *st = NULL;
+    pthread_mutex_lock(&db_lock);
+    int rc = sqlite3_prepare_v2(db, "SELECT MAX(event_id) FROM r2_log_pending_learning;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int64_t through = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&db_lock);
+    if (rc != SQLITE_ROW) log_post_turn_start_failure("pending learning lookup", 0);
+    if (through <= 0) return;
+    int64_t *cutoff = malloc(sizeof(*cutoff));
+    if (cutoff) {
+        *cutoff = through;
+        if (start_post_turn_worker(replay_pending_learning, cutoff) == 0) return;
+        free(cutoff);
+    }
+    log_post_turn_start_failure("pending learning replay", through);
 }
 
 /* Takes ownership of the recorded result, when a tool was run. */
@@ -14242,21 +14332,11 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
         return;
     }
 
-    pthread_mutex_lock(&post_turn_lock);
-    post_turn_active++;
-    pthread_mutex_unlock(&post_turn_lock);
-
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, post_turn_worker, job) != 0) {
-        pthread_mutex_lock(&post_turn_lock);
-        if (post_turn_active > 0) post_turn_active--;
-        pthread_cond_broadcast(&post_turn_cond);
-        pthread_mutex_unlock(&post_turn_lock);
+    if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         log_post_turn_start_failure("thread creation", event_id);
         return;
     }
-    pthread_detach(thread);
 }
 
 
@@ -14690,7 +14770,8 @@ finalize_reply:
 
     const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
     const R2TurnContextReviews *reviews = r2_turn_context_reviews;
-    int64_t turn_event_id = r2_log_conversation_turn_with_evidence(message, reply,
+    int64_t turn_event_id = (shutting_down ? r2_log_conversation_turn_with_evidence
+                                           : r2_log_conversation_turn_for_learning)(message, reply,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
     if (assistant_context_rc != 0) {
@@ -15733,6 +15814,7 @@ int main(void)
     }
 
     extern int r2_shell_run(void);
+    resume_post_turn_learning();
     if (r2_shell_run() != 0) {
         r2_shutdown();
         return 1;

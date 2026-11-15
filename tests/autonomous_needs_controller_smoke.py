@@ -87,8 +87,8 @@ vision_abort_start = source.index("int r2_ollama_vision_request_should_abort(voi
 vision_abort_end = source.index("\n/* Estimate safe Ollama context", vision_abort_start)
 assert "!ollama_foreground_turn_mode" in source[vision_abort_start:vision_abort_end]
 
-worker_start = source.index("static void *post_turn_worker(void *opaque)\n{")
-worker_end = source.index("\n/* These model-assisted bookkeeping tasks", worker_start)
+worker_start = source.index("static void run_post_turn_job(R2PostTurnJob *job, int first_stage)\n{")
+worker_end = source.index("\nstatic void finish_post_turn_worker", worker_start)
 worker = source[worker_start:worker_end]
 assert "stage < 2 && !shutting_down" in worker
 assert "atomic_load(&foreground_conversation_waiting) > 0" in worker

@@ -88,6 +88,7 @@ int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
 /* Commit an evaluated memory and its Life Log evidence together. The callback
  * writes the memory through the supplied connection inside the transaction.
  * Return 0 from the callback on success. The callback must not reenter Life Log. */
+int r2_log_ack_learning(int64_t event_id);
 int r2_log_save_learning(struct sqlite3 *peer, const char *memory, const char *category,
                          int64_t source_event_id,
                          int (*save)(struct sqlite3 *, const char *, const char *));
@@ -225,6 +226,11 @@ int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char
                                                const int64_t *speech_ids, size_t speech_count,
                                                const int64_t *review_ids, size_t review_count,
                                                const char *tool_result);
+/* Also stage the exact evidence for the restartable memory evaluation. */
+int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char *assistant_text,
+                                              const int64_t *speech_ids, size_t speech_count,
+                                              const int64_t *review_ids, size_t review_count,
+                                              const char *tool_result);
 
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
