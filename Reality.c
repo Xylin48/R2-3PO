@@ -4794,58 +4794,98 @@ int r2_reality_eat(const char *food, double fullness)
     return rc;
 }
 
-/* Read-only availability check used to validate autonomous sleep decisions.
- * Returns 1 when an accessible, metric-backed meal exists, 0 when none exists,
- * and -1 when authoritative inventory could not be checked safely. */
-int r2_reality_autonomous_food_available(void)
+/* When listing candidates, preserve each whole authoritative name. With no
+ * output stream this is an existence check and can stop on the first match. */
+static int autonomous_food_candidates(FILE *out)
 {
-    if (!r2_reality_is_initialized()) return -1;
-    char food[512] = {0};
+    int available = 0;
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(reality_db,
+    int rc = reality_ready && reality_db ? sqlite3_prepare_v2(reality_db,
         "SELECT name,container FROM r2_reality_objects WHERE quantity>0 ORDER BY id",
-        -1, &st, NULL);
-    int step_rc = SQLITE_OK;
+        -1, &st, NULL) : SQLITE_MISUSE;
     if (rc == SQLITE_OK) {
-        while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
-            const unsigned char *name = sqlite3_column_text(st, 0);
-            const unsigned char *container = sqlite3_column_text(st, 1);
-            if (!name || !container || !container_accessible((const char *)container))
-                continue;
-            double fullness = 0.0;
-            if (food_metric((const char *)name, &fullness, NULL) == 0 &&
-                isfinite(fullness) && fullness > 0.0) {
-                snprintf(food, sizeof(food), "%s", (const char *)name);
+        int step;
+        while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(st, 0);
+            const char *container = (const char *)sqlite3_column_text(st, 1);
+            if (!name || !container || strlen(name) != (size_t)sqlite3_column_bytes(st, 0) ||
+                strlen(container) != (size_t)sqlite3_column_bytes(st, 1)) {
+                rc = SQLITE_CORRUPT;
+                break;
+            }
+            if (!container_accessible(container)) continue;
+            R2FoodMetric metric;
+            int metric_state = load_food_metric(name, &metric);
+            double fullness = metric.fullness;
+            free(metric.line);
+            if (metric_state < 0) {
+                rc = SQLITE_IOERR;
+                break;
+            }
+            if (metric_state > 0 && isfinite(fullness) && fullness > 0.0) {
+                available = 1;
+                if (!out) break;
+                if (fprintf(out, "Tracked food: %s (fullness %.1f)\n", name, fullness) < 0) {
+                    rc = SQLITE_IOERR;
+                    break;
+                }
+            }
+        }
+        if (rc == SQLITE_OK && step != SQLITE_DONE && (out || !available)) rc = step;
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&reality_lock);
+    if (rc != SQLITE_OK) return -1;
+    if (available || !reality_is_home()) return available;
+
+    pthread_mutex_lock(&fridge_lock);
+    st = NULL;
+    rc = fridge_db ? sqlite3_prepare_v2(fridge_db,
+        "SELECT name,fullness FROM r2_fridge_items WHERE quantity>0 AND fullness>0 ORDER BY name",
+        -1, &st, NULL) : SQLITE_MISUSE;
+    if (rc == SQLITE_OK) {
+        int step;
+        while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(st, 0);
+            double fullness = sqlite3_column_double(st, 1);
+            if (!name || strlen(name) != (size_t)sqlite3_column_bytes(st, 0) || !isfinite(fullness)) {
+                rc = SQLITE_CORRUPT;
+                break;
+            }
+            available = 1;
+            if (!out) break;
+            if (fprintf(out, "Fridge food: %s (fullness %.1f)\n", name, fullness) < 0) {
+                rc = SQLITE_IOERR;
                 break;
             }
         }
-        if (!*food && step_rc != SQLITE_DONE) rc = step_rc;
+        if (rc == SQLITE_OK && step != SQLITE_DONE && (out || !available)) rc = step;
     }
-    if (st) sqlite3_finalize(st);
-    pthread_mutex_unlock(&reality_lock);
-    if (rc != SQLITE_OK) return -1;
-    if (*food) return 1;
-    if (!reality_is_home()) return 0;
-
-    int available = 0;
-    pthread_mutex_lock(&fridge_lock);
-    if (!fridge_db) {
-        pthread_mutex_unlock(&fridge_lock);
-        return -1;
-    }
-    st = NULL;
-    rc = sqlite3_prepare_v2(fridge_db,
-        "SELECT name FROM r2_fridge_items WHERE quantity>0 AND fullness>0 LIMIT 1",
-        -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        int step = sqlite3_step(st);
-        if (step == SQLITE_ROW) available = 1;
-        else if (step != SQLITE_DONE) rc = step;
-    }
-    if (st) sqlite3_finalize(st);
+    sqlite3_finalize(st);
     pthread_mutex_unlock(&fridge_lock);
     return rc == SQLITE_OK ? available : -1;
+}
+
+int r2_reality_autonomous_food_available(void)
+{
+    return autonomous_food_candidates(NULL);
+}
+
+char *r2_reality_autonomous_food_context(void)
+{
+    char *context = NULL;
+    size_t length = 0;
+    FILE *out = open_memstream(&context, &length);
+    if (!out) return NULL;
+    int available = autonomous_food_candidates(out);
+    if (available == 0 && fputs("No accessible metric-backed food is listed.\n", out) < 0)
+        available = -1;
+    if (fclose(out) != 0 || available < 0) {
+        free(context);
+        return NULL;
+    }
+    return context;
 }
 
 char *r2_reality_food_context(const char *food)

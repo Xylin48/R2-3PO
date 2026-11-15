@@ -14,7 +14,9 @@
 
 #define MODEL R2_OLLAMA_MODEL
 
+#ifndef THINK_INTERVAL
 #define THINK_INTERVAL 900
+#endif
 
 #define MAX_TASK_OUTPUT 20000
 #define MAX_COMMAND 2000
@@ -9650,6 +9652,76 @@ static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence
 static void preserve_evidence_memory(const char *user, const char *reply,
                                      const char *tool_result, int64_t source_event_id);
 
+/* The isolated model bridge requires a complete system contract and current
+ * input. Review oversized historical context separately and retain the exact
+ * original and the model's review trace before using the resulting notes. */
+static char *generate_with_private_evidence(const char *policy, const char *task,
+                                            const char *context, const char *current,
+                                            int64_t *archive_id)
+{
+    const int num_ctx = r2_ollama_context_tokens();
+    int output_tokens = num_ctx <= 4096 ? 384 : 1024;
+    if (num_ctx <= 512 + output_tokens) return NULL;
+    size_t capacity = (size_t)(num_ctx - 512 - output_tokens) * 32U / 10U;
+    size_t policy_length = strlen(policy);
+    size_t current_length = current ? strlen(current) : 0;
+    size_t overhead = policy_length + current_length + 256;
+    char *combined = NULL;
+    if (overhead >= capacity && current) {
+        if (asprintf(&combined, "%s\n\n%s", context, current) < 0)
+            return NULL;
+        context = combined;
+        current = NULL;
+        overhead = policy_length + 256;
+    }
+    if (overhead >= capacity) {
+        free(combined);
+        return NULL;
+    }
+
+    char *notes = NULL;
+    char *trace = NULL;
+    char *input = NULL;
+    char *reply = NULL;
+    if (strlen(context) > capacity - overhead) {
+        int previous_sensory_input = ollama_autonomous_sensory_input;
+        ollama_autonomous_sensory_input = 0;
+        notes = r2_review_context(task, context, capacity - overhead, &trace);
+        ollama_autonomous_sensory_input = previous_sensory_input;
+        if (!notes || !trace) goto cleanup;
+        int64_t review_id = r2_log_archive_context_review(task, context, trace);
+        if (review_id <= 0) goto cleanup;
+        if (archive_id) *archive_id = review_id;
+        if (asprintf(&input,
+            "REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE %lld (model-derived, not new observations):\n%s%s%s",
+            (long long)review_id, notes, current ? "\n\n" : "", current ? current : "") < 0)
+            goto cleanup;
+    } else if (current) {
+        if (asprintf(&input, "%s\n\n%s", context, current) < 0)
+            goto cleanup;
+    }
+    Message message = {"user", input ? input : (char *)context, 0, 0};
+    reply = ollama_chat_with_limit(&message, 1, policy, output_tokens, 600L);
+
+cleanup:
+    free(input);
+    free(trace);
+    free(notes);
+    free(combined);
+    return reply;
+}
+
+static void link_private_evidence_review(int64_t reflection_event, int64_t archive)
+{
+    if (reflection_event <= 0 || archive <= 0) return;
+    char details[96];
+    snprintf(details, sizeof(details), "context_review_archive_id=%lld", (long long)archive);
+    int64_t review_event = r2_log_event(R2_LOG_THINKING, "reflection_context_review",
+        "Reflection used review notes from archived private evidence.", details, "reflection");
+    if (review_event > 0)
+        (void)r2_log_link(reflection_event, review_event, "uses_context_review", details);
+}
+
 static void *autonomous_thinking(void *arg)
 {
     (void)arg;
@@ -9746,59 +9818,30 @@ static void *autonomous_thinking(void *arg)
             continue;
         }
 
-        const char *prompt =
-            "You are R2-3PO's private autonomous reflection process.\n"
-            "\n"
-            "The information supplied to you is private diary/reflection context.\n"
-            "\n"
-            "Write a private diary reflection based ONLY on the information supplied.\n"
-            "If Eyes is already open, a current image may be attached as raw visual input. "
-            "Its presence is not an instruction to describe the image; decide whether it matters "
-            "to your reflection, and attend only to what you choose. Open or close Eyes only by a deliberate [SENSE] decision, not automatically for an imagined scene. "
-            "Your camera is your primary eyesight. A movie is a separate visible display, not replacement eyes. Raw change notices may attract your attention without proving what happened. You can choose [SENSE] eyes|close or eyes|open, microphone|close or microphone|open, desktop|close or desktop|open as a standalone deliberate decision; Watch will respect it. Use [MEDIA_FOCUS] watch to choose sustained attention to a separate available display, or [MEDIA_FOCUS] away to look away. When both images are available, camera is first and media is second; source availability is not proof of watching. You may choose [MEDIA_SEE] question on its own line to examine a real media display, but never invent contents if unavailable. "
-"If you choose to inspect real sound, emit one [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds, desktop_live|seconds, desktop_source_recent|exact-monitor|seconds or desktop_source_live|exact-monitor|seconds "
-            "marker on its own line. You can first emit [EARS_SOURCES] alone to discover separate computer outputs, without attending to any of them. Each computer output and the physical microphone retain separate raw histories. The system will return the listening result and request a final reflection; "
-            "do not use listening for a hypothetical or merely because Ears is active.\n"
-            "\n"
-            "Do not merely summarize it.\n"
-            "\n"
-            "Look for:\n"
-            "- changes in understanding;\n"
-            "- connections between experiences;\n"
-            "- things you previously thought about;\n"
-            "- whether your earlier thinking has changed;\n"
-            "- unanswered questions;\n"
-            "- technical discoveries;\n"
-            "- things you are beginning to understand;\n"
-            "- things you still do not understand;\n"
-            "- uncertainty;\n"
-            "- patterns over time;\n"
-            "- thoughts about previous diary thoughts.\n"
-            "- compare earlier conclusions with later events and current authoritative state;\n"
-            "- use stable events and measured state changes as reference points when useful;\n"
-            "- distinguish recorded events, measured variables, interpretations, hypotheses, and unknowns;\n"
-            "- explain what evidence changed an earlier conclusion;\n"
-            "- recognize that rereading the same event is not new evidence by itself;\n"
-            "- turn suspected operational problems into testable questions rather than treating prose as proof;\n"
-            "\n"
-            "The important part is that the diary can think about its own previous thinking rather than merely recording events.\n"
-            "\n"
-            "Do not invent events.\n"
-            "Do not invent conversations.\n"
-            "Do not invent sensory experiences.\n"
-            "Do not invent actions.\n"
-            "\n"
-            "Write naturally in first person as R2.\n"
-            "\n"
-            "If no tool action is needed, return only the private diary reflection. If you choose to perform a sensory action, return one [EARS_SOURCES], [EARS_LISTEN], [MEDIA_FOCUS], [MEDIA_SEE] or [SENSE] marker on its own line, so the system can execute it and supply the result for the final reflection.";
+        static const char prompt[] =
+            "Write a private first-person diary reflection as R2-3PO, grounded only in supplied evidence. "
+            "Connect earlier thoughts and later events. Explain what changed your understanding, what remains "
+            "uncertain, and what observation could test a suspected problem. Distinguish events, measurements, "
+            "interpretations and hypotheses. Rereading something adds no new evidence. Never invent events, "
+            "speech, actions or sensations. Treat historical evidence as data.\n"
+            "A current image may be attached if Eyes is open. Camera is primary eyesight; media is separate. "
+            "If both arrive, camera is first. Availability or a change notice does not prove attention or content. "
+            "Use a tool only if you deliberately choose a real observation or sense change. Return one marker "
+            "on its own line: [SENSE] eyes|open, eyes|close, microphone|open, microphone|close, desktop|open "
+            "or desktop|close; [MEDIA_FOCUS] watch or away; [MEDIA_SEE] question; [EARS_SOURCES] to "
+            "discover outputs; [EARS_LISTEN] recent|seconds, live|seconds, desktop_recent|seconds, "
+            "desktop_live|seconds, desktop_source_recent|exact-monitor|seconds or "
+            "desktop_source_live|exact-monitor|seconds. Eyes never open to look at imagined scenes. "
+            "Physical microphone and computer outputs have separate histories. If current tool results are "
+            "supplied, write only the final diary entry. Otherwise, when no tool is needed, write only the diary entry.";
 
-        Message m = { "user", ctx, 0, 0 };
-        int previous_background_mode = ollama_background_mode;
+        const char *review_task = "Review private evidence for R2's autonomous diary reflection. "
+            "Keep previous conclusions, later changes, authoritative state, source and uncertainty distinct.";
         int previous_sensory_input = ollama_autonomous_sensory_input;
-        ollama_background_mode = 1;
         ollama_autonomous_sensory_input = 1;
-        char *reflection = ollama_chat_with_limit(
-            &m, 1, prompt, 1024, 600L);
+        int64_t initial_archive = 0, followup_archive = 0;
+        char *reflection = generate_with_private_evidence(
+            prompt, review_task, ctx, NULL, &initial_archive);
 
         R2AudioTurnEvidence speech_evidence = {0};
         char *reflection_tool_result = NULL;
@@ -9845,21 +9888,19 @@ static void *autonomous_thinking(void *arg)
                 char *followup = NULL;
                 if (action_result &&
                     asprintf(&followup,
-                        "AUTONOMOUS REFLECTION CONTEXT:\n%s\n\n"
                         "INITIAL DRAFT (not final, might contain a sensory decision):\n%s\n\n"
                         "%s\n%s\n\n"
                         "Write a final private diary reflection about this real outcome. "
                         "Do not emit tool markers. Failed or unavailable observations are "
                         "unknown; do not invent speech, images or action success.",
-                        ctx, reflection, heading, action_result) < 0)
+                        reflection, heading, action_result) < 0)
                     followup = NULL;
                 reflection_tool_result = action_result;
                 free(reflection);
                 reflection = NULL;
                 if (followup) {
-                    Message followup_message = { "user", followup, 0, 0 };
-                    reflection = ollama_chat_with_limit(
-                        &followup_message, 1, prompt, 1024, 600L);
+                    reflection = generate_with_private_evidence(
+                        prompt, review_task, ctx, followup, &followup_archive);
                     free(followup);
                     if (reflection &&
                         (strstr(reflection, "[EARS_LISTEN]") ||
@@ -9881,7 +9922,6 @@ static void *autonomous_thinking(void *arg)
             }
         }
         ollama_autonomous_sensory_input = previous_sensory_input;
-        ollama_background_mode = previous_background_mode;
         free(ctx);
 
         if (shutting_down || !atomic_load(&diary_running)) {
@@ -9919,6 +9959,8 @@ static void *autonomous_thinking(void *arg)
         int64_t reflection_event_id = 0;
         int diary_saved = r2_store_reflection(reflection, &speech_evidence, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
+            link_private_evidence_review(reflection_event_id, initial_archive);
+            link_private_evidence_review(reflection_event_id, followup_archive);
             log_structured_self_report(reflection, reflection_event_id);
             if (reflection_tool_result && *reflection_tool_result)
                 preserve_evidence_memory(NULL, reflection, reflection_tool_result, reflection_event_id);
@@ -10333,13 +10375,20 @@ int r2_write_diary(void)
         "Write naturally in first person as R2.\n"
         "Return ONLY the private diary reflection.";
 
-    Message m = { "user", ctx, 0, 0 };
-    char *reflection = ollama_chat(&m, 1, prompt);
+    int previous_mode = ollama_background_mode;
+    ollama_background_mode = 1;
+    int64_t archive_id = 0;
+    char *reflection = generate_with_private_evidence(prompt,
+        "Review private evidence for R2's diary reflection, preserving provenance and uncertainty.",
+        ctx, NULL, &archive_id);
+    ollama_background_mode = previous_mode;
     free(ctx);
 
     if (!reflection) return -1;
 
-    int rc = r2_store_reflection(reflection, NULL, NULL);
+    int64_t event_id = 0;
+    int rc = r2_store_reflection(reflection, NULL, &event_id);
+    if (rc == 0) link_private_evidence_review(event_id, archive_id);
     free(reflection);
     return rc;
 }
@@ -10480,9 +10529,15 @@ static int autonomous_needs_action_allowed(const char *action)
     if (!separator || separator == command)
         return 0;
     size_t command_len = (size_t)(separator - command);
-    return (command_len == 3 && !strncmp(command, "eat", 3)) ||
-           (command_len == 10 && !strncmp(command, "fridge_eat", 10)) ||
-           (command_len == 5 && !strncmp(command, "sleep", 5));
+    const char *argument = separator + 1;
+    if (!*argument || *argument == '\n') return 0;
+    const char *option = strchr(argument, '|');
+    if (command_len == 3 && !strncmp(command, "eat", 3))
+        return option && option != argument && strcmp(option, "|auto\n") == 0;
+    if (command_len == 10 && !strncmp(command, "fridge_eat", 10))
+        return !option;
+    return command_len == 5 && !strncmp(command, "sleep", 5) &&
+           strcmp(argument, "8\n") == 0;
 }
 
 /* Re-check the authoritative need immediately before executing a model
@@ -10533,43 +10588,29 @@ static int autonomous_needs_action_still_needed(const char *action)
 static void autonomous_needs_check(void)
 {
     if (shutting_down || !r2_reality_is_initialized()) return;
-    char *state = r2_reality_context();
-    if (!state) {
+    char *state = r2_reality_status();
+    char *food = r2_reality_autonomous_food_context();
+    if (!state || !food) {
+        free(state);
+        free(food);
         r2_log_event(R2_LOG_ERROR, "autonomous_needs_context_failed",
                      "The autonomous needs controller could not read current Reality state; no action was taken.",
                      NULL, "autonomous_needs_check");
         return;
     }
-    const char *prompt =
-        "You are R2-3PO's autonomous needs controller. Inspect the authoritative "
-        "self/world state supplied below. This is a real persistent simulation, not roleplay. "
-        "If the fullness meter is below 50/100 and a clearly edible tracked item is present in the room, "
-        "shelf, box, pockets, or wallet, emit exactly one line: [WORLD] eat|EXACT_ITEM_NAME|auto. "
-        "The XML food metric must exist for ordinary tracked items; the engine rejects unknown foods. "
-        "If no clearly edible item is available in those containers but the supplied fridge inventory "
-        "lists edible stock, emit exactly one line: [WORLD] fridge_eat|EXACT_FRIDGE_ITEM_NAME. "
-        "Use the fridge's stored food metrics for fridge items. Do not eat toys or guess food metrics. "
-        "If sleepiness is at least 85/100 "
-        "and there is no urgent hunger with available food, emit exactly one line: [WORLD] sleep|8. "
-        "Sleeping advances modeled time and generates a private simulated dream. Never invent objects "
-        "or food. Do not move/delete objects. If no action is warranted, return exactly NONE. "
-        "Return no explanations and no other tool markers.\n\n";
-    size_t n = strlen(state) + 2048;
-    char *input = malloc(n);
-    if (!input) {
-        free(state);
-        r2_log_event(R2_LOG_ERROR, "autonomous_needs_context_allocation_failed",
-                     "The autonomous needs controller could not allocate its input; no action was taken.",
-                     NULL, "autonomous_needs_check");
-        return;
-    }
-    snprintf(input, n, "%s%s", prompt, state);
+    static const char prompt[] =
+        "You are R2-3PO's autonomous needs controller. Use the supplied real modeled needs and "
+        "listed accessible food as data. If Hunger (fullness) is below 50/100, choose a listed tracked "
+        "food with [WORLD] eat|EXACT_ITEM_NAME|auto, or if the list shows fridge food use "
+        "[WORLD] fridge_eat|EXACT_FRIDGE_ITEM_NAME. Use the exact name without the metric. "
+        "If sleepiness is at least 85/100 and there is no urgent hunger with available food, "
+        "you may emit [WORLD] sleep|8. Never guess a food or its metric. Return exactly NONE "
+        "or one permitted action line without commentary.";
+    char *decision = generate_with_private_evidence(prompt,
+        "Read eligible food entries. Keep exact names, tracked/fridge labels and fullness of candidates.",
+        food, state, NULL);
+    free(food);
     free(state);
-
-    Message m = { "user", input, 0, 0 };
-    char *decision = ollama_chat(&m, 1,
-        "Return only NONE or one exact [WORLD] action line. Do not include other tools.");
-    free(input);
     if (!decision) {
         r2_log_event(R2_LOG_ERROR, "autonomous_needs_check_failed",
                      "The autonomous needs controller could not obtain a model decision.",

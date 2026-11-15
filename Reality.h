@@ -54,6 +54,8 @@ int r2_reality_remove_item(const char *name);
    API compatibility but cannot override the authoritative metric. */
 int r2_reality_eat(const char *food, double fullness);
 int r2_reality_autonomous_food_available(void);
+/* Caller frees exact accessible food choices. Tracked food takes priority. */
+char *r2_reality_autonomous_food_context(void);
 char *r2_reality_food_context(const char *food);
 int r2_reality_rate_food(const char *food, int satisfaction, const char *notes);
 int r2_reality_sleep(double hours);

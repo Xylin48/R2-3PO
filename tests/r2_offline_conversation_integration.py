@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -22,6 +23,10 @@ FIRST = "R2_OFFLINE_SESSION_ONE_73628"
 FOLLOWUP = "What is in your pockets? R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
 REPLY = "I received your message and can respond in this conversation."
+REFLECTION = "I closed Eyes deliberately and kept the earlier evidence separate."
+SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
+ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
+FRIDGE_FOOD = "Fixture pear"
 
 
 class LocalOllama(BaseHTTPRequestHandler):
@@ -53,6 +58,17 @@ class LocalOllama(BaseHTTPRequestHandler):
                               for message in user_messages[current_index + 1:])
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
+        system = "\n".join(item["content"] for item in payload.get("messages", [])
+                           if item.get("role") == "system" and isinstance(item.get("content"), str))
+        if "autonomous needs controller" in system:
+            reply = (f"[WORLD] fridge_eat|{FRIDGE_FOOD}"
+                     if any(f"Fridge food: {FRIDGE_FOOD}" in message for message in user_messages)
+                     else "NONE")
+        elif "Review supplied evidence for the current request" in system:
+            reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "private first-person diary reflection" in system:
+            reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
+                     else "[SENSE] eyes|close")
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
             "message": {"role": "assistant", "content": reply},
@@ -93,6 +109,7 @@ def compile_core(base: Path) -> Path:
         f'-DR2_WORKSPACE="{workspace}"',
         f'-DR2_DIARY_DATABASE="{home / "r2_memory.db"}"',
         f'-DR2_DIARY_DIR="{workspace / "R2_Diary"}"',
+        "-DTHINK_INTERVAL=4",
     ]
     # Opt in to both sanitizers for the same real compiled-core integration
     # path. The regular run remains unchanged to preserve baseline coverage.
@@ -110,8 +127,7 @@ def compile_core(base: Path) -> Path:
     return binary
 
 
-def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ...],
-                 context: int) -> str:
+def runtime_environment(workspace: Path, url: str, context: int) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("R2_SERVICE_MODE", None)
     env["R2_OLLAMA_BASE_URL"] = url
@@ -121,8 +137,13 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
     env["R2_FX_DIR"] = str(workspace / "unused-FX")
     env["R2_TV_SOCKET"] = str(workspace / "R2" / "tv-offline-test.sock")
     env["DISPLAY"] = ""
+    return env
+
+
+def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ...],
+                 context: int) -> str:
     output = subprocess.run(
-        [str(binary)], cwd=workspace, env=env,
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
         input="".join(f"talk {marker}\n" for marker in markers) + "exit\n",
         text=True, capture_output=True, timeout=100,
     )
@@ -134,6 +155,81 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
             + combined[-16000:]
         )
     return combined
+
+
+def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
+    home = workspace / "R2"
+    memory_db = home / "r2_memory.db"
+    with sqlite3.connect(memory_db) as db:
+        db.execute("INSERT INTO diary_entries(entry,created_at) VALUES (?,CURRENT_TIMESTAMP)", (ARCHIVED_ENTRY,))
+    with sqlite3.connect(home / "r2_reality.db") as db:
+        db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=0 WHERE id=1")
+    with sqlite3.connect(home / "r2_fridge.db") as db:
+        db.execute("INSERT INTO r2_fridge_items(name,quantity,fullness) VALUES (?,1,65)", (FRIDGE_FOOD,))
+
+    env = runtime_environment(workspace, url, 2048)
+    env["R2_SERVICE_MODE"] = "1"
+    log_file = workspace.parent / "autonomous-cycle.log"
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen([str(binary)], cwd=workspace, env=env,
+                                   stdout=log, stderr=subprocess.STDOUT)
+        completed = False
+        try:
+            deadline = time.monotonic() + 45
+            while process.poll() is None and time.monotonic() < deadline:
+                if "Autonomous reflection written to diary and Life Log" in log_file.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    completed = True
+                    break
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise
+        if not completed or process.returncode:
+            raise AssertionError("Small-context autonomous cycle failed\n"
+                                 + log_file.read_text(encoding="utf-8", errors="replace")[-20000:])
+
+    with sqlite3.connect(memory_db) as db:
+        links = db.execute(
+            "SELECT d.entry,r.details FROM diary_entries d "
+            "JOIN r2_sensory_journal_reflection_links dl ON dl.diary_entry_id=d.id "
+            "JOIN r2_log_links l ON l.from_event_id=dl.event_id "
+            "JOIN r2_log_events r ON r.id=l.to_event_id "
+            "WHERE d.entry=? AND l.relationship='uses_context_review' ORDER BY r.id",
+            (REFLECTION,),
+        ).fetchall()
+        assert len(links) == 2, links
+        archived_inputs = []
+        for _, details in links:
+            archive_id = int(details.split("=", 1)[1])
+            original, notes = db.execute(
+                "SELECT original_context,review_notes FROM r2_log_context_reviews WHERE id=?",
+                (archive_id,),
+            ).fetchone()
+            assert ARCHIVED_ENTRY in original and "Round 0, bytes [0," in notes
+            archived_inputs.append(original.encode("utf-8"))
+    with sqlite3.connect(home / "r2_fridge.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM r2_fridge_items WHERE name=?", (FRIDGE_FOOD,)).fetchone() == (0,)
+
+    seen_review = bytearray()
+    for request in LocalOllama.requests:
+        if request.get("options", {}).get("num_ctx") != 2048:
+            continue
+        for item in request.get("messages", []):
+            content = item.get("content", "")
+            if (item.get("role") == "user" and content.startswith("EVIDENCE REVIEW\n")
+                    and "autonomous diary reflection" in content.split("BEGIN FRAGMENT", 1)[0]
+                    and "\nRound 0," in content):
+                seen_review.extend(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
+    assert seen_review == b"".join(archived_inputs), "Reflection reviews omitted or changed original bytes"
+    print("PASS: 2048-token service completed its model-owned meal and reflection with exact evidence.")
 
 
 def main() -> int:
@@ -157,6 +253,7 @@ def main() -> int:
                 conversation(binary, workspace, url, (first, followup), context)
                 conversation(binary, workspace, url, (second,), context)
                 turns.extend((context, marker) for marker in (first, followup, second))
+            autonomous_cycle(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()
