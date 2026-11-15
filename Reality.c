@@ -4433,6 +4433,26 @@ static int reality_move_item_to_fridge(const char *name)
     return 0;
 }
 
+/* Call under reality_lock while the inventory write transaction is open. */
+static int read_tracked_item(const char *name, char **container,
+                             char **description, int *quantity)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(reality_db,
+        "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = bind_text(st, 1, name) == 0 ? sqlite3_step(st) : SQLITE_ERROR;
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    rc = inventory_read_text(st, 0, container);
+    if (rc == SQLITE_OK) rc = inventory_read_text(st, 1, description);
+    if (rc == SQLITE_OK) rc = inventory_read_quantity(st, 2, quantity);
+    sqlite3_finalize(st);
+    return rc == SQLITE_OK && *quantity > 0 && **container ? 0 : -1;
+}
+
 static int reality_move_item_internal(const char *name,const char *container)
 {
     if(!name||!*name||!container||!*container||strlen(name)>REALITY_MAX_TEXT||strlen(container)>REALITY_MAX_TEXT||!r2_reality_is_initialized()) return -1;
@@ -4441,8 +4461,8 @@ static int reality_move_item_internal(const char *name,const char *container)
     container = canonical_container;
     if (!strcasecmp(container, "fridge"))
         return reality_move_item_to_fridge(name);
-    char old_container[REALITY_MAX_TEXT + 1] = {0};
-    char old_description[REALITY_MAX_TEXT + 1] = {0};
+    char *old_container = NULL;
+    char *old_description = NULL;
     int old_quantity = 1;
     pthread_mutex_lock(&reality_lock);
     int rc = sqlite3_exec(reality_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
@@ -4451,28 +4471,12 @@ static int reality_move_item_internal(const char *name,const char *container)
         return -1;
     }
 
-    sqlite3_stmt *prior = NULL;
-    rc = sqlite3_prepare_v2(reality_db,
-        "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
-        -1, &prior, NULL);
-    if (rc == SQLITE_OK) {
-        rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
-        if (rc == SQLITE_ROW) {
-            const unsigned char *oc = sqlite3_column_text(prior, 0);
-            const unsigned char *od = sqlite3_column_text(prior, 1);
-            if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
-            if (od) snprintf(old_description, sizeof(old_description), "%s", (const char *)od);
-            old_quantity = sqlite3_column_int(prior, 2);
-            rc = SQLITE_DONE;
-        } else if (rc == SQLITE_DONE) {
-            rc = SQLITE_NOTFOUND;
-        }
-    }
-    if (prior) sqlite3_finalize(prior);
-    if (rc != SQLITE_DONE || !*old_container ||
+    if (read_tracked_item(name, &old_container, &old_description, &old_quantity) != 0 ||
         !container_accessible(old_container) || !container_accessible(container)) {
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
         pthread_mutex_unlock(&reality_lock);
+        free(old_container);
+        free(old_description);
         return -1;
     }
 
@@ -4507,10 +4511,14 @@ static int reality_move_item_internal(const char *name,const char *container)
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
     }
     pthread_mutex_unlock(&reality_lock);
+    if (rc == SQLITE_OK) {
+        mirror_remove(name, old_container);
+        if (mirror_write(name, old_description, old_quantity, container) != 0)
+            fprintf(stderr, "[R2 Reality] Database saved, but room mirror file could not be updated for '%s'.\n", name);
+    }
+    free(old_container);
+    free(old_description);
     if (rc != SQLITE_OK) return -1;
-    if (*old_container) mirror_remove(name, old_container);
-    if (mirror_write(name, old_description, old_quantity, container) != 0)
-        fprintf(stderr, "[R2 Reality] Database saved, but room mirror file could not be updated for '%s'.\n", name);
     char summary[REALITY_MAX_TEXT + 128];
     int length = snprintf(summary, sizeof(summary), "R2 moved '%s' to %s.", name, container);
     if (length < 0 || (size_t)length >= sizeof(summary))
@@ -4633,8 +4641,8 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
     if (energy_bonus < 0.0) energy_bonus = 0.0;
     if (energy_bonus > 100.0) energy_bonus = 100.0;
 
-    char container[REALITY_MAX_TEXT + 1] = {0};
-    char description[REALITY_MAX_TEXT + 1] = {0};
+    char *container = NULL;
+    char *description = NULL;
     int quantity = 0;
     int consumed_tracked_item = 0;
     pthread_mutex_lock(&reality_lock);
@@ -4643,39 +4651,18 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
         free(metric.line);
         return -1;
     }
-    sqlite3_stmt *st = NULL;
-    int tracked_lookup_rc = SQLITE_OK;
-    if (consume_tracked_item) {
-        tracked_lookup_rc = sqlite3_prepare_v2(reality_db,
-            "SELECT container,description,quantity FROM r2_reality_objects WHERE name=? COLLATE NOCASE",
-            -1, &st, NULL);
-        if (tracked_lookup_rc == SQLITE_OK && bind_text(st, 1, food) != 0)
-            tracked_lookup_rc = SQLITE_ERROR;
-        if (tracked_lookup_rc == SQLITE_OK) tracked_lookup_rc = sqlite3_step(st);
-        if (tracked_lookup_rc == SQLITE_ROW) {
-            const unsigned char *co = sqlite3_column_text(st, 0);
-            const unsigned char *de = sqlite3_column_text(st, 1);
-            if (co) snprintf(container, sizeof(container), "%s", (const char *)co);
-            if (de) snprintf(description, sizeof(description), "%s", (const char *)de);
-            quantity = sqlite3_column_int(st, 2);
-        }
-        if (tracked_lookup_rc != SQLITE_ROW && tracked_lookup_rc != SQLITE_DONE) {
-            if (st) sqlite3_finalize(st);
-            (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
-            pthread_mutex_unlock(&reality_lock);
-            free(metric.line);
-            return -1;
-        }
-    }
-    if (st) sqlite3_finalize(st);
-    st = NULL;
-    if (consume_tracked_item && (quantity < 1 || !container_accessible(container))) {
+    if (consume_tracked_item &&
+        (read_tracked_item(food, &container, &description, &quantity) != 0 ||
+         !container_accessible(container))) {
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
         pthread_mutex_unlock(&reality_lock);
         free(metric.line);
+        free(container);
+        free(description);
         return -1;
     }
 
+    sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(reality_db,
         "UPDATE r2_reality_self SET hunger=MIN(100,hunger+?), satisfaction=MIN(150,satisfaction+?), seconds_since_meal=0, energy=MIN(100,energy+?), updated_at=CURRENT_TIMESTAMP WHERE id=1",
         -1, &st, NULL);
@@ -4764,14 +4751,14 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
     }
     pthread_mutex_unlock(&reality_lock);
-    if (rc != SQLITE_DONE && rc != SQLITE_OK) return -1;
-    /* COMMIT returns SQLITE_OK; all earlier statements return SQLITE_DONE. */
-
-    if (consumed_tracked_item) {
+    if (rc == SQLITE_OK && consumed_tracked_item) {
         if (quantity == 1) mirror_remove(food, container);
         else if (mirror_write(food, description, quantity - 1, container) != 0)
             fprintf(stderr, "[R2 Reality] Food state saved, but mirror could not be updated for '%s'.\n", food);
     }
+    free(container);
+    free(description);
+    if (rc != SQLITE_OK) return -1;
 
     char summary[REALITY_MAX_TEXT + 128];
     int length = snprintf(summary, sizeof(summary),

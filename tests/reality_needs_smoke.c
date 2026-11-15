@@ -45,6 +45,20 @@ static void verify_complete_legacy_inventory(void)
         fail("legacy inventory omitted part of a row or result");
     free(list);
 
+    if (r2_reality_move_item("legacy_long_1", "shelf") != 0)
+        fail("could not move an old item with a long description");
+    FILE *mirror = fopen(R2_ROOT "/room/shelf/legacy_long_1.r2item", "r");
+    if (!mirror) fail("could not open mirror after moving a legacy item");
+    char *line = NULL;
+    size_t capacity = 0;
+    if (getline(&line, &capacity, mirror) < 0 ||
+        getline(&line, &capacity, mirror) < 9000 || !strstr(line, "TAIL_1"))
+        fail("moving a legacy item shortened its mirrored description");
+    free(line);
+    fclose(mirror);
+    if (r2_reality_remove_item("legacy_long_1") != 0)
+        fail("could not clean up moved legacy item");
+
     if (sqlite3_exec(db, "UPDATE r2_reality_objects SET description='prefix'||char(0)||'suffix' "
                          "WHERE name='legacy_long_4';", NULL, NULL, NULL) != SQLITE_OK)
         fail("could not seed embedded NUL inventory description");
@@ -709,7 +723,32 @@ static void verify_complete_food_metrics(void)
         strcmp((const char *)sqlite3_column_text(st, 1), ingredients))
         fail("food experience and ingredient preference did not keep complete metadata");
     sqlite3_finalize(st);
+    st = NULL;
+    if (r2_reality_add_item(food, "", "pockets", 2) != 0 ||
+        sqlite3_prepare_v2(db, "UPDATE r2_reality_objects SET description=? WHERE name=?",
+                           -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(st, 1, taste, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, food, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(db) != 1)
+        fail("could not create a legacy tracked-meal description");
+    sqlite3_finalize(st);
     sqlite3_close(db);
+    if (r2_reality_eat(food, -1.0) != 0)
+        fail("could not consume one unit of tracked legacy meal");
+    FILE *mirror = fopen(R2_ROOT "/Pockets/metric_complete.r2item", "r");
+    if (!mirror) fail("could not open updated tracked-meal mirror");
+    char *line = NULL;
+    size_t capacity = 0;
+    if (getline(&line, &capacity, mirror) < 0 ||
+        getline(&line, &capacity, mirror) != (ssize_t)(strlen("description=") + strlen(taste) + 1) ||
+        strcmp(line + strlen("description=") + strlen(taste), "\n") ||
+        strncmp(line, "description=", strlen("description=")) ||
+        strncmp(line + strlen("description="), taste, strlen(taste)))
+        fail("consuming a unit shortened the remaining item's mirrored description");
+    free(line);
+    fclose(mirror);
+    if (r2_reality_remove_item(food) != 0)
+        fail("could not remove the tracked-meal fixture");
 }
 
 static int count_item_mirrors(const char *folder, const char *name)
