@@ -1323,6 +1323,8 @@ int r2_visual_init(const char *database_path, const char *library_directory)
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
+    /* Resolve parent components only after verifying the final archive
+       component is a real directory. This also normalizes trailing slashes. */
     if (!realpath(library_directory, visual_directory)) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
