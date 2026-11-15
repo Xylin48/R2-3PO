@@ -212,7 +212,7 @@ class TVDisplaySmoke(unittest.TestCase):
             db.execute("UPDATE r2_tv_vcr_state SET cassette_path=?,transport='play' WHERE id=1",
                        (media,))
             db.execute("INSERT INTO r2_tv_vcr_tapes VALUES(?,?)", (media, 0.0))
-        for stored in ("not-a-number", "inf", "-inf", "nan"):
+        for stored in ("not-a-number", "inf", "-inf", "nan", "1e308", "604801"):
             with self.subTest(stored=stored):
                 with sqlite3.connect(self.db_path) as db:
                     db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=? WHERE media_path=?",
@@ -226,6 +226,10 @@ class TVDisplaySmoke(unittest.TestCase):
             db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=-12.5 WHERE media_path=?",
                        (media,))
         self.assertEqual(display.read_vcr_state(), (media, "play", 0.0))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=604800 WHERE media_path=?",
+                       (media,))
+        self.assertEqual(display.read_vcr_state(), (media, "play", 604800.0))
 
     def test_invalid_saved_position_shows_unavailable_without_crashing_refresh(self) -> None:
         class Widget:
