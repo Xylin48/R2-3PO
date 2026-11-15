@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import closing
 import socket
 import sqlite3
 import time
@@ -232,7 +233,7 @@ class CRTDisplay:
 
     def read_state(self) -> tuple[int, str, int, str | None]:
         uri = DB_PATH.resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
             row = db.execute(
                 "SELECT power, source_kind, source_value FROM r2_tv_state WHERE id=1"
             ).fetchone()
@@ -258,7 +259,7 @@ class CRTDisplay:
 
     def read_vcr_state(self) -> tuple[str | None, str, float]:
         uri = DB_PATH.resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
             row = db.execute(
                 "SELECT cassette_path, transport FROM r2_tv_vcr_state WHERE id=1"
             ).fetchone()
