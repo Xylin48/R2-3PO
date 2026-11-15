@@ -91,7 +91,7 @@ static atomic_int tv_control_stop = ATOMIC_VAR_INIT(0);
 /* One snapshot carries both the XID and its playback publication. The same
  * Tk surface can host multiple tapes between two Watch polls. */
 static atomic_uint_fast64_t tv_live_renderer = ATOMIC_VAR_INIT(0);
-static char tv_renderer_path[1100]; /* control-thread-only exact publication key */
+static char tv_renderer_path[PATH_MAX]; /* control-thread-only exact publication key */
 static char tv_control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 static void tv_publish_video_window(uint32_t window, const char *path)
@@ -197,7 +197,8 @@ static void *tv_control_server(void *unused)
             break;
         }
 
-        char command[1200] = {0};
+        /* A full Linux pathname plus the command, event or seek argument, and newline. */
+        char command[PATH_MAX + 128] = {0};
         size_t used = 0;
         int complete_line = 0;
         int idle_polls = 0;

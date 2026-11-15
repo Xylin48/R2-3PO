@@ -20,6 +20,7 @@ SOCKET_PATH = Path(os.environ.get("R2_TV_SOCKET", "/home/x/R2_Home/R2/tv-control
 MEDIA_DIR = Path(os.environ.get("R2_VCR_MEDIA_DIR", "/home/x/R2_Home/VCR_Tapes"))
 POLL_MS = 1000
 POSITION_SAVE_SECONDS = 5
+VCR_PATH_MAX_BYTES = os.pathconf("/", "PC_PATH_MAX") - 1
 MEDIA_EXTENSIONS = (
     ".avi", ".mkv", ".mp4", ".m4v", ".mov", ".mpeg", ".mpg", ".wmv",
     ".webm", ".ogv", ".flv", ".ts", ".vob", ".3gp", ".asf", ".m2ts",
@@ -30,6 +31,11 @@ MEDIA_EXTENSIONS = (
 def _valid_x11_id(value: str) -> bool:
     return (value.isascii() and value.isdecimal() and len(value) <= 10
             and 1 <= int(value) <= 0xFFFFFFFF)
+
+
+def _valid_media_path(path: str) -> bool:
+    return (Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
+            and len(path.encode("utf-8")) <= VCR_PATH_MAX_BYTES)
 
 
 def send_control_command(command: str) -> str:
@@ -45,8 +51,7 @@ def send_control_command(command: str) -> str:
         and 2 <= int(command[5:]) <= 13
     )
     if command.startswith("vcr insert "):
-        path = command[11:]
-        valid = Path(path).is_absolute() and "\n" not in path and "\r" not in path and len(command) <= 1199
+        valid = _valid_media_path(command[11:])
     if command.startswith(("media ", "media-path ")):
         if command.startswith("media-path "):
             action, separator, path = command[11:].partition("|")
@@ -65,24 +70,17 @@ def send_control_command(command: str) -> str:
                 "vcr_playback_stopped", "vcr_playback_ended",
                 "vcr_playback_error",
             }
-            and Path(path).is_absolute()
-            and "\n" not in path and "\r" not in path and "\0" not in path
-            and len(path.encode("utf-8")) < 1100
-            and len(command.encode("utf-8")) <= 1198
+            and _valid_media_path(path)
         )
     if command.startswith("renderer "):
         window_id, marker, path = command[9:].partition("|")
         valid = (command == "renderer 0"
                  or bool(marker) and _valid_x11_id(window_id)
-                 and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
-                 and len(path.encode("utf-8")) < 1100)
+                 and _valid_media_path(path))
     if command.startswith("vcr tape-position "):
         seconds, marker, path = command[18:].partition("|")
         try:
-            valid = (bool(marker) and 0 <= float(seconds) <= 604800
-                     and Path(path).is_absolute() and not any(c in path for c in "\r\n\0")
-                     and len(path.encode("utf-8")) <= 1024
-                     and len(command.encode("utf-8")) <= 1198)
+            valid = bool(marker) and 0 <= float(seconds) <= 604800 and _valid_media_path(path)
         except ValueError:
             valid = False
     if command.startswith("vcr position "):
@@ -91,7 +89,7 @@ def send_control_command(command: str) -> str:
             valid = 0 <= seconds <= 604800
         except ValueError:
             valid = False
-    if not valid:
+    if not valid or len(command.encode("utf-8")) > VCR_PATH_MAX_BYTES + 127:
         raise ValueError("Unsupported TV/VCR control command")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(2.0)
@@ -188,6 +186,7 @@ class CRTDisplay:
         self._vlc_error_shown = False
         self._pending_vcr_seek: object | None = None
         self._last_logged_vlc_state: tuple[str, str] | None = None
+        self._pending_playback_stop = False
         self._renderer_published = False
         root.protocol("WM_DELETE_WINDOW", self.close)
         # Record the GUI opening through Reality, even while the modeled TV is off.
@@ -401,9 +400,14 @@ class CRTDisplay:
 
     def _record_playback_state(self, path: str | None) -> None:
         previous = self._last_logged_vlc_state
+        if previous and previous[1] == "playing" and (self._pending_playback_stop or previous[0] != path):
+            self._pending_playback_stop = True
+            if not self._send_media_event("vcr_playback_stopped", previous[0]):
+                return
+            self._last_logged_vlc_state = None
+            self._pending_playback_stop = False
+            previous = None
         if not path:
-            if previous and previous[1] == "playing":
-                self._send_media_event("vcr_playback_stopped", previous[0])
             self._last_logged_vlc_state = None
             return
         if self._player is None or self._vlc is None:
@@ -426,8 +430,6 @@ class CRTDisplay:
 
         state_name, action = current
         if previous and previous[0] != path:
-            if previous[1] == "playing":
-                self._send_media_event("vcr_playback_stopped", previous[0])
             previous = None
             self._last_logged_vlc_state = None
 
@@ -455,10 +457,7 @@ class CRTDisplay:
 
     def close(self) -> None:
         self._save_vcr_position(force=True)
-        previous = self._last_logged_vlc_state
-        if previous and previous[1] == "playing":
-            self._send_media_event("vcr_playback_stopped", previous[0])
-            self._last_logged_vlc_state = (previous[0], "stopped")
+        self._record_playback_state(None)
         try:
             send_control_command("display closed")
         except (OSError, RuntimeError, ValueError):

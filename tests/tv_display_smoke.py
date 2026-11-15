@@ -153,6 +153,20 @@ class TVDisplaySmoke(unittest.TestCase):
         with self.assertRaises(ValueError):
             TV.send_control_command("sql update r2_tv_state")
 
+    def test_vcr_client_preserves_long_utf8_paths(self) -> None:
+        path = "/" + "/".join(["é" * 100] * 16 + ["audit|x11=film.mp4"])
+        commands = (f"vcr insert {path}", f"vcr tape-position 42.75|{path}",
+                    f"renderer 8412|{path}", f"media-path vcr_playback_started|{path}")
+        with patch.object(TV.socket, "socket") as factory:
+            client = factory.return_value.__enter__.return_value
+            for command in commands:
+                client.recv.side_effect = [b"OK accepted", b""]
+                self.assertEqual(TV.send_control_command(command), "OK accepted")
+                client.sendall.assert_called_with((command + "\n").encode("utf-8"))
+            oversized = path + "/" + "é" * 600 + ".mp4"
+            with self.assertRaises(ValueError):
+                TV.send_control_command(f"vcr insert {oversized}")
+
 
     def test_vcr_starts_ejected(self) -> None:
         self.assertEqual(TV.CRTDisplay.read_vcr_state(object.__new__(TV.CRTDisplay)),
@@ -342,6 +356,7 @@ class TVDisplaySmoke(unittest.TestCase):
         display._player = FakePlayer()
         display._vlc = type("FakeVLC", (), {"State": FakeState})
         display._last_logged_vlc_state = None
+        display._pending_playback_stop = False
         display.video_surface = type("Surface", (), {"winfo_id": lambda self: 8412})()
         commands = []
         with patch.object(TV, "send_control_command",
@@ -356,6 +371,30 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertEqual(commands, [
             "media-path vcr_playback_started|/tmp/movie.mp4",
             "media-path vcr_playback_paused|/tmp/movie.mp4",
+        ])
+
+    def test_outgoing_playback_stop_is_retried_before_next_tape(self) -> None:
+        class FakeState:
+            Playing, Paused, Stopped, Ended, Error = range(1, 6)
+
+        display = object.__new__(TV.CRTDisplay)
+        display._player = type("Player", (), {"get_state": lambda self: FakeState.Playing})()
+        display._vlc = type("VLC", (), {"State": FakeState})
+        first = "/tmp/first.mp4"
+        second = "/tmp/second.mp4"
+        display._last_logged_vlc_state = (first, "playing")
+        display._pending_playback_stop = False
+        with patch.object(TV, "send_control_command",
+                          side_effect=[OSError(), OSError(), "OK", "OK"]) as send:
+            display._record_playback_state(None)
+            self.assertEqual(display._last_logged_vlc_state, (first, "playing"))
+            display._record_playback_state(first)
+            self.assertEqual(display._last_logged_vlc_state, (first, "playing"))
+            display._record_playback_state(second)
+            self.assertEqual(display._last_logged_vlc_state, (second, "playing"))
+        self.assertEqual([call.args[0] for call in send.call_args_list], [
+            *[f"media-path vcr_playback_stopped|{first}"] * 3,
+            f"media-path vcr_playback_started|{second}",
         ])
 
     def test_renderer_publication_tracks_visible_playback_separately(self) -> None:

@@ -1685,17 +1685,16 @@ int64_t r2_log_media_event(const char *action, const char *media_type,
                            const char *path_or_identifier,
                            const char *details)
 {
-    char summary[2048];
-
     if (!valid_text(action) || !valid_text(media_type) ||
         !valid_text(path_or_identifier))
         return -1;
 
-    snprintf(summary, sizeof(summary), "%s %s: %s",
-             action, media_type, path_or_identifier);
-
-    return r2_log_event(R2_LOG_MEDIA, action, summary,
-                        details, "media");
+    char *summary = NULL;
+    if (asprintf(&summary, "%s %s: %s", action, media_type, path_or_identifier) < 0)
+        return -1;
+    int64_t event_id = r2_log_event(R2_LOG_MEDIA, action, summary, details, "media");
+    free(summary);
+    return event_id;
 }
 
 int64_t r2_log_world_event(const char *object_or_device,

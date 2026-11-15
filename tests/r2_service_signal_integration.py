@@ -110,12 +110,15 @@ def main() -> int:
                     if not response.startswith(expected):
                         raise AssertionError(f"Control command {command!r} failed: {response!r}")
 
-                first = base / "audit|x11=film.mp4"
+                media_dir = base.joinpath(*(["tape-é" + "x" * 178] * 17))
+                media_dir.mkdir(parents=True)
+                first = media_dir / "audit|x11=film.mp4"
                 second = base / "second.mp4"
                 first.touch()
                 second.touch()
                 control("media vcr_playback_started|/tmp/audit-film.mp4", "OK media event recorded")
                 control(f"media-path vcr_playback_started|{first}", "OK media event recorded")
+                control(f"renderer 8412|{first}", "OK renderer publication received")
                 control("renderer 0", "OK renderer publication received")
                 control(f"vcr insert {first}", "OK VCR tape inserted")
                 control(f"vcr insert {second}", "OK VCR tape inserted")
@@ -127,8 +130,14 @@ def main() -> int:
                         ("vcr_playback_started", "vcr_playback_started media: /tmp/audit-film.mp4",
                          f"vcr_playback_started media: {first}"),
                     ).fetchall()
+                    insertion = db.execute(
+                        "SELECT COUNT(*) FROM r2_log_events WHERE event_type=? AND instr(details,?)>0",
+                        ("vcr_tape_inserted", str(first)),
+                    ).fetchone()[0]
                 if len(summaries) != 2:
                     raise AssertionError("Legacy and exact-path playback events did not persist.")
+                if insertion != 1:
+                    raise AssertionError("Life Log did not preserve the complete inserted tape path.")
                 with sqlite3.connect(f"file:{home / 'r2_reality.db'}?mode=ro", uri=True, timeout=5.0) as db:
                     positions = dict(db.execute("SELECT media_path,position_seconds FROM r2_tv_vcr_tapes"))
                     cassette = db.execute("SELECT cassette_path FROM r2_tv_vcr_state WHERE id=1").fetchone()

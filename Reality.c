@@ -6026,7 +6026,7 @@ int r2_reality_tv_disconnect(const char *name)
  * Reality owns transport state; the GUI is only the video renderer. */
 static int tv_vcr_path_key_valid(const char *path)
 {
-    return path && path[0] == '/' && strlen(path) <= 1024 &&
+    return path && path[0] == '/' && strlen(path) < PATH_MAX &&
         !strpbrk(path, "\n\r");
 }
 
@@ -6079,9 +6079,8 @@ int r2_reality_tv_vcr_insert(const char *media_path)
     if (rc != SQLITE_OK) (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
     pthread_mutex_unlock(&reality_lock);
     if (rc != SQLITE_OK) return -1;
-    char detail[1200];
-    snprintf(detail, sizeof(detail), "Inserted VCR tape: %s. Its saved playback position is retained.", media_path);
-    bridge_event("vcr_tape_inserted", "A tape was inserted into R2's built-in VCR.", detail, 1, 0);
+    bridge_eventf("vcr_tape_inserted", "A tape was inserted into R2's built-in VCR.", 1, 0,
+                  "Inserted VCR tape: %s. Its saved playback position is retained.", media_path);
     return 0;
 }
 
