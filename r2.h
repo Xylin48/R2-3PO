@@ -70,6 +70,8 @@ int r2_init(void);
  * directly manipulating R2's internal threads/resources.
  */
 void r2_shutdown(void);
+/* Set the existing lock-free cancellation flag from a signal handler. */
+void r2_request_shutdown_from_signal(void);
 
 
 /*

@@ -42,9 +42,15 @@ LARGE_FILE = "Start of exact file." + ("\nExact record é 🐈." * 850) + "\nEnd
 EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal: literal file line  \n\n"
 
 
+STOPPED_REQUEST = "R2_OFFLINE_INTERRUPT_ACTIVE_81842"
+INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
+
+
 class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
     lock = threading.Lock()
+    slow_started = threading.Event()
+    slow_release = threading.Event()
 
     def do_POST(self) -> None:
         if self.path != "/api/chat":
@@ -69,6 +75,10 @@ class LocalOllama(BaseHTTPRequestHandler):
         asks_for_pockets = current_index >= 0 and user_messages[current_index].startswith(FOLLOWUP + " CTX_")
         has_tool_result = any(message.startswith(result_prefix)
                               for message in user_messages[current_index + 1:])
+        if current_index >= 0 and user_messages[current_index] == STOPPED_REQUEST and payload.get("think"):
+            self.slow_started.set()
+            self.slow_release.wait(timeout=25)
+            return
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -189,6 +199,11 @@ def runtime_environment(workspace: Path, url: str, context: int) -> dict[str, st
     env["R2_FX_DIR"] = str(workspace / "unused-FX")
     env["R2_TV_SOCKET"] = str(workspace / "R2" / "tv-offline-test.sock")
     env["DISPLAY"] = ""
+    if env.get("R2_TEST_VIRTUAL_CLOCK") == "1":
+        library = next(Path("/usr/lib").glob("*/faketime/libfaketime.so.1"), None)
+        assert library is not None and library.is_file(), "libfaketime test dependency is missing"
+        env.update(LD_PRELOAD=str(library), FAKETIME="-852076800",
+                   FAKETIME_DONT_RESET="1", FAKETIME_DONT_FAKE_MONOTONIC="1")
     return env
 
 
@@ -451,6 +466,14 @@ def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
     original.write_text("Synthetic original conversation.", encoding="utf-8")
     fresh = "How old are you? R2_OFFLINE_AGE_FRESH"
     conversation(binary, workspace, url, (fresh,), 2048)
+    if os.environ.get("R2_TEST_VIRTUAL_CLOCK") == "1":
+        with sqlite3.connect(home / "r2_memory.db") as db:
+            stamp = db.execute(
+                "SELECT e.local_time FROM r2_log_events e JOIN r2_log_conversations c ON c.event_id=e.id "
+                "WHERE c.user_text=?", (fresh,),
+            ).fetchone()[0]
+            private_year = time.localtime(time.time() - 852076800).tm_year
+            assert stamp.startswith(str(private_year) + "-"), stamp
     with sqlite3.connect(reality) as db:
         stored = int(db.execute("SELECT value FROM r2_reality_meta WHERE key=?", (key,)).fetchone()[0])
         assert abs(stored - time.time()) < 60
@@ -530,6 +553,37 @@ def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> 
     print("PASS: interactive SIGTERM left the incomplete line undispatched and closed cleanly.")
 
 
+def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
+    log_file = workspace.parent / "active-reply-shutdown.log"
+    LocalOllama.slow_started.clear()
+    LocalOllama.slow_release.clear()
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {STOPPED_REQUEST}\n")
+            process.stdin.flush()
+            assert LocalOllama.slow_started.wait(20), log_file.read_text(encoding="utf-8", errors="replace")
+            process.terminate()
+            process.wait(timeout=8)
+            assert process.returncode == 0
+            assert "[R2-3PO shut down.]" in log_file.read_text(encoding="utf-8", errors="replace")
+        finally:
+            LocalOllama.slow_release.set()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text=?", (STOPPED_REQUEST,)
+        ).fetchall() == [(INTERRUPTED_REPLY,)]
+    print("PASS: interactive SIGTERM cancelled active inference and preserved the accepted user turn.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -566,6 +620,7 @@ def main() -> int:
             compact_age_continuity(binary, workspace, url)
             autonomous_cycle(binary, workspace, url)
             interrupt_partial_terminal_line(binary, workspace, url)
+            interrupt_foreground_reply(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

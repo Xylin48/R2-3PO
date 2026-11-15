@@ -411,8 +411,8 @@ static void tv_control_stop_server(void)
 static void shell_signal_handler(int sig)
 {
     (void)sig;
-
     shell_shutdown = 1;
+    r2_request_shutdown_from_signal();
 }
 
 

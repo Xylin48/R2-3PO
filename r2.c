@@ -10362,8 +10362,7 @@ static void sigint_handler(
     int sig)
 {
     (void)sig;
-
-    shutting_down = 1;
+    r2_request_shutdown_from_signal();
 }
 
 
@@ -10374,6 +10373,11 @@ static void sigint_handler(
 /* ============================================================
    PUBLIC CORE BRIDGE
    ============================================================ */
+
+void r2_request_shutdown_from_signal(void)
+{
+    atomic_store_explicit(&shutting_down, 1, memory_order_relaxed);
+}
 
 int r2_is_shutting_down(void){ return shutting_down ? 1 : 0; }
 int r2_is_initialized(void){ return core_initialized ? 1 : 0; }
@@ -14419,8 +14423,9 @@ static char *r2_talk_impl(const char *message)
 
     pthread_mutex_unlock(&messages_lock);
 
+    char *tool_evidence = NULL;
     char *reply = chat_with_relevant_memories(message);
-    if (!reply) {
+    if (!reply && !shutting_down) {
         /* First generation failed. Refresh live Reality context and rebuild the
            memory/history-augmented prompt once before giving up on this turn. */
         r2_log_event(R2_LOG_SYSTEM, "conversation_generation_retry",
@@ -14432,6 +14437,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2 Reality] Retry could not refresh Reality/learning context; using the previous valid snapshot.\n");
         reply = chat_with_relevant_memories(message);
     }
+    if (shutting_down) goto interrupted_reply;
     if (!reply) {
         /*
          * A failed inference must never look like an ignored user message.
@@ -14484,7 +14490,10 @@ static char *r2_talk_impl(const char *message)
         }
     }
 
-    char *tool_evidence = NULL;
+    if (shutting_down) {
+        free(stripped_reply);
+        goto interrupted_reply;
+    }
     char *tools = process_tools(stripped_reply);
     if (!tools) {
         free(reply);
@@ -14584,7 +14593,7 @@ static char *r2_talk_impl(const char *message)
         tools = NULL;
 
         reply = chat_with_relevant_memories(message);
-        if (!reply) {
+        if (!reply && !shutting_down) {
             r2_log_event(R2_LOG_SYSTEM, "conversation_tool_followup_retry",
                          "R2's first post-action response attempt failed; refreshing current context and retrying once.",
                          "The already completed tool result remains in live context. The retry regenerates only the user-facing follow-up and does not rerun the completed action.",
@@ -14646,6 +14655,13 @@ static char *r2_talk_impl(const char *message)
             reply = sound_clean_reply;
         }
     }
+
+    goto finalize_reply;
+
+interrupted_reply:
+    free(reply);
+    reply = strdup("I received your message. Shutdown interrupted my reply.");
+    if (!reply) return NULL;
 
 finalize_reply:
     pthread_mutex_lock(&messages_lock);

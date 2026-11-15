@@ -44,7 +44,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libcurl4-openssl-dev libsqlite3-dev libjson-c-dev libpulse-dev python3-tk
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libsqlite3-dev libjson-c-dev libpulse-dev python3-tk libfaketime
 
       - name: Check consistent strict build configuration
         run: |
@@ -680,6 +680,8 @@ jobs:
           python3 tests/copy_ollama_model_integrity.py
 
       - name: Exercise offline typed conversations and persisted history across restart
+        env:
+          R2_TEST_VIRTUAL_CLOCK: '1'
         run: |
           python3 -m py_compile tests/r2_offline_conversation_integration.py
           python3 tests/r2_offline_conversation_integration.py
