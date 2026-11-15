@@ -2912,6 +2912,11 @@ static int shell_dispatch(char *input)
    SHELL LOOP
    ============================================================ */
 
+static int shell_input_cancelled(void)
+{
+    return shell_shutdown || r2_is_shutting_down();
+}
+
 int r2_shell_run(void)
 {
     if (!atomic_is_lock_free(&shell_shutdown)) {
@@ -2977,7 +2982,10 @@ int r2_shell_run(void)
         errno = 0;
         size_t input_bytes = 0;
         R2InputLineStatus input_status =
-            r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES, &input_bytes);
+            r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity,
+                                  R2_MAX_TURN_INPUT_BYTES, &input_bytes, shell_input_cancelled);
+        if (shell_shutdown || r2_is_shutting_down())
+            break;
         if (input_status == R2_INPUT_LINE_EOF) {
             printf("\n[R2 Shell] End of input.\n");
             break;
@@ -3003,10 +3011,6 @@ int r2_shell_run(void)
             fflush(stdout);
             continue;
         }
-
-        /* Never dispatch a partial line after shutdown interrupted input. */
-        if (shell_shutdown || r2_is_shutting_down())
-            break;
 
         shell_dispatch(line);
     }

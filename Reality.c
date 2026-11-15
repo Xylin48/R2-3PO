@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -4066,6 +4067,12 @@ char *r2_reality_status(void)
  * wall clock. Both values come from procfs and are unaffected by LD_PRELOAD. */
 static sqlite3_int64 real_epoch_seconds(void)
 {
+#ifdef SYS_clock_gettime
+    /* Bypass the virtual wall clock and procfs boot-time rounding. */
+    struct timespec real_time;
+    if (syscall(SYS_clock_gettime, CLOCK_REALTIME, &real_time) == 0 && real_time.tv_sec > 0)
+        return (sqlite3_int64)real_time.tv_sec;
+#endif
     FILE *fp = fopen("/proc/stat", "r");
     if (!fp) return 0;
     char line[256];
@@ -4081,44 +4088,98 @@ static sqlite3_int64 real_epoch_seconds(void)
     double uptime = 0.0;
     int parsed = fscanf(fp, "%lf", &uptime);
     fclose(fp);
-    if (parsed != 1 || !isfinite(uptime) || uptime < 0.0) return 0;
+    if (parsed != 1 || !isfinite(uptime) || uptime < 0.0 ||
+        uptime >= (double)(INT64_MAX - boot_epoch)) return 0;
     return (sqlite3_int64)boot_epoch + (sqlite3_int64)uptime;
 }
 
-static char *origin_age_context(void)
+static int read_origin_locked(sqlite3_int64 *started)
 {
-    char path[1400]; snprintf(path,sizeof(path),"%s/r2_original_conversation.txt",R2_HOME);
-    sqlite3_int64 started=0; pthread_mutex_lock(&reality_lock); sqlite3_stmt *st=NULL;
-    if(reality_db&&sqlite3_prepare_v2(reality_db,"SELECT value FROM r2_reality_meta WHERE key='original_conversation_birth_time'",-1,&st,NULL)==SQLITE_OK&&sqlite3_step(st)==SQLITE_ROW){
-        const unsigned char *v=sqlite3_column_text(st,0);if(v)started=(sqlite3_int64)strtoll((const char*)v,NULL,10);}
-    if (st) sqlite3_finalize(st);
-    pthread_mutex_unlock(&reality_lock);
-    if(started<=0){
-        struct statx sx;memset(&sx,0,sizeof(sx));
-        if(statx(AT_FDCWD,path,AT_STATX_SYNC_AS_STAT,STATX_BTIME,&sx)==0&&
-           (sx.stx_mask&STATX_BTIME)&&sx.stx_btime.tv_sec>0)
-            started=(sqlite3_int64)sx.stx_btime.tv_sec;
-        if(started>0){char v[64];snprintf(v,sizeof(v),"%lld",(long long)started);pthread_mutex_lock(&reality_lock);st=NULL;
-            if(reality_db&&sqlite3_prepare_v2(reality_db,"INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('original_conversation_birth_time',?)",-1,&st,NULL)==SQLITE_OK){bind_text(st,1,v);(void)sqlite3_step(st);}
-            if (st) sqlite3_finalize(st);
-            pthread_mutex_unlock(&reality_lock);
+    sqlite3_stmt *st = NULL;
+    int rc = reality_db ? sqlite3_prepare_v2(reality_db,
+        "SELECT value FROM r2_reality_meta WHERE key='original_conversation_birth_time'",
+        -1, &st, NULL) : SQLITE_MISUSE;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int result = rc == SQLITE_DONE ? 0 : -1;
+    if (rc == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(st, 0);
+        int bytes = sqlite3_column_bytes(st, 0);
+        if (value && bytes > 0 && strspn(value, "0123456789") == (size_t)bytes) {
+            errno = 0;
+            long long parsed = strtoll(value, NULL, 10);
+            if (!errno && parsed > 0) {
+                *started = (sqlite3_int64)parsed;
+                result = 1;
+            }
         }
     }
-    if(started<=0){
-        if(access(path,F_OK)==0)
-            return strdup("AGE: original conversation file exists, but its filesystem creation time is unavailable; age is not guessed.");
-        return strdup("AGE: original conversation file is not present yet; age is not established.");
+    sqlite3_finalize(st);
+    return result;
+}
+
+char *r2_reality_age_context(void)
+{
+    static const char unavailable[] =
+        "AGE: the persisted creation time is unavailable or invalid; age is not guessed.";
+    const char original[] = R2_HOME "/r2_original_conversation.txt";
+    sqlite3_int64 started = 0;
+    pthread_mutex_lock(&reality_lock);
+    int origin = read_origin_locked(&started);
+    pthread_mutex_unlock(&reality_lock);
+    if (origin < 0) return strdup(unavailable);
+    if (origin == 0) {
+        struct statx sx = {0};
+        if (statx(AT_FDCWD, original, AT_STATX_SYNC_AS_STAT, STATX_BTIME | STATX_TYPE, &sx) != 0) {
+            if (errno == ENOENT)
+                return strdup("AGE: original conversation file is not present yet; age is not established.");
+            return strdup("AGE: the original conversation file cannot be inspected; age is not guessed.");
+        }
+        if (!(sx.stx_mask & STATX_BTIME) || !(sx.stx_mask & STATX_TYPE) ||
+            !S_ISREG(sx.stx_mode) || sx.stx_btime.tv_sec <= 0)
+            return strdup("AGE: the original conversation file has no usable creation time; age is not guessed.");
+
+        char value[64];
+        snprintf(value, sizeof(value), "%lld", (long long)sx.stx_btime.tv_sec);
+        pthread_mutex_lock(&reality_lock);
+        sqlite3_stmt *st = NULL;
+        int rc = reality_db ? sqlite3_prepare_v2(reality_db,
+            "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('original_conversation_birth_time',?)",
+            -1, &st, NULL) : SQLITE_MISUSE;
+        if (rc == SQLITE_OK && bind_text(st, 1, value) != 0) rc = SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        origin = rc == SQLITE_DONE ? read_origin_locked(&started) : -1;
+        pthread_mutex_unlock(&reality_lock);
+        if (origin != 1) return strdup(unavailable);
     }
+
     sqlite3_int64 now = real_epoch_seconds();
     if (now <= 0)
         return strdup("AGE: the host's real elapsed time is unavailable; age is not guessed from R2's private clock.");
-    sqlite3_int64 days = now > started ? (now - started) / 86400 : 0;
+    if (now < started)
+        return strdup("AGE: the host's real time predates the stored creation time; age is not guessed.");
+    sqlite3_int64 days = (now - started) / 86400;
     char out[256];
-    if(days<30)snprintf(out,sizeof(out),"AGE: about %lld days since the original conversation file was created.",(long long)days);
-    else if(days<365){double m=(double)days/30.436875;if(m>=5.5&&m<=6.5)snprintf(out,sizeof(out),"AGE: about half a year old (%lld days).",(long long)days);else snprintf(out,sizeof(out),"AGE: about %d months old, measured from the original conversation file's creation time.",(int)(m+0.5));}
-    else{int y=(int)(days/365.2425),m=(int)(((double)days-y*365.2425)/30.436875+0.5);if(m>=12){y++;m=0;}
-        if(m)snprintf(out,sizeof(out),"AGE: about %d years and %d months old, measured from the original conversation file's creation time.",y,m);
-        else snprintf(out,sizeof(out),"AGE: about %d years old, measured from the original conversation file's creation time.",y);}
+    if (days < 30) {
+        snprintf(out, sizeof(out), "AGE: about %lld days since the original conversation file was created.",
+                 (long long)days);
+    } else if (days < 365) {
+        double months = (double)days / 30.436875;
+        if (months >= 5.5 && months <= 6.5)
+            snprintf(out, sizeof(out), "AGE: about half a year old (%lld days).", (long long)days);
+        else
+            snprintf(out, sizeof(out), "AGE: about %d months old, measured from the original conversation file's creation time.",
+                     (int)(months + 0.5));
+    } else {
+        int years = (int)(days / 365.2425);
+        int months = (int)(((double)days - years * 365.2425) / 30.436875 + 0.5);
+        if (months >= 12) { ++years; months = 0; }
+        if (months)
+            snprintf(out, sizeof(out), "AGE: about %d years and %d months old, measured from the original conversation file's creation time.",
+                     years, months);
+        else
+            snprintf(out, sizeof(out), "AGE: about %d years old, measured from the original conversation file's creation time.", years);
+    }
     return strdup(out);
 }
 
@@ -4132,7 +4193,7 @@ char *r2_reality_context(void)
     char *food_preferences = query_text("SELECT ingredient,printf('average enjoyment rating %.2f/2',satisfaction_sum/rating_count),printf('%d ratings',rating_count) FROM r2_food_ingredient_preferences WHERE rating_count>0 ORDER BY satisfaction_sum*1.0/rating_count DESC LIMIT 24", NULL);
     char *food_experiences = query_text("SELECT food_name,printf('enjoyment rating %+d/2',satisfaction),notes FROM r2_food_experiences WHERE satisfaction IS NOT NULL ORDER BY eaten_at DESC LIMIT 20", NULL);
     char *foods = food_metrics_context();
-    char *fridge=r2_fridge_context(); char *age=origin_age_context(); char *money=r2_reality_money_context();
+    char *fridge=r2_fridge_context(); char *age=r2_reality_age_context(); char *money=r2_reality_money_context();
     char *recent_log=r2_log_recent(5);
     char *visual_memory=r2_visual_recent(2);
     /* Keep the combined context usable when one optional subsystem query

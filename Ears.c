@@ -752,7 +752,9 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
         if (bytes_read < 0 && read_error != ECANCELED)
             r2_log_sensory("audio_read_failed",
                            "R2 Ears encountered an error reading audio-file samples.",
-                           "The decoded PCM stream ended with an error.",
+                           read_error == ETIMEDOUT || read_error == ECHILD
+                               ? "The decoder output ended before a successful exit could be confirmed."
+                               : "The decoded PCM stream ended with an error.",
                            ears->event.source_name);
         /* Do not free the decoder here: the lifecycle owner must first
          * establish that the reader has exited, then close and reap FFmpeg. */

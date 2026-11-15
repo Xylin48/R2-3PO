@@ -4836,13 +4836,16 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     static const char *const room_terms[] = {"room", "shelf", "box", "inventory", "world", "look"};
     static const char *const pocket_terms[] = {"pocket", "pockets"};
     static const char *const fridge_terms[] = {"fridge", "food", "eat", "meal"};
-    static const char *const self_terms[] = {"hungry", "hunger", "tired", "sleep", "needs", "fullness", "age"};
+    static const char *const self_terms[] = {"hungry", "hunger", "tired", "sleep", "needs", "fullness"};
+    static const char *const age_terms[] = {"age", "born", "birth"};
     static const char *const money_terms[] = {"wallet", "money", "cash", "piggybank", "buy", "purchase"};
     static const char *const tv_terms[] = {"tv", "television", "vcr", "cassette", "crt", "channel"};
     int room = r2_query_matches_any_term(query, room_terms, sizeof(room_terms) / sizeof(room_terms[0]));
     int pockets = r2_query_matches_any_term(query, pocket_terms, sizeof(pocket_terms) / sizeof(pocket_terms[0]));
     int fridge = r2_query_matches_any_term(query, fridge_terms, sizeof(fridge_terms) / sizeof(fridge_terms[0]));
     int self = r2_query_matches_any_term(query, self_terms, sizeof(self_terms) / sizeof(self_terms[0]));
+    int age = r2_query_matches_any_term(query, age_terms, sizeof(age_terms) / sizeof(age_terms[0])) ||
+        query_has_phrase(query, "how old");
     int money = r2_query_matches_any_term(query, money_terms, sizeof(money_terms) / sizeof(money_terms[0]));
     int tv = r2_query_matches_any_term(query, tv_terms, sizeof(tv_terms) / sizeof(tv_terms[0]));
     int recalled = r2_query_explicitly_requests_recall(query);
@@ -4854,19 +4857,21 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     char *pocket_state = pockets ? r2_reality_list("pockets") : NULL;
     char *fridge_state = fridge ? r2_fridge_context() : NULL;
     char *self_state = self ? r2_reality_status() : NULL;
+    char *age_state = age ? r2_reality_age_context() : NULL;
     char *money_state = money ? r2_reality_money_context() : NULL;
     char *tv_state = tv ? r2_reality_tv_status() : NULL;
     char *state = NULL;
     char *answer = NULL;
     char *reviewed_result = NULL;
     char *reviewed_query = NULL;
-    if ((room || pockets || fridge || self || money || tv) &&
+    if ((room || pockets || fridge || self || age || money || tv) &&
         asprintf(&state, "PERSISTENT REALITY CONTEXT (selected current views, evidence only)\n"
-                "%s%s%s%s%s%s%s%s%s%s%s%s",
+                "%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
                 room ? "ROOM:\n" : "", room_state ? room_state : room ? "Unavailable.\n" : "",
                 pockets ? "POCKETS:\n" : "", pocket_state ? pocket_state : pockets ? "Unavailable.\n" : "",
                 fridge ? "FRIDGE:\n" : "", fridge_state ? fridge_state : fridge ? "Unavailable.\n" : "",
                 self ? "SELF AND NEEDS:\n" : "", self_state ? self_state : self ? "Unavailable.\n" : "",
+                age ? (age_state ? age_state : "AGE: unavailable.") : "", age ? "\n" : "",
                 money ? "MONEY:\n" : "", money_state ? money_state : money ? "Unavailable.\n" : "",
                 tv ? "TV:\n" : "", tv_state ? tv_state : tv ? "Unavailable.\n" : "") < 0)
         goto cleanup;
@@ -4962,7 +4967,7 @@ cleanup:
     free(reviewed_result);
     free(selected);
     free(state);
-    free(room_state); free(pocket_state); free(fridge_state); free(self_state); free(money_state); free(tv_state);
+    free(room_state); free(pocket_state); free(fridge_state); free(self_state); free(age_state); free(money_state); free(tv_state);
     return answer;
 }
 
@@ -14886,8 +14891,9 @@ int r2_conversation(void)
         errno = 0;
         size_t input_bytes = 0;
         R2InputLineStatus input_status =
-            r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES,
-                                  &input_bytes);
+            r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity,
+                                  R2_MAX_TURN_INPUT_BYTES, &input_bytes, r2_is_shutting_down);
+        if (shutting_down) break;
         if (input_status == R2_INPUT_LINE_EOF)
             break;
         if (input_status == R2_INPUT_LINE_IO_ERROR) {

@@ -442,6 +442,94 @@ def oversized_user_and_action(binary: Path, workspace: Path, url: str) -> None:
     print("PASS: 2048-token follow-up preserved both an oversized typed request and its large file result.")
 
 
+def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
+    home = workspace / "R2"
+    original = home / "r2_original_conversation.txt"
+    reality = home / "r2_reality.db"
+    key = "original_conversation_birth_time"
+
+    original.write_text("Synthetic original conversation.", encoding="utf-8")
+    fresh = "How old are you? R2_OFFLINE_AGE_FRESH"
+    conversation(binary, workspace, url, (fresh,), 2048)
+    with sqlite3.connect(reality) as db:
+        stored = int(db.execute("SELECT value FROM r2_reality_meta WHERE key=?", (key,)).fetchone()[0])
+        assert abs(stored - time.time()) < 60
+    original.unlink()
+
+    old_anchor = str(stored - 186 * 86400)
+    with sqlite3.connect(reality) as db:
+        db.execute("UPDATE r2_reality_meta SET value=? WHERE key=?", (old_anchor, key))
+    saved = "How old are you? R2_OFFLINE_AGE_SAVED"
+    conversation(binary, workspace, url, (saved,), 2048)
+
+    with sqlite3.connect(reality) as db:
+        db.execute("UPDATE r2_reality_meta SET value=? WHERE key=?", (old_anchor + "invalid", key))
+    invalid = "How old are you? R2_OFFLINE_AGE_INVALID"
+    conversation(binary, workspace, url, (invalid,), 2048)
+    with sqlite3.connect(reality) as db:
+        assert db.execute("SELECT value FROM r2_reality_meta WHERE key=?", (key,)).fetchone() == (
+            old_anchor + "invalid",
+        )
+        db.execute("UPDATE r2_reality_meta SET value=? WHERE key=?", (old_anchor, key))
+
+    for marker, evidence in (
+        (fresh, "AGE: about 0 days since the original conversation file was created."),
+        (saved, "AGE: about half a year old"),
+        (invalid, "creation time is unavailable or invalid; age is not guessed."),
+    ):
+        assert any(
+            request.get("options", {}).get("num_ctx") == 2048
+            and any(item.get("role") == "user" and item.get("content") == marker
+                    for item in request.get("messages", []))
+            and any(item.get("role") == "system" and item.get("content", "").startswith("PERSISTENT REALITY CONTEXT")
+                    and evidence in item["content"] for item in request.get("messages", []))
+            for request in LocalOllama.requests
+        ), marker
+    print("PASS: compact age context used the file creation date and preserved its authority across restart.")
+
+
+def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> None:
+    log_file = workspace.parent / "partial-line-shutdown.log"
+    unfinished = "R2_PARTIAL_INPUT_SHOULD_NEVER_REACH_THE_MODEL"
+    start = len(LocalOllama.requests)
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            deadline = time.monotonic() + 20
+            while process.poll() is None and time.monotonic() < deadline:
+                if "R2> " in log_file.read_text(encoding="utf-8", errors="replace"):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(log_file.read_text(encoding="utf-8", errors="replace")[-16000:])
+            process.stdin.write(f"talk {unfinished}")
+            process.stdin.flush()
+            time.sleep(0.2)
+            # Leave stdin open and omit the newline, reproducing the blocked read.
+            process.terminate()
+            process.wait(timeout=8)
+            assert process.returncode == 0
+            assert "[R2-3PO shut down.]" in log_file.read_text(encoding="utf-8", errors="replace")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    assert not any(
+        unfinished in item.get("content", "")
+        for request in LocalOllama.requests[start:] for item in request.get("messages", [])
+    )
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM r2_log_conversations WHERE instr(user_text,?)", (unfinished,)
+        ).fetchone() == (0,)
+    print("PASS: interactive SIGTERM left the incomplete line undispatched and closed cleanly.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -475,7 +563,9 @@ def main() -> int:
             oversized_typed_turn(binary, workspace, url)
             oversized_action_result(binary, workspace, url)
             oversized_user_and_action(binary, workspace, url)
+            compact_age_continuity(binary, workspace, url)
             autonomous_cycle(binary, workspace, url)
+            interrupt_partial_terminal_line(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

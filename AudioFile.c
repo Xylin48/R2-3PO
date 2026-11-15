@@ -25,6 +25,7 @@ struct R2AudioFile {
     int cancel_fd;          /* eventfd wakes an indefinitely silent decoder */
     pid_t child;            /* direct FFmpeg child, NOT a shell PID */
     size_t frame_bytes;     /* interleaved S16LE sample for each channel */
+    int eof_error;          /* retained by the sole reader */
     atomic_int cancelled;
 };
 
@@ -121,6 +122,7 @@ error:
  * the lifecycle owner to terminate rather than blocking the reader. */
 static int r2_file_check_eof(R2AudioFile *file)
 {
+    if (file->eof_error) { errno = file->eof_error; return -1; }
     if (file->child <= 0) return 0;
     uint64_t start = r2_file_now_ms();
     for (;;) {
@@ -131,13 +133,15 @@ static int r2_file_check_eof(R2AudioFile *file)
         if (result == file->child) {
             file->child = -1; /* reaped; owner must never signal this PID */
             if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                file->eof_error = EIO;
                 errno = EIO;
                 return -1;
             }
             return 0;
         }
         if (result < 0) {
-            if (errno == ECHILD) { file->child = -1; return 0; }
+            file->eof_error = errno;
+            if (errno == ECHILD) file->child = -1;
             return -1;
         }
         if (atomic_load(&file->cancelled)) {
@@ -146,8 +150,11 @@ static int r2_file_check_eof(R2AudioFile *file)
         }
         uint64_t now = r2_file_now_ms();
         if (start == UINT64_MAX || now == UINT64_MAX ||
-            now < start || now - start >= 150U)
-            return 0; /* EOF certain, child exit status not yet known */
+            now < start || now - start >= 150U) {
+            file->eof_error = ETIMEDOUT;
+            errno = ETIMEDOUT;
+            return -1; /* Pipe EOF is known; successful decoding is unconfirmed. */
+        }
         struct timespec pause = {0, 5000000L};
         while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {}
     }

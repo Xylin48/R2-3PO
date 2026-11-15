@@ -13,7 +13,7 @@ def require(ok: bool, message: str) -> None:
 require("R2_MAX_TURN_INPUT_BYTES" in shell and "char *line = NULL;" in shell,
         "shell bounds dynamic input with the same limit as the direct console")
 loop = shell.find("int r2_shell_run(void)")
-read = shell.find("r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES, &input_bytes)", loop)
+read = shell.find("r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity,", loop)
 check = shell.find("if (input_status == R2_INPUT_LINE_TOO_LONG)", read)
 dispatch = shell.find("shell_dispatch(line);", check)
 require(min(loop, read, check, dispatch) >= 0 and read < check < dispatch,

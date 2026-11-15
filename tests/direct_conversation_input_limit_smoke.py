@@ -17,7 +17,7 @@ def require(ok: bool, message: str) -> None:
         print(f"FAIL: {message}", file=sys.stderr)
         raise SystemExit(1)
 
-read = body.find("r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES,")
+read = body.find("r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity,")
 check = body.find("if (input_status == R2_INPUT_LINE_TOO_LONG)", read)
 quit_check = body.find('!strcasecmp(line, "quit")', check)
 talk = body.find("r2_talk(line)", check)

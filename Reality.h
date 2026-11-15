@@ -33,6 +33,8 @@ int r2_reality_tick(void);
 
 /* Caller frees all returned strings. */
 char *r2_reality_status(void);
+/* Caller frees evidence based on the original conversation's creation time. */
+char *r2_reality_age_context(void);
 char *r2_reality_room_look(void);
 char *r2_reality_list(const char *container);
 char *r2_reality_context(void);

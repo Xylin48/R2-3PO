@@ -22,7 +22,7 @@ loop = shell[start:end]
 
 require("char *line = NULL;" in loop and "R2_MAX_TURN_INPUT_BYTES" in loop,
         "terminal input grows only to the shared live turn limit")
-require("r2_read_complete_line(stdin, &line, &line_capacity, R2_MAX_TURN_INPUT_BYTES, &input_bytes)" in loop
+require("r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity," in loop
         and "getline(" not in loop,
         "interactive input uses the shared bounded reader, not unbounded getline allocation")
 require("if (input_status == R2_INPUT_LINE_TOO_LONG)" in loop
