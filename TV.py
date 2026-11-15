@@ -279,6 +279,10 @@ class CRTDisplay:
                         raise ValueError("Saved VCR position is invalid") from exc
                     if not math.isfinite(saved_position):
                         raise ValueError("Saved VCR position is not finite")
+                    # Match the validated control protocol: malformed legacy
+                    # values must not overflow VLC's millisecond seek.
+                    if saved_position > 604800:
+                        raise ValueError("Saved VCR position exceeds the supported range")
                     position = max(0.0, saved_position)
             return path, transport, position
 
