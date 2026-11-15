@@ -71,6 +71,10 @@ jobs:
         run: |
           python3 -m py_compile tests/shell_input_bound_smoke.py
           python3 tests/shell_input_bound_smoke.py
+      - name: Preserve seasonal shell themes and manual theme selection
+        run: |
+          python3 -m py_compile tests/seasonal_shell_smoke.py
+          python3 tests/seasonal_shell_smoke.py
       - name: Check fail-closed Ollama message serialization
         run: |
           python3 -m py_compile tests/ollama_payload_allocation_smoke.py
