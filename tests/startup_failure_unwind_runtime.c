@@ -32,12 +32,24 @@ static void check_location_reply(const char *action, const char *expected)
     free(reply);
 }
 
-static void test_welcome_replay(void)
+static void test_world_and_welcome_replay(void)
 {
     assert(r2_init() == 0);
     sqlite3 *memory = NULL;
     assert(sqlite3_open_v2(R2_DIARY_DATABASE, &memory,
                           SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+    check_location_reply("[WORLD] add|fixture book|A sample book|pockets", "REAL WORLD RESULT");
+    check_location_reply("[WORLD] remove|fixture book|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] move|fixture book|shelf|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] self|fixture|value|evidence|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] activity_start|fixture|Sample|details|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] money_withdraw|1.00|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] eat|fixture book|auto|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] sleep|8|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] tv_power|on|extra", "REAL WORLD ERROR");
+    check_location_reply("[WORLD] tv_tune|99", "could not select RF channel 99");
+    check_location_reply("[WORLD] gameboy_power_on|extra", "unsupported Game Boy console action");
+    check_location_reply("[WORLD] remove|fixture book", "REAL WORLD RESULT");
     check_location_reply("[WORLD] location|library|outside|extra", "LOCATION ERROR");
     assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
                                "WHERE event_type='location_changed'") == 0);
@@ -97,7 +109,7 @@ int main(int argc, char **argv)
     }
 
     if (!strcmp(argv[1], "welcome")) {
-        test_welcome_replay();
+        test_world_and_welcome_replay();
         return 0;
     }
 

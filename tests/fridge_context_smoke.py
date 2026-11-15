@@ -76,8 +76,8 @@ if '"fullness", "REAL NOT NULL DEFAULT 0"' not in legacy_migration_block or '"en
 if "double fullness = 100.0, energy = 10.0;" in reality or "double stored_fullness = 100.0, energy = 10.0;" in reality:
     raise SystemExit("fridge take/eat paths must not carry fabricated nutrition fallback values")
 
-eat_start = r2.find('} else if (nf >= 3 && !strcasecmp(fields[0], "eat")) {')
-eat_end = r2.find('} else if (nf >= 4 && !strcasecmp(fields[0], "ratefood")) {', eat_start)
+eat_start = r2.find('} else if (nf == 3 && !strcasecmp(fields[0], "eat")) {')
+eat_end = r2.find('} else if (nf == 4 && !strcasecmp(fields[0], "ratefood")) {', eat_start)
 if eat_start < 0 or eat_end < 0:
     raise SystemExit("could not find the world-eat action parser")
 eat_action = r2[eat_start:eat_end]

@@ -9049,7 +9049,7 @@ static char *process_tools_with_status(
             APPEND("WORLD ERROR: too many fields; no action was taken.\n");
             continue;
         }
-        if (nf >= 3 && !strcasecmp(fields[0], "activity_start")) {
+        if (nf >= 3 && nf <= 4 && !strcasecmp(fields[0], "activity_start")) {
             int64_t id = r2_log_activity_start(fields[1], fields[2], nf >= 4 ? fields[3] : NULL);
             APPEND("ACTIVITY %s: %s.\n",
                    id > 0 ? "STARTED" : "ERROR",
@@ -9068,30 +9068,30 @@ static char *process_tools_with_status(
             int is_power_on = 0;
             int is_power_off = 0;
             int is_status = 0;
-            if (!strcasecmp(fields[0], "gameboy_status")) {
+            if (nf == 1 && !strcasecmp(fields[0], "gameboy_status")) {
                 command = "status";
                 is_status = 1;
-            } else if (!strcasecmp(fields[0], "gameboy_list")) {
+            } else if (nf == 1 && !strcasecmp(fields[0], "gameboy_list")) {
                 command = "list";
-            } else if (!strcasecmp(fields[0], "gameboy_insert") && nf >= 2) {
+            } else if (nf == 2 && !strcasecmp(fields[0], "gameboy_insert")) {
                 command = "insert";
                 arg1 = fields[1];
-            } else if (!strcasecmp(fields[0], "gameboy_eject")) {
+            } else if (nf == 1 && !strcasecmp(fields[0], "gameboy_eject")) {
                 command = "eject";
-            } else if (!strcasecmp(fields[0], "gameboy_move_cartridge") && nf >= 3) {
+            } else if (nf == 3 && !strcasecmp(fields[0], "gameboy_move_cartridge")) {
                 command = "move";
                 arg1 = fields[1];
                 arg2 = fields[2];
-            } else if (!strcasecmp(fields[0], "gameboy_power_on")) {
+            } else if (nf == 1 && !strcasecmp(fields[0], "gameboy_power_on")) {
                 command = "power";
                 arg1 = "on";
                 is_power_on = 1;
-            } else if (!strcasecmp(fields[0], "gameboy_power_off")) {
+            } else if (nf == 1 && !strcasecmp(fields[0], "gameboy_power_off")) {
                 command = "power";
                 arg1 = "off";
                 is_power_off = 1;
             } else if ((!strcasecmp(fields[0], "gameboy_press") ||
-                        !strcasecmp(fields[0], "gameboy_hold")) && nf >= 2) {
+                        !strcasecmp(fields[0], "gameboy_hold")) && nf >= 2 && nf <= 3) {
                 command = "press";
                 arg1 = fields[1];
                 arg2 = nf >= 3 ? fields[2] : "120";
@@ -9207,7 +9207,7 @@ static char *process_tools_with_status(
                 else
                     APPEND("LOCATION ERROR: the requested move could not be committed.\n");
             }
-        } else if (nf > 0 && !strcasecmp(fields[0], "look")) {
+        } else if (nf == 1 && !strcasecmp(fields[0], "look")) {
             char *view = r2_reality_room_look();
             APPEND("REAL WORLD RESULT:\n%s\n", view ? view : "Could not read room state.");
             free(view);
@@ -9228,33 +9228,33 @@ static char *process_tools_with_status(
                    rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was persisted in the requested container" :
                    (valid_qty ? "could not be saved" : "was rejected because quantity must be a positive whole number"));
-        } else if (nf >= 3 && !strcasecmp(fields[0], "move")) {
+        } else if (nf == 3 && !strcasecmp(fields[0], "move")) {
             int rc = r2_reality_move_item(fields[1], fields[2]);
             APPEND("REAL WORLD %s: item '%s' %s.\n",
                    rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was moved to the requested container" : "could not be moved (item may not exist)");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "remove")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "remove")) {
             int rc = r2_reality_remove_item(fields[1]);
             APPEND("REAL WORLD %s: item '%s' %s.\n",
                    rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was removed from the tracked world" : "could not be removed (item may not exist)");
-        } else if(nf>=2&&!strcasecmp(fields[0],"money_receive")){
+        } else if (nf == 2 && !strcasecmp(fields[0], "money_receive")) {
             double a=0.0;int valid=parse_finite_double(fields[1],&a);int rc=valid?r2_reality_money_receive(a):-1;APPEND("MONEY %s: received $%.2f %s.\n",rc==0?"RESULT":"ERROR",a,rc==0?"as carried cash":"failed; check amount");
-        } else if(nf>=2&&!strcasecmp(fields[0],"money_deposit")){
+        } else if (nf == 2 && !strcasecmp(fields[0], "money_deposit")) {
             double a=0.0;int valid=parse_finite_double(fields[1],&a);int rc=valid?r2_reality_money_deposit(a):-1;APPEND("MONEY %s: deposit $%.2f %s.\n",rc==0?"RESULT":"ERROR",a,rc==0?"saved to piggybank":"failed; check cash");
-        } else if(nf>=2&&!strcasecmp(fields[0],"money_withdraw")){
+        } else if (nf == 2 && !strcasecmp(fields[0], "money_withdraw")) {
             double a=0.0;int valid=parse_finite_double(fields[1],&a);int rc=valid?r2_reality_money_withdraw(a):-1;APPEND("MONEY %s: withdrawal $%.2f %s.\n",rc==0?"RESULT":"ERROR",a,rc==0?"moved to cash":"failed; check bank balance");
-        } else if(nf>=5&&!strcasecmp(fields[0],"buy")){
+        } else if (nf == 5 && !strcasecmp(fields[0], "buy")) {
             double price=0.0;int valid=parse_finite_double(fields[2],&price);int rc=valid?r2_reality_buy_item(fields[1],fields[3],price,fields[4]):-1;APPEND("PURCHASE %s: %s for $%.2f %s.\n",rc==0?"RESULT":"ERROR",fields[1],price,rc==0?"paid and added":"failed; check funds and destination");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "fridge")) {
+        } else if (nf <= 2 && !strcasecmp(fields[0], "fridge")) {
             char *view = r2_fridge_context();
             APPEND("FRIDGE RESULT:\n%s\n", view ? view : "Fridge database unavailable.");
             free(view);
-        } else if (nf >= 2 && !strcasecmp(fields[0], "fridge_take")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "fridge_take")) {
             int rc = r2_fridge_take(fields[1]);
             APPEND("FRIDGE %s: '%s' %s.\n", rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was moved into R2's pockets" : "could not be taken from the fridge");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "fridge_eat")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "fridge_eat")) {
             int rc = r2_eat_fridge_and_learn(fields[1], -1.0);
             if (rc == 0 && world_action_succeeded)
                 *world_action_succeeded = 1;
@@ -9264,25 +9264,28 @@ static char *process_tools_with_status(
             char *tv = r2_reality_tv_status();
             APPEND("TV STATUS:\n%s", tv ? tv : "TV state unavailable.\n");
             free(tv);
-        } else if (nf >= 2 && !strcasecmp(fields[0], "tv_power")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "tv_power")) {
             int on = !strcasecmp(fields[1], "on") ? 1 : !strcasecmp(fields[1], "off") ? 0 : -1;
             int rc = on >= 0 ? r2_reality_tv_power(on) : -1;
-            APPEND("TV %s: power %s. Eyes/attention are separate and were not changed.\n",
-                   rc == 0 ? "RESULT" : "ERROR", on ? "on" : "off");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "tv_input")) {
+            if (rc == 0)
+                APPEND("TV RESULT: power %s.\n", on ? "on" : "off");
+            else
+                APPEND("TV ERROR: could not set power. Use on or off.\n");
+        } else if (nf == 2 && !strcasecmp(fields[0], "tv_input")) {
             char *end = NULL; long input = strtol(fields[1], &end, 10);
             int rc = (end != fields[1] && !*end && input >= 1 && input <= 4)
                 ? r2_reality_tv_select_input((int)input) : -1;
             APPEND("TV %s: AV input %s.\n", rc == 0 ? "RESULT" : "ERROR", fields[1]);
-        } else if (nf >= 2 && !strcasecmp(fields[0], "tv_tune")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "tv_tune")) {
             char *end = NULL; long channel = strtol(fields[1], &end, 10);
             int rc = (end != fields[1] && !*end && channel >= 2 && channel <= 13)
                 ? r2_reality_tv_tune_rf((int)channel) : -1;
             char *tv = r2_reality_tv_status();
-            APPEND("TV %s: RF channel %s selected. Current state:\n%s",
-                   rc == 0 ? "RESULT" : "ERROR", fields[1], tv ? tv : "unavailable\n");
+            APPEND("TV %s: %s RF channel %s. Current state:\n%s",
+                   rc == 0 ? "RESULT" : "ERROR",
+                   rc == 0 ? "selected" : "could not select", fields[1], tv ? tv : "unavailable\n");
             free(tv);
-        } else if (nf >= 4 && !strcasecmp(fields[0], "tv_connect")) {
+        } else if (nf == 4 && !strcasecmp(fields[0], "tv_connect")) {
             char *end = NULL;
             errno = 0;
             long port = strtol(fields[3], &end, 10);
@@ -9290,17 +9293,19 @@ static char *process_tools_with_status(
                 port >= INT_MIN && port <= INT_MAX;
             int rc = valid_port
                 ? r2_reality_tv_connect(fields[1], fields[2], (int)port) : -1;
-            APPEND("TV DEVICE %s: %s connected to %s %s.\n",
-                   rc == 0 ? "RESULT" : "ERROR", fields[1], fields[2], fields[3]);
-        } else if (nf >= 2 && !strcasecmp(fields[0], "tv_disconnect")) {
+            APPEND("TV DEVICE %s: %s %s to %s %s.\n",
+                   rc == 0 ? "RESULT" : "ERROR", fields[1],
+                   rc == 0 ? "connected" : "could not connect", fields[2], fields[3]);
+        } else if (nf == 2 && !strcasecmp(fields[0], "tv_disconnect")) {
             int rc = r2_reality_tv_disconnect(fields[1]);
-            APPEND("TV DEVICE %s: %s disconnected.\n",
-                   rc == 0 ? "RESULT" : "ERROR", fields[1]);
-        } else if (nf >= 2 && !strcasecmp(fields[0], "fridge_store")) {
+            APPEND("TV DEVICE %s: %s %s.\n",
+                   rc == 0 ? "RESULT" : "ERROR", fields[1],
+                   rc == 0 ? "disconnected" : "could not disconnect");
+        } else if (nf == 2 && !strcasecmp(fields[0], "fridge_store")) {
             int rc = r2_reality_move_item(fields[1], "fridge");
             APPEND("FRIDGE %s: '%s' %s.\n", rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was moved from inventory into the fridge" : "could not be stored");
-        } else if (nf >= 3 && !strcasecmp(fields[0], "eat")) {
+        } else if (nf == 3 && !strcasecmp(fields[0], "eat")) {
             /* The XML metric is authoritative for tracked food. Do not let
                model output invent a fullness value with atof() (which also
                silently turns malformed text into zero). */
@@ -9313,7 +9318,7 @@ static char *process_tools_with_status(
                    rc == 0 ? "updated persistent hunger and energy" :
                    (valid_metric_request ? "failed; item or authoritative food metric is unavailable" :
                                            "failed; use auto so the configured food metric remains authoritative"));
-        } else if (nf >= 4 && !strcasecmp(fields[0], "ratefood")) {
+        } else if (nf == 4 && !strcasecmp(fields[0], "ratefood")) {
             char *end = NULL;
             long score = strtol(fields[2], &end, 10);
             int rc = (end != fields[2] && !*end && score >= -2 && score <= 2)
@@ -9321,7 +9326,7 @@ static char *process_tools_with_status(
             APPEND("FOOD PREFERENCE %s: rating for '%s' %s.\n",
                    rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "was saved as a subjective score" : "could not be saved; score must be -2..2 and an unrated meal must exist");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "sleep")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "sleep")) {
             double hours = 0.0;
             int valid_hours = parse_finite_double(fields[1], &hours) &&
                               hours > 0.0 && hours <= 48.0;
@@ -9331,12 +9336,12 @@ static char *process_tools_with_status(
             APPEND("REAL NEEDS %s: sleep transition %s.\n",
                    rc == 0 ? "RESULT" : "ERROR",
                    rc == 0 ? "was persisted" : "could not be persisted (hours must be a finite number >0 and <=48)");
-        } else if (nf >= 2 && !strcasecmp(fields[0], "dream")) {
+        } else if (nf == 2 && !strcasecmp(fields[0], "dream")) {
             int rc = r2_reality_record_dream(fields[1]);
             APPEND("REAL SELF-CONTINUITY %s: reported dream %s.\n",
                    rc == 0 ? "RESULT" : "ERROR",
                    rc == 0 ? "was recorded as a report, not verified fact" : "could not be recorded");
-        } else if (nf >= 3 && !strcasecmp(fields[0], "self")) {
+        } else if (nf >= 3 && nf <= 4 && !strcasecmp(fields[0], "self")) {
             int rc = r2_reality_set_self(fields[1], fields[2], nf >= 4 ? fields[3] : "R2 self-report");
             APPEND("REAL SELF-CONTINUITY %s: '%s' %s.\n",
                    rc == 0 ? "RESULT" : "ERROR", fields[1],
