@@ -359,6 +359,22 @@ int main(void)
     char refused_path[PATH_MAX];
     assert(visual_create_archive(library, &archive_probe, refused_path,
                                  sizeof(refused_path)) < 0);
+    char redirected_file[PATH_MAX], redirected_claim[PATH_MAX];
+    assert(snprintf(redirected_file, sizeof(redirected_file), "%s/redirected.jpg",
+                    R2_HOME) < (int)sizeof(redirected_file));
+    assert(snprintf(redirected_claim, sizeof(redirected_claim), "%s/redirected.jpg",
+                    library) < (int)sizeof(redirected_claim));
+    int redirected_fd = open(redirected_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(redirected_fd >= 0 && __real_write(redirected_fd, "ORIGINAL", 8) == 8);
+    assert(close(redirected_fd) == 0);
+    assert(visual_restore_pending_image(redirected_claim,
+                                        (const unsigned char *)"ORIGINAL", 8) < 0);
+    size_t redirected_length = 0;
+    unsigned char *redirected_bytes = read_file(redirected_file, &redirected_length);
+    assert(redirected_bytes && redirected_length == 8 &&
+           !memcmp(redirected_bytes, "ORIGINAL", 8));
+    free(redirected_bytes);
+    assert(unlink(redirected_file) == 0);
     assert(unlink(library) == 0);
     assert(rename(moved_library, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
