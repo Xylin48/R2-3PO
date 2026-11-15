@@ -1227,10 +1227,14 @@ static int visual_restore_pending_image(const char *path, const unsigned char *j
     /* A stored archive path is evidence, not authority to traverse arbitrary
        directories. Pin the configured library and open only its leaf name. */
     size_t root_length = strlen(visual_directory);
+    int root_is_slash = root_length == 1 && visual_directory[0] == '/';
+    size_t name_offset = root_length + (root_is_slash ? 0 : 1);
     if (!path || strncmp(path, visual_directory, root_length) != 0 ||
-        path[root_length] != '/' || !path[root_length + 1] ||
-        strchr(path + root_length + 1, '/')) { errno = EINVAL; return -1; }
-    const char *name = path + root_length + 1;
+        (!root_is_slash && path[root_length] != '/') ||
+        !path[name_offset] || strchr(path + name_offset, '/')) {
+        errno = EINVAL; return -1;
+    }
+    const char *name = path + name_offset;
     int dirfd = open(visual_directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dirfd < 0) return -1;
     struct stat pinned, current;
