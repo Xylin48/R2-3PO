@@ -14108,8 +14108,9 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                 *sep = '\0';
                 char *category = trim(p);
                 char *memory = trim(sep + 1);
-                if (*memory && !shutting_down &&
-                    atomic_load(&foreground_conversation_waiting) == 0) {
+                /* Foreground priority governs inference. A result already
+                   accepted by the parser still owns its durable memory write. */
+                if (*memory && !shutting_down) {
                     if (r2_log_save_learning(db, memory, category,
                                              source_event_id, write_memory) == 0) {
                         context_cache_invalidate();

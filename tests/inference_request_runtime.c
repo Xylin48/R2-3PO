@@ -21,6 +21,7 @@ static char *reviewed_bytes;
 static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
+static int foreground_after_response;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -94,6 +95,10 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     size_t n = strlen(response_body), split = n / 3;
     assert(write_response(response_body, 1, split, write_data) == split);
     assert(write_response(response_body + split, 1, n - split, write_data) == n - split);
+    if (foreground_after_response) {
+        foreground_after_response = 0;
+        atomic_store(&foreground_conversation_waiting, 1);
+    }
     return CURLE_OK;
 }
 CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
@@ -489,7 +494,9 @@ static void check_evaluated_memory_atomicity(void)
     assert(memory_fixture_count(memory_count) == 0 && memory_fixture_count(log_count) == 0);
     assert(db_exec("DROP TRIGGER ignore_learning_memory;") == 0);
 
+    foreground_after_response = 1;
     preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(atomic_exchange(&foreground_conversation_waiting, 0) == 1);
     assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 1);
     assert(memory_fixture_count(
         "SELECT count(*) FROM r2_log_links l JOIN r2_log_events from_event "
