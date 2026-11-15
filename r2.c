@@ -165,6 +165,8 @@ static atomic_int foreground_conversation_waiting = ATOMIC_VAR_INIT(0);
 /* Monotonic elapsed time of the most recent foreground user turn. */
 static atomic_uint_fast64_t last_conversation_activity_ms = ATOMIC_VAR_INIT(0);
 static _Thread_local int ollama_background_mode = 0;
+/* Set only while a post-turn worker can retry a deferred text request. */
+static _Thread_local int *post_turn_deferred;
 static _Thread_local int ollama_reflection_worker = 0;
 /* Nested model calls made by the foreground turn itself are not background work. */
 static _Thread_local int ollama_foreground_turn_mode = 0;
@@ -2946,12 +2948,14 @@ static int ollama_progress(void *userdata,
         }
     }
 
-    return shutting_down ||
-           (ollama_reflection_worker && !atomic_load(&diary_running)) ||
-           (ollama_background_mode &&
+    int foreground_has_priority = ollama_background_mode &&
             (atomic_load(&foreground_ollama_waiting) > 0 ||
              (atomic_load(&foreground_conversation_waiting) > 0 &&
-              !ollama_foreground_turn_mode))) ? 1 : 0;
+              !ollama_foreground_turn_mode));
+    if (foreground_has_priority && post_turn_deferred)
+        *post_turn_deferred = 1;
+    return shutting_down || (ollama_reflection_worker && !atomic_load(&diary_running)) ||
+           foreground_has_priority;
 }
 
 int r2_ollama_vision_request_begin(void)
@@ -4436,7 +4440,12 @@ static char *ollama_chat_with_limit(
 
     if (ollama_background_mode) {
         /* Never queue background reflection/bookkeeping ahead of a live turn. */
-        if (pthread_mutex_trylock(&ollama_request_lock) != 0) {
+        int lock_result = pthread_mutex_trylock(&ollama_request_lock);
+        if (lock_result != 0 || ollama_progress(NULL, 0, 0, 0, 0)) {
+            if (lock_result == 0)
+                pthread_mutex_unlock(&ollama_request_lock);
+            if (lock_result == EBUSY && post_turn_deferred)
+                *post_turn_deferred = 1;
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
             json_object_put(root);
@@ -4468,7 +4477,8 @@ static char *ollama_chat_with_limit(
         /* A background request intentionally yields when a foreground turn
            arrives or shutdown begins; that is not a user-facing transport error. */
         if (ollama_background_mode &&
-            (shutting_down || atomic_load(&foreground_ollama_waiting) > 0 ||
+            (shutting_down || (post_turn_deferred && *post_turn_deferred) ||
+             atomic_load(&foreground_ollama_waiting) > 0 ||
              (atomic_load(&foreground_conversation_waiting) > 0 &&
               !ollama_foreground_turn_mode))) {
             free(b.data);
@@ -13963,6 +13973,7 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     }
     free(input);
     if (!json_text) {
+        if (post_turn_deferred && *post_turn_deferred) return;
         r2_log_event(R2_LOG_ERROR, "self_state_extraction_failed",
                      "Structured self-state extraction did not return a response.",
                      NULL, "log_structured_self_report");
@@ -14109,6 +14120,7 @@ static void preserve_evidence_memory(const char *user, const char *reply,
             fprintf(stderr, "[R2 Post-turn] Memory review archive #%lld could not be linked to conversation #%lld.\n",
                     (long long)archive_id, (long long)source_event_id);
         if (!decision) {
+            if (post_turn_deferred && *post_turn_deferred) return;
             char details[160];
             snprintf(details, sizeof(details),
                      "source_event_id=%lld; memory decision returned no result.",
@@ -14161,13 +14173,21 @@ static void *post_turn_worker(void *opaque)
        releases its foreground-priority flag before starting background model
        work; otherwise its own post-turn inference would cancel itself. */
     const struct timespec post_turn_pause = { .tv_sec = 0, .tv_nsec = 100000000L };
-    while (!shutting_down &&
-           atomic_load(&foreground_conversation_waiting) > 0)
-        nanosleep(&post_turn_pause, NULL);
-
-    if (!shutting_down)
-        log_structured_self_report(job->reply, job->event_id);
-    preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
+    int deferred = 0;
+    post_turn_deferred = &deferred;
+    for (int stage = 0; stage < 2 && !shutting_down;) {
+        if (deferred || atomic_load(&foreground_conversation_waiting) > 0)
+            nanosleep(&post_turn_pause, NULL);
+        if (shutting_down) break;
+        if (atomic_load(&foreground_conversation_waiting) > 0) continue;
+        deferred = 0;
+        if (stage == 0)
+            log_structured_self_report(job->reply, job->event_id);
+        else
+            preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
+        if (!deferred) stage++;
+    }
+    post_turn_deferred = NULL;
 
     ollama_background_mode = 0;
     free(job->user);

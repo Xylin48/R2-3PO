@@ -23,6 +23,7 @@ static int staged_calls;
 static int fail_transport_at;
 static int foreground_after_response;
 static int completed_turn_after_response;
+static int defer_post_turn_request;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -52,6 +53,12 @@ CURLcode __wrap_curl_easy_setopt(CURL *curl, CURLoption option, ...)
 CURLcode __wrap_curl_easy_perform(CURL *curl)
 {
     (void)curl; ++perform_count;
+    if (defer_post_turn_request && --defer_post_turn_request == 0) {
+        atomic_store(&foreground_conversation_waiting, 1);
+        assert(ollama_progress(NULL, 0, 0, 0, 0));
+        atomic_store(&foreground_conversation_waiting, 0);
+        return CURLE_ABORTED_BY_CALLBACK;
+    }
     if (perform_count == fail_transport_at) return CURLE_COULDNT_CONNECT;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
@@ -93,9 +100,13 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         }
         assert(request_bytes <= (size_t)(4096 - 512 - 512) * 32U / 10U);
     }
-    size_t n = strlen(response_body), split = n / 3;
-    assert(write_response(response_body, 1, split, write_data) == split);
-    assert(write_response(response_body + split, 1, n - split, write_data) == n - split);
+    char structured[] = "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+                        "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
+                        "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
+    char *body = defer_post_turn_request == 1 ? structured : response_body;
+    size_t n = strlen(body), split = n / 3;
+    assert(write_response(body, 1, split, write_data) == split);
+    assert(write_response(body + split, 1, n - split, write_data) == n - split);
     if (foreground_after_response) {
         foreground_after_response = 0;
         atomic_store(&foreground_conversation_waiting, 1);
@@ -489,6 +500,31 @@ static void check_stale_needs_decision(void)
     db = NULL;
 }
 
+static void check_post_turn_retry(void)
+{
+    assert(init_db() == 0);
+    int64_t source = r2_log_conversation_turn("What do you remember?", "I remember the blue door.");
+    assert(source > 0);
+    R2PostTurnJob *job = calloc(1, sizeof(*job));
+    assert(job);
+    job->user = strdup("What do you remember?");
+    job->reply = strdup("I remember the blue door.");
+    job->event_id = source;
+    assert(job->user && job->reply);
+    set_response("knowledge | The door was blue.", "stop", 1);
+    const char *failures = "SELECT count(*) FROM r2_log_events WHERE event_type='post_turn_memory_decision_failed';";
+    int initial_failures = memory_fixture_count(failures);
+    int before = perform_count;
+    defer_post_turn_request = 2;
+    post_turn_worker(job);
+    assert(perform_count == before + 3 && defer_post_turn_request == 0);
+    assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
+    assert(memory_fixture_count(failures) == initial_failures);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_evaluated_memory_atomicity(void)
 {
     assert(init_db() == 0);
@@ -873,6 +909,7 @@ int main(void)
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
+    check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();
     r2_log_shutdown();

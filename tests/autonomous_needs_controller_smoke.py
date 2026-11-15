@@ -90,7 +90,7 @@ assert "!ollama_foreground_turn_mode" in source[vision_abort_start:vision_abort_
 worker_start = source.index("static void *post_turn_worker(void *opaque)\n{")
 worker_end = source.index("\n/* These model-assisted bookkeeping tasks", worker_start)
 worker = source[worker_start:worker_end]
-assert "while (!shutting_down" in worker
+assert "stage < 2 && !shutting_down" in worker
 assert "atomic_load(&foreground_conversation_waiting) > 0" in worker
 assert worker.index("atomic_load(&foreground_conversation_waiting) > 0") < worker.index("log_structured_self_report")
 
