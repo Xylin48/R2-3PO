@@ -1224,12 +1224,29 @@ static int visual_managed_archive_path(const char *path, const R2VisionFrame *fr
  * existing, nonempty prefix. Conflicting files and active claims stay intact. */
 static int visual_restore_pending_image(const char *path, const unsigned char *jpeg, size_t length)
 {
+    /* A stored archive path is evidence, not authority to traverse arbitrary
+       directories. Pin the configured library and open only its leaf name. */
+    size_t root_length = strlen(visual_directory);
+    if (!path || strncmp(path, visual_directory, root_length) != 0 ||
+        path[root_length] != '/' || !path[root_length + 1] ||
+        strchr(path + root_length + 1, '/')) { errno = EINVAL; return -1; }
+    const char *name = path + root_length + 1;
+    int dirfd = open(visual_directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0) return -1;
+    struct stat pinned, current;
+    if (fstat(dirfd, &pinned) != 0 || lstat(visual_directory, &current) != 0) {
+        int error = errno; close(dirfd); errno = error; return -1;
+    }
+    if (!S_ISDIR(current.st_mode) || !S_ISDIR(pinned.st_mode) ||
+        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
+        close(dirfd); errno = ESTALE; return -1;
+    }
     int flags = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
-    int fd = open(path, O_RDWR | flags);
+    int fd = openat(dirfd, name, O_RDWR | flags);
     int writable = fd >= 0;
     if (fd < 0 && (errno == EACCES || errno == EROFS))
-        fd = open(path, O_RDONLY | flags);
-    if (fd < 0) return -1;
+        fd = openat(dirfd, name, O_RDONLY | flags);
+    if (fd < 0) { int error = errno; close(dirfd); errno = error; return -1; }
     struct stat st;
     int valid = flock(fd, LOCK_EX | LOCK_NB) == 0 && fstat(fd, &st) == 0 &&
         S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_size > 0 &&
@@ -1248,10 +1265,13 @@ static int visual_restore_pending_image(const char *path, const unsigned char *j
             lseek(fd, (off_t)present, SEEK_SET) == (off_t)present &&
             write_all(fd, jpeg + present, length - present) == 0;
     }
-    if (valid && visual_sync(fd) == 0 && visual_sync_directory(visual_directory) == 0 &&
-        visual_archive_matches_claim(fd, path))
+    if (valid && visual_sync(fd) == 0 && visual_sync(dirfd) == 0 &&
+        visual_archive_matches_claim(fd, path)) {
+        close(dirfd);
         return fd;
+    }
     close(fd);
+    close(dirfd);
     return -1;
 }
 
