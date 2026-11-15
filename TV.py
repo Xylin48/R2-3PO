@@ -231,7 +231,7 @@ class CRTDisplay:
         self.control(f"tune {channel}")
 
     def read_state(self) -> tuple[int, str, int, str | None]:
-        uri = f"file:{DB_PATH}?mode=ro"
+        uri = DB_PATH.resolve().as_uri() + "?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
             row = db.execute(
                 "SELECT power, source_kind, source_value FROM r2_tv_state WHERE id=1"
@@ -257,7 +257,7 @@ class CRTDisplay:
             return power, kind, value, device
 
     def read_vcr_state(self) -> tuple[str | None, str, float]:
-        uri = f"file:{DB_PATH}?mode=ro"
+        uri = DB_PATH.resolve().as_uri() + "?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
             row = db.execute(
                 "SELECT cassette_path, transport FROM r2_tv_vcr_state WHERE id=1"
