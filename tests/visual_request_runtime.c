@@ -349,6 +349,18 @@ int main(void)
     assert(r2_visual_init(database, symlink_nested) != 0);
     assert(unlink(symlink_library) == 0);
     assert(r2_visual_init(database, library) == 0);
+    /* A replaced archive root must never redirect frame writes. */
+    char moved_library[PATH_MAX];
+    assert(snprintf(moved_library, sizeof(moved_library), "%s-moved", library)
+           < (int)sizeof(moved_library));
+    assert(rename(library, moved_library) == 0);
+    assert(symlink(R2_HOME, library) == 0);
+    R2VisionFrame archive_probe = {.timestamp=1234, .frame_number=1};
+    char refused_path[PATH_MAX];
+    assert(visual_create_archive(library, &archive_probe, refused_path,
+                                 sizeof(refused_path)) < 0);
+    assert(unlink(library) == 0);
+    assert(rename(moved_library, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
     R2VisionFrame frame = {.data=rgb, .size=sizeof(rgb), .format={1,1,3,24,R2_PIXEL_RGB24}, .timestamp=1234, .frame_number=1, .preview_session=fixture_preview_session};
     size_t encoded = 0;
