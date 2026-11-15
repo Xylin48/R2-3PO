@@ -477,7 +477,8 @@ static int sound_fence_line(const char *line, size_t length,
     return 1;
 }
 
-static char *process_reply_markers(const char *reply, int play_sound)
+static char *process_reply_markers(const char *reply, int play_sound,
+                                   size_t (*literal_span)(const char *, size_t))
 {
     if (!reply) return NULL;
     size_t len = strlen(reply);
@@ -496,6 +497,13 @@ static char *process_reply_markers(const char *reply, int play_sound)
     const size_t marker_length = sizeof(marker_text) - 1;
 
     while (src < len) {
+        size_t span = !in_fence && inline_ticks == 0 && literal_span ? literal_span(reply, src) : 0;
+        if (span && span <= len - src) {
+            memcpy(clean + dst, reply + src, span);
+            dst += span;
+            src += span;
+            continue;
+        }
         size_t line_end = src;
         while (line_end < len && reply[line_end] != '\n')
             ++line_end;
@@ -604,10 +612,16 @@ static char *process_reply_markers(const char *reply, int play_sound)
 
 char *r2_sounds_strip_markers(const char *reply)
 {
-    return process_reply_markers(reply, 0);
+    return process_reply_markers(reply, 0, NULL);
+}
+
+char *r2_sounds_strip_markers_with_literals(const char *reply,
+                                            size_t (*literal_span)(const char *, size_t))
+{
+    return process_reply_markers(reply, 0, literal_span);
 }
 
 char *r2_sounds_process_reply(const char *reply)
 {
-    return process_reply_markers(reply, 1);
+    return process_reply_markers(reply, 1, NULL);
 }

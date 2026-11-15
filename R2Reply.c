@@ -202,12 +202,18 @@ static const char *reply_find_fence_close(const char *text, size_t length,
 }
 
 /* Return the answer after a line label outside Markdown code. */
-static const char *reply_find_final_content(const char *text)
+static const char *reply_find_final_content(const char *text,
+                                             size_t (*literal_span)(const char *, size_t))
 {
     size_t length = strlen(text);
     size_t pos = 0;
     while (pos < length) {
         if (pos == 0 || text[pos - 1] == '\n') {
+            size_t span = literal_span ? literal_span(text, pos) : 0;
+            if (span && span <= length - pos) {
+                pos += span;
+                continue;
+            }
             size_t line_end = pos;
             while (line_end < length && text[line_end] != '\n') ++line_end;
             size_t line_length = line_end - pos;
@@ -240,6 +246,12 @@ static const char *reply_find_final_content(const char *text)
 }
 
 char *r2_reply_sanitize(const char *reply)
+{
+    return r2_reply_sanitize_with_literals(reply, NULL);
+}
+
+char *r2_reply_sanitize_with_literals(const char *reply,
+                                       size_t (*literal_span)(const char *, size_t))
 {
     if (!reply) return NULL;
     size_t input_len = strlen(reply);
@@ -286,6 +298,13 @@ char *r2_reply_sanitize(const char *reply)
         /* Recognize Markdown fences only at line boundaries and outside
            inline code; private tag bodies are still redacted within examples. */
         if (inline_ticks == 0 && (src == 0 || start[src - 1] == '\n')) {
+            size_t span = !in_fence && literal_span ? literal_span(start, src) : 0;
+            if (span && span <= len - src) {
+                memcpy(clean + dst, start + src, span);
+                dst += span;
+                src += span;
+                continue;
+            }
             size_t line_end = src;
             while (line_end < len && start[line_end] != '\n') ++line_end;
             size_t line_length = line_end - src;
@@ -417,7 +436,7 @@ char *r2_reply_sanitize(const char *reply)
             visible_looks_private = 1;
     }
     if (visible_looks_private) {
-        const char *final_content = reply_find_final_content(visible);
+        const char *final_content = reply_find_final_content(visible, literal_span);
         if (!final_content) {
             free(clean);
             return NULL;

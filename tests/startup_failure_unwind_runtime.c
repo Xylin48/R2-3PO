@@ -49,9 +49,26 @@ static void test_world_and_welcome_replay(void)
     check_world_reply("[WORLD] tv_power|on|extra", "REAL WORLD ERROR");
     check_world_reply("[WORLD] tv_tune|99", "could not select RF channel 99");
     check_world_reply("[WORLD] gameboy_power_on|extra", "unsupported Game Boy console action");
-    check_world_reply("I can record what I imagined.\n[DIARY]\n"
-                      "Example of an action: \n[WORLD] remove|fixture book\n[END DIARY]",
+    static const char diary_text[] = "\n  Example of an action: \n[WORLD] remove|fixture book\n\n";
+    check_world_reply("I can record what I imagined.\n[DIARY]\n\n"
+                      "  Example of an action: \n[WORLD] remove|fixture book\n\n  [END DIARY]",
                       "REAL DIARY RESULT");
+    sqlite3_stmt *entry = NULL;
+    assert(sqlite3_prepare_v2(memory, "SELECT entry FROM diary_entries WHERE entry=?;",
+                              -1, &entry, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(entry, 1, diary_text, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(entry) == SQLITE_ROW);
+    sqlite3_finalize(entry);
+
+    static const char file_text[] = "\r\n  file content  \r\n\r\n";
+    check_world_reply("[WRITE] exact-spacing.txt\r\n\r\n  file content  \r\n\r\n  [END WRITE]",
+                      "REAL WRITE RESULT");
+    FILE *written = fopen(R2_WORKSPACE "/exact-spacing.txt", "rb");
+    assert(written);
+    char exact[sizeof(file_text)] = {0};
+    assert(fread(exact, 1, sizeof(exact), written) == sizeof(file_text) - 1);
+    assert(memcmp(exact, file_text, sizeof(file_text)) == 0 && fclose(written) == 0);
+    assert(unlink(R2_WORKSPACE "/exact-spacing.txt") == 0);
     check_world_reply("[WORLD] remove|fixture book", "REAL WORLD RESULT");
     char value[4001], evidence[8001], action[12500];
     memset(value, 'v', sizeof(value));

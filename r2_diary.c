@@ -1428,25 +1428,10 @@ static int r2_diary_write_unlocked(
         return -1;
     }
 
-    /*
-     * Skip leading whitespace.
-     */
-    while (
-        isspace(
-            (unsigned char)*entry
-        )
-    )
-    {
-        entry++;
-    }
-
-    /*
-     * Reject empty/whitespace-only entries.
-     */
-    if (*entry == '\0')
-    {
-        return -1;
-    }
+    /* Reject an empty entry while retaining whitespace in the original. */
+    const char *first_text = entry;
+    while (isspace((unsigned char)*first_text)) ++first_text;
+    if (!*first_text) return -1;
 
     if (r2_diary_get_time(timestamp, sizeof(timestamp)) != 0)
         return -1;

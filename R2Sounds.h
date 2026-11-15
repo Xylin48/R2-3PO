@@ -26,6 +26,8 @@ void r2_sounds_shutdown(void);
    Caller frees the returned reply. Unknown/malformed markers are stripped. */
 /* Remove internal sound controls without playing them (tool-routing replies). */
 char *r2_sounds_strip_markers(const char *reply);
+char *r2_sounds_strip_markers_with_literals(const char *reply,
+                                            size_t (*literal_span)(const char *, size_t));
 /* Remove controls and play at most one valid sound marker in a final reply. */
 char *r2_sounds_process_reply(const char *reply);
 

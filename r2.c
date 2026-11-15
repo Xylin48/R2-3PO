@@ -611,7 +611,7 @@ static const char *SYSTEM_PROMPT =
 "Do not invent events or experiences.\n"
 "\n"
 "Use:\n"
-"[DIARY] your diary entry [END DIARY]\n"
+"[DIARY] on its own line, then the complete entry, then [END DIARY] on its own line.\n"
 "\n"
 "The C diary subsystem actually writes the entry.\n"
 "\n"
@@ -642,7 +642,7 @@ static const char *SYSTEM_PROMPT =
 "[LIST] directory\n"
 "\n"
 "Write a file:\n"
-"[WRITE] filename content [END WRITE]\n"
+"[WRITE] filename on one line, then complete file content, then [END WRITE] on its own line.\n"
 "\n"
 "Delete a file:\n"
 "[DELETE] filename\n"
@@ -6107,6 +6107,7 @@ static char *r2_build_associative_search_query(const char *query)
     return combined;
 }
 
+static size_t literal_tool_span(const char *reply, size_t offset);
 static const char *find_control_marker_line(const char *reply,
                                             const char *marker,
                                             size_t from_position);
@@ -6590,7 +6591,7 @@ static char *chat_with_relevant_memories(
        planner/diary calls which have separate machine-readable contracts. */
     int retry_after_sanitize_failure = 0;
     if (reply) {
-        char *user_facing = r2_reply_sanitize(reply);
+        char *user_facing = r2_reply_sanitize_with_literals(reply, literal_tool_span);
         free(reply);
         reply = user_facing;
         if (!reply || !*reply) {
@@ -6611,7 +6612,7 @@ static char *chat_with_relevant_memories(
         char *retry = r2_retry_direct_answer(copy, base_count, query);
         char *retry_user_facing = NULL;
         if (retry) {
-            retry_user_facing = r2_reply_sanitize(retry);
+            retry_user_facing = r2_reply_sanitize_with_literals(retry, literal_tool_span);
             free(retry);
         } else {
             fprintf(stderr, "[R2 Conversation] Direct-answer retry could not be completed.\n");
@@ -7776,6 +7777,39 @@ static const char *find_control_marker_line(const char *reply,
     return NULL;
 }
 
+/* A recognized closing control may be indented up to three spaces. Its
+ * indentation belongs to the delimiter line, not the tool's content. */
+static const char *control_delimiter_line(const char *marker, const char *body)
+{
+    while (marker > body && marker[-1] == ' ')
+        --marker;
+    return marker;
+}
+
+/* A tool can carry literal text that happens to look like model metadata.
+ * Preserve only a complete executable block recognized by the tool parser. */
+static size_t literal_tool_span(const char *reply, size_t offset)
+{
+    const char *line = reply + offset;
+    const char *marker = line + strspn(line, " ");
+    const char *open = NULL;
+    const char *close = NULL;
+    if (control_marker_matches(marker, "[DIARY]")) {
+        open = "[DIARY]";
+        close = "[END DIARY]";
+    } else if (control_marker_matches(marker, "[WRITE]")) {
+        open = "[WRITE]";
+        close = "[END WRITE]";
+    }
+    if (!open || marker - line > 3 ||
+        find_control_marker_line(reply, open, offset) != marker)
+        return 0;
+    const char *end = find_control_marker_line(reply, close, (size_t)(marker - reply) + strlen(open));
+    if (!end) return 0;
+    const char *after = strchr(end, '\n');
+    return after ? (size_t)(after + 1 - line) : strlen(line);
+}
+
 static char *extract_marker(
     const char *reply,
     const char *start,
@@ -7811,8 +7845,18 @@ static char *extract_marker(
             strlen(end)
         );
 
-    size_t n =
-        (size_t)(q - p);
+    int exact_diary = !strcmp(start, "[DIARY]");
+    if (exact_diary) {
+        const char *opening_line_end = p + strspn(p, " \t");
+        if (*opening_line_end == '\r' && opening_line_end[1] == '\n')
+            p = opening_line_end + 2;
+        else if (*opening_line_end == '\n')
+            p = opening_line_end + 1;
+        else if (*p == ' ' || *p == '\t')
+            ++p;
+        q = control_delimiter_line(q, p);
+    }
+    size_t n = (size_t)(q - p);
 
     char *s =
         malloc(n + 1);
@@ -7827,6 +7871,7 @@ static char *extract_marker(
     );
 
     s[n] = '\0';
+    if (exact_diary) return s;
 
     /*
      * Callers own and free this allocation. trim() may return an interior
@@ -8761,14 +8806,7 @@ static char *process_tools_with_status(
 
                 path[pn] = '\0';
 
-                const char *content =
-                    nl;
-
-            while (
-                *content == '\r' ||
-                *content == '\n'
-            )
-                content++;
+                const char *content = nl + (*nl == '\r' && nl[1] == '\n' ? 2 : 1);
 
             const char *e =
                 find_control_marker_line(reply, "[END WRITE]",
@@ -8776,8 +8814,7 @@ static char *process_tools_with_status(
 
             if (e) {
 
-                size_t cn =
-                    (size_t)(e - content);
+                size_t cn = (size_t)(control_delimiter_line(e, content) - content);
 
                 char *data =
                     malloc(cn + 1);
@@ -14166,14 +14203,10 @@ static int refresh_reality_context_message(void)
     return add_rc == 0 ? 0 : -1;
 }
 
-static int reply_has_visible_text(const char *text)
+/* Route, count and hide only executable control syntax. Quoted or fenced
+ * examples remain ordinary outward text even when they spell a marker. */
+static size_t reply_control_span(const char *text, const char *line)
 {
-    /*
-     * Tool control syntax is not a user-facing answer. A reply consisting
-     * only of [RUN]/[WORLD]/etc. markers must be retried before any action is
-     * executed; checking merely for non-whitespace would treat the command
-     * itself as visible text and bypass that gate.
-     */
     static const char *const control_lines[] = {
         "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]", "[ALTERNATE_COMPARE]",
         "[ALTERNATE_RETAIN]", "[ALTERNATE_DISCARD]", "[READ_DIARY]",
@@ -14183,65 +14216,70 @@ static int reply_has_visible_text(const char *text)
         "[END HAND_REQUEST]", "[END RUN]", "[END IMAGINE]",
         "[END IMAGINE_FEEDBACK]"
     };
-
-    if (!text) return 0;
-    const char *p = text;
-    while (*p) {
-        const char *line_end = strchr(p, '\n');
-        if (!line_end) line_end = p + strlen(p);
-        const char *first = p;
-        while (first < line_end &&
-               (*first == ' ' || *first == '\t' || *first == '\r'))
-            ++first;
-
-        if (first == line_end) {
-            p = *line_end ? line_end + 1 : line_end;
+    const char *first = line + strspn(line, " ");
+    if (first - line > 3 || *first != '[') return 0;
+    size_t offset = (size_t)(first - text);
+    for (size_t i = 0; i < sizeof(control_blocks) / sizeof(control_blocks[0]); ++i) {
+        if (!control_marker_matches(first, control_blocks[i].open) ||
+            find_control_marker_line(text, control_blocks[i].open, offset) != first)
             continue;
+        const char *close = find_control_marker_line(text, control_blocks[i].close,
+            offset + strlen(control_blocks[i].open));
+        /* Malformed control output is never user-facing text. */
+        const char *end = close ? strchr(close, '\n') : NULL;
+        return end ? (size_t)(end + 1 - line) : strlen(line);
+    }
+    for (size_t i = 0; i < sizeof(control_lines) / sizeof(control_lines[0]); ++i) {
+        if (control_marker_matches(first, control_lines[i]) &&
+            find_control_marker_line(text, control_lines[i], offset) == first) {
+            const char *end = strchr(first, '\n');
+            return end ? (size_t)(end + 1 - line) : strlen(line);
         }
-
-        int skipped = 0;
-        for (size_t i = 0; i < sizeof(control_blocks) / sizeof(control_blocks[0]); ++i) {
-            size_t open_len = strlen(control_blocks[i].open);
-            if ((size_t)(line_end - first) < open_len ||
-                memcmp(first, control_blocks[i].open, open_len) != 0 ||
-                find_control_marker_line(text, control_blocks[i].open,
-                                         (size_t)(first - text)) != first)
-                continue;
-
-            const char *close = find_control_marker_line(text, control_blocks[i].close,
-                                                        (size_t)(first + open_len - text));
-            if (!close)
-                return 0; /* Malformed control output is never user-facing text. */
-            const char *close_end = strchr(close, '\n');
-            p = close_end ? close_end + 1 : close + strlen(close);
-            skipped = 1;
-            break;
-        }
-        if (skipped)
-            continue;
-
-        for (size_t i = 0; i < sizeof(control_lines) / sizeof(control_lines[0]); ++i) {
-            size_t marker_len = strlen(control_lines[i]);
-            if ((size_t)(line_end - first) >= marker_len &&
-                memcmp(first, control_lines[i], marker_len) == 0 &&
-                find_control_marker_line(text, control_lines[i],
-                                         (size_t)(first - text)) == first) {
-                p = *line_end ? line_end + 1 : line_end;
-                skipped = 1;
-                break;
-            }
-        }
-        if (skipped)
-            continue;
-
-        for (const unsigned char *q = (const unsigned char *)first;
-             q < (const unsigned char *)line_end; ++q) {
-            if (!isspace(*q))
-                return 1;
-        }
-        p = *line_end ? line_end + 1 : line_end;
     }
     return 0;
+}
+
+static int reply_has_visible_text(const char *text)
+{
+    if (!text) return 0;
+    for (const char *line = text; *line;) {
+        size_t control = reply_control_span(text, line);
+        if (control) {
+            line += control;
+            continue;
+        }
+        const char *end = strchr(line, '\n');
+        if (!end) end = line + strlen(line);
+        for (const char *p = line; p < end; ++p)
+            if (!isspace((unsigned char)*p)) return 1;
+        line = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+static char *clean_final_reply(const char *reply)
+{
+    size_t length = strlen(reply);
+    char *visible = malloc(length + 1);
+    if (!visible) return NULL;
+    size_t written = 0;
+    for (size_t offset = 0; offset < length;) {
+        size_t hidden = reply_control_span(reply, reply + offset);
+        if (hidden) {
+            offset += hidden;
+            continue;
+        }
+        const char *end = strchr(reply + offset, '\n');
+        size_t line = end ? (size_t)(end + 1 - reply) - offset : length - offset;
+        memcpy(visible + written, reply + offset, line);
+        written += line;
+        offset += line;
+    }
+    visible[written] = '\0';
+    /* Sound playback is a final side effect. */
+    char *result = r2_sounds_process_reply(visible);
+    free(visible);
+    return result;
 }
 
 static char *r2_talk_impl(const char *message)
@@ -14302,7 +14340,7 @@ static char *r2_talk_impl(const char *message)
     /* Strip markers into a temporary copy before executing tools, so a
        cleanup allocation failure cannot occur after a tool side effect. Keep
        the original separately in case this is a final reply and should play. */
-    char *stripped_reply = r2_sounds_strip_markers(reply);
+    char *stripped_reply = r2_sounds_strip_markers_with_literals(reply, literal_tool_span);
     if (!reply_has_visible_text(stripped_reply)) {
         /* Marker-only/whitespace output is not a valid conversational answer.
            Retry once before executing any tool action. */
@@ -14313,14 +14351,14 @@ static char *r2_talk_impl(const char *message)
         fprintf(stderr, "[R2] Model output contained no visible reply after marker cleanup; retrying once.\n");
         reply = chat_with_relevant_memories(message);
         if (reply)
-            stripped_reply = r2_sounds_strip_markers(reply);
+            stripped_reply = r2_sounds_strip_markers_with_literals(reply, literal_tool_span);
         if (!reply || !reply_has_visible_text(stripped_reply)) {
             free(reply);
             free(stripped_reply);
             reply = xstrdup(
                 "I'm sorry—I couldn't produce a usable reply just now. "
                 "Your message hasn't been discarded; please try again in a moment.");
-            stripped_reply = reply ? r2_sounds_strip_markers(reply) : NULL;
+            stripped_reply = reply ? r2_sounds_strip_markers_with_literals(reply, literal_tool_span) : NULL;
             if (!reply || !reply_has_visible_text(stripped_reply)) {
                 free(reply);
                 free(stripped_reply);
@@ -14455,7 +14493,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2] Follow-up generation failed after one refreshed retry; returning a visible reply and preserving the action result.\n");
         }
 
-        char *sound_clean_reply = r2_sounds_process_reply(reply);
+        char *sound_clean_reply = clean_final_reply(reply);
         if (!reply_has_visible_text(sound_clean_reply)) {
             free(reply);
             free(sound_clean_reply);
@@ -14477,7 +14515,7 @@ static char *r2_talk_impl(const char *message)
         free(tools);
         free(stripped_reply);
         /* Only a final, user-facing response may trigger an effect. */
-        char *sound_clean_reply = r2_sounds_process_reply(reply);
+        char *sound_clean_reply = clean_final_reply(reply);
         if (!reply_has_visible_text(sound_clean_reply)) {
             free(reply);
             free(sound_clean_reply);

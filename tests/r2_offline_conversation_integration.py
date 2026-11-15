@@ -31,6 +31,8 @@ FRIDGE_INGREDIENTS = "pear,ginger"
 FRIDGE_TASTE = "Soft pear with sharp ginger."
 RATING_REASON = "I liked the ginger in this particular modeled meal."
 DREAM = "In the dream I watched a paper moon drift across the room."
+WRITE_REQUEST = "Write the audit fixture R2_OFFLINE_WRITE_36139"
+EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal: literal file line  \n\n"
 
 
 class LocalOllama(BaseHTTPRequestHandler):
@@ -62,6 +64,13 @@ class LocalOllama(BaseHTTPRequestHandler):
                               for message in user_messages[current_index + 1:])
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
+        if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
+            reply = (REPLY + "\n[DELETE] hidden-sentinel.txt"
+                      "\n[DIARY]\nFOLLOWUP_PRIVATE_CONTROL_SENTINEL\n[END DIARY]"
+                     if has_tool_result
+                     else "<think>Proposed private tool syntax:\n[DELETE] hidden-sentinel.txt\n</think>\n"
+                          "I will write the exact file.\n[WRITE] literal-fixture.txt\n"
+                          + EXACT_FILE + "  [END WRITE]")
         system = "\n".join(item["content"] for item in payload.get("messages", [])
                            if item.get("role") == "system" and isinstance(item.get("content"), str))
         if "autonomous needs controller" in system:
@@ -163,7 +172,9 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
     )
     combined = output.stdout + "\n" + output.stderr
     if (output.returncode or combined.count("R2-3PO: " + REPLY) != len(markers)
-            or "[R2-3PO shut down.]" not in combined):
+            or "[R2-3PO shut down.]" not in combined
+            or "FOLLOWUP_PRIVATE_CONTROL_SENTINEL" in output.stdout
+            or "[DELETE] hidden-sentinel.txt" in output.stdout):
         raise AssertionError(
             f"Typed conversation failed for {markers}: exit={output.returncode}\n"
             + combined[-16000:]
@@ -300,6 +311,15 @@ def main() -> int:
                 conversation(binary, workspace, url, (first, followup), context)
                 conversation(binary, workspace, url, (second,), context)
                 turns.extend((context, marker) for marker in (first, followup, second))
+            sentinel = workspace / "hidden-sentinel.txt"
+            sentinel.write_bytes(b"private planned action must remain inert")
+            conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
+            assert sentinel.read_bytes() == b"private planned action must remain inert"
+            assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")
+            with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+                assert db.execute(
+                    "SELECT COUNT(*) FROM diary_entries WHERE entry LIKE '%FOLLOWUP_PRIVATE_CONTROL_SENTINEL%'"
+                ).fetchone() == (0,)
             autonomous_cycle(binary, workspace, url)
         finally:
             server.shutdown()
