@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <math.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdarg.h>
@@ -955,40 +956,135 @@ static void item_slug(const char *name, char *out, size_t cap)
     out[j] = '\0';
 }
 
-static int mirror_path(const char *name, const char *container, char *path, size_t cap)
+/* An unrecognized or non-regular file is occupied but is never ours. */
+static int mirror_read_name(const char *path, char **name, int *fridge_projection)
 {
-    if (!name || !container || !path) return -1;
-    char base[1400];
-    if (!strcasecmp(container, "room")) snprintf(base, sizeof(base), "%s/room", R2_ROOT);
-    else if (!strcasecmp(container, "shelf")) snprintf(base, sizeof(base), "%s/room/shelf", R2_ROOT);
-    else if (!strcasecmp(container, "box") || !strcasecmp(container, "toy box"))
-        snprintf(base, sizeof(base), "%s/room/box", R2_ROOT);
-    else if (!strcasecmp(container, "pockets")) snprintf(base, sizeof(base), "%s/Pockets", R2_ROOT);
-    else if (!strcasecmp(container, "wallet")) snprintf(base, sizeof(base), "%s/Pockets/Wallet", R2_ROOT);
-    else return 1; /* Other named containers remain database-only. */
-    char slug[256];
+    *name = NULL;
+    if (fridge_projection) *fridge_projection = 0;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    FILE *fp = fdopen(fd, "r");
+    if (!fp) { close(fd); return -1; }
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t size = getline(&line, &capacity, fp);
+    int result = -1;
+    if (size > 6 && line[size - 1] == '\n' &&
+        !memcmp(line, "name=", 5) && !memchr(line, '\0', (size_t)size)) {
+        *name = strndup(line + 5, (size_t)size - 6);
+        if (*name) {
+            result = 0;
+            if (fridge_projection && getline(&line, &capacity, fp) >= 0)
+                *fridge_projection = !strcmp(line, "r2_projection=fridge\n");
+        }
+    }
+    free(line);
+    fclose(fp);
+    return result;
+}
+
+static int mirror_owner_state(const char *path, const char *name)
+{
+    char *owner = NULL;
+    int result = mirror_read_name(path, &owner, NULL);
+    if (result == 0 && sqlite3_stricmp(owner, name) != 0) result = -1;
+    free(owner);
+    return result;
+}
+
+static uint64_t mirror_name_hash(const char *name)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        unsigned char byte = *p >= 'A' && *p <= 'Z' ? *p + ('a' - 'A') : *p;
+        hash = (hash ^ byte) * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static int inventory_mirror_path(const char *folder, const char *name, char *path,
+                                 size_t capacity, int for_write)
+{
+    if (!name || !*name || strchr(name, '\n')) return -1;
+    char slug[249];
     item_slug(name, slug, sizeof(slug));
-    int n = snprintf(path, cap, "%s/%s.r2item", base, slug);
-    return n > 0 && (size_t)n < cap ? 0 : -1;
+    int n = snprintf(path, capacity, "%s/%s.r2item", folder, slug);
+    if (n <= 0 || (size_t)n >= capacity) return -1;
+    int primary = mirror_owner_state(path, name);
+    if (primary == 0) return 0;
+
+    char alternate[2048];
+    n = snprintf(alternate, sizeof(alternate), "%s/%.231s~%016" PRIx64 ".r2item",
+                 folder, slug, mirror_name_hash(name));
+    if (n <= 0 || (size_t)n >= sizeof(alternate) || (size_t)n >= capacity) return -1;
+    int secondary = mirror_owner_state(alternate, name);
+    if (secondary == 0 || (for_write && primary < 0 && secondary == 1)) {
+        memcpy(path, alternate, (size_t)n + 1);
+        return 0;
+    }
+    if (for_write && primary == 1) return 0;
+    return for_write ? -1 : 1;
+}
+
+static int mirror_path(const char *name, const char *container, char *path,
+                       size_t capacity, int for_write)
+{
+    const char *relative = NULL;
+    if (!strcasecmp(container, "room")) relative = "/room";
+    else if (!strcasecmp(container, "shelf")) relative = "/room/shelf";
+    else if (!strcasecmp(container, "box") || !strcasecmp(container, "toy box"))
+        relative = "/room/box";
+    else if (!strcasecmp(container, "pockets")) relative = "/Pockets";
+    else if (!strcasecmp(container, "wallet")) relative = "/Pockets/Wallet";
+    else return 1; /* Other named containers remain database-only. */
+    char folder[1400];
+    int n = snprintf(folder, sizeof(folder), "%s%s", R2_ROOT, relative);
+    if (n <= 0 || (size_t)n >= sizeof(folder)) return -1;
+    return inventory_mirror_path(folder, name, path, capacity, for_write);
 }
 
 static void mirror_remove(const char *name, const char *container)
 {
     char path[2048];
-    if (mirror_path(name, container, path, sizeof(path)) == 0)
+    if (mirror_path(name, container, path, sizeof(path), 0) == 0)
         (void)unlink(path);
+}
+
+/* Reserve a separate short sibling name even when the projection leaf is at
+ * the filesystem's filename limit. Keep normal creation permissions. */
+static FILE *mirror_create_temporary(const char *path, char *temporary, size_t capacity)
+{
+    const char *leaf = strrchr(path, '/');
+    if (!leaf) return NULL;
+    static unsigned long serial;
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        unsigned long next = __atomic_add_fetch(&serial, 1, __ATOMIC_RELAXED);
+        int n = snprintf(temporary, capacity, "%.*s/.r2item.%ld.%lu.tmp",
+                         (int)(leaf - path), path, (long)getpid(), next);
+        if (n <= 0 || (size_t)n >= capacity) return NULL;
+        int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        if (fd < 0 && errno == EEXIST) continue;
+        if (fd < 0) return NULL;
+        FILE *fp = fdopen(fd, "w");
+        if (!fp) { close(fd); unlink(temporary); }
+        return fp;
+    }
+    return NULL;
 }
 
 static int mirror_write(const char *name, const char *description,
                         int quantity, const char *container)
 {
     char path[2048], temp[2100];
-    int p = mirror_path(name, container, path, sizeof(path));
+    int p = mirror_path(name, container, path, sizeof(path), 1);
     if (p == 1) return 0;
     if (p != 0) return -1;
-    int n = snprintf(temp, sizeof(temp), "%s.tmp.%ld", path, (long)getpid());
-    if (n <= 0 || (size_t)n >= sizeof(temp)) return -1;
-    FILE *fp = fopen(temp, "w");
+    FILE *fp = mirror_create_temporary(path, temp, sizeof(temp));
     if (!fp) return -1;
     int failed = fprintf(fp, "name=%s\ndescription=%s\nquantity=%d\ncontainer=%s\n",
                          name, description ? description : "", quantity, container) < 0;
@@ -1244,12 +1340,18 @@ static void sync_room_mirrors(void)
         while (sqlite3_step(st) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 0);
             const unsigned char *description = sqlite3_column_text(st, 1);
-            int quantity = sqlite3_column_int(st, 2);
+            sqlite3_int64 quantity = sqlite3_column_int64(st, 2);
             const unsigned char *container = sqlite3_column_text(st, 3);
-            if (name && container)
-                (void)mirror_write((const char *)name,
-                    description ? (const char *)description : "",
-                    quantity, (const char *)container);
+            if (!name || !container || quantity < 1 || quantity > INT_MAX ||
+                strlen((const char *)name) != (size_t)sqlite3_column_bytes(st, 0) ||
+                strlen((const char *)container) != (size_t)sqlite3_column_bytes(st, 3) ||
+                (description && strlen((const char *)description) != (size_t)sqlite3_column_bytes(st, 1))) {
+                fprintf(stderr, "[R2 Reality] A stored item could not be represented in its room mirror.\n");
+                continue;
+            }
+            (void)mirror_write((const char *)name,
+                description ? (const char *)description : "",
+                (int)quantity, (const char *)container);
         }
     }
     if (st) sqlite3_finalize(st);
@@ -1257,28 +1359,25 @@ static void sync_room_mirrors(void)
 }
 
 /* Independent fridge database: fridge stock is not a room-object container. */
-static int fridge_mirror_path(const char *name, char *path, size_t cap)
+static int fridge_mirror_path(const char *name, char *path, size_t capacity,
+                             int for_write)
 {
-    char slug[256];
-    item_slug(name, slug, sizeof(slug));
-    int n = snprintf(path, cap, "%s/fridge/%s.r2item", R2_ROOT, slug);
-    return n > 0 && (size_t)n < cap ? 0 : -1;
+    return inventory_mirror_path(R2_ROOT "/fridge", name, path, capacity, for_write);
 }
+
 static void fridge_mirror_remove(const char *name)
 {
     char path[2048];
-    if (fridge_mirror_path(name, path, sizeof(path)) == 0) (void)unlink(path);
+    if (fridge_mirror_path(name, path, sizeof(path), 0) == 0) (void)unlink(path);
 }
 static int fridge_mirror_write(const char *name, const char *description, int quantity,
                                double fullness, double energy)
 {
     char path[2048], temp[2100];
-    if (fridge_mirror_path(name, path, sizeof(path)) != 0) return -1;
-    int n = snprintf(temp, sizeof(temp), "%s.tmp.%ld", path, (long)getpid());
-    if (n <= 0 || (size_t)n >= sizeof(temp)) return -1;
-    FILE *fp = fopen(temp, "w");
+    if (fridge_mirror_path(name, path, sizeof(path), 1) != 0) return -1;
+    FILE *fp = mirror_create_temporary(path, temp, sizeof(temp));
     if (!fp) return -1;
-    int failed = fprintf(fp, "name=%s\ndescription=%s\nquantity=%d\ncontainer=fridge\nfullness=%.1f\nenergy=%.1f\n",
+    int failed = fprintf(fp, "name=%s\nr2_projection=fridge\ndescription=%s\nquantity=%d\ncontainer=fridge\nfullness=%.1f\nenergy=%.1f\n",
                          name, description ? description : "", quantity, fullness, energy) < 0;
     if (fclose(fp) != 0) failed = 1;
     if (!failed && rename(temp, path) != 0) failed = 1;
@@ -1371,11 +1470,25 @@ static void fridge_sync_mirrors(void)
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
             size_t n = strlen(entry->d_name);
-            if (n >= 7 && !strcmp(entry->d_name + n - 7, ".r2item")) {
-                char path[1600];
-                snprintf(path, sizeof(path), "%s/%s", folder, entry->d_name);
-                (void)unlink(path);
+            if (n < 7 || strcmp(entry->d_name + n - 7, ".r2item")) continue;
+            char path[1600], selected[2048];
+            int length = snprintf(path, sizeof(path), "%s/%s", folder, entry->d_name);
+            if (length <= 0 || (size_t)length >= sizeof(path)) continue;
+            char *name = NULL;
+            int generated = 0;
+            if (mirror_read_name(path, &name, &generated) == 0 && generated &&
+                fridge_mirror_path(name, selected, sizeof(selected), 0) == 0 &&
+                !strcmp(path, selected)) {
+                sqlite3_stmt *lookup = NULL;
+                int rc = sqlite3_prepare_v2(fridge_db,
+                    "SELECT 1 FROM r2_fridge_items WHERE name=? COLLATE NOCASE",
+                    -1, &lookup, NULL);
+                if (rc == SQLITE_OK && bind_text(lookup, 1, name) == 0 &&
+                    sqlite3_step(lookup) == SQLITE_DONE)
+                    (void)unlink(path);
+                sqlite3_finalize(lookup);
             }
+            free(name);
         }
         closedir(dir);
     }
@@ -1386,7 +1499,14 @@ static void fridge_sync_mirrors(void)
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *name = (const char *)sqlite3_column_text(st, 0);
             const char *description = (const char *)sqlite3_column_text(st, 1);
-            if (name) fridge_mirror_write_warn(name, description, sqlite3_column_int(st, 2),
+            sqlite3_int64 quantity = sqlite3_column_int64(st, 2);
+            if (!name || quantity < 1 || quantity > INT_MAX ||
+                strlen(name) != (size_t)sqlite3_column_bytes(st, 0) ||
+                (description && strlen(description) != (size_t)sqlite3_column_bytes(st, 1))) {
+                fprintf(stderr, "[R2 Fridge] A stored item could not be represented in its fridge mirror.\n");
+                continue;
+            }
+            fridge_mirror_write_warn(name, description, (int)quantity,
                 sqlite3_column_double(st, 3), sqlite3_column_double(st, 4), "startup sync");
         }
     }

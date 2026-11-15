@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dirent.h>
 
 #ifndef R2_ROOT
 #define R2_ROOT "/tmp/r2-needs-smoke"
@@ -709,6 +710,75 @@ static void verify_complete_food_metrics(void)
         fail("food experience and ingredient preference did not keep complete metadata");
     sqlite3_finalize(st);
     sqlite3_close(db);
+}
+
+static int count_item_mirrors(const char *folder, const char *name)
+{
+    DIR *dir = opendir(folder);
+    if (!dir) fail("could not inspect inventory mirror directory");
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        size_t length = strlen(entry->d_name);
+        if (length < 7 || strcmp(entry->d_name + length - 7, ".r2item")) continue;
+        char path[2048];
+        int size = snprintf(path, sizeof(path), "%s/%s", folder, entry->d_name);
+        if (size <= 0 || (size_t)size >= sizeof(path)) fail("invalid fixture mirror path");
+        FILE *fp = fopen(path, "r");
+        if (!fp) fail("could not read fixture mirror");
+        char *line = NULL;
+        size_t capacity = 0;
+        ssize_t line_size = getline(&line, &capacity, fp);
+        if (line_size > 6 && !strncmp(line, "name=", 5)) {
+            line[line_size - 1] = '\0';
+            if (!strcmp(line + 5, name)) ++count;
+        }
+        free(line);
+        fclose(fp);
+    }
+    closedir(dir);
+    return count;
+}
+
+static void verify_distinct_inventory_mirrors(void)
+{
+    const char *pockets = R2_ROOT "/Pockets";
+    const char *fridge = R2_ROOT "/fridge";
+    const char *foreign_file = R2_ROOT "/fridge/manual.r2item";
+    FILE *foreign = fopen(foreign_file, "w");
+    if (!foreign || fputs("A workspace file belonging to the user.\n", foreign) < 0 ||
+        fclose(foreign) != 0)
+        fail("could not create unrelated fridge file");
+    if (r2_reality_add_item("mirror clash", "First", "pockets", 1) != 0 ||
+        r2_reality_add_item("mirror-clash", "Second", "pockets", 1) != 0 ||
+        r2_fridge_add_item("fridge clash", "", 1, 10.0, 0.0, "", "") != 0 ||
+        r2_fridge_add_item("fridge-clash", "", 1, 10.0, 0.0, "", "") != 0 ||
+        r2_fridge_add_item("stale_projection", "", 1, 10.0, 0.0, "", "") != 0)
+        fail("could not create two inventory names sharing one slug");
+    if (count_item_mirrors(pockets, "mirror clash") != 1 ||
+        count_item_mirrors(pockets, "mirror-clash") != 1 ||
+        count_item_mirrors(fridge, "fridge clash") != 1 ||
+        count_item_mirrors(fridge, "fridge-clash") != 1)
+        fail("one inventory projection overwrote a different item");
+    sqlite3 *db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_fridge.db", &db) != SQLITE_OK ||
+        sqlite3_exec(db, "DELETE FROM r2_fridge_items WHERE name='stale_projection'",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not leave a stale generated fridge mirror for startup cleanup");
+    sqlite3_close(db);
+    r2_reality_shutdown();
+    if (r2_reality_init() != 0 || access(foreign_file, F_OK) != 0 ||
+        count_item_mirrors(fridge, "stale_projection") != 0 ||
+        count_item_mirrors(fridge, "fridge clash") != 1 ||
+        count_item_mirrors(fridge, "fridge-clash") != 1)
+        fail("fridge rebuild lost a current or unrelated file, or kept a stale generated mirror");
+    if (r2_reality_remove_item("mirror clash") != 0 ||
+        r2_fridge_take("fridge clash") != 0 ||
+        count_item_mirrors(pockets, "mirror-clash") != 1 ||
+        count_item_mirrors(fridge, "fridge-clash") != 1 ||
+        count_item_mirrors(pockets, "mirror clash") != 0 ||
+        count_item_mirrors(fridge, "fridge clash") != 0)
+        fail("removing one projection changed a different item's mirror");
 }
 
 int main(void)
@@ -1842,6 +1912,7 @@ int main(void)
     if (hunger < 79.9 || hunger > 80.1)
         fail("hunger semantics migration must not invert state again on later restarts");
     verify_complete_food_metrics();
+    verify_distinct_inventory_mirrors();
     verify_location_delivery_replay();
     r2_reality_shutdown();
 
