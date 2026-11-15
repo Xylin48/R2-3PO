@@ -623,37 +623,64 @@ static void check_reflection_stop_and_long_visual_query(void)
 
 static void check_structured_report_evidence(void)
 {
-    const char *reply = "I feel curious. My project is open. Hypothetically, I could fly.";
+    const char *reply = "I feel curious. I believe it is quiet. My project is open. Hypothetically, I could fly.";
     const char *report =
         "{\"states\":[{\"description\":\"curiosity\",\"evidence\":\"I feel curious.\"},"
         "{\"description\":\"anger\",\"evidence\":\"I feel angry.\"},"
         "{\"description\":\"unsupported\\u0000suffix\",\"evidence\":\"I feel curious.\"},"
         "{\"description\":\"spoof\",\"evidence\":\"I feel curious.\\u0000extra\"}],"
-        "\"beliefs\":[{\"key\":\"invented\",\"belief\":\"unsupported\",\"evidence\":\"made up\"}],"
+        "\"beliefs\":[{\"key\":\"invented\",\"belief\":\"unsupported\",\"evidence\":\"made up\"},"
+        "{\"key\":\"quiet\",\"belief\":\"It is quiet.\",\"evidence\":\"I believe it is quiet.\"}],"
         "\"continuity\":[{\"key\":\"project\",\"title\":\"Project\",\"evidence\":\"My project is open.\"},"
         "{\"key\":\"invented\",\"title\":\"Unsupported\",\"next_action\":\"prefix\\u0000suffix\",\"evidence\":\"My project is open.\"}],"
         "\"hypotheticals\":[{\"scenario\":\"Flight\",\"evidence\":\"Hypothetically, I could fly.\"},"
         "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
     sqlite3 *fixture = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    int64_t parent = r2_log_conversation_turn("Tell me what you think.", reply);
+    assert(parent > 0);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER ignore_structured_row BEFORE INSERT ON r2_log_inner_states "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_inner_state("question", "Uncommitted inner state", NULL, -1.0, "fixture") < 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER ignore_structured_row", NULL, NULL, NULL) == SQLITE_OK);
     const char *sql =
         "SELECT (SELECT COUNT(*) FROM r2_log_inner_states),"
         "(SELECT COUNT(*) FROM r2_log_beliefs WHERE belief_key='invented'),"
         "(SELECT COUNT(*) FROM r2_log_continuity WHERE item_key IN ('project','invented')),"
-        "(SELECT COUNT(*) FROM r2_log_hypotheticals WHERE scenario IN ('Flight','Unsupported'))";
-    for (int valid = 0; valid <= 1; ++valid) {
+        "(SELECT COUNT(*) FROM r2_log_hypotheticals WHERE scenario IN ('Flight','Unsupported')),"
+        "(SELECT COUNT(*) FROM r2_log_beliefs WHERE belief_key='quiet'),"
+        "(SELECT COUNT(*) FROM r2_log_events WHERE event_type IN "
+        "('inner_state_recorded','belief_updated','continuity_updated','hypothetical_recorded')),"
+        "(SELECT COUNT(*) FROM r2_log_links l JOIN r2_log_events e ON e.id=l.to_event_id "
+        "WHERE l.from_event_id=?1 AND (l.relationship,e.event_type,l.notes) IN (VALUES "
+        "('extracts_self_state','inner_state_recorded','I feel curious.'),"
+        "('supports_belief_record','belief_updated','I believe it is quiet.'),"
+        "('updates_continuity','continuity_updated','My project is open.'),"
+        "('contains_hypothetical','hypothetical_recorded','Hypothetically, I could fly.')))";
+    for (int phase = 0; phase <= 2; ++phase) {
         char *invalid = NULL;
-        if (!valid) assert(asprintf(&invalid, "%s trailing text", report) >= 0);
-        set_response(valid ? report : invalid, "stop", 1);
+        if (!phase) assert(asprintf(&invalid, "%s trailing text", report) >= 0);
+        if (phase == 1) assert(sqlite3_exec(fixture,
+            "CREATE TRIGGER ignore_evidence_link BEFORE INSERT ON r2_log_links "
+            "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+        set_response(phase ? report : invalid, "stop", 1);
         free(invalid);
-        log_structured_self_report(reply, 0);
+        log_structured_self_report(reply, parent);
+        if (phase == 1) assert(sqlite3_exec(fixture,
+            "DROP TRIGGER ignore_evidence_link", NULL, NULL, NULL) == SQLITE_OK);
+        int valid = phase == 2;
         sqlite3_stmt *st = NULL;
         assert(sqlite3_prepare_v2(fixture, sql, -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(st, 1, parent) == SQLITE_OK);
         assert(sqlite3_step(st) == SQLITE_ROW);
         assert(sqlite3_column_int(st, 0) == valid);
         assert(sqlite3_column_int(st, 1) == 0);
         assert(sqlite3_column_int(st, 2) == valid);
         assert(sqlite3_column_int(st, 3) == valid);
+        assert(sqlite3_column_int(st, 4) == valid);
+        assert(sqlite3_column_int(st, 5) == 4 * valid);
+        assert(sqlite3_column_int(st, 6) == 4 * valid);
         sqlite3_finalize(st);
     }
     assert(sqlite3_close(fixture) == SQLITE_OK);

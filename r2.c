@@ -13890,7 +13890,7 @@ static const char *structured_report_evidence(json_object *item, const char *rep
 
 static void log_structured_self_report(const char *reply, int64_t parent_event_id)
 {
-    if (!reply || !*reply || !r2_log_is_initialized())
+    if (!reply || !*reply || parent_event_id <= 0 || !r2_log_is_initialized())
         return;
 
     char *input = NULL;
@@ -13979,10 +13979,8 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (description && *description && evidence) {
-                int64_t child = r2_log_inner_state(kind, description, evidence, confidence,
-                                   "explicit R2 response; model-extracted with quoted evidence");
-                if (parent_event_id > 0 && child > 0)
-                    r2_log_link(parent_event_id, child, "extracts_self_state", evidence);
+                r2_log_inner_state_with_evidence(kind, description, evidence, confidence,
+                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
             }
         }
     }
@@ -14006,10 +14004,8 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (key && *key && belief && *belief && evidence) {
-                int64_t child = r2_log_belief(key, belief, evidence, confidence, status,
-                              "explicit R2 response; model-extracted with quoted evidence");
-                if (parent_event_id > 0 && child > 0)
-                    r2_log_link(parent_event_id, child, "supports_belief_record", evidence);
+                r2_log_belief_with_evidence(key, belief, evidence, confidence, status,
+                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
             }
         }
     }
@@ -14035,11 +14031,8 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 json_object_is_type(v, json_type_string)) next_action = json_object_get_string(v);
             const char *evidence = structured_report_evidence(item, reply);
             if (key && *key && title && *title && evidence) {
-                int64_t child = r2_log_continuity(key, type, title, description, status,
-                                  next_action,
-                                  "explicit R2 response; model-extracted");
-                if (parent_event_id > 0 && child > 0)
-                    r2_log_link(parent_event_id, child, "updates_continuity", evidence);
+                r2_log_continuity_with_evidence(key, type, title, description, status, next_action,
+                    "explicit R2 response; model-extracted", parent_event_id, evidence);
             }
         }
     }
@@ -14067,15 +14060,12 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
 
             const char *evidence = structured_report_evidence(item, reply);
             if (scenario && *scenario && evidence) {
-                int64_t child = r2_log_hypothetical(
+                int64_t child = r2_log_hypothetical_with_evidence(
                     scenario, assumptions, predicted, conclusion,
-                    "explicit R2 response; model-extracted");
+                    "explicit R2 response; model-extracted", parent_event_id, evidence);
                 if (child > 0)
                     (void)r2_altself_import_hypothesis(
                         scenario, assumptions, predicted, conclusion, child, 0);
-                if (parent_event_id > 0 && child > 0)
-                    r2_log_link(parent_event_id, child,
-                                "contains_hypothetical", evidence);
             }
         }
     }

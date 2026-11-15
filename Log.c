@@ -2040,11 +2040,37 @@ static void log_structured_insert_error(const char *record_type)
             record_type, log_db ? sqlite3_errmsg(log_db) : "database unavailable");
 }
 
-int64_t r2_log_inner_state(const char *state_kind,
-                           const char *description,
-                           const char *evidence,
-                           double confidence,
-                           const char *origin)
+/* On success, leave the transaction and lock owned by the caller. */
+static int64_t log_begin_structured(R2LogCategory category, const char *event_type,
+                                   const char *summary, const char *details, const char *origin)
+{
+    pthread_mutex_lock(&log_lock);
+    if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0) {
+        int64_t event_id = log_insert_event_locked(category, event_type, summary, details, origin);
+        if (event_id > 0) return event_id;
+        (void)log_finish_write(0);
+    }
+    pthread_mutex_unlock(&log_lock);
+    return -1;
+}
+
+static int64_t log_finish_structured(int64_t event_id, sqlite3_stmt *st, int rc,
+                                    const char *record_type, int64_t parent_event_id,
+                                    const char *relationship, const char *evidence)
+{
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    if (!saved) log_structured_insert_error(record_type);
+    sqlite3_finalize(st);
+    if (saved && parent_event_id > 0)
+        saved = log_link_locked(parent_event_id, event_id, relationship, evidence) == 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    return result == 0 ? event_id : -1;
+}
+
+int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id)
 {
     if (!valid_text(state_kind) || !valid_text(description) ||
         strlen(state_kind) > 128 || strlen(description) > 8192 ||
@@ -2052,18 +2078,13 @@ int64_t r2_log_inner_state(const char *state_kind,
         (origin && strlen(origin) > 512) || !valid_confidence(confidence))
         return -1;
 
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_THINKING, "inner_state_recorded",
         description, evidence, origin);
     if (event_id < 0) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_inner_states "
         "(event_id,state_kind,description,evidence,confidence,origin) "
@@ -2077,18 +2098,21 @@ int64_t r2_log_inner_state(const char *state_kind,
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, origin);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("inner state");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    event_id = log_finish_structured(event_id, st, rc, "inner state", parent_event_id,
+                                     "extracts_self_state", evidence);
+    if (event_id > 0) r2_sj_index_event(event_id, "thinking", "inner_state_recorded", origin);
+    return event_id;
 }
 
-int64_t r2_log_belief(const char *belief_key,
-                      const char *belief,
-                      const char *evidence,
-                      double confidence,
-                      const char *status,
-                      const char *origin)
+int64_t r2_log_inner_state(const char *state_kind, const char *description,
+                           const char *evidence, double confidence, const char *origin)
+{
+    return r2_log_inner_state_with_evidence(state_kind, description, evidence, confidence, origin, 0);
+}
+
+int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id)
 {
     if (!valid_text(belief_key) || !valid_text(belief) ||
         !valid_text(status) || strlen(belief_key) > 512 ||
@@ -2100,7 +2124,7 @@ int64_t r2_log_belief(const char *belief_key,
     char *details = format_record_details(
         "Status: %s\nEvidence: %s", status, evidence ? evidence : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_BELIEF, "belief_updated", belief, details, origin);
     free(details);
     if (event_id < 0) return -1;
@@ -2109,11 +2133,6 @@ int64_t r2_log_belief(const char *belief_key,
     timestamp_pair(utc, sizeof(utc), NULL, 0);
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_beliefs "
         "(belief_key,belief,evidence,confidence,status,origin,first_seen_utc,"
@@ -2136,19 +2155,19 @@ int64_t r2_log_belief(const char *belief_key,
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 9, event_id);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("belief");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    return log_finish_structured(event_id, st, rc, "belief", parent_event_id,
+                                 "supports_belief_record", evidence);
 }
 
-int64_t r2_log_continuity(const char *item_key,
-                          const char *item_type,
-                          const char *title,
-                          const char *description,
-                          const char *status,
-                          const char *next_action,
-                          const char *origin)
+int64_t r2_log_belief(const char *belief_key, const char *belief, const char *evidence,
+                      double confidence, const char *status, const char *origin)
+{
+    return r2_log_belief_with_evidence(belief_key, belief, evidence, confidence, status, origin, 0);
+}
+
+int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence)
 {
     if (!valid_text(item_key) || !valid_text(item_type) ||
         !valid_text(title) || !valid_text(status) ||
@@ -2164,7 +2183,7 @@ int64_t r2_log_continuity(const char *item_key,
         status, description ? description : "(none)",
         next_action ? next_action : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_CONTINUITY, "continuity_updated", title, details, origin);
     free(details);
     if (event_id < 0) return -1;
@@ -2173,11 +2192,6 @@ int64_t r2_log_continuity(const char *item_key,
     timestamp_pair(utc, sizeof(utc), NULL, 0);
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_continuity "
         "(item_key,item_type,title,description,status,next_action,origin,"
@@ -2212,10 +2226,16 @@ int64_t r2_log_continuity(const char *item_key,
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 12, event_id);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("continuity item");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    return log_finish_structured(event_id, st, rc, "continuity item", parent_event_id,
+                                 "updates_continuity", evidence);
+}
+
+int64_t r2_log_continuity(const char *item_key, const char *item_type, const char *title,
+                          const char *description, const char *status, const char *next_action,
+                          const char *origin)
+{
+    return r2_log_continuity_with_evidence(item_key, item_type, title, description, status,
+                                          next_action, origin, 0, NULL);
 }
 
 static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
@@ -2423,11 +2443,10 @@ int r2_log_replay_reflections(void)
     }
 }
 
-int64_t r2_log_hypothetical(const char *scenario,
-                            const char *assumptions,
-                            const char *predicted_outcome,
-                            const char *conclusion,
-                            const char *origin)
+int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence)
 {
     if (!valid_text(scenario) || strlen(scenario) > 8192 ||
         (assumptions && strlen(assumptions) > R2_LOG_MAX_TEXT) ||
@@ -2442,18 +2461,13 @@ int64_t r2_log_hypothetical(const char *scenario,
         predicted_outcome ? predicted_outcome : "(none)",
         conclusion ? conclusion : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_HYPOTHETICAL, "hypothetical_recorded", scenario, details, origin);
     free(details);
     if (event_id < 0) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_hypotheticals "
         "(event_id,scenario,assumptions,predicted_outcome,conclusion,origin) "
@@ -2467,10 +2481,16 @@ int64_t r2_log_hypothetical(const char *scenario,
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, origin);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("hypothetical");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    return log_finish_structured(event_id, st, rc, "hypothetical", parent_event_id,
+                                 "contains_hypothetical", evidence);
+}
+
+int64_t r2_log_hypothetical(const char *scenario, const char *assumptions,
+                            const char *predicted_outcome, const char *conclusion,
+                            const char *origin)
+{
+    return r2_log_hypothetical_with_evidence(scenario, assumptions, predicted_outcome,
+                                            conclusion, origin, 0, NULL);
 }
 
 /* Keep complete processing snapshots outside ordinary event recall so later

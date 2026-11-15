@@ -137,9 +137,11 @@ int main(void)
     expect_copies(visual_context, visual_text, 2);
     char *long_pattern = make_text('j', 55000, "%_literal-long-pattern");
     assert(r2_diary_write(long_pattern) == 0);
-    expect_copies(r2_diary_search(long_pattern, 1), long_pattern, 1);
-    expect_copies(r2_diary_search("%_literal-long-pattern", 1), long_pattern, 1);
-    empty = r2_diary_search("jj%_literal-long%pattern", 1);
+    const char *literal_keywords[] = {long_pattern};
+    expect_copies(r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search), long_pattern, 1);
+    expect_copies(r2_diary_search("jj%_literal-long%pattern", 1), long_pattern, 1);
+    literal_keywords[0] = "jj%_literal-long%pattern";
+    empty = r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search);
     assert(empty && !*empty);
     free(empty);
     assert(r2_log_conversation_turn(long_pattern, "This is its full receipt") > 0);

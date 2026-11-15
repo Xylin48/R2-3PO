@@ -236,6 +236,10 @@ int64_t r2_log_inner_state(const char *state_kind,
                            const char *evidence,
                            double confidence,
                            const char *origin);
+/* A positive parent ID requires the quoted evidence link in the same commit. */
+int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id);
 
 /* Belief ledger retains current state and full revision history in events. */
 int64_t r2_log_belief(const char *belief_key,
@@ -244,6 +248,9 @@ int64_t r2_log_belief(const char *belief_key,
                      double confidence,
                      const char *status,
                      const char *origin);
+int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id);
 
 /* Continuity ledger for projects, goals, tasks, questions, and routines. */
 int64_t r2_log_continuity(const char *item_key,
@@ -253,6 +260,9 @@ int64_t r2_log_continuity(const char *item_key,
                           const char *status,
                           const char *next_action,
                           const char *origin);
+int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence);
 
 /* Consume one pending reflection in the same transaction as its event and
  * speech edges. Returns the new event ID, 0 if no work exists, or -1 on failure. */
@@ -270,6 +280,10 @@ int64_t r2_log_hypothetical(const char *scenario,
                             const char *predicted_outcome,
                             const char *conclusion,
                             const char *origin);
+int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence);
 
 /* Complete inference snapshots use an archive outside ordinary event recall.
  * Returned text is caller-owned. Missing or unreadable snapshots return NULL. */

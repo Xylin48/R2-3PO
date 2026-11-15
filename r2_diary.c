@@ -1553,21 +1553,30 @@ static sqlite3 *diary_open_reader(void)
     return reader;
 }
 
-static int diary_query(const char *query, int limit,
+static int diary_query(const char *query, int limit, int allow_wildcards,
     int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
     sqlite3 *reader = diary_open_reader();
     if (!reader) return -1;
     sqlite3_stmt *statement = NULL;
     int rc;
-    const char *sql = query
+    int wildcard = query && allow_wildcards && strpbrk(query, "%_");
+    const char *sql = wildcard
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ?1 ORDER BY id DESC LIMIT ?2;"
+        : query
         ? "SELECT entry,created_at,id FROM diary_entries WHERE instr(lower(entry),lower(?1))>0 "
           "ORDER BY id DESC LIMIT ?2;"
         : "SELECT entry,created_at,id FROM diary_entries ORDER BY id DESC LIMIT ?;";
     rc = sqlite3_prepare_v2(reader, sql, -1, &statement, NULL);
     if (rc != SQLITE_OK) goto failed;
     if (query) {
-        rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (wildcard) {
+            char *pattern = sqlite3_mprintf("%%%s%%", query);
+            if (!pattern) goto failed;
+            rc = sqlite3_bind_text64(statement, 1, pattern, strlen(pattern), sqlite3_free, SQLITE_UTF8);
+        } else {
+            rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
+        }
         if (rc != SQLITE_OK) goto failed;
     }
     rc = sqlite3_bind_int(statement, query ? 2 : 1, limit);
@@ -1615,7 +1624,7 @@ static char *diary_query_string(const char *query, int limit)
 {
     struct diary_query_text text = {.data = strdup("")};
     if (!text.data) return NULL;
-    if (diary_query(query, limit, diary_collect_row, &text) != 0) {
+    if (diary_query(query, limit, 1, diary_collect_row, &text) != 0) {
         free(text.data);
         return NULL;
     }
@@ -1627,7 +1636,7 @@ int r2_diary_visit_search(const char *query, int limit,
 {
     if (!query || !*query || !visit) return -1;
     if (limit <= 0 || limit > 20) limit = 20;
-    return diary_query(query, limit, visit, context);
+    return diary_query(query, limit, 0, visit, context);
 }
 
 char *r2_diary_recent(int limit)
