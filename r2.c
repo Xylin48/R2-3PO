@@ -9635,12 +9635,12 @@ static char *process_tools(const char *reply)
 /* Persist the actual diary row and exact evidence relationships together in
  * the existing stores; matching repeated reflection prose is unnecessary. */
 static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence *evidence,
-                                int64_t *event_id_out)
+                                const int64_t reviews[2], int64_t *event_id_out)
 {
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
-    if (r2_diary_stage_reflection(reflection, evidence ? evidence->events : NULL,
-                                  evidence ? evidence->count : 0, &diary_id) != 0)
+    if (r2_diary_stage_reviewed_reflection(reflection, evidence ? evidence->events : NULL,
+                                           evidence ? evidence->count : 0, reviews, &diary_id) != 0)
         return -1;
     int64_t event_id = r2_log_complete_reflection(diary_id);
     if (event_id > 0) {
@@ -9709,17 +9709,6 @@ cleanup:
     free(notes);
     free(combined);
     return reply;
-}
-
-static void link_private_evidence_review(int64_t reflection_event, int64_t archive)
-{
-    if (reflection_event <= 0 || archive <= 0) return;
-    char details[96];
-    snprintf(details, sizeof(details), "context_review_archive_id=%lld", (long long)archive);
-    int64_t review_event = r2_log_event(R2_LOG_THINKING, "reflection_context_review",
-        "Reflection used review notes from archived private evidence.", details, "reflection");
-    if (review_event > 0)
-        (void)r2_log_link(reflection_event, review_event, "uses_context_review", details);
 }
 
 static void *autonomous_thinking(void *arg)
@@ -9957,10 +9946,9 @@ static void *autonomous_thinking(void *arg)
         }
 
         int64_t reflection_event_id = 0;
-        int diary_saved = r2_store_reflection(reflection, &speech_evidence, &reflection_event_id);
+        const int64_t reviews[] = {initial_archive, followup_archive};
+        int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
-            link_private_evidence_review(reflection_event_id, initial_archive);
-            link_private_evidence_review(reflection_event_id, followup_archive);
             log_structured_self_report(reflection, reflection_event_id);
             if (reflection_tool_result && *reflection_tool_result)
                 preserve_evidence_memory(NULL, reflection, reflection_tool_result, reflection_event_id);
@@ -10386,9 +10374,8 @@ int r2_write_diary(void)
 
     if (!reflection) return -1;
 
-    int64_t event_id = 0;
-    int rc = r2_store_reflection(reflection, NULL, &event_id);
-    if (rc == 0) link_private_evidence_review(event_id, archive_id);
+    const int64_t reviews[] = {archive_id, 0};
+    int rc = r2_store_reflection(reflection, NULL, reviews, NULL);
     free(reflection);
     return rc;
 }
@@ -10493,8 +10480,13 @@ int r2_sleep_and_dream(double hours)
         "Write a vivid but coherent first-person dream, using supplied memories and the persistent room/world as inspiration. "
         "Dream events are fictional and must not be presented as waking actions, verified memories, or external facts. "
         "Do not invent waking experiences. Do not include tool markers or instructions. Return only the dream narrative.";
-    Message m = { "user", context, 0, 0 };
-    char *dream = ollama_chat(&m, 1, prompt);
+    int previous_mode = ollama_background_mode;
+    ollama_background_mode = 1;
+    int64_t archive = 0;
+    char *dream = generate_with_private_evidence(prompt,
+        "Review supplied inspiration for a fictional dream. Keep prior memories, "
+        "old simulated dreams and waking events distinct.", context, NULL, &archive);
+    ollama_background_mode = previous_mode;
     free(context);
 
     if (!dream || !*dream) {
@@ -10506,11 +10498,18 @@ int r2_sleep_and_dream(double hours)
     }
 
     int rc = r2_reality_record_dream(dream);
-    if (rc == 0)
-        r2_log_event(R2_LOG_WORLD, "dream_simulated",
-                     "R2 generated and stored a private simulated dream.",
-                     dream, "r2_sleep_and_dream");
-    else
+    if (rc == 0) {
+        int64_t dream_event = r2_log_event(R2_LOG_WORLD, "dream_simulated",
+            "R2 generated and stored a private simulated dream.", dream, "r2_sleep_and_dream");
+        if (archive > 0 && dream_event > 0) {
+            char details[96];
+            snprintf(details, sizeof(details), "context_review_archive_id=%lld", (long long)archive);
+            int64_t review_event = r2_log_event(R2_LOG_THINKING, "dream_context_review",
+                "Dream used review notes as fictional inspiration.", details, "r2_sleep_and_dream");
+            if (review_event > 0)
+                (void)r2_log_link(dream_event, review_event, "uses_context_review", details);
+        }
+    } else
         r2_log_event(R2_LOG_ERROR, "dream_record_failed",
                      "R2 generated a dream but could not persist it.",
                      dream, "r2_sleep_and_dream");

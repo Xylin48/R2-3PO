@@ -584,6 +584,11 @@ static int ensure_tables(void)
         " conversation_event_id INTEGER,"
         " created_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_reflection_reviews ("
+        " event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+        " ordinal INTEGER NOT NULL,"
+        " archive_id INTEGER NOT NULL REFERENCES r2_log_context_reviews(id),"
+        " PRIMARY KEY(event_id,ordinal));"
         "CREATE TABLE IF NOT EXISTS r2_log_system_snapshots ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -2329,8 +2334,23 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
         saved = rc == SQLITE_DONE && count == expected;
         sqlite3_finalize(st);
     }
+    sqlite3_int64 reviewed = 0;
+    if (saved) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_reflection_reviews(event_id,ordinal,archive_id) "
+            "SELECT ?1,ordinal,archive_id FROM r2_diary_pending_reflection_reviews "
+            "WHERE diary_entry_id=?2;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, diary_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE;
+        if (saved) reviewed = sqlite3_changes64(log_db);
+        sqlite3_finalize(st);
+    }
     if (saved) {
         const char *deletions[] = {
+            "DELETE FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=?;",
             "DELETE FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?;",
             "DELETE FROM r2_diary_pending_reflections WHERE diary_entry_id=?;"
         };
@@ -2340,7 +2360,7 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
             saved = rc == SQLITE_DONE &&
-                sqlite3_changes64(log_db) == (i == 0 ? expected : 1);
+                sqlite3_changes64(log_db) == (i == 0 ? reviewed : i == 1 ? expected : 1);
             sqlite3_finalize(st);
         }
     }

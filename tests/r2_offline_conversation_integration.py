@@ -27,6 +27,7 @@ REFLECTION = "I closed Eyes deliberately and kept the earlier evidence separate.
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
+DREAM = "In the dream I watched a paper moon drift across the room."
 
 
 class LocalOllama(BaseHTTPRequestHandler):
@@ -61,14 +62,19 @@ class LocalOllama(BaseHTTPRequestHandler):
         system = "\n".join(item["content"] for item in payload.get("messages", [])
                            if item.get("role") == "system" and isinstance(item.get("content"), str))
         if "autonomous needs controller" in system:
-            reply = (f"[WORLD] fridge_eat|{FRIDGE_FOOD}"
-                     if any(f"Fridge food: {FRIDGE_FOOD}" in message for message in user_messages)
-                     else "NONE")
+            if any(f"Fridge food: {FRIDGE_FOOD}" in message for message in user_messages):
+                reply = f"[WORLD] fridge_eat|{FRIDGE_FOOD}"
+            elif any("Sleepiness: 99." in message for message in user_messages):
+                reply = "[WORLD] sleep|8"
+            else:
+                reply = "NONE"
         elif "Review supplied evidence for the current request" in system:
             reply = "Prior diary evidence and current modeled state have separate sources."
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
+        elif "private, simulated dream" in system:
+            reply = DREAM
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
             "message": {"role": "assistant", "content": reply},
@@ -157,16 +163,7 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
     return combined
 
 
-def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
-    home = workspace / "R2"
-    memory_db = home / "r2_memory.db"
-    with sqlite3.connect(memory_db) as db:
-        db.execute("INSERT INTO diary_entries(entry,created_at) VALUES (?,CURRENT_TIMESTAMP)", (ARCHIVED_ENTRY,))
-    with sqlite3.connect(home / "r2_reality.db") as db:
-        db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=0 WHERE id=1")
-    with sqlite3.connect(home / "r2_fridge.db") as db:
-        db.execute("INSERT INTO r2_fridge_items(name,quantity,fullness) VALUES (?,1,65)", (FRIDGE_FOOD,))
-
+def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
     env = runtime_environment(workspace, url, 2048)
     env["R2_SERVICE_MODE"] = "1"
     log_file = workspace.parent / "autonomous-cycle.log"
@@ -196,23 +193,31 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
             raise AssertionError("Small-context autonomous cycle failed\n"
                                  + log_file.read_text(encoding="utf-8", errors="replace")[-20000:])
 
+
+def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
+    home = workspace / "R2"
+    memory_db = home / "r2_memory.db"
+    with sqlite3.connect(memory_db) as db:
+        db.execute("INSERT INTO diary_entries(entry,created_at) VALUES (?,CURRENT_TIMESTAMP)", (ARCHIVED_ENTRY,))
+    with sqlite3.connect(home / "r2_reality.db") as db:
+        db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=0 WHERE id=1")
+    with sqlite3.connect(home / "r2_fridge.db") as db:
+        db.execute("INSERT INTO r2_fridge_items(name,quantity,fullness) VALUES (?,1,65)", (FRIDGE_FOOD,))
+
+    run_idle_service(binary, workspace, url)
+
     with sqlite3.connect(memory_db) as db:
         links = db.execute(
-            "SELECT d.entry,r.details FROM diary_entries d "
+            "SELECT r.original_context,r.review_notes FROM diary_entries d "
             "JOIN r2_sensory_journal_reflection_links dl ON dl.diary_entry_id=d.id "
-            "JOIN r2_log_links l ON l.from_event_id=dl.event_id "
-            "JOIN r2_log_events r ON r.id=l.to_event_id "
-            "WHERE d.entry=? AND l.relationship='uses_context_review' ORDER BY r.id",
+            "JOIN r2_log_reflection_reviews l ON l.event_id=dl.event_id "
+            "JOIN r2_log_context_reviews r ON r.id=l.archive_id "
+            "WHERE d.entry=? ORDER BY l.ordinal",
             (REFLECTION,),
         ).fetchall()
         assert len(links) == 2, links
         archived_inputs = []
-        for _, details in links:
-            archive_id = int(details.split("=", 1)[1])
-            original, notes = db.execute(
-                "SELECT original_context,review_notes FROM r2_log_context_reviews WHERE id=?",
-                (archive_id,),
-            ).fetchone()
+        for original, notes in links:
             assert ARCHIVED_ENTRY in original and "Round 0, bytes [0," in notes
             archived_inputs.append(original.encode("utf-8"))
     with sqlite3.connect(home / "r2_fridge.db") as db:
@@ -229,7 +234,24 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
                     and "\nRound 0," in content):
                 seen_review.extend(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
     assert seen_review == b"".join(archived_inputs), "Reflection reviews omitted or changed original bytes"
-    print("PASS: 2048-token service completed its model-owned meal and reflection with exact evidence.")
+    with sqlite3.connect(home / "r2_reality.db") as db:
+        db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=99 WHERE id=1")
+    run_idle_service(binary, workspace, url)
+    with sqlite3.connect(home / "r2_reality.db") as db:
+        assert db.execute(
+            "SELECT value FROM r2_reality_self_facts WHERE key='last_reported_dream'"
+        ).fetchone() == (DREAM,)
+    with sqlite3.connect(memory_db) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM r2_log_events WHERE event_type='dream_simulated' AND details=?",
+            (DREAM,),
+        ).fetchone() == (1,)
+        archive = db.execute(
+            "SELECT original_context FROM r2_log_context_reviews WHERE request LIKE '%fictional dream%'"
+        ).fetchone()
+        assert archive is not None and ARCHIVED_ENTRY in archive[0]
+    print("PASS: 2048-token service completed model-owned eating, reflection, sleep and dreaming.")
+
 
 
 def main() -> int:
