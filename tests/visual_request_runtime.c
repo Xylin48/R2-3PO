@@ -326,6 +326,12 @@ int main(void)
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     snprintf(database, sizeof(database), "%s", R2_DIARY_DATABASE); snprintf(library, sizeof(library), "%s/library", R2_HOME);
     snprintf(next_db, sizeof(next_db), "%s/next.db", R2_HOME); snprintf(next_library, sizeof(next_library), "%s/next-library", R2_HOME);
+    /* A library path replaced by a symlink must not redirect archived frames. */
+    char symlink_library[PATH_MAX];
+    snprintf(symlink_library, sizeof(symlink_library), "%s/symlink-library", R2_HOME);
+    assert(symlink(R2_HOME, symlink_library) == 0);
+    assert(r2_visual_init(database, symlink_library) != 0);
+    assert(unlink(symlink_library) == 0);
     assert(r2_visual_init(database, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
     R2VisionFrame frame = {.data=rgb, .size=sizeof(rgb), .format={1,1,3,24,R2_PIXEL_RGB24}, .timestamp=1234, .frame_number=1, .preview_session=fixture_preview_session};
