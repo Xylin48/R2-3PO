@@ -75,6 +75,18 @@ int main(void)
     printf("PASS: bounded memory ranking orders by score, timestamp, and stable ID; excludes weaker matches.\n");
     free(result);
 
+    char exact_cue[257];
+    memset(exact_cue, 'q', sizeof(exact_cue) - 1);
+    memcpy(exact_cue + 240, "exactIdentifier", sizeof("exactIdentifier"));
+    char false_prefix[64];
+    memcpy(false_prefix, exact_cue, sizeof(false_prefix) - 1);
+    false_prefix[sizeof(false_prefix) - 1] = '\0';
+    assert(save_memory(exact_cue, "exact cue") == 0);
+    assert(save_memory(false_prefix, "former false match") == 0);
+    result = get_relevant_memories(exact_cue, 3);
+    assert(result && strstr(result, exact_cue) && !strstr(result, "former false match"));
+    free(result);
+
     assert(db_exec("UPDATE memories SET memory='nebula prefix'||char(0)||'tail' "
                    "WHERE memory='nebula quiet';") == 0);
     assert(get_relevant_memories("nebula", 10) == NULL);

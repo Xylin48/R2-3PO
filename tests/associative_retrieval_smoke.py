@@ -121,7 +121,7 @@ association_end = core.find("static pthread_mutex_t r2_associative_query_cache_l
 association_search = core[association_start:association_end] if association_start >= 0 and association_end > association_start else ""
 require(
     "searches < 6" in association_search
-    and "associated_keywords, associated_count, r2_diary_visit_search" in builder
+    and "keywords, keyword_count, r2_diary_visit_search" in builder
     and "r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search" in association_search
     and "r2_visual_visit_recent(3, r2_history_append_unique_row, &selection)" in association_search,
     "diary and visual retrieval retain full selected records across bounded search slots",

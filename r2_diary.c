@@ -1559,23 +1559,15 @@ static int diary_query(const char *query, int limit,
     sqlite3 *reader = diary_open_reader();
     if (!reader) return -1;
     sqlite3_stmt *statement = NULL;
-    char *pattern = NULL;
     int rc;
     const char *sql = query
-        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ? ORDER BY id DESC LIMIT ?;"
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE instr(lower(entry),lower(?1))>0 "
+          "ORDER BY id DESC LIMIT ?2;"
         : "SELECT entry,created_at,id FROM diary_entries ORDER BY id DESC LIMIT ?;";
     rc = sqlite3_prepare_v2(reader, sql, -1, &statement, NULL);
     if (rc != SQLITE_OK) goto failed;
     if (query) {
-        size_t n = strlen(query);
-        if (n > SIZE_MAX - 3) { errno = EOVERFLOW; goto failed; }
-        pattern = malloc(n + 3);
-        if (!pattern) goto failed;
-        pattern[0] = '%'; memcpy(pattern + 1, query, n);
-        pattern[n + 1] = '%'; pattern[n + 2] = '\0';
-        rc = sqlite3_bind_text64(statement, 1, pattern, (sqlite3_uint64)n + 2,
-                                 SQLITE_TRANSIENT, SQLITE_UTF8);
-        free(pattern); pattern = NULL;
+        rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
         if (rc != SQLITE_OK) goto failed;
     }
     rc = sqlite3_bind_int(statement, query ? 2 : 1, limit);
@@ -1603,7 +1595,6 @@ static int diary_query(const char *query, int limit,
 failed:
     sqlite3_finalize(statement);
     sqlite3_close(reader);
-    free(pattern);
     return -1;
 }
 
@@ -1691,13 +1682,14 @@ static char *r2_diary_recent_life_log(int limit)
     out[0] = '\0';
 
     rc = sqlite3_prepare_v2(reader,
-        "SELECT id,local_time,category,event_type,summary,details,source "
-        "FROM r2_log_events "
-        "WHERE category IN ('world','media','filesystem','sensory','milestone',"
+        "SELECT e.id,e.local_time,e.category,e.event_type,e.summary,e.details,e.source,"
+        "c.user_text,c.assistant_text FROM r2_log_events e "
+        "LEFT JOIN r2_log_conversations c ON c.event_id=e.id "
+        "WHERE e.category IN ('world','media','filesystem','sensory','milestone',"
         "'error','belief','continuity','conversation','memory') "
-        "AND event_type NOT IN ('diary_entry_linked','life_log_initialized',"
+        "AND e.event_type NOT IN ('diary_entry_linked','life_log_initialized',"
         "'session_started','session_ended') "
-        "ORDER BY id DESC LIMIT ?;",
+        "ORDER BY e.id DESC LIMIT ?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK || sqlite3_bind_int(st, 1, limit) != SQLITE_OK)
         goto failed;
@@ -1710,20 +1702,30 @@ static char *r2_diary_recent_life_log(int limit)
         const char *summary = (const char *)sqlite3_column_text(st, 4);
         const char *details = (const char *)sqlite3_column_text(st, 5);
         const char *source = (const char *)sqlite3_column_text(st, 6);
-        const char *fields[] = {time_text, category, type, summary, details, source};
-        for (int i = 0; i < 6; ++i) {
-            if ((!fields[i] && sqlite3_column_type(st, i + 1) != SQLITE_NULL) ||
-                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i + 1))) {
+        const char *archive_user = (const char *)sqlite3_column_text(st, 7);
+        const char *archive_reply = (const char *)sqlite3_column_text(st, 8);
+        const char *fields[] = {time_text, category, type, summary, details, source,
+                                archive_user, archive_reply};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            int column = (int)i + 1;
+            if ((!fields[i] && sqlite3_column_type(st, column) != SQLITE_NULL) ||
+                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, column))) {
                 goto failed;
             }
         }
+        int show_archive = (archive_user || archive_reply) &&
+            !r2_log_details_include_conversation(details, archive_user, archive_reply);
         char *row = NULL;
         int n = asprintf(&row,
-            "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s\n",
+            "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s%s%s%s%s\n",
             (int64_t)id, time_text ? time_text : "time unavailable",
             category ? category : "unknown", type ? type : "unknown",
             summary ? summary : "", source ? source : "unknown",
-            details && *details ? " | details=" : "", details ? details : "");
+            details && *details ? " | details=" : "", details ? details : "",
+            show_archive ? "\n  Archived user message:\n" : "",
+            show_archive ? (archive_user ? archive_user : "(unavailable)") : "",
+            show_archive ? "\n  Archived R2 reply:\n" : "",
+            show_archive ? (archive_reply ? archive_reply : "(unavailable)") : "");
         if (n < 0) goto failed;
         int append_rc = diary_append_record(&out, &length, row);
         free(row);

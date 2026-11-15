@@ -2889,11 +2889,11 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     const char *sql_search =
         "SELECT id, utc_time, local_time, category, event_type, summary, "
         "details, source, memory_saved FROM r2_log_events "
-        "WHERE summary LIKE ?1 ESCAPE '\\' OR details LIKE ?1 ESCAPE '\\' "
-        "OR event_type LIKE ?1 ESCAPE '\\' OR category LIKE ?1 ESCAPE '\\' "
-        "OR source LIKE ?1 ESCAPE '\\' "
+        "WHERE instr(lower(summary),lower(?1))>0 OR instr(lower(details),lower(?1))>0 "
+        "OR instr(lower(event_type),lower(?1))>0 OR instr(lower(category),lower(?1))>0 "
+        "OR instr(lower(source),lower(?1))>0 "
         "OR EXISTS (SELECT 1 FROM r2_log_conversations c WHERE c.event_id=r2_log_events.id "
-        "AND (c.user_text LIKE ?1 ESCAPE '\\' OR c.assistant_text LIKE ?1 ESCAPE '\\')) "
+        "AND (instr(lower(c.user_text),lower(?1))>0 OR instr(lower(c.assistant_text),lower(?1))>0)) "
         "ORDER BY id DESC LIMIT ?2;";
 
     rc = sqlite3_prepare_v2(
@@ -2907,36 +2907,8 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     }
 
     if (query) {
-        size_t qlen = strlen(query);
-        if (qlen > (SIZE_MAX - 3) / 2) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            errno = E2BIG;
-            return NULL;
-        }
-        char *pattern = malloc(qlen * 2 + 3);
-
-        if (!pattern) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
-
-        size_t p = 0;
-        pattern[p++] = '%';
-
-        for (size_t i = 0; i < qlen; ++i) {
-            if (query[i] == '%' || query[i] == '_' || query[i] == '\\')
-                pattern[p++] = '\\';
-            pattern[p++] = query[i];
-        }
-
-        pattern[p++] = '%';
-        pattern[p] = '\0';
-
-        rc = sqlite3_bind_text(statement, 1, pattern, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
-        free(pattern);
     } else {
         rc = sqlite3_bind_int(statement, 1, limit);
     }

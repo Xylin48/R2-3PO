@@ -197,9 +197,10 @@ int main(void)
                     !r2_keyword_is_low_signal("pockets"),
                 "Life Log retrieval preserves relationship and concrete-topic keywords");
 
-    char history_keywords[MAX_MEMORY_KEYWORDS][64] = { { 0 } };
+    char *keyword_source = strdup(mother_message);
+    const char *history_keywords[MAX_MEMORY_KEYWORDS];
     size_t history_keyword_count = extract_memory_keywords(
-        mother_message, history_keywords);
+        keyword_source, history_keywords);
     const char *first_history_searches[2] = { NULL, NULL };
     size_t selected_history_searches = 0;
     for (size_t i = 0; i < history_keyword_count &&
@@ -230,6 +231,7 @@ int main(void)
     }
     ok &= check(has_pockets_keyword && has_mother_keyword && !has_low_signal_keyword,
                 "memory keyword budget retains the actual relationship term and concrete pocket topic without filler");
+    free(keyword_source);
 
     ok &= check(r2_reply_misclassifies_plain_text(mother_message,
                     "That's a bit garbled, but I think you're trying to say "

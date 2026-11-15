@@ -154,8 +154,7 @@ int main(void)
     free(utf8_edge);
 
     /* Selected associated records remain complete, including multibyte text. */
-    char keywords[MAX_MEMORY_KEYWORDS][64] = {{0}};
-    snprintf(keywords[0], sizeof(keywords[0]), "signal");
+    const char *keywords[] = {"signal"};
     char *associated = r2_collect_associated_records(keywords, 1, fake_associated_search);
     assert(associated != NULL);
     assert(test_valid_utf8((const unsigned char *)associated));

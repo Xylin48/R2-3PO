@@ -278,6 +278,8 @@ static int open_test_db(sqlite3 **db)
         "details TEXT,"
         "source TEXT,"
         "memory_saved INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS r2_log_conversations ("
+        "event_id INTEGER PRIMARY KEY,user_text TEXT NOT NULL,assistant_text TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS memories ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "memory TEXT NOT NULL,"

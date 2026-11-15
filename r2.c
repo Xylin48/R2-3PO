@@ -1860,21 +1860,16 @@ static int memory_word_is_useful(
 
 
 static size_t extract_memory_keywords(
-    const char *text,
-    char keywords[MAX_MEMORY_KEYWORDS][64])
+    char *text,
+    const char *keywords[MAX_MEMORY_KEYWORDS])
 {
     size_t count = 0;
 
     if (!text)
         return 0;
 
-    /* Keyword extraction is optional context work: allocation failure
-       should skip retrieval, not terminate the whole R2 process. */
-    char *copy = strdup(text);
-    if (!copy)
-        return 0;
-
-    for (char *p = copy;
+    /* Cue views refer to the caller's mutable copy or to static aliases. */
+    for (char *p = text;
          *p && count < MAX_MEMORY_KEYWORDS;
     ) {
         while (*p && !isalnum((unsigned char)*p))
@@ -1883,16 +1878,12 @@ static size_t extract_memory_keywords(
         if (!*p)
             break;
 
-        char word[64];
-        size_t n = 0;
-
+        char *word = p;
         while (*p && isalnum((unsigned char)*p)) {
-            if (n < sizeof(word) - 1)
-                word[n++] = (char)tolower((unsigned char)*p);
+            *p = (char)tolower((unsigned char)*p);
             ++p;
         }
-
-        word[n] = '\0';
+        if (*p) *p++ = '\0';
 
         if (!memory_word_is_useful(word))
             continue;
@@ -1905,10 +1896,7 @@ static size_t extract_memory_keywords(
             }
         }
 
-        if (!duplicate) {
-            snprintf(keywords[count], sizeof(keywords[count]), "%s", word);
-            count++;
-        }
+        if (!duplicate) keywords[count++] = word;
     }
 
     /*
@@ -1943,14 +1931,10 @@ static size_t extract_memory_keywords(
                 }
             }
 
-            if (!duplicate) {
-                snprintf(keywords[count], sizeof(keywords[count]), "%s", aliases[a].b);
-                count++;
-            }
+            if (!duplicate) keywords[count++] = aliases[a].b;
         }
     }
 
-    free(copy);
     return count;
 }
 
@@ -2024,13 +2008,17 @@ static char *get_relevant_memories(const char *query, int limit)
     if (limit > MAX_RELEVANT_MEMORIES)
         limit = MAX_RELEVANT_MEMORIES;
 
-    char keywords[MAX_MEMORY_KEYWORDS][64];
-    size_t keyword_count = extract_memory_keywords(query, keywords);
+    char *keyword_text = strdup(query ? query : "");
+    if (!keyword_text) return NULL;
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t keyword_count = extract_memory_keywords(keyword_text, keywords);
     size_t capacity = 1024;
     size_t length = 0;
     char *out = malloc(capacity);
-    if (!out)
+    if (!out) {
+        free(keyword_text);
         return NULL;
+    }
     out[0] = '\0';
 
     pthread_mutex_lock(&db_lock);
@@ -2038,6 +2026,7 @@ static char *get_relevant_memories(const char *query, int limit)
         fprintf(stderr, "[R2 memory] Current-turn retrieval has no open memory database.\n");
         pthread_mutex_unlock(&db_lock);
         free(out);
+        free(keyword_text);
         return NULL;
     }
 
@@ -2232,6 +2221,7 @@ static char *get_relevant_memories(const char *query, int limit)
     }
 
     pthread_mutex_unlock(&db_lock);
+    free(keyword_text);
     if (failed) {
         free(out);
         return NULL;
@@ -5965,7 +5955,7 @@ static int r2_history_append_unique_row(void *context, int64_t id,
 /* Search/row counts bound selection while the visitor receives complete rows.
  * Discard all accumulated rows if a provider or allocation fails. */
 static int r2_collect_associated_rows(
-    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count,
+    const char *const keywords[], size_t keyword_count,
     R2AssociationSearchFn search_fn, R2HistorySelection *selection)
 {
     if (!search_fn) { errno = EINVAL; return -1; }
@@ -5980,7 +5970,7 @@ static int r2_collect_associated_rows(
 }
 
 static char *r2_collect_associated_records(
-    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, R2AssociationSearchFn search_fn)
+    const char *const keywords[], size_t keyword_count, R2AssociationSearchFn search_fn)
 {
     R2HistorySelection selection = {0};
     if (r2_collect_associated_rows(keywords, keyword_count, search_fn, &selection) != 0) {
@@ -5992,7 +5982,7 @@ static char *r2_collect_associated_records(
 }
 
 static int r2_append_visual_associations(char **context,
-    char keywords[MAX_MEMORY_KEYWORDS][64], size_t keyword_count, int include_recent)
+    const char *const keywords[], size_t keyword_count, int include_recent)
 {
     R2HistorySelection selection = {0};
     int rc = r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search, &selection);
@@ -6396,9 +6386,9 @@ static char *chat_with_relevant_memories(
        later media encounter can reconnect to an earlier discussion.
     */
     R2HistorySelection life_history = {0};
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t keyword_count = extract_memory_keywords(associative_query, keywords);
     if (query && *query && r2_log_is_initialized()) {
-        char keywords[MAX_MEMORY_KEYWORDS][64];
-        size_t keyword_count = extract_memory_keywords(associative_query, keywords);
         int searches = 0;
 
         for (size_t k = 0; k < keyword_count &&
@@ -6432,12 +6422,8 @@ static char *chat_with_relevant_memories(
     /* Diary reflections and visual experience descriptions are separate
        stores, so search them directly instead of assuming every experience
        was promoted into the generic memories table or Life Log. */
-    char associated_keywords[MAX_MEMORY_KEYWORDS][64];
-    size_t associated_count =
-        extract_memory_keywords(associative_query, associated_keywords);
-
     char *diary_matches = r2_collect_associated_records(
-        associated_keywords, associated_count, r2_diary_visit_search);
+        keywords, keyword_count, r2_diary_visit_search);
     if (!diary_matches || r2_append_association_section(&memory_context,
             "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n", diary_matches) != 0) {
         free(diary_matches); free(associative_query); free(memory_context);
@@ -6447,7 +6433,7 @@ static char *chat_with_relevant_memories(
 
     int visual_requested = query_requests_visual_context(query);
     if (r2_visual_is_initialized() &&
-        r2_append_visual_associations(&memory_context, associated_keywords, associated_count,
+        r2_append_visual_associations(&memory_context, keywords, keyword_count,
             visual_requested || (eyes && r2_eyes_is_open(eyes))) != 0) {
         free(associative_query); free(memory_context);
         r2_history_release(&life_history); return NULL;
