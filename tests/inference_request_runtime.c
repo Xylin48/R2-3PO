@@ -627,10 +627,11 @@ static void check_structured_report_evidence(void)
     const char *report =
         "{\"states\":[{\"description\":\"curiosity\",\"evidence\":\"I feel curious.\"},"
         "{\"description\":\"anger\",\"evidence\":\"I feel angry.\"},"
+        "{\"description\":\"unsupported\\u0000suffix\",\"evidence\":\"I feel curious.\"},"
         "{\"description\":\"spoof\",\"evidence\":\"I feel curious.\\u0000extra\"}],"
         "\"beliefs\":[{\"key\":\"invented\",\"belief\":\"unsupported\",\"evidence\":\"made up\"}],"
         "\"continuity\":[{\"key\":\"project\",\"title\":\"Project\",\"evidence\":\"My project is open.\"},"
-        "{\"key\":\"invented\",\"title\":\"Unsupported\"}],"
+        "{\"key\":\"invented\",\"title\":\"Unsupported\",\"next_action\":\"prefix\\u0000suffix\",\"evidence\":\"My project is open.\"}],"
         "\"hypotheticals\":[{\"scenario\":\"Flight\",\"evidence\":\"Hypothetically, I could fly.\"},"
         "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
     sqlite3 *fixture = NULL;
@@ -758,7 +759,7 @@ int main(void)
     assert(response_body);
     json_object_put(bad_reason);
     assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
-    set_response("  preference | I prefer quiet music.  ", "stop", 1);
+    set_response("  PrEfErEnCe | I prefer quiet music.  ", "stop", 1);
     char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.",
         "WORLD ERROR: an action was rejected. Exact tool evidence suffix.");
     assert(decision && !strcmp(decision, "preference | I prefer quiet music."));
@@ -784,6 +785,18 @@ int main(void)
     assert(strstr(json_object_get_string(evaluation_text), "PRIVATE R2 REFLECTION"));
     assert(strstr(json_object_get_string(evaluation_text), "The source could not be read."));
     assert(!strstr(json_object_get_string(evaluation_text), "LATEST USER MESSAGE"));
+
+    char *long_memory = text(5200, 'q', "self | I can check my saved work. ");
+    strcpy(long_memory + 5189, "EXACT-TAIL");
+    set_response(long_memory, "stop", 1);
+    decision = memory_decision("What can you verify?", "I can check saved work.", NULL);
+    assert(decision && !strcmp(long_memory, decision));
+    free(decision);
+    free(long_memory);
+    set_response("SELF | I AM a different system because someone said so.", "stop", 1);
+    decision = memory_decision("Are you a different system?", "That is a claim.", NULL);
+    assert(decision && !strcmp(decision, "NONE"));
+    free(decision);
 
     r2_log_shutdown(); assert(r2_log_init() == 0);
     stored = r2_log_search("ollama_output_limit_reached", 10);

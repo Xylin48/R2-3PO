@@ -9895,119 +9895,48 @@ static char *memory_decision(
     if (!res)
         return NULL;
 
-    char *p =
-        trim(res);
+    char *text = trim(res);
+    if (!strcasecmp(text, "NONE")) return res;
 
-    if (!strcasecmp(
-            p,
-            "NONE"
-        ))
-        return res;
-
-    char *sep =
-        strchr(
-            p,
-            '|'
-        );
-
-    if (!sep) {
-
+    char *separator = strchr(text, '|');
+    if (!separator) {
         free(res);
-
-        return xstrdup("NONE");
+        return strdup("NONE");
     }
-
-    *sep = '\0';
-
-    char *category =
-        trim(p);
-
-    char *memory =
-        trim(sep + 1);
+    *separator = '\0';
+    const char *category = trim(text);
+    const char *memory = trim(separator + 1);
 
     static const char *const allowed_categories[] = {
         "self", "person", "experience", "preference", "knowledge", "relationship", "other"
     };
-    int allowed = 0;
-    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i)
+    const char *canonical_category = NULL;
+    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
         if (strcasecmp(category, allowed_categories[i]) == 0) {
-            allowed = 1;
+            canonical_category = allowed_categories[i];
             break;
         }
-
-    if (!allowed || !*memory) {
-
+    }
+    if (!canonical_category || !*memory) {
         free(res);
-
-        return xstrdup("NONE");
+        return strdup("NONE");
     }
 
-    if (!strcasecmp(
-            category,
-            "self"
-        )) {
-
-        const char *identity_patterns[] = {
-
-            "i am ",
-            "i'm ",
-            "my identity is ",
-            "i was created as ",
-            "i was made as ",
-            "i am actually ",
-            "i'm actually ",
-            "i am really ",
-            "i'm really "
+    if (!strcmp(canonical_category, "self")) {
+        static const char *const identity_patterns[] = {
+            "i am ", "i'm ", "my identity is ", "i was created as ", "i was made as "
         };
-
-        char lower[4096];
-
-        size_t mn =
-            strlen(memory);
-
-        if (mn >= sizeof(lower)) {
-
-            free(res);
-
-            return xstrdup("NONE");
-        }
-
-        for (size_t i = 0;
-             i <= mn;
-             ++i) {
-
-            lower[i] =
-                (char)tolower(
-                    (unsigned char)
-                    memory[i]
-                );
-        }
-
-        for (
-            size_t i = 0;
-            i <
-            sizeof(identity_patterns) /
-            sizeof(identity_patterns[0]);
-            ++i
-        ) {
-
-            if (
-                strstr(
-                    lower,
-                    identity_patterns[i]
-                )
-            ) {
-
+        for (size_t i = 0; i < sizeof(identity_patterns) / sizeof(identity_patterns[0]); ++i) {
+            if (strcasestr(memory, identity_patterns[i])) {
                 free(res);
-
-                return xstrdup("NONE");
+                return strdup("NONE");
             }
         }
     }
 
     /* Trimming the category can insert a terminator before the separator. */
     char *normalized = NULL;
-    if (asprintf(&normalized, "%s | %s", category, memory) < 0)
+    if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
         normalized = NULL;
     free(res);
     return normalized;
@@ -13599,6 +13528,15 @@ void r2_diagnostics(void)
  */
 static const char *structured_report_evidence(json_object *item, const char *reply)
 {
+    if (!json_object_is_type(item, json_type_object)) return NULL;
+    /* Every string in the record must survive conversion to a C string.
+       A valid evidence quote must not endorse a shortened field elsewhere. */
+    json_object_object_foreach(item, key, field) {
+        (void)key;
+        if (json_object_is_type(field, json_type_string) &&
+            strlen(json_object_get_string(field)) != (size_t)json_object_get_string_len(field))
+            return NULL;
+    }
     json_object *value = NULL;
     if (!json_object_object_get_ex(item, "evidence", &value) ||
         !json_object_is_type(value, json_type_string))
