@@ -326,7 +326,57 @@ int main(void)
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     snprintf(database, sizeof(database), "%s", R2_DIARY_DATABASE); snprintf(library, sizeof(library), "%s/library", R2_HOME);
     snprintf(next_db, sizeof(next_db), "%s/next.db", R2_HOME); snprintf(next_library, sizeof(next_library), "%s/next-library", R2_HOME);
+    /* A library path replaced by a symlink must not redirect archived frames. */
+    char symlink_library[PATH_MAX];
+    snprintf(symlink_library, sizeof(symlink_library), "%s/symlink-library", R2_HOME);
+    assert(symlink(R2_HOME, symlink_library) == 0);
+    assert(r2_visual_init(database, symlink_library) != 0);
+    char symlink_with_slash[PATH_MAX];
+    assert(snprintf(symlink_with_slash, sizeof(symlink_with_slash), "%s/",
+                    symlink_library) < (int)sizeof(symlink_with_slash));
+    assert(r2_visual_init(database, symlink_with_slash) != 0);
+    char symlink_with_dot[PATH_MAX];
+    assert(snprintf(symlink_with_dot, sizeof(symlink_with_dot), "%s/.",
+                    symlink_library) < (int)sizeof(symlink_with_dot));
+    assert(r2_visual_init(database, symlink_with_dot) != 0);
+    char symlink_with_parent[PATH_MAX];
+    assert(snprintf(symlink_with_parent, sizeof(symlink_with_parent), "%s/..",
+                    symlink_library) < (int)sizeof(symlink_with_parent));
+    assert(r2_visual_init(database, symlink_with_parent) != 0);
+    char symlink_nested[PATH_MAX];
+    assert(snprintf(symlink_nested, sizeof(symlink_nested), "%s/Visual_Library",
+                    symlink_library) < (int)sizeof(symlink_nested));
+    assert(r2_visual_init(database, symlink_nested) != 0);
+    assert(unlink(symlink_library) == 0);
     assert(r2_visual_init(database, library) == 0);
+    /* A replaced archive root must never redirect frame writes. */
+    char moved_library[PATH_MAX];
+    assert(snprintf(moved_library, sizeof(moved_library), "%s-moved", library)
+           < (int)sizeof(moved_library));
+    assert(rename(library, moved_library) == 0);
+    assert(symlink(R2_HOME, library) == 0);
+    R2VisionFrame archive_probe = {.timestamp=1234, .frame_number=1};
+    char refused_path[PATH_MAX];
+    assert(visual_create_archive(library, &archive_probe, refused_path,
+                                 sizeof(refused_path)) < 0);
+    char redirected_file[PATH_MAX], redirected_claim[PATH_MAX];
+    assert(snprintf(redirected_file, sizeof(redirected_file), "%s/redirected.jpg",
+                    R2_HOME) < (int)sizeof(redirected_file));
+    assert(snprintf(redirected_claim, sizeof(redirected_claim), "%s/redirected.jpg",
+                    library) < (int)sizeof(redirected_claim));
+    int redirected_fd = open(redirected_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(redirected_fd >= 0 && __real_write(redirected_fd, "ORIGINAL", 8) == 8);
+    assert(close(redirected_fd) == 0);
+    assert(visual_restore_pending_image(redirected_claim,
+                                        (const unsigned char *)"ORIGINAL", 8) < 0);
+    size_t redirected_length = 0;
+    unsigned char *redirected_bytes = read_file(redirected_file, &redirected_length);
+    assert(redirected_bytes && redirected_length == 8 &&
+           !memcmp(redirected_bytes, "ORIGINAL", 8));
+    free(redirected_bytes);
+    assert(unlink(redirected_file) == 0);
+    assert(unlink(library) == 0);
+    assert(rename(moved_library, library) == 0);
     unsigned char rgb[] = {1, 2, 3};
     R2VisionFrame frame = {.data=rgb, .size=sizeof(rgb), .format={1,1,3,24,R2_PIXEL_RGB24}, .timestamp=1234, .frame_number=1, .preview_session=fixture_preview_session};
     size_t encoded = 0;
