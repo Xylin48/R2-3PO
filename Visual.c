@@ -305,7 +305,8 @@ static int visual_prepare_directory(const char *path)
     if (mkdir(path, 0750) != 0) {
         if (errno != EEXIST) return -1;
         struct stat metadata;
-        if (stat(path, &metadata) != 0) return -1;
+        /* Never follow a replaced library directory into an unrelated tree. */
+        if (lstat(path, &metadata) != 0) return -1;
         if (S_ISDIR(metadata.st_mode)) return 0;
         errno = ENOTDIR;
         return -1;
