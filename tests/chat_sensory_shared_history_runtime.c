@@ -95,11 +95,11 @@ int main(void)
     char *found = r2_log_search(tail_user, 5);
     assert(found && contains(found, "conversation_turn"));
     assert(contains(found, tail_user));
-    assert(contains(found, "Matched full user archive excerpt"));
+    assert(contains(found, user) && contains(found, reply));
     free(found);
     found = r2_log_search(tail_reply, 5);
     assert(found && contains(found, tail_reply));
-    assert(contains(found, "Matched full R2 archive excerpt"));
+    assert(contains(found, user) && contains(found, reply));
     free(found);
     found = r2_sj_search(tail_reply, 5);
     assert(found && contains(found, "conversation_turn"));
@@ -116,24 +116,31 @@ int main(void)
     assert(sqlite3_bind_int64(q, 1, turn_id) == SQLITE_OK);
     assert(sqlite3_step(q) == SQLITE_ROW);
     const char *details = (const char *)sqlite3_column_text(q, 0);
-    assert(contains(details, "Excerpt only: full user text archived"));
-    assert(contains(details, "Excerpt only: full R2 reply archived"));
-    assert(!contains(details, tail_user));
+    /* The current Life Log intentionally retains exact conversation details,
+       including deep-tail evidence, rather than a truncated excerpt. */
+    assert(contains(details, user));
+    assert(contains(details, reply));
+    assert(contains(details, tail_user) && contains(details, tail_reply));
     sqlite3_finalize(q);
     sqlite3_close(db);
-    /* Archive failure rolls back the event as well; no false success ID,
-       orphan event, or journal projection may claim a complete turn. */
+    /* A rejected archive write must preserve a committed, searchable
+       conversation event with its exact pending archive, not falsely report
+       that the user's accepted turn was erased. */
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
     assert(sqlite3_exec(db,
         "CREATE TRIGGER fail_archive BEFORE INSERT ON r2_log_conversations "
         "BEGIN SELECT RAISE(ABORT,'injected archive write failure'); END;",
         NULL, NULL, NULL) == SQLITE_OK);
-    assert(r2_log_conversation_turn("ATOMIC_FAILURE_SENTINEL", "reply") < 0);
-    assert(r2_sj_count() == 2);
+    int64_t pending_id = r2_log_conversation_turn("ATOMIC_FAILURE_SENTINEL", "reply");
+    assert(pending_id > turn_id);
+    assert(r2_sj_count() == 3);
     assert(sqlite3_prepare_v2(db,
-        "SELECT count(*) FROM r2_log_events WHERE summary LIKE '%ATOMIC_FAILURE_SENTINEL%'",
-        -1, &q, NULL) == SQLITE_OK);
-    assert(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 0);
+        "SELECT count(*) FROM r2_log_events e "
+        "JOIN r2_log_pending_conversations p ON p.event_id=e.id "
+        "WHERE e.id=? AND p.user_text='ATOMIC_FAILURE_SENTINEL' "
+        "AND p.assistant_text='reply'", -1, &q, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(q, 1, pending_id) == SQLITE_OK);
+    assert(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 1);
     sqlite3_finalize(q);
     assert(sqlite3_exec(db, "DROP TRIGGER fail_archive;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
@@ -143,13 +150,29 @@ int main(void)
     /* Both sensory and chat identities stay linked after a real restart. */
     assert(r2_log_init() == 0);
     assert(r2_sj_init() == 0);
-    assert(r2_sj_count() == 2);
+    assert(r2_sj_count() == 3);
     found = r2_log_search(tail_reply, 5);
     assert(found && contains(found, tail_reply));
     free(found);
     found = r2_sj_search("oak leaves in daylight", 5);
     assert(found && contains(found, "chosen_visual_observation"));
     free(found);
+    /* Startup replay publishes the staged exact text under its original ID. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM r2_log_conversations WHERE event_id=? "
+        "AND user_text='ATOMIC_FAILURE_SENTINEL' AND assistant_text='reply'",
+        -1, &q, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(q, 1, pending_id) == SQLITE_OK);
+    assert(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 1);
+    sqlite3_finalize(q);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?",
+        -1, &q, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(q, 1, pending_id) == SQLITE_OK);
+    assert(sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int(q, 0) == 0);
+    sqlite3_finalize(q);
+    sqlite3_close(db);
     r2_sj_shutdown();
     r2_log_shutdown();
     free(user);
