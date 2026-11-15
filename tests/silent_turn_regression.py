@@ -44,7 +44,7 @@ require(
     "failed inference produces a visible allocated fallback instead of returning NULL",
 )
 require(
-    "The action result is still in the conversation; please ask me again" in implementation
+    "The recorded tool result is still in the conversation." in implementation
     and "does not rerun the completed action" in implementation,
     "failed post-action generation preserves the completed action result without replaying the action",
 )

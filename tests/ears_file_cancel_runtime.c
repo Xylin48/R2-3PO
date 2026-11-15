@@ -77,6 +77,11 @@ int main(void)
         "done\n"
         "printf '%s\\n' \"$$\" > \"$R2_TEST_CHILD_PID_FILE\"\n"
         "if [ \"$R2_TEST_FILE_MODE\" = failed ]; then exit 23; fi\n"
+        "if [ \"$R2_TEST_FILE_MODE\" = unconfirmed ]; then\n"
+        "  printf 'WXYZ'\n"
+        "  exec 1>&-\n"
+        "  exec sleep 60\n"
+        "fi\n"
         "if [ \"$R2_TEST_FILE_MODE\" = stalled ]; then\n"
         "  printf 'WXYZ'\n"
         "  exec sleep 60\n"
@@ -132,6 +137,14 @@ int main(void)
     assert(errno == EIO);
     r2_ears_close(ears);
 
+    /* Keep valid frames even if pipe closure precedes a confirmed exit. */
+    assert(setenv("R2_TEST_FILE_MODE", "unconfirmed", 1) == 0);
+    assert(r2_ears_open_file(ears, unusual_filename) == 0);
+    assert(r2_ears_read(ears, out, sizeof(out)) == 4 && memcmp(out, "WXYZ", 4) == 0);
+    assert(r2_ears_read(ears, out, sizeof(out)) == -1 && errno == ETIMEDOUT);
+    assert(r2_audio_file_read(ears->file_stream, out, sizeof(out)) == -1 && errno == ETIMEDOUT);
+    r2_ears_close(ears);
+
     assert(setenv("R2_TEST_FILE_MODE", "stalled", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
@@ -164,7 +177,7 @@ int main(void)
     assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
-    assert(source_closes == 4); /* EOF, reopened file, failed decoder, cancellation */
+    assert(source_closes == 5); /* EOF, reopen, failed decoder, unconfirmed exit, cancellation */
     assert(unlink(pid_path) == 0);
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);

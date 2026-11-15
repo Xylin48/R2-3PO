@@ -97,6 +97,39 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertEqual(snapshot.execute("SELECT value FROM safe").fetchone()[0], "source")
             snapshot.close()
 
+    def test_snapshot_directory_symlink_is_rejected_before_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "source"
+            root.mkdir()
+            sqlite3.connect(root / "r2_memory.db").close()
+            external = base / "outside"
+            external.mkdir()
+            destination = base / "snapshots"
+            destination.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(OSError, "symlinked snapshot destination"):
+                audit.create_snapshot_set(root, destination)
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_symlinked_optional_snapshot_parent_cannot_redirect_private_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "source"
+            state = root / "Devices" / "GameBoyAdvance" / "State"
+            state.mkdir(parents=True)
+            sqlite3.connect(state / "console_state.db").close()
+            destination = base / "snapshots"
+            destination.mkdir()
+            external = base / "outside"
+            external.mkdir()
+            (destination / "Devices").symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(OSError, "symlinked snapshot destination"):
+                audit.create_snapshot_set(root, destination)
+            self.assertFalse((external / "GameBoyAdvance").exists())
+            self.assertFalse((destination / "Devices" / "GameBoyAdvance").exists())
+
     def test_empty_database_is_valid_and_missing_files_are_not_created(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

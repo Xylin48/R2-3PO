@@ -115,8 +115,8 @@ Do **not** run a source-tree script with `sudo`. The checkout under `/home/x/R2_
 Do **not** copy the bootstrap directly from `/home/x/R2_Home/R2`: that tree is writable by `r2`, so checking it and then running `sudo install` from the same path leaves a time-of-check/time-of-use gap. Fetch the reviewed bootstrap from an immutable commit into the desktop user's home (outside the R2-writable tree), verify its Git blob ID, then install that exact file:
 
 ```sh
-BOOTSTRAP_COMMIT=2aec6cee84ed1274a6c7324ec6ac5560d8088240
-BOOTSTRAP_BLOB_SHA=6e9906e6ac3e7299b368585fc7e842f32ceb2646
+BOOTSTRAP_COMMIT=6bc5217ae07d7b7cd3927fb045a71482d11affa5
+BOOTSTRAP_BLOB_SHA=10489001918f3155fbb28a00aec0f14534268c94
 umask 077
 curl -fsSL \
   "https://raw.githubusercontent.com/Xylin48/R2-3PO/${BOOTSTRAP_COMMIT}/tools/r2_install_root_bootstrap.sh" \
@@ -172,7 +172,7 @@ systemctl --no-pager --full status r2-3po.service
 journalctl -u r2-3po.service -n 100 --no-pager
 ```
 
-Expected state is `enabled` and `active`. The journal should report successful text and synthetic-image Ollama preflights and the core readiness marker (`[R2 READY] Core initialized; entering shell.`). The installer does not call the service ready based only on systemd's early `active` state. If the unit keeps restarting, inspect the logs; common causes are a missing `qwen3.5:9b` model, missing `libfaketime`, inaccessible workspace/database files, or Ollama not running.
+Expected state is `enabled` and `active`. The journal should report successful text and synthetic-image Ollama preflights and the core readiness marker (`[R2 READY] Core initialized; entering shell.`). The installer checks the readiness marker for the active service invocation. It allows up to 90 minutes for model preflight and core startup, and rolls back sooner if that invocation stops or restarts. If the unit keeps restarting, inspect the logs; common causes are a missing `qwen3.5:9b` model, missing `libfaketime`, inaccessible workspace/database files, or Ollama not running.
 
 Follow live logs with `journalctl -u r2-3po.service -f`.
 

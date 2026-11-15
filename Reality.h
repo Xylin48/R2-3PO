@@ -2,6 +2,7 @@
 #define R2_REALITY_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 
 
@@ -24,11 +25,16 @@ extern "C" {
 int r2_reality_init(void);
 void r2_reality_shutdown(void);
 int r2_reality_is_initialized(void);
-int r2_reality_set_location(int home); /* 1=home, 0=away; persistent physical location. */
+int r2_reality_set_location(int home); /* Low-level legacy status setter (no named Life Log event). */
+/* Return 0 when delivered, 1 when the move committed and delivery is pending,
+ * or -1 when the requested move could not be committed. */
+int r2_reality_transition_location(const char *location, int home);
 int r2_reality_tick(void);
 
 /* Caller frees all returned strings. */
 char *r2_reality_status(void);
+/* Caller frees evidence based on the original conversation's creation time. */
+char *r2_reality_age_context(void);
 char *r2_reality_room_look(void);
 char *r2_reality_list(const char *container);
 char *r2_reality_context(void);
@@ -50,9 +56,17 @@ int r2_reality_remove_item(const char *name);
 /* Tracked food always uses its configured XML metric; fullness is retained for
    API compatibility but cannot override the authoritative metric. */
 int r2_reality_eat(const char *food, double fullness);
+/* Capture the committed meal identity for model-assisted feedback. */
+int r2_reality_eat_with_experience(const char *food, double fullness, int64_t *experience_out);
+int r2_reality_fridge_eat_with_experience(const char *food, double fullness, int64_t *experience_out);
 int r2_reality_autonomous_food_available(void);
+/* Caller frees exact accessible food choices. Tracked food takes priority. */
+char *r2_reality_autonomous_food_context(void);
 char *r2_reality_food_context(const char *food);
+char *r2_reality_food_experience_context(const char *food, int64_t experience_id);
 int r2_reality_rate_food(const char *food, int satisfaction, const char *notes);
+int r2_reality_rate_food_experience(const char *food, int64_t experience_id,
+                                   int satisfaction, const char *notes);
 int r2_reality_sleep(double hours);
 int r2_reality_record_dream(const char *description);
 int r2_reality_set_self(const char *key, const char *value,

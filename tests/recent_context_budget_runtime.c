@@ -85,6 +85,17 @@ int main(void)
     assert(!reply_has_visible_text("[DIARY] diary entry\n[END DIARY]"));
     assert(!reply_has_visible_text("[RUN] echo unsafe")); /* unterminated controls fail closed */
     assert(reply_has_visible_text("I can do that.\n[WORLD] activity_start|session|details"));
+    assert(!reply_has_visible_text("[EARS_SOURCES]"));
+    assert(!reply_has_visible_text("[DIARY]\n```text\n[END DIARY]\n```\nbody\n[END DIARY]"));
+    assert(reply_has_visible_text("[WORLD]building is a word, not a control."));
+    assert(reply_has_visible_text("    [WORLD] read-only indentation example"));
+    const char *nested = "[DIARY]\n[WORLD] remove|example\n[END DIARY]\n[WORLD] look";
+    size_t tool_position = 0;
+    char *world = extract_marker(nested, "[WORLD]", "\n", &tool_position);
+    assert(world && !strcmp(world, "look"));
+    free(world);
+    assert(!find_control_marker_line("[WRITE] note.txt\n[WORLD] look", "[WORLD]", 0));
+    assert(!reply_has_visible_text("[DIARY]\n[WORLD] look\n[END DIARY]"));
     assert(reply_has_visible_text("Ordinary conversational text."));
 
     /* Model-generated Alternate-Self IDs must reject scanf-style overflow. */
@@ -143,8 +154,7 @@ int main(void)
     free(utf8_edge);
 
     /* Selected associated records remain complete, including multibyte text. */
-    char keywords[MAX_MEMORY_KEYWORDS][64] = {{0}};
-    snprintf(keywords[0], sizeof(keywords[0]), "signal");
+    const char *keywords[] = {"signal"};
     char *associated = r2_collect_associated_records(keywords, 1, fake_associated_search);
     assert(associated != NULL);
     assert(test_valid_utf8((const unsigned char *)associated));

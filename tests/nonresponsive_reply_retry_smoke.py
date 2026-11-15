@@ -86,7 +86,7 @@ retry = core[start:end]
 for phrase, message in (
     ("messages_copy[index].content,", "retry locates the actual user turn before constructing the compact prompt"),
     ("r2_build_retry_system_prompt()", "retry obtains the complete combined system prompt"),
-    ("Message compact_messages[5];", "retry reserves a bounded compact window for context and the exact active turn"),
+    ("Message *compact_messages = calloc(message_count + 2,", "retry reserves room for context, the exact active turn, and its tool evidence"),
     ("compact_count < 3", "retry can preserve up to three relevant system contexts without replaying stale dialogue"),
     ("r2_is_retry_context_message(&messages_copy[i])", "retry delegates context selection to the tested relevance predicate"),
     ("compact_messages[compact_count++] = (Message)", "retry appends the exact current user message as the authoritative turn"),
@@ -176,8 +176,8 @@ require(
     "retrieval breadth is selected from the user's actual request",
 )
 
-history_filter_start = core.find("static int r2_keyword_is_low_signal(")
-history_filter_end = core.find("\nstatic int r2_query_explicitly_requests_recall(", history_filter_start)
+history_filter_start = core.find("static int r2_keyword_is_low_signal(const char *word)\n{")
+history_filter_end = core.find("\nstatic int r2_query_explicitly_requests_recall(const char *query)\n{", history_filter_start)
 require(
     history_filter_start >= 0 and history_filter_end > history_filter_start,
     "memory and Life Log retrieval share a low-signal keyword filter",

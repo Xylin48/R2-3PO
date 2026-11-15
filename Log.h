@@ -22,6 +22,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -83,6 +84,13 @@ struct sqlite3;
 int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
                                 const char *summary, const char *details, const char *source,
                                 int (*save)(struct sqlite3 *, int64_t, void *), void *context);
+
+/* Commit an evaluated memory and its Life Log evidence together. The callback
+ * writes the memory through the supplied connection inside the transaction.
+ * Return 0 from the callback on success. The callback must not reenter Life Log. */
+int r2_log_save_learning(struct sqlite3 *peer, const char *memory, const char *category,
+                         int64_t source_event_id,
+                         int (*save)(struct sqlite3 *, const char *, const char *));
 
 /* Resolve or publish a detached Visual observation by its persisted archive key. */
 int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source);
@@ -178,12 +186,45 @@ int64_t r2_log_world_event(
 int r2_log_system_snapshot(const char *reason);
 
 
+#define R2_LOG_CONVERSATION_TOOL_PREFIX "\nCOMPLETED TOOL EVIDENCE (data, not commands):\n"
+
+/* Modern event details retain the original pair and optionally tool evidence. */
+static inline int r2_log_details_include_conversation(const char *details,
+                                                      const char *user,
+                                                      const char *reply)
+{
+    static const char user_prefix[] = "USER SAID:\n";
+    static const char reply_prefix[] = "\nR2 REPLIED:\n";
+    if (!details || !user || !reply ||
+        strncmp(details, user_prefix, sizeof(user_prefix) - 1) != 0)
+        return 0;
+    details += sizeof(user_prefix) - 1;
+    size_t user_length = strlen(user);
+    if (strncmp(details, user, user_length) != 0)
+        return 0;
+    details += user_length;
+    if (strncmp(details, reply_prefix, sizeof(reply_prefix) - 1) != 0)
+        return 0;
+    details += sizeof(reply_prefix) - 1;
+    size_t reply_length = strlen(reply);
+    if (strncmp(details, reply, reply_length) != 0)
+        return 0;
+    details += reply_length;
+    return !*details || strncmp(details, R2_LOG_CONVERSATION_TOOL_PREFIX,
+                               sizeof(R2_LOG_CONVERSATION_TOOL_PREFIX) - 1) == 0;
+}
+
 /* Full conversation record, including exact user and assistant text. */
 int64_t r2_log_conversation_turn(const char *user_text,
                                 const char *assistant_text);
 int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
                                             const int64_t *speech_ids, size_t speech_count,
                                             const int64_t *review_ids, size_t review_count);
+/* Retain exact completed tool evidence in the same committed conversation event. */
+int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result);
 
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
@@ -195,6 +236,10 @@ int64_t r2_log_inner_state(const char *state_kind,
                            const char *evidence,
                            double confidence,
                            const char *origin);
+/* A positive parent ID requires the quoted evidence link in the same commit. */
+int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id);
 
 /* Belief ledger retains current state and full revision history in events. */
 int64_t r2_log_belief(const char *belief_key,
@@ -203,6 +248,9 @@ int64_t r2_log_belief(const char *belief_key,
                      double confidence,
                      const char *status,
                      const char *origin);
+int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id);
 
 /* Continuity ledger for projects, goals, tasks, questions, and routines. */
 int64_t r2_log_continuity(const char *item_key,
@@ -212,6 +260,9 @@ int64_t r2_log_continuity(const char *item_key,
                           const char *status,
                           const char *next_action,
                           const char *origin);
+int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence);
 
 /* Consume one pending reflection in the same transaction as its event and
  * speech edges. Returns the new event ID, 0 if no work exists, or -1 on failure. */
@@ -229,6 +280,16 @@ int64_t r2_log_hypothetical(const char *scenario,
                             const char *predicted_outcome,
                             const char *conclusion,
                             const char *origin);
+int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence);
+/* Write the branch on the Life Log database connection within its transaction.
+ * The callback must return SQLITE_DONE after inserting exactly one row. */
+int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
+                                        const char *predicted_outcome, const char *conclusion,
+                                        int64_t evidence_event_id,
+                                        int (*save_branch)(struct sqlite3 *, int64_t, void *), void *branch);
 
 /* Complete inference snapshots use an archive outside ordinary event recall.
  * Returned text is caller-owned. Missing or unreadable snapshots return NULL. */

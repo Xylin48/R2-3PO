@@ -50,7 +50,7 @@ if "asprintf(&context" not in learning or "%.900s" in learning:
 if "reward && addiction" not in learning:
     raise SystemExit("Live learning context must fail if either required provider fails.")
 
-dream_start = core.find("int r2_sleep_and_dream(double hours)")
+dream_start = core.find("static char *r2_build_dream_context(")
 dream_end = core.find("static int autonomous_needs_action_allowed", dream_start)
 if dream_start < 0 or dream_end < 0:
     raise SystemExit("Could not locate the private dream context path.")
@@ -58,6 +58,10 @@ dream = core[dream_start:dream_end]
 for source in ("r2_reward_context()", "r2_addiction_report()", "LEARNED REINFORCEMENT CONTEXT", "REPEATED-INTEREST HISTORY"):
     if source not in dream:
         raise SystemExit(f"Private dream context omits {source}")
+if "asprintf(&context" not in dream or "r2_build_dream_context(reality, memories, diary, reward, addiction)" not in dream:
+    raise SystemExit("The private dream must use complete dynamically assembled inputs.")
+if "%.4000s" in dream or "%.3500s" in dream or "%.2500s" in dream:
+    raise SystemExit("Private dream context must never silently shorten remembered evidence.")
 
 for boundary in (
     "Imagined sensory details are predictions, not observations.",

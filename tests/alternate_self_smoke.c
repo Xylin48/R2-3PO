@@ -4,6 +4,7 @@
 #include "r2_diary.h"
 
 #include <sqlite3.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,16 +62,11 @@ static int ensure_log_schema(void)
     return rc == SQLITE_OK ? 0 : -1;
 }
 
-static int64_t insert_log_event(R2LogCategory category, const char *type,
+static int64_t insert_log_event_on(sqlite3 *db, R2LogCategory category, const char *type,
                                 const char *summary, const char *details,
                                 const char *source)
 {
-    sqlite3 *db = NULL;
     sqlite3_stmt *st = NULL;
-    if (sqlite3_open(R2_DIARY_DATABASE, &db) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return -1;
-    }
     const char *sql =
         "INSERT INTO r2_log_events(category,event_type,summary,details,source) "
         "VALUES(?,?,?,?,?);";
@@ -87,6 +83,15 @@ static int64_t insert_log_event(R2LogCategory category, const char *type,
     }
     int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(db) : -1;
     if (st) sqlite3_finalize(st);
+    return id;
+}
+
+static int64_t insert_log_event(R2LogCategory category, const char *type,
+                                const char *summary, const char *details, const char *source)
+{
+    sqlite3 *db = NULL;
+    int64_t id = sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK
+        ? insert_log_event_on(db, category, type, summary, details, source) : -1;
     sqlite3_close(db);
     return id;
 }
@@ -108,6 +113,29 @@ int64_t r2_log_hypothetical(const char *scenario, const char *assumptions,
                             conclusion, origin);
 }
 
+static int reject_log_links;
+
+int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
+                                        const char *predicted_outcome, const char *conclusion,
+                                        int64_t evidence_event_id,
+                                        int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
+{
+    (void)assumptions;
+    (void)predicted_outcome;
+    (void)evidence_event_id;
+    sqlite3 *db = NULL;
+    int64_t id = -1;
+    if (sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK &&
+        sqlite3_exec(db, "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK) {
+        id = insert_log_event_on(db, R2_LOG_HYPOTHETICAL, "hypothetical", scenario, conclusion, "fixture");
+        if (id <= 0 || save_branch(db, id, branch) != SQLITE_DONE || sqlite3_changes(db) != 1 ||
+            sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK)
+            id = -1;
+    }
+    sqlite3_close(db);
+    return id;
+}
+
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,
                 const char *relationship, const char *notes)
 {
@@ -115,7 +143,7 @@ int r2_log_link(int64_t from_event_id, int64_t to_event_id,
     (void)to_event_id;
     (void)relationship;
     (void)notes;
-    return 0;
+    return reject_log_links ? -1 : 0;
 }
 
 static int check(int condition, const char *message)
@@ -220,6 +248,20 @@ int main(void)
         "My preference might change.", "Prediction only.", imported_event, evidence_id);
     if (!check(imported1 > 0 && imported1 == imported2,
                "importing the same hypothetical is idempotent")) goto done;
+    if (!check(r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",
+               "My preference might change.", "Prediction only.", INT64_MAX, 0) < 0 &&
+               r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",
+               "My preference might change.", "Prediction only.", imported_event, INT64_MAX) < 0,
+               "an identical branch cannot acknowledge missing source or evidence")) goto done;
+    int64_t retry_event = r2_log_hypothetical("Repeated occurrence", NULL, NULL, NULL, "smoke test");
+    if (!check(retry_event > 0, "create repeated hypothesis event")) goto done;
+    reject_log_links = 1;
+    int64_t rejected = r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",
+        "My preference might change.", "Prediction only.", retry_event, 0);
+    reject_log_links = 0;
+    if (!check(rejected < 0 && r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",
+               "My preference might change.", "Prediction only.", retry_event, 0) == imported1,
+               "a refused relationship can retry against the existing branch")) goto done;
 
     view = r2_altself_list(20);
     if (!check(view && strstr(view, "Look left") && strstr(view, "Look right") &&

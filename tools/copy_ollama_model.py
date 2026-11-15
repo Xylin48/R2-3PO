@@ -110,6 +110,16 @@ def _sha256_file(path: Path) -> str:
 
 def copy_model(source_root: Path, destination_root: Path, model: str, owner: str) -> None:
     rel = model_manifest_relative(model)
+    # This tool must never change the original model store. In addition to
+    # replacing destination files, the copier changes their ownership and
+    # permissions. An accidentally identical or nested source/destination
+    # would therefore mutate the authoritative source even on a clean copy.
+    source_canonical = source_root.resolve()
+    destination_canonical = destination_root.resolve()
+    if (source_canonical == destination_canonical
+            or source_canonical in destination_canonical.parents
+            or destination_canonical in source_canonical.parents):
+        raise ValueError("source and destination model stores must not overlap")
     source_manifest = source_root / rel
     # The source model store is read by a privileged installer. Refuse symlinked
     # path components and leaf files so a modified store cannot redirect reads
@@ -196,7 +206,13 @@ def copy_model(source_root: Path, destination_root: Path, model: str, owner: str
         # Every source blob was hashed before destination changes began.
         # Verify existing destination content independently; when repair is
         # needed, the copied temporary file is hashed before atomic replacement.
-        if dst.is_symlink() or not dst.is_file() or _sha256_file(dst) != expected_sha256:
+        # An existing correct-hash blob may still be a hard link into the
+        # source store or another directory. Changing its owner or mode would
+        # change that other file too. Replace shared inodes before metadata
+        # updates so ownership of the private store stays independent.
+        if (dst.is_symlink() or not dst.is_file()
+                or dst.stat().st_nlink != 1
+                or _sha256_file(dst) != expected_sha256):
             # Create the temporary file exclusively in the destination directory.
             # A predictable PID-based name could already be a symlink and redirect
             # shutil.copyfile() outside the model store.
@@ -256,7 +272,7 @@ def copy_model(source_root: Path, destination_root: Path, model: str, owner: str
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default=os.environ.get("R2_MODEL", "gemma3:4b"))
+    parser.add_argument("--model", default=os.environ.get("R2_MODEL", "qwen3.5:9b"))
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--destination-root", type=Path, default=Path("/home/x/R2_Home/.ollama/models"))
     parser.add_argument("--owner", default="r2")

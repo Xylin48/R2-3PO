@@ -8,9 +8,9 @@ sounds = (ROOT / "R2Sounds.c").read_text(encoding="utf-8")
 sound_header = (ROOT / "R2Sounds.h").read_text(encoding="utf-8")
 reply_module = (ROOT / "R2Reply.c").read_text(encoding="utf-8")
 
-marker_processing_index = r2.find("r2_sounds_process_reply(reply)")
+marker_processing_index = r2.find("clean_final_reply(reply)")
 tool_processing_index = r2.find("char *tools = process_tools(stripped_reply)")
-strip_marker_index = r2.find("r2_sounds_strip_markers(reply)")
+strip_marker_index = r2.find("r2_sounds_strip_markers_with_literals(reply, literal_tool_span)")
 
 checks = {
     "core includes the existing sound API": '#include "R2Sounds.h"' in r2,
@@ -22,7 +22,7 @@ checks = {
     "official FX location is hard-coded in the sound API": '/home/x/R2_Home/R2_sounds/FX' in sound_header,
     "launcher uses the official FX location as its default": '/home/x/R2_Home/R2_sounds/FX' in launcher,
     "reply sanitizer removes explicit private reasoning blocks": 'r2_reply_sanitize' in reply_module and '"<think>"' in reply_module and '"<analysis>"' in reply_module,
-    "core sanitizes generated user-facing replies": 'r2_reply_sanitize(reply)' in r2,
+    "core sanitizes generated user-facing replies": 'r2_reply_sanitize_with_literals(reply, literal_tool_span)' in r2,
     "launcher compiles the reply sanitizer module": '"$R2_SOURCE/R2Reply.c"' in launcher,
     "Makefile builds and tracks reply sanitizer": "R2Reply.c" in makefile and "R2Reply.h" in makefile,
     "launcher compiles the sound module": '"$R2_SOURCE/R2Sounds.c"' in launcher,
@@ -39,7 +39,7 @@ checks = {
     "marker cleanup failure returns a visible fallback instead of exposing control text": "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in r2 and "if (!reply_has_visible_text(sound_clean_reply))" in r2,
     "empty or marker-only replies trigger recovery before a visible fallback is returned": "Model output contained no visible reply after marker cleanup; retrying once." in r2 and "Retry still produced no visible reply" in r2 and "Your message hasn't been discarded" in r2,
     "tool output append preserves full action output with exact-size allocation": "asprintf(&_part, __VA_ARGS__)" in r2 and "memcpy(results + len, _part, (size_t)_n)" in r2 and "[tool output truncated]" not in r2 and "snprintf(results, cap, \"%s\", _capture_failure)" in r2,
-    "reply sanitizer classifies scratch and finds the answer in visible text": "visible_looks_private" in reply_module and "reply_find_final_content(visible)" in reply_module,
+    "reply sanitizer classifies scratch and finds the answer in visible text": "visible_looks_private" in reply_module and "reply_find_final_content(visible, literal_span)" in reply_module,
 }
 failed = [label for label, ok in checks.items() if not ok]
 for label, ok in checks.items():

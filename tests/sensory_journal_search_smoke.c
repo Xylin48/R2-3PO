@@ -177,6 +177,44 @@ int main(void)
     assert(found && strstr(found, "No Sensory Journal entries matched."));
     free(found);
 
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db,
+        "CREATE TABLE r2_log_conversations (event_id INTEGER PRIMARY KEY,"
+        "user_text TEXT NOT NULL,assistant_text TEXT NOT NULL);"
+        "INSERT INTO r2_log_conversations SELECT id,"
+        "printf('%.*c',3000,'x') || 'archive_tail%literal',"
+        "'assistant!suffix' FROM r2_log_events WHERE summary='Saw bang!mark';") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+
+    char archived_user[3000 + sizeof("archive_tail%literal")];
+    memset(archived_user, 'x', 3000);
+    memcpy(archived_user + 3000, "archive_tail%literal", sizeof("archive_tail%literal"));
+    found = r2_sj_search("archive_tail%literal", 20);
+    assert(found && strstr(found, "Saw bang!mark"));
+    assert(strstr(found, archived_user) && strstr(found, "assistant!suffix"));
+    free(found);
+    found = r2_sj_search("assistant!suffix", 20);
+    assert(found && strstr(found, archived_user) && strstr(found, "assistant!suffix"));
+    free(found);
+    found = r2_sj_search("archiveXtail%literal", 20);
+    assert(found && strstr(found, "No Sensory Journal entries matched."));
+    free(found);
+    found = r2_sj_recent(20);
+    assert(found && strstr(found, archived_user) && strstr(found, "assistant!suffix"));
+    free(found);
+
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db,
+        "UPDATE r2_log_events SET details=(SELECT 'USER SAID:' || char(10) || user_text "
+        "|| char(10) || 'R2 REPLIED:' || char(10) || assistant_text || '"
+        R2_LOG_CONVERSATION_TOOL_PREFIX "exact tool archive' FROM r2_log_conversations c "
+        "WHERE c.event_id=r2_log_events.id) WHERE summary='Saw bang!mark';") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    found = r2_sj_recent(20);
+    assert(found && strstr(found, archived_user) && strstr(found, "assistant!suffix"));
+    assert(strstr(found, "exact tool archive") && !strstr(found, "Archived user message:"));
+    free(found);
+
     /* New diary-writing events must be indexed and linked immediately, not
        only discovered during the next journal initialization. */
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
@@ -206,6 +244,11 @@ int main(void)
                        "WHERE summary='Saw 100% battery';") == 0);
     assert(sqlite3_close(db) == SQLITE_OK);
     assert(r2_sj_search("100%", 20) == NULL);
+
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db, "UPDATE r2_log_conversations SET user_text=CAST(X'61620063' AS TEXT);") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(r2_sj_search("assistant!suffix", 20) == NULL);
 
     r2_sj_shutdown();
     remove(R2_DIARY_DATABASE);

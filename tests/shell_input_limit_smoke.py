@@ -10,13 +10,12 @@ def require(ok: bool, message: str) -> None:
     if not ok:
         raise SystemExit(f"FAIL: {message}")
 
-require("#define SHELL_INPUT_MAX       12000" in shell and
-        "char line[SHELL_INPUT_MAX + 2]" in shell,
-        "shell uses a fixed 12,000-byte input buffer")
+require("R2_MAX_TURN_INPUT_BYTES" in shell and "char *line = NULL;" in shell,
+        "shell bounds dynamic input with the same limit as the direct console")
 loop = shell.find("int r2_shell_run(void)")
-read = shell.find("r2_read_bounded_line(stdin, line, SHELL_INPUT_MAX, &input_bytes)", loop)
+read = shell.find("r2_read_terminal_line(stdin, STDIN_FILENO, &line, &line_capacity,", loop)
 check = shell.find("if (input_status == R2_INPUT_LINE_TOO_LONG)", read)
-dispatch = shell.find("shell_dispatch(input);", check)
+dispatch = shell.find("shell_dispatch(line);", check)
 require(min(loop, read, check, dispatch) >= 0 and read < check < dispatch,
         "bounded input is checked before command dispatch")
 guard = shell[check:dispatch]

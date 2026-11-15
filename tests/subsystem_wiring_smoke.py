@@ -129,7 +129,7 @@ for init_failure in (
     assert init_failure in core, f"core startup silently degrades instead of requiring {init_failure}"
 assert "r2_sj_recent((int)limit)" in core
 assert "r2_sj_search(arg1, (int)limit)" in core
-memory_save_start = core.find("int save_memory(")
+memory_save_start = core.find("static int write_memory(")
 memory_save_end = core.find("\nstatic ", memory_save_start + 1)
 if memory_save_start < 0 or memory_save_end < 0:
     raise SystemExit("Could not locate persistent memory save implementation.")
@@ -143,11 +143,11 @@ for bind in (
         raise SystemExit(f"Persistent memory update ignores a SQLite binding result: {bind}")
 
 gameboy_link_start = core.find("static int64_t gameboy_find_life_event_for_console_event(")
-gameboy_link_end = core.find("\n/* Pull only adapter-verified virtual events", gameboy_link_start)
+gameboy_link_end = core.find("\nstatic int gameboy_sync_verified_event(", gameboy_link_start)
 if gameboy_link_start < 0 or gameboy_link_end < 0:
     raise SystemExit("Could not locate Game Boy Life Log deduplication lookup.")
 gameboy_link = core[gameboy_link_start:gameboy_link_end]
-if "lookup_rc = sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
+if "lookup_rc = sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
     raise SystemExit("Game Boy Life Log deduplication ignores the event lookup binding result.")
 
 reward_modifier_start = reward.find("int r2_reward_current_modifier(")
@@ -229,7 +229,7 @@ for bind in (
     if bind not in activity_end_body:
         raise SystemExit(f"Life Log activity-end persistence ignores a binding result: {bind}")
 
-location_start = log.find("int r2_log_location_transition(")
+location_start = log.find("static int log_stage_location_transition(")
 location_end = log.find("\nint64_t r2_log_", location_start + 1)
 if location_start < 0 or location_end < 0:
     raise SystemExit("Could not locate Life Log location persistence.")

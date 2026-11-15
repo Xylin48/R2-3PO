@@ -36,6 +36,31 @@ class CopyOllamaModelIntegrityTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return blob_paths
 
+    def test_overlapping_stores_are_rejected_without_changing_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            source = Path(temporary) / "source"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            manifest = source / copier.model_manifest_relative("qwen3.5:9b")
+            original = manifest.read_bytes()
+            original_mode = manifest.stat().st_mode
+            # A mistaken --destination-root must not chown/chmod, overwrite,
+            # or create files anywhere inside the source model store.
+            for destination in (source, source / "nested", source.parent):
+                with self.subTest(destination=destination):
+                    with self.assertRaisesRegex(ValueError, "must not overlap"):
+                        copier.copy_model(source, destination, "qwen3.5:9b", "")
+                    self.assertEqual(manifest.read_bytes(), original)
+                    self.assertEqual(manifest.stat().st_mode, original_mode)
+                    self.assertFalse((source / "nested").exists())
+
+    def test_overlapping_stores_detected_after_parent_normalization(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            source = Path(temporary) / "source"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            destination = source.parent / "source" / ".." / "source"
+            with self.assertRaisesRegex(ValueError, "must not overlap"):
+                copier.copy_model(source, destination, "qwen3.5:9b", "")
+
     def test_same_size_corrupt_destination_is_repaired(self) -> None:
         with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
             base = Path(temporary)
@@ -48,6 +73,26 @@ class CopyOllamaModelIntegrityTests(unittest.TestCase):
             self.assertEqual(copied.stat().st_size, len(b"weights"))
             copier.copy_model(source, destination, "qwen3.5:9b", "")
             self.assertEqual(copied.read_bytes(), b"weights")
+
+    def test_hardlinked_destination_blob_is_detached_before_metadata_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
+            base = Path(temporary)
+            source, destination = base / "source", base / "destination"
+            self._write_model(source, "qwen3.5:9b", {b"config": "unused", b"weights": "unused"})
+            copier.copy_model(source, destination, "qwen3.5:9b", "")
+            digest = hashlib.sha256(b"weights").hexdigest()
+            copied = destination / "blobs" / ("sha256-" + digest)
+            external = base / "shared-weights"
+            copied.rename(external)
+            os.link(external, copied)
+            os.chmod(external, 0o600)
+            original_mode = external.stat().st_mode
+            self.assertEqual(copied.stat().st_ino, external.stat().st_ino)
+            copier.copy_model(source, destination, "qwen3.5:9b", "")
+            self.assertNotEqual(copied.stat().st_ino, external.stat().st_ino)
+            self.assertEqual(copied.read_bytes(), b"weights")
+            self.assertEqual(external.read_bytes(), b"weights")
+            self.assertEqual(external.stat().st_mode, original_mode)
 
     def test_symlinked_destination_blob_is_replaced_not_followed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:

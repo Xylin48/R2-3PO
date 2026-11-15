@@ -75,6 +75,11 @@ int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out);
 int r2_diary_stage_reflection(const char *entry, const int64_t *speech_ids,
                               size_t speech_count, int64_t *entry_id_out);
 
+/* The optional two review IDs refer to initial and post-action evidence. */
+int r2_diary_stage_reviewed_reflection(const char *entry, const int64_t *speech_ids,
+                                       size_t speech_count, const int64_t reviews[2],
+                                       int64_t *entry_id_out);
+
 /* Retry pending Markdown appends in order within each day. */
 int r2_diary_replay_mirrors(void);
 

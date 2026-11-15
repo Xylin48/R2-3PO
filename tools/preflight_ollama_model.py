@@ -6,7 +6,6 @@ import argparse
 import base64
 import json
 import os
-import re
 import struct
 import zlib
 import subprocess
@@ -22,6 +21,15 @@ ALLOWED_API_BASES = {
     "http://127.0.0.1:11435",
 }
 MODEL = "qwen3.5:9b"
+
+def _is_required_model(item: Any) -> bool:
+    """Match the requested Ollama model, not a similarly prefixed tag.
+
+    Names such as qwen3.5:9b-other are different models and must never
+    establish either model availability or GPU placement for qwen3.5:9b.
+    """
+    return isinstance(item, dict) and item.get("name") == MODEL
+
 
 
 def _adaptive_context_tokens() -> int:
@@ -129,10 +137,12 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 def _is_complete_assistant_turn(reply: dict[str, Any]) -> bool:
     """Match the core's non-streaming Ollama completion contract."""
     message = reply.get("message")
+    reason = reply.get("done_reason", "")
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and reply.get("done") is True
+        and isinstance(reason, str) and "\x00" not in reason and reason != "length"
     )
 
 
@@ -179,11 +189,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         try:
             tags = _read_json(f"{api_base}/api/tags", timeout=min(4, max(1, timeout)))
             models = tags.get("models", [])
-            if any(
-                isinstance(item, dict)
-                and (item.get("name") == MODEL or str(item.get("name", "")).startswith(MODEL + "-"))
-                for item in models
-            ):
+            if isinstance(models, list) and any(_is_required_model(item) for item in models):
                 break
             last_error = RuntimeError(f"required local model {MODEL} is not installed")
         except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
@@ -285,7 +291,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     if not _is_complete_assistant_turn(reply):
         print(
             f"ERROR: Ollama listed {MODEL} but text generation did not return a complete assistant turn "
-            "(expected message.role=assistant and done=true).",
+            "(expected message.role=assistant and done=true without a generation limit).",
             file=sys.stderr,
         )
         return False
@@ -343,7 +349,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     if not _is_complete_assistant_turn(vision_reply):
         print(
             f"ERROR: {MODEL} returned an incomplete or invalid assistant turn for the image-bearing probe "
-            "(expected message.role=assistant and done=true).",
+            "(expected message.role=assistant and done=true without a generation limit).",
             file=sys.stderr,
         )
         return False
@@ -355,7 +361,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     except json.JSONDecodeError:
         vision_data = {}
     vision_color = vision_data.get("color") if isinstance(vision_data, dict) else None
-    if not isinstance(vision_color, str) or not re.search(r"\bblue\b", vision_color, re.IGNORECASE):
+    if not isinstance(vision_color, str) or vision_color.strip().casefold() != "blue":
         print(
             f"ERROR: {MODEL} passed text generation but failed the JSON known-color vision probe "
             "(expected the image-bearing reply to report color=blue).",
@@ -375,10 +381,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     try:
         ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
         loaded = ps.get("models", [])
-        active = next((item for item in loaded
-                       if isinstance(item, dict)
-                       and (item.get("name") == MODEL
-                            or str(item.get("name", "")).startswith(MODEL + "-"))), None)
+        active = next((item for item in loaded if _is_required_model(item)), None) if isinstance(loaded, list) else None
         if active is None:
             print("GPU verification: model not present in /api/ps; placement remains unverified.")
         else:
@@ -439,7 +442,7 @@ def main() -> int:
     parser.add_argument("--wait-seconds", type=float, default=0,
                         help="wait this long for the local API/model to become available")
     parser.add_argument("--timeout", type=float, default=180,
-                        help="maximum seconds for the single real inference request")
+                        help="timeout in seconds for each inference request")
     parser.add_argument("--require-gpu-offload", action="store_true",
                         help="fail unless Ollama reports both VRAM allocation and model memory outside VRAM")
     args = parser.parse_args()

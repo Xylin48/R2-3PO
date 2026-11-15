@@ -334,62 +334,48 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
 
-    const char *sql_recent =
+    const char *sql_select =
         "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
         "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
         "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
         "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
-        "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
+        "THEN NULL ELSE d.diary_entry_id END)";
+    const char *from =
+        " FROM r2_sensory_journal j "
         "JOIN r2_log_events e ON e.id=j.event_id "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
-        "ORDER BY e.id DESC LIMIT ?;";
-    const char *sql_search =
-        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
-        "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
-        "e.event_type IN ('diary_entry_written','reflection_completed') "
-        "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
-        "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
-        "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
-        "THEN NULL ELSE d.diary_entry_id END) FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
-        "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
-        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id "
-        "WHERE e.summary LIKE ? ESCAPE '!' OR e.details LIKE ? ESCAPE '!' "
-        "OR e.event_type LIKE ? ESCAPE '!' OR j.journal_kind LIKE ? ESCAPE '!' "
-        "OR e.source LIKE ? ESCAPE '!' ORDER BY e.id DESC LIMIT ?;";
+        "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id ";
+    const char *search =
+        "WHERE (instr(lower(e.summary),lower(?1))>0 OR instr(lower(e.details),lower(?1))>0 "
+        "OR instr(lower(e.event_type),lower(?1))>0 OR instr(lower(j.journal_kind),lower(?1))>0 "
+        "OR instr(lower(e.source),lower(?1))>0";
+    int event_id = sj_column_exists("r2_log_conversations", "event_id");
+    int user_text = sj_column_exists("r2_log_conversations", "user_text");
+    int assistant_text = sj_column_exists("r2_log_conversations", "assistant_text");
+    if (event_id < 0 || user_text < 0 || assistant_text < 0) {
+        pthread_mutex_unlock(&sj_lock);
+        return NULL;
+    }
+    int archive_available = event_id && user_text && assistant_text;
+    char *sql = sqlite3_mprintf("%s%s%s%s%s%s%s ORDER BY e.id DESC LIMIT %s;",
+        sql_select, archive_available ? ",c.user_text,c.assistant_text" : ",NULL,NULL", from,
+        archive_available ? "LEFT JOIN r2_log_conversations c ON c.event_id=e.id " : "",
+        query ? search : "",
+        query && archive_available ? " OR instr(lower(c.user_text),lower(?1))>0 "
+                                      "OR instr(lower(c.assistant_text),lower(?1))>0" : "",
+        query ? ")" : "", query ? "?2" : "?1");
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(sj_db, query ? sql_search : sql_recent, -1, &st, NULL) != SQLITE_OK) {
+    int prepare_rc = sql ? sqlite3_prepare_v2(sj_db, sql, -1, &st, NULL) : SQLITE_NOMEM;
+    sqlite3_free(sql);
+    if (prepare_rc != SQLITE_OK) {
         pthread_mutex_unlock(&sj_lock);
         return NULL;
     }
     if (query) {
-        size_t n = strlen(query);
-        /* Treat user search text literally: LIKE's %, _, and our escape
-           character must not silently broaden the requested search. */
-        if (n > ((size_t)-1 - 3) / 2) {
-            sqlite3_finalize(st);
-            pthread_mutex_unlock(&sj_lock);
-            return NULL;
-        }
-        char *pat = malloc(n * 2 + 3);
-        if (!pat) { sqlite3_finalize(st); pthread_mutex_unlock(&sj_lock); return NULL; }
-        size_t pat_len = 0;
-        pat[pat_len++] = '%';
-        for (size_t i = 0; i < n; ++i) {
-            if (query[i] == '%' || query[i] == '_' || query[i] == '!')
-                pat[pat_len++] = '!';
-            pat[pat_len++] = query[i];
-        }
-        pat[pat_len++] = '%';
-        pat[pat_len] = '\0';
-        int bind_rc = SQLITE_OK;
-        for (int i = 1; i <= 5 && bind_rc == SQLITE_OK; ++i)
-            bind_rc = sqlite3_bind_text(st, i, pat, -1, SQLITE_TRANSIENT);
-        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 6, limit);
-        free(pat);
+        int bind_rc = sqlite3_bind_text64(st, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (bind_rc == SQLITE_OK) bind_rc = sqlite3_bind_int(st, 2, limit);
         if (bind_rc != SQLITE_OK) {
             sqlite3_finalize(st);
             pthread_mutex_unlock(&sj_lock);
@@ -416,7 +402,12 @@ static char *sj_query(const char *query, int limit)
         const unsigned char *details = sqlite3_column_text(st, 6);
         const unsigned char *source = sqlite3_column_text(st, 7);
         const unsigned char *diary_id = sqlite3_column_text(st, 8);
-        const unsigned char *fields[] = {utc, local, kind, type, summary, details, source, diary_id};
+        const char *archive_user = (const char *)sqlite3_column_text(st, 9);
+        const char *archive_reply = (const char *)sqlite3_column_text(st, 10);
+        const unsigned char *fields[] = {
+            utc, local, kind, type, summary, details, source, diary_id,
+            (const unsigned char *)archive_user, (const unsigned char *)archive_reply
+        };
         for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
             int column = (int)i + 1;
             if ((!fields[i] && sqlite3_column_type(st, column) != SQLITE_NULL) ||
@@ -426,8 +417,11 @@ static char *sj_query(const char *query, int limit)
             }
         }
         if (serialization_failed) break;
-        int needed = snprintf(NULL, 0,
-            "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s\n\n",
+        int show_archive = (archive_user || archive_reply) &&
+            !r2_log_details_include_conversation((const char *)details, archive_user, archive_reply);
+        char *row = NULL;
+        int needed = asprintf(&row,
+            "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s%s%s%s%s\n\n",
             (long long)sqlite3_column_int64(st, 0),
             utc ? (const char *)utc : "unknown UTC",
             local ? (const char *)local : "unknown local",
@@ -436,37 +430,35 @@ static char *sj_query(const char *query, int limit)
             summary ? (const char *)summary : "",
             source ? (const char *)source : "unspecified",
             diary_id ? (const char *)diary_id : "none",
-            details ? (const char *)details : "");
+            details ? (const char *)details : "",
+            show_archive ? "\n  Archived user message:\n" : "",
+            show_archive ? (archive_user ? archive_user : "(unavailable)") : "",
+            show_archive ? "\n  Archived R2 reply:\n" : "",
+            show_archive ? (archive_reply ? archive_reply : "(unavailable)") : "");
         if (needed < 0) {
             serialization_failed = 1;
             break;
         }
         if (len == SIZE_MAX || (size_t)needed > SIZE_MAX - len - 1) {
+            free(row);
             serialization_failed = 1;
             errno = EOVERFLOW;
             break;
         }
-        if (len + (size_t)needed + 1 > cap) {
+        size_t required = len + (size_t)needed + 1;
+        if (required > cap) {
             size_t next = cap;
-            while (next < len + (size_t)needed + 1) {
-                if (next > SIZE_MAX / 2) { next = len + (size_t)needed + 1; break; }
+            while (next < required) {
+                if (next > SIZE_MAX / 2) { next = required; break; }
                 next *= 2;
             }
             char *grown = realloc(out, next);
-            if (!grown) { free(out); out = NULL; break; }
-            out = grown; cap = next;
+            if (!grown) { free(row); serialization_failed = 1; break; }
+            out = grown;
+            cap = next;
         }
-        snprintf(out + len, cap - len,
-            "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s\n\n",
-            (long long)sqlite3_column_int64(st, 0),
-            utc ? (const char *)utc : "unknown UTC",
-            local ? (const char *)local : "unknown local",
-            kind ? (const char *)kind : "unknown",
-            type ? (const char *)type : "unknown",
-            summary ? (const char *)summary : "",
-            source ? (const char *)source : "unspecified",
-            diary_id ? (const char *)diary_id : "none",
-            details ? (const char *)details : "");
+        memcpy(out + len, row, (size_t)needed + 1);
+        free(row);
         len += (size_t)needed;
     }
     sqlite3_finalize(st);

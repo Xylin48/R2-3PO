@@ -82,9 +82,19 @@ def _path_has_symlink_component(root: Path, relative: str) -> bool:
     return False
 
 
+def _reject_snapshot_symlink_components(path: Path) -> None:
+    """Refuse an existing symlink at any destination ancestor or leaf."""
+    absolute = path.absolute()
+    for component in reversed((absolute, *absolute.parents)):
+        if component.is_symlink():
+            raise OSError(f"refusing symlinked snapshot destination: {component}")
+
+
 def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
     """Create snapshots for required and present optional DBs, never overwriting."""
+    _reject_snapshot_symlink_components(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_snapshot_symlink_components(snapshot_dir)
     targets = [snapshot_dir / name for name in ALL_DATABASES]
     conflicts = [path for path in targets if path.exists() or path.is_symlink()]
     if conflicts:
@@ -105,7 +115,9 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
             if not source.is_file():
                 continue
             destination = snapshot_dir / name
+            _reject_snapshot_symlink_components(destination.parent)
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _reject_snapshot_symlink_components(destination.parent)
             snapshot_database(source, destination)
             created.append(destination)
     except Exception:

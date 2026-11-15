@@ -35,8 +35,20 @@ require("int complete_line = 0;" in server
 require("int client = accept(server_fd, NULL, NULL);" in server
         and "POLLIN" in server,
         "accept occurs only after listener readiness is polled")
+require("poll(&output, 1, 250)" in server
+        and "reply_idle >= 8" in server
+        and "reply_sent < reply_len && !atomic_load(&tv_control_stop)" in server
+        and "MSG_NOSIGNAL | MSG_DONTWAIT" in server,
+        "a client that stops reading cannot hold the shutdown join indefinitely")
 
 stop_start = shell.find("static void tv_control_stop_server(void)")
+startup = shell[end:stop_start]
+bind_failure = startup.find("if (bind(fd,")
+owned_socket = startup.find("if (chmod(tv_control_path", bind_failure)
+require(bind_failure >= 0 and owned_socket > bind_failure
+        and "return -1;" in startup[bind_failure:owned_socket]
+        and "unlink(" not in startup[bind_failure:owned_socket],
+        "a failed bind leaves the other listener's socket path intact")
 stop_end = shell.find("/* ============================================================\n   SIGNAL HANDLING", stop_start)
 if stop_start < 0 or stop_end <= stop_start:
     raise SystemExit("FAIL: could not isolate tv_control_stop_server()")

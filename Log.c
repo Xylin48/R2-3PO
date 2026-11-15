@@ -58,6 +58,7 @@
 
 static sqlite3 *log_db = NULL;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t log_location_lock = PTHREAD_MUTEX_INITIALIZER;
 static int log_initialized = 0;
 static int64_t current_session_id = 0;
 static struct timespec process_start_time;
@@ -325,6 +326,7 @@ static int migrate_legacy_log_schema(void)
         {"r2_log_location_state","current_location","TEXT NOT NULL DEFAULT 'home'"},
         {"r2_log_location_state","is_home","INTEGER NOT NULL DEFAULT 1"},
         {"r2_log_location_state","was_away","INTEGER NOT NULL DEFAULT 0"},
+        {"r2_log_location_state","welcome_pending","INTEGER NOT NULL DEFAULT 0"},
         {"r2_log_location_state","updated_utc","TEXT NOT NULL DEFAULT ''"},
 
         {"r2_log_milestones","milestone_key","TEXT NOT NULL DEFAULT ''"},
@@ -482,6 +484,7 @@ static int ensure_tables(void)
         " current_location TEXT NOT NULL,"
         " is_home INTEGER NOT NULL DEFAULT 1,"
         " was_away INTEGER NOT NULL DEFAULT 0,"
+        " welcome_pending INTEGER NOT NULL DEFAULT 0,"
         " updated_utc TEXT NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS r2_log_milestones ("
@@ -581,6 +584,11 @@ static int ensure_tables(void)
         " conversation_event_id INTEGER,"
         " created_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_reflection_reviews ("
+        " event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+        " ordinal INTEGER NOT NULL,"
+        " archive_id INTEGER NOT NULL REFERENCES r2_log_context_reviews(id),"
+        " PRIMARY KEY(event_id,ordinal));"
         "CREATE TABLE IF NOT EXISTS r2_log_system_snapshots ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -1065,6 +1073,34 @@ int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char
     return 0;
 }
 
+int r2_log_save_learning(sqlite3 *peer, const char *memory, const char *category,
+                         int64_t source_event_id,
+                         int (*save)(sqlite3 *, const char *, const char *))
+{
+    if (!peer || !save || !valid_text(memory) || !valid_text(category))
+        return -1;
+    pthread_mutex_lock(&log_lock);
+    const char *life_path = log_initialized && log_db
+        ? sqlite3_db_filename(log_db, "main") : NULL;
+    const char *peer_path = sqlite3_db_filename(peer, "main");
+    if (!life_path || !*life_path || !peer_path || strcmp(life_path, peer_path) != 0 ||
+        exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    int64_t learning = log_insert_event_locked(R2_LOG_MEMORY, "memory_saved",
+        "A persistent memory was saved from an evaluated exchange or observation.",
+        memory, category);
+    int saved = learning > 0 &&
+        (source_event_id <= 0 || log_link_locked(learning, source_event_id,
+            "memory_learned_from", "evidence evaluation") == 0) &&
+        save(log_db, memory, category) == 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
 int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source)
 {
     const char *type = "visual_experience";
@@ -1163,12 +1199,14 @@ int64_t r2_log_event_with_memory(
      * The full factual event remains in r2_log_events.
      * This call happens outside log_lock to avoid lock coupling.
      */
-    char memory[2048];
-    snprintf(memory, sizeof(memory),
-             "Life Log event %" PRId64 ": [%s/%s] %s",
-             event_id, category_name(category), event_type, summary);
+    char *memory = NULL;
+    if (asprintf(&memory, "Life Log event %" PRId64 ": [%s/%s] %s",
+                 event_id, category_name(category), event_type, summary) < 0)
+        return event_id;
+    int memory_result = r2_save_memory(memory, "experience");
+    free(memory);
 
-    if (r2_save_memory(memory, "experience") == 0) {
+    if (memory_result == 0) {
         sqlite3_stmt *statement = NULL;
         int update_rc = SQLITE_ERROR;
         int updated_rows = 0;
@@ -1342,9 +1380,21 @@ static void log_replay_conversation_archives(void)
  * The dedicated table is for durable full-text continuity; the event
  * details make the same turn discoverable through r2_log_search().
  */
+static const char log_conversation_tool_prefix[] =
+    R2_LOG_CONVERSATION_TOOL_PREFIX;
+
 int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,
                                             const int64_t *speech_ids, size_t speech_count,
                                             const int64_t *review_ids, size_t review_count)
+{
+    return r2_log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids,
+                                                   speech_count, review_ids, review_count, NULL);
+}
+
+int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result)
 {
     if (!valid_text(user_text) || !valid_text(assistant_text) ||
         (speech_count && !speech_ids) || (review_count && !review_ids))
@@ -1354,13 +1404,16 @@ int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *a
     size_t assistant_len = strlen(assistant_text);
     const char user_prefix[] = "USER SAID:\n";
     const char reply_prefix[] = "\nR2 REPLIED:\n";
-    size_t overhead = sizeof(user_prefix) - 1 + sizeof(reply_prefix);
+    size_t tool_len = tool_result ? strlen(tool_result) : 0;
+    size_t overhead = sizeof(user_prefix) - 1 + sizeof(reply_prefix) +
+                      (tool_len ? sizeof(log_conversation_tool_prefix) - 1 : 0);
     if (user_len > SIZE_MAX - overhead ||
-        assistant_len > SIZE_MAX - overhead - user_len) {
+        assistant_len > SIZE_MAX - overhead - user_len ||
+        tool_len > SIZE_MAX - overhead - user_len - assistant_len) {
         errno = EOVERFLOW;
         return -1;
     }
-    size_t details_size = user_len + assistant_len + overhead;
+    size_t details_size = user_len + assistant_len + tool_len + overhead;
     char *details = malloc(details_size);
     if (!details) return -1;
     memcpy(details, user_prefix, sizeof(user_prefix) - 1);
@@ -1369,6 +1422,12 @@ int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *a
            reply_prefix, sizeof(reply_prefix) - 1);
     memcpy(details + sizeof(user_prefix) - 1 + user_len + sizeof(reply_prefix) - 1,
            assistant_text, assistant_len + 1);
+    if (tool_len) {
+        char *tool_at = details + sizeof(user_prefix) - 1 + user_len +
+                        sizeof(reply_prefix) - 1 + assistant_len;
+        memcpy(tool_at, log_conversation_tool_prefix, sizeof(log_conversation_tool_prefix) - 1);
+        memcpy(tool_at + sizeof(log_conversation_tool_prefix) - 1, tool_result, tool_len + 1);
+    }
 
     char summary[1024];
     size_t preview = user_len;
@@ -1626,17 +1685,16 @@ int64_t r2_log_media_event(const char *action, const char *media_type,
                            const char *path_or_identifier,
                            const char *details)
 {
-    char summary[2048];
-
     if (!valid_text(action) || !valid_text(media_type) ||
         !valid_text(path_or_identifier))
         return -1;
 
-    snprintf(summary, sizeof(summary), "%s %s: %s",
-             action, media_type, path_or_identifier);
-
-    return r2_log_event(R2_LOG_MEDIA, action, summary,
-                        details, "media");
+    char *summary = NULL;
+    if (asprintf(&summary, "%s %s: %s", action, media_type, path_or_identifier) < 0)
+        return -1;
+    int64_t event_id = r2_log_event(R2_LOG_MEDIA, action, summary, details, "media");
+    free(summary);
+    return event_id;
 }
 
 int64_t r2_log_world_event(const char *object_or_device,
@@ -1830,13 +1888,44 @@ int64_t r2_log_activity_end(const char *activity_key,
 /* ------------------------------------------------------------
  * PERSISTENT LOCATION TRANSITIONS
  * ------------------------------------------------------------ */
-int r2_log_location_transition(const char *location, int is_home)
+/* The caller holds log_location_lock, but not log_lock while writing memory. */
+static int log_deliver_welcome_home(void)
+{
+    const char *query = "SELECT welcome_pending FROM r2_log_location_state WHERE id=1";
+    sqlite3_stmt *statement = NULL;
+    pthread_mutex_lock(&log_lock);
+    int pending = -1;
+    if (log_initialized && log_db &&
+        sqlite3_prepare_v2(log_db, query, -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW)
+        pending = sqlite3_column_int(statement, 0);
+    sqlite3_finalize(statement);
+    pthread_mutex_unlock(&log_lock);
+    if (pending <= 0) return pending;
+
+    /* The memory writer deduplicates the exact memory and category. Replay
+       after a committed write only refreshes the existing memory. */
+    if (r2_save_memory("Welcome Home. You have returned home after being away.",
+                       "private_notification") != 0)
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    int result = -1;
+    if (log_initialized && log_db &&
+        exec_sql("UPDATE r2_log_location_state SET welcome_pending=0 "
+                 "WHERE id=1 AND welcome_pending=1;") == 0 &&
+        sqlite3_changes(log_db) == 1)
+        result = 0;
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
+static int log_stage_location_transition(const char *location, int is_home)
 {
     sqlite3_stmt *statement = NULL;
     char previous[257] = "home";
     int previous_home = 1, was_away = 0, should_welcome = 0, rc;
     char summary[640], details[1200];
-    if (!valid_text(location) || strlen(location) > 256) return -1;
     pthread_mutex_lock(&log_lock);
     if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
@@ -1868,11 +1957,13 @@ int r2_log_location_transition(const char *location, int is_home)
     should_welcome = is_home && !previous_home && was_away;
     rc = sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_location_state SET current_location=?,is_home=?,"
-        "was_away=?,updated_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=1",
+        "was_away=?,welcome_pending=?,"
+        "updated_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=1",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, location, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, is_home ? 1 : 0);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, is_home ? 0 : 1);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 4, should_welcome);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
@@ -1890,13 +1981,18 @@ int r2_log_location_transition(const char *location, int is_home)
                            "world_location") > 0;
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
-    if (result != 0) return -1;
-    if (should_welcome) {
-        (void)r2_save_memory(
-            "Welcome Home. You have returned home after being away.",
-            "private_notification");
-    }
-    return 0;
+    return result;
+}
+
+int r2_log_location_transition(const char *location, int is_home)
+{
+    if (!valid_text(location) || strlen(location) > 256) return -1;
+    pthread_mutex_lock(&log_location_lock);
+    int result = log_deliver_welcome_home();
+    if (result == 0) result = log_stage_location_transition(location, is_home);
+    if (result == 0) result = log_deliver_welcome_home();
+    pthread_mutex_unlock(&log_location_lock);
+    return result;
 }
 
 
@@ -1944,11 +2040,37 @@ static void log_structured_insert_error(const char *record_type)
             record_type, log_db ? sqlite3_errmsg(log_db) : "database unavailable");
 }
 
-int64_t r2_log_inner_state(const char *state_kind,
-                           const char *description,
-                           const char *evidence,
-                           double confidence,
-                           const char *origin)
+/* On success, leave the transaction and lock owned by the caller. */
+static int64_t log_begin_structured(R2LogCategory category, const char *event_type,
+                                   const char *summary, const char *details, const char *origin)
+{
+    pthread_mutex_lock(&log_lock);
+    if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0) {
+        int64_t event_id = log_insert_event_locked(category, event_type, summary, details, origin);
+        if (event_id > 0) return event_id;
+        (void)log_finish_write(0);
+    }
+    pthread_mutex_unlock(&log_lock);
+    return -1;
+}
+
+static int64_t log_finish_structured(int64_t event_id, sqlite3_stmt *st, int rc,
+                                    const char *record_type, int64_t parent_event_id,
+                                    const char *relationship, const char *evidence)
+{
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    if (!saved) log_structured_insert_error(record_type);
+    sqlite3_finalize(st);
+    if (saved && parent_event_id > 0)
+        saved = log_link_locked(parent_event_id, event_id, relationship, evidence) == 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    return result == 0 ? event_id : -1;
+}
+
+int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id)
 {
     if (!valid_text(state_kind) || !valid_text(description) ||
         strlen(state_kind) > 128 || strlen(description) > 8192 ||
@@ -1956,18 +2078,13 @@ int64_t r2_log_inner_state(const char *state_kind,
         (origin && strlen(origin) > 512) || !valid_confidence(confidence))
         return -1;
 
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_THINKING, "inner_state_recorded",
         description, evidence, origin);
     if (event_id < 0) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_inner_states "
         "(event_id,state_kind,description,evidence,confidence,origin) "
@@ -1981,18 +2098,21 @@ int64_t r2_log_inner_state(const char *state_kind,
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, origin);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("inner state");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    event_id = log_finish_structured(event_id, st, rc, "inner state", parent_event_id,
+                                     "extracts_self_state", evidence);
+    if (event_id > 0) r2_sj_index_event(event_id, "thinking", "inner_state_recorded", origin);
+    return event_id;
 }
 
-int64_t r2_log_belief(const char *belief_key,
-                      const char *belief,
-                      const char *evidence,
-                      double confidence,
-                      const char *status,
-                      const char *origin)
+int64_t r2_log_inner_state(const char *state_kind, const char *description,
+                           const char *evidence, double confidence, const char *origin)
+{
+    return r2_log_inner_state_with_evidence(state_kind, description, evidence, confidence, origin, 0);
+}
+
+int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id)
 {
     if (!valid_text(belief_key) || !valid_text(belief) ||
         !valid_text(status) || strlen(belief_key) > 512 ||
@@ -2004,7 +2124,7 @@ int64_t r2_log_belief(const char *belief_key,
     char *details = format_record_details(
         "Status: %s\nEvidence: %s", status, evidence ? evidence : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_BELIEF, "belief_updated", belief, details, origin);
     free(details);
     if (event_id < 0) return -1;
@@ -2013,11 +2133,6 @@ int64_t r2_log_belief(const char *belief_key,
     timestamp_pair(utc, sizeof(utc), NULL, 0);
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_beliefs "
         "(belief_key,belief,evidence,confidence,status,origin,first_seen_utc,"
@@ -2040,19 +2155,19 @@ int64_t r2_log_belief(const char *belief_key,
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 9, event_id);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("belief");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    return log_finish_structured(event_id, st, rc, "belief", parent_event_id,
+                                 "supports_belief_record", evidence);
 }
 
-int64_t r2_log_continuity(const char *item_key,
-                          const char *item_type,
-                          const char *title,
-                          const char *description,
-                          const char *status,
-                          const char *next_action,
-                          const char *origin)
+int64_t r2_log_belief(const char *belief_key, const char *belief, const char *evidence,
+                      double confidence, const char *status, const char *origin)
+{
+    return r2_log_belief_with_evidence(belief_key, belief, evidence, confidence, status, origin, 0);
+}
+
+int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence)
 {
     if (!valid_text(item_key) || !valid_text(item_type) ||
         !valid_text(title) || !valid_text(status) ||
@@ -2068,7 +2183,7 @@ int64_t r2_log_continuity(const char *item_key,
         status, description ? description : "(none)",
         next_action ? next_action : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_CONTINUITY, "continuity_updated", title, details, origin);
     free(details);
     if (event_id < 0) return -1;
@@ -2077,11 +2192,6 @@ int64_t r2_log_continuity(const char *item_key,
     timestamp_pair(utc, sizeof(utc), NULL, 0);
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_continuity "
         "(item_key,item_type,title,description,status,next_action,origin,"
@@ -2116,10 +2226,16 @@ int64_t r2_log_continuity(const char *item_key,
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 12, event_id);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("continuity item");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    return log_finish_structured(event_id, st, rc, "continuity item", parent_event_id,
+                                 "updates_continuity", evidence);
+}
+
+int64_t r2_log_continuity(const char *item_key, const char *item_type, const char *title,
+                          const char *description, const char *status, const char *next_action,
+                          const char *origin)
+{
+    return r2_log_continuity_with_evidence(item_key, item_type, title, description, status,
+                                          next_action, origin, 0, NULL);
 }
 
 static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
@@ -2258,8 +2374,23 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
         saved = rc == SQLITE_DONE && count == expected;
         sqlite3_finalize(st);
     }
+    sqlite3_int64 reviewed = 0;
+    if (saved) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_reflection_reviews(event_id,ordinal,archive_id) "
+            "SELECT ?1,ordinal,archive_id FROM r2_diary_pending_reflection_reviews "
+            "WHERE diary_entry_id=?2;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, diary_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE;
+        if (saved) reviewed = sqlite3_changes64(log_db);
+        sqlite3_finalize(st);
+    }
     if (saved) {
         const char *deletions[] = {
+            "DELETE FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=?;",
             "DELETE FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?;",
             "DELETE FROM r2_diary_pending_reflections WHERE diary_entry_id=?;"
         };
@@ -2269,7 +2400,7 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
             saved = rc == SQLITE_DONE &&
-                sqlite3_changes64(log_db) == (i == 0 ? expected : 1);
+                sqlite3_changes64(log_db) == (i == 0 ? reviewed : i == 1 ? expected : 1);
             sqlite3_finalize(st);
         }
     }
@@ -2312,11 +2443,11 @@ int r2_log_replay_reflections(void)
     }
 }
 
-int64_t r2_log_hypothetical(const char *scenario,
-                            const char *assumptions,
-                            const char *predicted_outcome,
-                            const char *conclusion,
-                            const char *origin)
+static int64_t log_hypothetical_record(const char *scenario, const char *assumptions,
+                                       const char *predicted_outcome, const char *conclusion,
+                                       const char *origin, int64_t parent_event_id,
+                                       const char *relationship, const char *evidence,
+                                       int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
 {
     if (!valid_text(scenario) || strlen(scenario) > 8192 ||
         (assumptions && strlen(assumptions) > R2_LOG_MAX_TEXT) ||
@@ -2331,18 +2462,13 @@ int64_t r2_log_hypothetical(const char *scenario,
         predicted_outcome ? predicted_outcome : "(none)",
         conclusion ? conclusion : "(none)");
     if (!details) return -1;
-    int64_t event_id = r2_log_event(
+    int64_t event_id = log_begin_structured(
         R2_LOG_HYPOTHETICAL, "hypothetical_recorded", scenario, details, origin);
     free(details);
     if (event_id < 0) return -1;
 
     sqlite3_stmt *st = NULL;
     int rc;
-    pthread_mutex_lock(&log_lock);
-    if (!log_initialized || !log_db) {
-        pthread_mutex_unlock(&log_lock);
-        return -1;
-    }
     rc = sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_hypotheticals "
         "(event_id,scenario,assumptions,predicted_outcome,conclusion,origin) "
@@ -2356,10 +2482,41 @@ int64_t r2_log_hypothetical(const char *scenario,
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, origin);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
-    if (rc != SQLITE_DONE) log_structured_insert_error("hypothetical");
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&log_lock);
-    return rc == SQLITE_DONE ? event_id : -1;
+    if (save_branch && rc == SQLITE_DONE && sqlite3_changes(log_db) == 1) {
+        sqlite3_finalize(st);
+        st = NULL;
+        rc = save_branch(log_db, event_id, branch);
+    }
+    return log_finish_structured(event_id, st, rc, "hypothetical", parent_event_id,
+                                 relationship, evidence);
+}
+
+int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence)
+{
+    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+                                   origin, parent_event_id, "contains_hypothetical", evidence, NULL, NULL);
+}
+
+int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
+                                        const char *predicted_outcome, const char *conclusion,
+                                        int64_t evidence_event_id,
+                                        int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
+{
+    if (!save_branch) return -1;
+    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+        "Alternate-Self Lab; hypothetical only", evidence_event_id, "evidence_for_hypothesis",
+        "Evidence is referenced for comparison; it is not altered by this branch.", save_branch, branch);
+}
+
+int64_t r2_log_hypothetical(const char *scenario, const char *assumptions,
+                            const char *predicted_outcome, const char *conclusion,
+                            const char *origin)
+{
+    return r2_log_hypothetical_with_evidence(scenario, assumptions, predicted_outcome,
+                                            conclusion, origin, 0, NULL);
 }
 
 /* Keep complete processing snapshots outside ordinary event recall so later
@@ -2726,10 +2883,33 @@ static int log_record_span(R2LogRecordBatch *batch, int64_t id,
     return 0;
 }
 
+/* Retain the original pair whenever a selected event has a legacy preview. */
+static int append_archived_conversation(sqlite3_stmt *archive, int64_t event_id,
+                                        const char *details, char **out,
+                                        size_t *length, size_t *capacity)
+{
+    int rc = sqlite3_reset(archive);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(archive, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(archive);
+    if (rc == SQLITE_DONE) return 0;
+    if (rc != SQLITE_ROW) return -1;
+    const char *fields[2];
+    if (log_read_text_fields(archive, 0, 2, fields) != 0 || !fields[0] || !fields[1])
+        return -1;
+    if (r2_log_details_include_conversation(details, fields[0], fields[1]))
+        return 0;
+    return append_text(out, length, capacity,
+        "  Archived conversation [%" PRId64 "] (historical dialogue):\n"
+        "    Original user message: %s\n"
+        "    Original R2 response: %s\n",
+        event_id, fields[0], fields[1]);
+}
+
 static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
 {
     sqlite3_stmt *statement = NULL;
     sqlite3_stmt *link_statement = NULL;
+    sqlite3_stmt *archive = NULL;
     char *output = NULL;
     size_t length = 0;
     size_t capacity = 0;
@@ -2755,10 +2935,12 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     const char *sql_search =
         "SELECT id, utc_time, local_time, category, event_type, summary, "
         "details, source, memory_saved FROM r2_log_events "
-        "WHERE summary LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' "
-        "OR event_type LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' "
-        "OR source LIKE ? ESCAPE '\\' "
-        "ORDER BY id DESC LIMIT ?;";
+        "WHERE instr(lower(summary),lower(?1))>0 OR instr(lower(details),lower(?1))>0 "
+        "OR instr(lower(event_type),lower(?1))>0 OR instr(lower(category),lower(?1))>0 "
+        "OR instr(lower(source),lower(?1))>0 "
+        "OR EXISTS (SELECT 1 FROM r2_log_conversations c WHERE c.event_id=r2_log_events.id "
+        "AND (instr(lower(c.user_text),lower(?1))>0 OR instr(lower(c.assistant_text),lower(?1))>0)) "
+        "ORDER BY id DESC LIMIT ?2;";
 
     rc = sqlite3_prepare_v2(
         log_db, query ? sql_search : sql_recent, -1, &statement, NULL
@@ -2771,51 +2953,20 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     }
 
     if (query) {
-        size_t qlen = strlen(query);
-        if (qlen > (SIZE_MAX - 3) / 2) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            errno = E2BIG;
-            return NULL;
-        }
-        char *pattern = malloc(qlen * 2 + 3);
-
-        if (!pattern) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
-
-        size_t p = 0;
-        pattern[p++] = '%';
-
-        for (size_t i = 0; i < qlen; ++i) {
-            if (query[i] == '%' || query[i] == '_' || query[i] == '\\')
-                pattern[p++] = '\\';
-            pattern[p++] = query[i];
-        }
-
-        pattern[p++] = '%';
-        pattern[p] = '\0';
-
-        for (int i = 1; i <= 5 && rc == SQLITE_OK; ++i)
-            rc = sqlite3_bind_text(statement, i, pattern, -1, SQLITE_TRANSIENT);
-
-        if (rc == SQLITE_OK)
-            rc = sqlite3_bind_int(statement, 6, limit);
-        free(pattern);
-        if (rc != SQLITE_OK) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
+        rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
     } else {
         rc = sqlite3_bind_int(statement, 1, limit);
-        if (rc != SQLITE_OK) {
-            sqlite3_finalize(statement);
-            pthread_mutex_unlock(&log_lock);
-            return NULL;
-        }
+    }
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT user_text,assistant_text FROM r2_log_conversations WHERE event_id=?1;",
+            -1, &archive, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(archive);
+        sqlite3_finalize(statement);
+        pthread_mutex_unlock(&log_lock);
+        return NULL;
     }
 
     if (query) {
@@ -2830,6 +2981,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
         if (rc != SQLITE_OK) {
             sqlite3_finalize(statement);
             sqlite3_finalize(link_statement);
+            sqlite3_finalize(archive);
             pthread_mutex_unlock(&log_lock);
             return NULL;
         }
@@ -2839,6 +2991,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     if (!output) {
         sqlite3_finalize(statement);
         sqlite3_finalize(link_statement);
+        sqlite3_finalize(archive);
         pthread_mutex_unlock(&log_lock);
         return NULL;
     }
@@ -2884,7 +3037,8 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
             }
         }
 
-        if (append_text(&output, &length, &capacity, "\n") != 0) {
+        if (append_archived_conversation(archive, id, fields[5], &output, &length, &capacity) != 0 ||
+            append_text(&output, &length, &capacity, "\n") != 0) {
             free(output);
             output = NULL;
             break;
@@ -2954,7 +3108,9 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
                     output = NULL;
                     break;
                 }
-                if (append_text(&output, &length, &capacity, "\n") != 0) {
+                if (append_archived_conversation(archive, linked_id, linked_fields[3],
+                                                 &output, &length, &capacity) != 0 ||
+                    append_text(&output, &length, &capacity, "\n") != 0) {
                     free(output);
                     output = NULL;
                     break;
@@ -2987,6 +3143,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     }
     sqlite3_finalize(statement);
     sqlite3_finalize(link_statement);
+    sqlite3_finalize(archive);
     pthread_mutex_unlock(&log_lock);
     return output;
 }

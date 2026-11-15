@@ -783,23 +783,41 @@ int main(void)
     sqlite3_finalize(pending);
     r2_visual_shutdown();
     assert(r2_visual_init(database, library) == 0);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial);
-    r2_visual_shutdown();
-    assert(unlink(partial_path) == 0);
-    assert(r2_visual_init(database, library) == 0);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
-    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial);
-    r2_visual_shutdown();
-    int repaired = open(partial_path, O_WRONLY | O_CREAT | O_EXCL, 0640);
-    assert(repaired >= 0 && __real_write(repaired, original_jpeg, sizeof(original_jpeg)) == 20);
-    assert(__real_fsync(repaired) == 0 && close(repaired) == 0);
-    assert(r2_visual_init(database, library) == 0);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == before_partial + 1);
     assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences v JOIN r2_log_events e "
         "ON e.id=v.life_log_event_id WHERE v.source='partial storage camera' "
         "AND v.description=e.details AND v.prompt='original storage question'") == 1);
+    size_t healed_length;
+    unsigned char *healed = read_file(partial_path, &healed_length);
+    assert(healed && healed_length == sizeof(original_jpeg) &&
+           !memcmp(healed, original_jpeg, healed_length));
+    free(healed);
+
+    /* Absence alone cannot distinguish storage loss from cancellation. */
+    response("{\"description\":\"missing archive recovered\",\"focus\":null}", "stop");
+    fail_partial_archive_write = 1;
+    assert(!r2_visual_analyze_frame(&frame, "missing storage camera", "original missing question"));
+    pending = NULL;
+    assert(sqlite3_prepare_v2(visual_db, "SELECT image_path FROM r2_visual_pending_archives",
+                             -1, &pending, NULL) == SQLITE_OK && sqlite3_step(pending) == SQLITE_ROW);
+    char *missing_path = strdup((const char *)sqlite3_column_text(pending, 0));
+    assert(missing_path && unlink(missing_path) == 0);
+    sqlite3_finalize(pending);
+    r2_visual_shutdown();
+    assert(r2_visual_init(database, library) == 0);
+    assert(access(missing_path, F_OK) != 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 1);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences "
+        "WHERE source='missing storage camera'") == 0);
+    int restored = open(missing_path, O_WRONLY | O_CREAT | O_EXCL, 0640);
+    assert(restored >= 0 && __real_write(restored, original_jpeg, sizeof(original_jpeg)) == 20);
+    assert(__real_fsync(restored) == 0 && close(restored) == 0);
+    r2_visual_shutdown();
+    assert(r2_visual_init(database, library) == 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_pending_archives") == 0);
+    free(missing_path);
+    int repaired;
     free(partial_path);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);

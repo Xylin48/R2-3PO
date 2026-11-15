@@ -461,6 +461,55 @@ static int r2_workspace_path(
     return 0;
 }
 
+/* Revalidate the canonical workspace boundary, then pin every component.
+ * Merely calling realpath() before fopen()/opendir() permits a symlink swap
+ * during the gap and may disclose an outside-workspace file. */
+static int r2_workspace_open_checked(const char *relative, int want_directory)
+{
+    char canonical[R2_MAX_PATH], root[R2_MAX_PATH];
+    if (r2_workspace_path(relative, canonical, sizeof(canonical)) != 0 ||
+        !realpath(R2_WORKSPACE, root))
+        return -1;
+    size_t root_len = strlen(root);
+    if (strncmp(canonical, root, root_len) != 0 ||
+        (canonical[root_len] != '\0' && canonical[root_len] != '/')) {
+        errno = EACCES;
+        return -1;
+    }
+
+    int fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    const char *cursor = canonical + root_len;
+    if (*cursor == '/') ++cursor;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t count = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (!count || count > NAME_MAX) {
+            close(fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        char component[NAME_MAX + 1];
+        memcpy(component, cursor, count);
+        component[count] = '\0';
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+        if (slash || want_directory) flags |= O_DIRECTORY;
+        int child = openat(fd, component, flags);
+        close(fd);
+        if (child < 0) return -1;
+        fd = child;
+        cursor = slash ? slash + 1 : cursor + count;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        (want_directory ? !S_ISDIR(st.st_mode) : !S_ISREG(st.st_mode))) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    return fd;
+}
+
 
 /* ============================================================
  * DATABASE INITIALIZATION
@@ -684,6 +733,11 @@ static int r2_diary_init_unlocked(void)
             " diary_entry_id INTEGER NOT NULL REFERENCES r2_diary_pending_reflections(diary_entry_id),"
             " ordinal INTEGER NOT NULL,"
             " speech_event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+            " PRIMARY KEY(diary_entry_id,ordinal));"
+            "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflection_reviews ("
+            " diary_entry_id INTEGER NOT NULL REFERENCES r2_diary_pending_reflections(diary_entry_id),"
+            " ordinal INTEGER NOT NULL,"
+            " archive_id INTEGER NOT NULL REFERENCES r2_log_context_reviews(id),"
             " PRIMARY KEY(diary_entry_id,ordinal));"
             "CREATE TABLE IF NOT EXISTS r2_diary_pending_mirrors ("
             " diary_entry_id INTEGER PRIMARY KEY REFERENCES diary_entries(id),"
@@ -1047,6 +1101,29 @@ static int diary_stage_reflection(int64_t diary_id, const int64_t *speech_ids,
     return rc == SQLITE_OK ? 0 : -1;
 }
 
+static int diary_stage_reflection_reviews(int64_t diary_id, const int64_t reviews[2])
+{
+    if (!reviews || (!reviews[0] && !reviews[1])) return 0;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "INSERT INTO r2_diary_pending_reflection_reviews(diary_entry_id,ordinal,archive_id) "
+        "SELECT ?1,?2,id FROM r2_log_context_reviews WHERE id=?3;", -1, &st, NULL);
+    for (int i = 0; rc == SQLITE_OK && i < 2; ++i) {
+        if (!reviews[i]) continue;
+        rc = sqlite3_bind_int64(st, 1, diary_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, i);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, reviews[i]);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc != SQLITE_DONE || sqlite3_changes(r2_diary_db) != 1) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        rc = sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
 static int diary_stage_mirror(int64_t diary_id)
 {
     sqlite3_stmt *st = NULL;
@@ -1060,7 +1137,7 @@ static int diary_stage_mirror(int64_t diary_id)
 
 static int64_t diary_insert_entry_row(const char *entry, const char *timestamp,
                                       int reflection, const int64_t *speech_ids,
-                                      size_t speech_count)
+                                      size_t speech_count, const int64_t reviews[2])
 {
     int present[sizeof(diary_time_aliases) / sizeof(diary_time_aliases[0])];
     char sql[1024] = "INSERT INTO diary_entries(entry,created_at";
@@ -1115,6 +1192,7 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp,
     sqlite3_finalize(st);
     if (id > 0 && diary_stage_mirror(id) == 0 &&
         (!reflection || diary_stage_reflection(id, speech_ids, speech_count) == 0) &&
+        diary_stage_reflection_reviews(id, reviews) == 0 &&
         sqlite3_exec(r2_diary_db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK)
         return id;
     if (!sqlite3_get_autocommit(r2_diary_db))
@@ -1191,15 +1269,31 @@ static int mirror_reserve(int64_t id, int fd, off_t *start)
 
 static int mirror_append(int64_t id, const char *path, const char *record, size_t length)
 {
-    int fd = open(path, O_RDWR | O_APPEND | O_CREAT | O_NONBLOCK | O_CLOEXEC, 0666);
-    if (fd < 0) return -1;
+    /* A diary mirror has a trusted daily basename. Pin the directory first
+     * and never follow a replaced daily file or parent directory symlink. */
+    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory < 0) return -1;
+    const size_t prefix_length = strlen(R2_DIARY_DIR);
+    if (strncmp(path, R2_DIARY_DIR, prefix_length) != 0 ||
+        path[prefix_length] != '/' || !path[prefix_length + 1] ||
+        strchr(path + prefix_length + 1, '/')) {
+        close(directory);
+        errno = EINVAL;
+        return -1;
+    }
+    const char *filename = path + prefix_length + 1;
+    int fd = openat(directory, filename,
+                    O_RDWR | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                    0666);
+    if (fd < 0) {
+        int error = errno;
+        close(directory);
+        errno = error;
+        return -1;
+    }
     int result = -1;
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) goto done;
-    int directory = open(R2_DIARY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (directory < 0) goto done;
-    int sync_error = fsync(directory) == 0 ? 0 : errno;
-    if (close(directory) != 0 && !sync_error) sync_error = errno;
-    if (sync_error) { errno = sync_error; goto done; }
+    if (fsync(directory) != 0) goto done;
     off_t start;
     int reserved = mirror_reserve(id, fd, &start);
     if (reserved != 0) {
@@ -1221,8 +1315,11 @@ static int mirror_append(int64_t id, const char *path, const char *record, size_
         goto done;
     if (present != length) { errno = ESTALE; goto done; }
     struct stat open_file, named_file;
-    if (fstat(fd, &open_file) != 0 || stat(path, &named_file) != 0) goto done;
-    if (open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
+    if (fstat(fd, &open_file) != 0 ||
+        fstatat(directory, filename, &named_file, AT_SYMLINK_NOFOLLOW) != 0)
+        goto done;
+    if (!S_ISREG(named_file.st_mode) ||
+        open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
         errno = ESTALE;
         goto done;
     }
@@ -1249,6 +1346,7 @@ done:
     {
         int error = errno;
         (void)close(fd);
+        (void)close(directory);
         errno = error;
     }
     return result;
@@ -1314,7 +1412,7 @@ int r2_diary_replay_mirrors(void)
 
 static int r2_diary_write_unlocked(
     const char *entry, int64_t *entry_id_out, int reflection,
-    const int64_t *speech_ids, size_t speech_count
+    const int64_t *speech_ids, size_t speech_count, const int64_t reviews[2]
 )
 {
     char timestamp[64];
@@ -1330,25 +1428,10 @@ static int r2_diary_write_unlocked(
         return -1;
     }
 
-    /*
-     * Skip leading whitespace.
-     */
-    while (
-        isspace(
-            (unsigned char)*entry
-        )
-    )
-    {
-        entry++;
-    }
-
-    /*
-     * Reject empty/whitespace-only entries.
-     */
-    if (*entry == '\0')
-    {
-        return -1;
-    }
+    /* Reject an empty entry while retaining whitespace in the original. */
+    const char *first_text = entry;
+    while (isspace((unsigned char)*first_text)) ++first_text;
+    if (!*first_text) return -1;
 
     if (r2_diary_get_time(timestamp, sizeof(timestamp)) != 0)
         return -1;
@@ -1359,7 +1442,7 @@ static int r2_diary_write_unlocked(
      * --------------------------------------------------------
      */
 
-    diary_entry_id = diary_insert_entry_row(entry, timestamp, reflection, speech_ids, speech_count);
+    diary_entry_id = diary_insert_entry_row(entry, timestamp, reflection, speech_ids, speech_count, reviews);
     if (diary_entry_id <= 0)
         return -1;
     if (entry_id_out) *entry_id_out = diary_entry_id;
@@ -1398,7 +1481,7 @@ int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 {
     if (entry_id_out) *entry_id_out = 0;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry, entry_id_out, 0, NULL, 0);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 0, NULL, 0, NULL);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
 }
@@ -1406,11 +1489,18 @@ int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 int r2_diary_stage_reflection(const char *entry, const int64_t *speech_ids,
                               size_t speech_count, int64_t *entry_id_out)
 {
+    return r2_diary_stage_reviewed_reflection(entry, speech_ids, speech_count, NULL, entry_id_out);
+}
+
+int r2_diary_stage_reviewed_reflection(const char *entry, const int64_t *speech_ids,
+                                       size_t speech_count, const int64_t reviews[2],
+                                       int64_t *entry_id_out)
+{
     if (entry_id_out) *entry_id_out = 0;
     if ((speech_count && !speech_ids) || speech_count > (size_t)INT64_MAX)
         return -1;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry, entry_id_out, 1, speech_ids, speech_count);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 1, speech_ids, speech_count, reviews);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
 }
@@ -1463,29 +1553,30 @@ static sqlite3 *diary_open_reader(void)
     return reader;
 }
 
-static int diary_query(const char *query, int limit,
+static int diary_query(const char *query, int limit, int allow_wildcards,
     int (*visit)(void *, int64_t, const char *, size_t), void *context)
 {
     sqlite3 *reader = diary_open_reader();
     if (!reader) return -1;
     sqlite3_stmt *statement = NULL;
-    char *pattern = NULL;
     int rc;
-    const char *sql = query
-        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ? ORDER BY id DESC LIMIT ?;"
+    int wildcard = query && allow_wildcards && strpbrk(query, "%_");
+    const char *sql = wildcard
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE entry LIKE ?1 ORDER BY id DESC LIMIT ?2;"
+        : query
+        ? "SELECT entry,created_at,id FROM diary_entries WHERE instr(lower(entry),lower(?1))>0 "
+          "ORDER BY id DESC LIMIT ?2;"
         : "SELECT entry,created_at,id FROM diary_entries ORDER BY id DESC LIMIT ?;";
     rc = sqlite3_prepare_v2(reader, sql, -1, &statement, NULL);
     if (rc != SQLITE_OK) goto failed;
     if (query) {
-        size_t n = strlen(query);
-        if (n > SIZE_MAX - 3) { errno = EOVERFLOW; goto failed; }
-        pattern = malloc(n + 3);
-        if (!pattern) goto failed;
-        pattern[0] = '%'; memcpy(pattern + 1, query, n);
-        pattern[n + 1] = '%'; pattern[n + 2] = '\0';
-        rc = sqlite3_bind_text64(statement, 1, pattern, (sqlite3_uint64)n + 2,
-                                 SQLITE_TRANSIENT, SQLITE_UTF8);
-        free(pattern); pattern = NULL;
+        if (wildcard) {
+            char *pattern = sqlite3_mprintf("%%%s%%", query);
+            if (!pattern) goto failed;
+            rc = sqlite3_bind_text64(statement, 1, pattern, strlen(pattern), sqlite3_free, SQLITE_UTF8);
+        } else {
+            rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
+        }
         if (rc != SQLITE_OK) goto failed;
     }
     rc = sqlite3_bind_int(statement, query ? 2 : 1, limit);
@@ -1513,7 +1604,6 @@ static int diary_query(const char *query, int limit,
 failed:
     sqlite3_finalize(statement);
     sqlite3_close(reader);
-    free(pattern);
     return -1;
 }
 
@@ -1534,7 +1624,7 @@ static char *diary_query_string(const char *query, int limit)
 {
     struct diary_query_text text = {.data = strdup("")};
     if (!text.data) return NULL;
-    if (diary_query(query, limit, diary_collect_row, &text) != 0) {
+    if (diary_query(query, limit, 1, diary_collect_row, &text) != 0) {
         free(text.data);
         return NULL;
     }
@@ -1546,7 +1636,7 @@ int r2_diary_visit_search(const char *query, int limit,
 {
     if (!query || !*query || !visit) return -1;
     if (limit <= 0 || limit > 20) limit = 20;
-    return diary_query(query, limit, visit, context);
+    return diary_query(query, limit, 0, visit, context);
 }
 
 char *r2_diary_recent(int limit)
@@ -1601,13 +1691,14 @@ static char *r2_diary_recent_life_log(int limit)
     out[0] = '\0';
 
     rc = sqlite3_prepare_v2(reader,
-        "SELECT id,local_time,category,event_type,summary,details,source "
-        "FROM r2_log_events "
-        "WHERE category IN ('world','media','filesystem','sensory','milestone',"
+        "SELECT e.id,e.local_time,e.category,e.event_type,e.summary,e.details,e.source,"
+        "c.user_text,c.assistant_text FROM r2_log_events e "
+        "LEFT JOIN r2_log_conversations c ON c.event_id=e.id "
+        "WHERE e.category IN ('world','media','filesystem','sensory','milestone',"
         "'error','belief','continuity','conversation','memory') "
-        "AND event_type NOT IN ('diary_entry_linked','life_log_initialized',"
+        "AND e.event_type NOT IN ('diary_entry_linked','life_log_initialized',"
         "'session_started','session_ended') "
-        "ORDER BY id DESC LIMIT ?;",
+        "ORDER BY e.id DESC LIMIT ?;",
         -1, &st, NULL);
     if (rc != SQLITE_OK || sqlite3_bind_int(st, 1, limit) != SQLITE_OK)
         goto failed;
@@ -1620,20 +1711,30 @@ static char *r2_diary_recent_life_log(int limit)
         const char *summary = (const char *)sqlite3_column_text(st, 4);
         const char *details = (const char *)sqlite3_column_text(st, 5);
         const char *source = (const char *)sqlite3_column_text(st, 6);
-        const char *fields[] = {time_text, category, type, summary, details, source};
-        for (int i = 0; i < 6; ++i) {
-            if ((!fields[i] && sqlite3_column_type(st, i + 1) != SQLITE_NULL) ||
-                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i + 1))) {
+        const char *archive_user = (const char *)sqlite3_column_text(st, 7);
+        const char *archive_reply = (const char *)sqlite3_column_text(st, 8);
+        const char *fields[] = {time_text, category, type, summary, details, source,
+                                archive_user, archive_reply};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            int column = (int)i + 1;
+            if ((!fields[i] && sqlite3_column_type(st, column) != SQLITE_NULL) ||
+                (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, column))) {
                 goto failed;
             }
         }
+        int show_archive = (archive_user || archive_reply) &&
+            !r2_log_details_include_conversation(details, archive_user, archive_reply);
         char *row = NULL;
         int n = asprintf(&row,
-            "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s\n",
+            "[event #%" PRId64 "] %s | %s/%s | %s | source=%s%s%s%s%s%s%s\n",
             (int64_t)id, time_text ? time_text : "time unavailable",
             category ? category : "unknown", type ? type : "unknown",
             summary ? summary : "", source ? source : "unknown",
-            details && *details ? " | details=" : "", details ? details : "");
+            details && *details ? " | details=" : "", details ? details : "",
+            show_archive ? "\n  Archived user message:\n" : "",
+            show_archive ? (archive_user ? archive_user : "(unavailable)") : "",
+            show_archive ? "\n  Archived R2 reply:\n" : "",
+            show_archive ? (archive_reply ? archive_reply : "(unavailable)") : "");
         if (n < 0) goto failed;
         int append_rc = diary_append_record(&out, &length, row);
         free(row);
@@ -1729,7 +1830,7 @@ char *r2_workspace_list(
     const char *relative_directory
 )
 {
-    char path[R2_MAX_PATH];
+    int directory_fd;
 
     DIR *directory;
 
@@ -1749,23 +1850,11 @@ char *r2_workspace_list(
         relative_directory = ".";
     }
 
-    if (
-        r2_workspace_path(
-            relative_directory,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    directory = opendir(
-        path
-    );
-
-    if (!directory)
-    {
+    directory_fd = r2_workspace_open_checked(relative_directory, 1);
+    if (directory_fd < 0) return NULL;
+    directory = fdopendir(directory_fd);
+    if (!directory) {
+        close(directory_fd);
         return NULL;
     }
 
@@ -1781,13 +1870,11 @@ char *r2_workspace_list(
 
     result[0] = '\0';
 
-    while (
-        (entry = readdir(directory))
-        != NULL
-    )
-    {
-        char full_path[R2_MAX_PATH];
-
+    for (;;) {
+        /* errno from fstatat() must not masquerade as a readdir() failure. */
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) break;
         struct stat st;
 
         size_t required;
@@ -1801,32 +1888,9 @@ char *r2_workspace_list(
             continue;
         }
 
-        int path_written = snprintf(
-            full_path,
-            sizeof(full_path),
-            "%s/%s",
-            path,
-            entry->d_name
-        );
-
-        if (
-            path_written < 0
-            ||
-            (size_t)path_written >= sizeof(full_path)
-        )
-        {
+        /* Classification is also anchored to the opened directory. */
+        if (fstatat(dirfd(directory), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
             continue;
-        }
-
-        if (
-            stat(
-                full_path,
-                &st
-            ) != 0
-        )
-        {
-            continue;
-        }
 
         required =
             strlen(entry->d_name)
@@ -1911,9 +1975,13 @@ char *r2_workspace_list(
         }
     }
 
-    closedir(
-        directory
-    );
+    int read_error = errno;
+    closedir(directory);
+    if (read_error) {
+        free(result);
+        errno = read_error;
+        return NULL;
+    }
 
     if (length == 0)
     {
@@ -1947,7 +2015,7 @@ char *r2_workspace_read(
     size_t *file_size
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -1964,24 +2032,11 @@ char *r2_workspace_read(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2083,7 +2138,7 @@ char *r2_workspace_read_chunk(
     long *next_offset
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2115,24 +2170,11 @@ char *r2_workspace_read_chunk(
         length = R2_MAX_CHUNK_SIZE;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "rb"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2165,6 +2207,13 @@ char *r2_workspace_read_chunk(
         file
     );
 
+    /* Report read errors, not a falsely successful shortened file chunk. */
+    if (ferror(file) || actual > (size_t)(LONG_MAX - offset)) {
+        fclose(file);
+        free(buffer);
+        errno = EIO;
+        return NULL;
+    }
     buffer[actual] = '\0';
 
     fclose(file);
@@ -2203,7 +2252,7 @@ char *r2_workspace_search(
     const char *term
 )
 {
-    char path[R2_MAX_PATH];
+    int fd;
 
     FILE *file;
 
@@ -2227,24 +2276,11 @@ char *r2_workspace_search(
         return NULL;
     }
 
-    if (
-        r2_workspace_path(
-            relative_path,
-            path,
-            sizeof(path)
-        ) != 0
-    )
-    {
-        return NULL;
-    }
-
-    file = fopen(
-        path,
-        "r"
-    );
-
-    if (!file)
-    {
+    fd = r2_workspace_open_checked(relative_path, 0);
+    if (fd < 0) return NULL;
+    file = fdopen(fd, "r");
+    if (!file) {
+        close(fd);
         return NULL;
     }
 
@@ -2333,9 +2369,14 @@ char *r2_workspace_search(
         );
     }
 
-    fclose(
-        file
-    );
+    /* Do not report a partially searched file as a complete result. */
+    if (ferror(file)) {
+        fclose(file);
+        free(result);
+        errno = EIO;
+        return NULL;
+    }
+    fclose(file);
 
     if (length == 0)
     {

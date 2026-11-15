@@ -23,6 +23,14 @@ int main(void)
         "VALUES('legacy apples',2,99,'old inventory');",
         NULL, NULL, NULL) == SQLITE_OK);
 
+    assert(sqlite3_exec(fridge_db,
+        "CREATE TRIGGER fail_quantity_copy BEFORE UPDATE ON r2_fridge_items "
+        "BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(fridge_migrate_schema() != SQLITE_OK);
+    assert(!fridge_column_exists("quantity"));
+    assert(sqlite3_exec(fridge_db, "DROP TRIGGER fail_quantity_copy",
+                        NULL, NULL, NULL) == SQLITE_OK);
     assert(fridge_migrate_schema() == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     assert(sqlite3_prepare_v2(fridge_db,
@@ -35,9 +43,9 @@ int main(void)
     sqlite3_finalize(st);
 
     assert(fridge_insert_item_compat("new apples", "fresh stock", 3,
-        25.0, 5.0, "apple", "sweet", 1) == SQLITE_DONE);
+        25.0, 5.0, "apple", "sweet", 0) == SQLITE_DONE);
     assert(fridge_insert_item_compat("new apples", "fresh stock", 2,
-        25.0, 5.0, "apple", "sweet", 1) == SQLITE_DONE);
+        25.0, 5.0, "apple", "sweet", 0) == SQLITE_DONE);
 
     assert(sqlite3_prepare_v2(fridge_db,
         "SELECT quantity,qty,amount FROM r2_fridge_items WHERE name='new apples'",
@@ -99,6 +107,24 @@ int main(void)
     assert(sqlite3_column_int(st, 1) == 4);
     assert(sqlite3_column_int(st, 2) == 4);
     sqlite3_finalize(st);
+
+    assert(sqlite3_exec(fridge_db,
+        "DROP TRIGGER ignore_fridge_stock;"
+        "CREATE TRIGGER ignore_fridge_delete BEFORE DELETE ON r2_fridge_items "
+        "WHEN OLD.name='new apples' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(inventory_transfer_restore_fridge_locked(&snapshot) == 0);
+    assert(inventory_transfer_restore_fridge_locked(&snapshot) == 0);
+    assert(sqlite3_prepare_v2(fridge_db,
+        "SELECT quantity,qty,amount FROM r2_fridge_items WHERE name='new apples'",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int(st, 0) == 8);
+    assert(sqlite3_column_int(st, 1) == 8);
+    assert(sqlite3_column_int(st, 2) == 8);
+    sqlite3_finalize(st);
+    snapshot.fridge_exists = 0;
+    assert(inventory_transfer_restore_fridge_locked(&snapshot) != 0);
 
     assert(sqlite3_close(fridge_db) == SQLITE_OK);
     fridge_db = NULL;

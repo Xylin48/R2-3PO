@@ -77,7 +77,9 @@ static int ensure_db_locked(void)
         " id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL,"
         " source TEXT NOT NULL, points INTEGER NOT NULL CHECK(points BETWEEN -7 AND 5 AND points<>0),"
         " reason TEXT NOT NULL, occurred_at INTEGER NOT NULL, modifier INTEGER NOT NULL,"
-        " expires_at INTEGER NOT NULL, log_event_id INTEGER, memory_indexed INTEGER NOT NULL DEFAULT 0);"
+        " expires_at INTEGER NOT NULL, log_event_id INTEGER, memory_indexed INTEGER NOT NULL DEFAULT 0,"
+        " voluntary_choice INTEGER NOT NULL DEFAULT 0,"
+        " addiction_choice_indexed INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS reward_events_target_time ON reward_events(target,occurred_at);",
         NULL, NULL, NULL) != SQLITE_OK) {
         fprintf(stderr, "[R2 Reward] Schema error: %s\n", sqlite3_errmsg(reward_db));
@@ -121,11 +123,17 @@ static int ensure_db_locked(void)
         return -1;
     }
 
-    /* Older ledgers may predate one or both cross-reference columns. */
-    const char *required_columns[] = {"log_event_id", "memory_indexed"};
+    /* Additive, in-place migration: old reward rows are never replayed as
+       voluntary choices without an actual historical indication. */
+    const char *required_columns[] = {
+        "log_event_id", "memory_indexed",
+        "voluntary_choice", "addiction_choice_indexed"
+    };
     const char *alter_statements[] = {
         "ALTER TABLE reward_events ADD COLUMN log_event_id INTEGER",
-        "ALTER TABLE reward_events ADD COLUMN memory_indexed INTEGER NOT NULL DEFAULT 0"
+        "ALTER TABLE reward_events ADD COLUMN memory_indexed INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE reward_events ADD COLUMN voluntary_choice INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE reward_events ADD COLUMN addiction_choice_indexed INTEGER NOT NULL DEFAULT 0"
     };
     for (size_t i = 0; i < sizeof(required_columns) / sizeof(required_columns[0]); ++i) {
         sqlite3_stmt *columns = NULL;
@@ -195,7 +203,19 @@ typedef struct {
     sqlite3_int64 occurred_at;
     int modifier;
     sqlite3_int64 expires_at;
+    int voluntary_choice;
+    int addiction_choice_indexed;
 } PendingReward;
+
+static int copy_reward_text(sqlite3_stmt *st, int column, char *out, size_t capacity)
+{
+    const unsigned char *text = sqlite3_column_text(st, column);
+    if (!text) return -1;
+    size_t length = (size_t)sqlite3_column_bytes(st, column);
+    if (length >= capacity || memchr(text, '\0', length)) return -1;
+    memcpy(out, text, length + 1);
+    return 0;
+}
 
 static void format_reward_event(const PendingReward *event,
                                 char *summary, size_t summary_size,
@@ -330,6 +350,43 @@ static int store_log_link(sqlite3_int64 reward_id, int64_t log_event_id,
     return rc == SQLITE_DONE ? 0 : -1;
 }
 
+/* Reward and Addiction use separate databases. Store intent in the reward
+   transaction, then deliver using the existing reward_event_id idempotency
+   token. If the process dies between databases, startup reconciliation can
+   retry without adding a second Addiction choice event. */
+static int reward_deliver_addiction_choice(const PendingReward *event)
+{
+    if (!event || event->id <= 0) return -1;
+    if (!event->voluntary_choice || event->addiction_choice_indexed) return 0;
+
+    char summary[512], details[REWARD_DETAILS_CAPACITY];
+    format_reward_event(event, summary, sizeof(summary), details, sizeof(details));
+    const int enjoyment = event->points >= 0 ?
+        50 + event->points * 5 : 50 + event->points * 4;
+    if (r2_addiction_record_choice(event->target, "activity", enjoyment,
+                                   "reinforcement", details) != 0)
+        return -1;
+
+    pthread_mutex_lock(&reward_lock);
+    if (ensure_db_locked() != 0) {
+        pthread_mutex_unlock(&reward_lock);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(reward_db,
+        "UPDATE reward_events SET addiction_choice_indexed=1 "
+        "WHERE id=? AND voluntary_choice=1",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(st, 1, event->id);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_step(st);
+    int count = rc == SQLITE_DONE ? sqlite3_changes(reward_db) : 0;
+    if (st) sqlite3_finalize(st);
+    pthread_mutex_unlock(&reward_lock);
+    return rc == SQLITE_DONE && count == 1 ? 0 : -1;
+}
+
 /* Persist the reward event, total, and optional idempotency key in one
  * SQLite transaction. A durable once-key without its reward row is not a
  * completed reward: older versions could leave that state after a crash. */
@@ -351,6 +408,8 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     sqlite3_int64 reward_id = 0;
     sqlite3_stmt *st = NULL;
     int duplicate = 0;
+    int once_key_exists = 0, once_key_needs_link = 0;
+    sqlite3_int64 once_event_id = 0, once_key_created = 0;
     PendingReward prior_event = {0};
 
     pthread_mutex_lock(&reward_lock);
@@ -362,7 +421,7 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     if (apply_once && sqlite3_exec(reward_db,
             "CREATE TABLE IF NOT EXISTS reward_once_keys ("
             "target TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0,"
-            "PRIMARY KEY(target,source));",
+            "reward_event_id INTEGER, PRIMARY KEY(target,source));",
             NULL, NULL, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&reward_lock);
         return -1;
@@ -374,10 +433,10 @@ static int reward_apply_internal(const char *target, const char *source, int poi
           sqlite3_exec(reward_db,
               "ALTER TABLE reward_once_keys ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
               NULL, NULL, NULL) != SQLITE_OK) ||
-         sqlite3_exec(reward_db,
-              "UPDATE reward_once_keys SET created_at=CAST(strftime('%s','now') AS INTEGER) "
-              "WHERE created_at IS NULL OR created_at=0",
-              NULL, NULL, NULL) != SQLITE_OK)) {
+         (!reward_column_exists("reward_once_keys", "reward_event_id") &&
+          sqlite3_exec(reward_db,
+              "ALTER TABLE reward_once_keys ADD COLUMN reward_event_id INTEGER",
+              NULL, NULL, NULL) != SQLITE_OK))) {
         fprintf(stderr, "[R2 Reward] Could not migrate reward idempotency keys: %s\n",
                 sqlite3_errmsg(reward_db));
         pthread_mutex_unlock(&reward_lock);
@@ -386,45 +445,131 @@ static int reward_apply_internal(const char *target, const char *source, int poi
 
     rc = sqlite3_exec(reward_db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     if (rc == SQLITE_OK && apply_once) {
-        /* First check the durable event as well as the key. This repairs old
-           key-only rows left by the former two-transaction implementation. */
+        /* One-time rewards belong to keys, never merely to targets/sources. */
         rc = sqlite3_prepare_v2(reward_db,
-            "SELECT id,target,source,points,reason,occurred_at,modifier,expires_at "
-            "FROM reward_events WHERE target=? AND source=? LIMIT 1",
+            "SELECT COALESCE(reward_event_id,0),created_at "
+            "FROM reward_once_keys WHERE target=? AND source=?",
             -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
         if (rc == SQLITE_OK) {
-            rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
-            if (rc == SQLITE_OK)
-                rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
-            int step_rc = rc == SQLITE_OK ? sqlite3_step(st) : rc;
+            int step_rc = sqlite3_step(st);
             if (step_rc == SQLITE_ROW) {
-                const unsigned char *saved_target = sqlite3_column_text(st, 1);
-                const unsigned char *saved_source = sqlite3_column_text(st, 2);
-                const unsigned char *saved_reason = sqlite3_column_text(st, 4);
-                prior_event.id = sqlite3_column_int64(st, 0);
-                snprintf(prior_event.target, sizeof(prior_event.target), "%s",
-                    saved_target ? (const char *)saved_target : target);
-                snprintf(prior_event.source, sizeof(prior_event.source), "%s",
-                    saved_source ? (const char *)saved_source : source);
-                prior_event.points = sqlite3_column_int(st, 3);
-                snprintf(prior_event.reason, sizeof(prior_event.reason), "%s",
-                    saved_reason ? (const char *)saved_reason : "");
-                prior_event.occurred_at = sqlite3_column_int64(st, 5);
-                prior_event.modifier = sqlite3_column_int(st, 6);
-                prior_event.expires_at = sqlite3_column_int64(st, 7);
-                duplicate = 1;
-                rc = SQLITE_OK;
-            } else {
-                rc = step_rc == SQLITE_DONE ? SQLITE_OK : step_rc;
-            }
+                once_key_exists = 1;
+                once_key_needs_link = sqlite3_column_int64(st, 0) == 0;
+                once_event_id = sqlite3_column_int64(st, 0);
+                once_key_created = sqlite3_column_int64(st, 1);
+            } else if (step_rc != SQLITE_DONE) rc = step_rc;
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
     }
-
-    if (rc == SQLITE_OK && apply_once && !duplicate) {
+    if (rc == SQLITE_OK && apply_once && once_key_exists && once_event_id == 0) {
+        /* Old keys lacked exact IDs. Match the sole historical reward or
+           a uniquely timestamp-matched record; preserve ambiguous multirow
+           history rather than inventing an ID. A key-only legacy row can
+           still be completed by writing its missing reward below. */
         rc = sqlite3_prepare_v2(reward_db,
-            "INSERT OR IGNORE INTO reward_once_keys(target,source,created_at) VALUES(?,?,?);",
+            "SELECT COUNT(*),COALESCE(MAX(CASE WHEN occurred_at=? THEN id END),MAX(id),0),"
+            "SUM(CASE WHEN occurred_at=? THEN 1 ELSE 0 END) "
+            "FROM reward_events WHERE target=? AND source=?",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, once_key_created);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, once_key_created);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 4, source, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) {
+            int step_rc = sqlite3_step(st);
+            if (step_rc == SQLITE_ROW) {
+                sqlite3_int64 total = sqlite3_column_int64(st, 0);
+                sqlite3_int64 matching = sqlite3_column_int64(st, 2);
+                if (total == 0) {
+                    once_event_id = 0;
+                } else if (total == 1 ||
+                           (once_key_created > 0 && matching == 1)) {
+                    /* Old one-time keys without timestamps can identify a
+                       sole historical event. Multiple candidates still need
+                       an original timestamp to resolve their identity. */
+                    once_event_id = sqlite3_column_int64(st, 1);
+                } else {
+                    fprintf(stderr,
+                        "[R2 Reward] Legacy one-time key for '%s' / '%s' "
+                        "has ambiguous reward history; preserving it for review.\n",
+                        target, source);
+                    rc = SQLITE_CONSTRAINT;
+                }
+            } else if (step_rc != SQLITE_DONE) rc = step_rc;
+            else rc = SQLITE_CORRUPT;
+        }
+        if (st) sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (rc == SQLITE_OK && apply_once && once_event_id > 0) {
+        rc = sqlite3_prepare_v2(reward_db,
+            "SELECT id,target,source,points,reason,occurred_at,modifier,expires_at,"
+            "voluntary_choice,addiction_choice_indexed "
+            "FROM reward_events WHERE id=? AND target=? AND source=?",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, once_event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, source, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) {
+            int step_rc = sqlite3_step(st);
+            if (step_rc == SQLITE_ROW) {
+                prior_event.id = sqlite3_column_int64(st, 0);
+                prior_event.points = sqlite3_column_int(st, 3);
+                if (copy_reward_text(st, 1, prior_event.target, sizeof(prior_event.target)) != 0 ||
+                    copy_reward_text(st, 2, prior_event.source, sizeof(prior_event.source)) != 0 ||
+                    copy_reward_text(st, 4, prior_event.reason, sizeof(prior_event.reason)) != 0)
+                    rc = SQLITE_MISMATCH;
+                prior_event.occurred_at = sqlite3_column_int64(st, 5);
+                prior_event.modifier = sqlite3_column_int(st, 6);
+                prior_event.expires_at = sqlite3_column_int64(st, 7);
+                prior_event.voluntary_choice = sqlite3_column_int(st, 8);
+                prior_event.addiction_choice_indexed = sqlite3_column_int(st, 9);
+                duplicate = 1;
+            } else if (step_rc == SQLITE_DONE) rc = SQLITE_CORRUPT;
+            else rc = step_rc;
+        }
+        if (st) sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (rc == SQLITE_OK && duplicate && once_key_needs_link) {
+        rc = sqlite3_prepare_v2(reward_db,
+            "UPDATE reward_once_keys SET reward_event_id=? "
+            "WHERE target=? AND source=? AND COALESCE(reward_event_id,0)=0",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, once_event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, source, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE)
+            rc = sqlite3_changes(reward_db) == 1 ? SQLITE_OK : SQLITE_CONSTRAINT;
+        if (st) sqlite3_finalize(st);
+        st = NULL;
+    }
+
+    /* A retry with an explicit voluntary-choice request can recover an old
+       row that predates delivery tracking; it does not create a new reward. */
+    if (rc == SQLITE_OK && duplicate && voluntary_choice &&
+        !prior_event.voluntary_choice) {
+        sqlite3_stmt *upgrade = NULL;
+        rc = sqlite3_prepare_v2(reward_db,
+            "UPDATE reward_events SET voluntary_choice=1 WHERE id=?",
+            -1, &upgrade, NULL);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_int64(upgrade, 1, prior_event.id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(upgrade);
+        if (rc == SQLITE_DONE && sqlite3_changes(reward_db) == 1) {
+            prior_event.voluntary_choice = 1;
+            rc = SQLITE_OK;
+        }
+        if (upgrade) sqlite3_finalize(upgrade);
+    }
+
+    if (rc == SQLITE_OK && apply_once && !duplicate && !once_key_exists) {
+        rc = sqlite3_prepare_v2(reward_db,
+            "INSERT INTO reward_once_keys(target,source,created_at) VALUES(?,?,?);",
             -1, &st, NULL);
         if (rc == SQLITE_OK) {
             rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
@@ -433,7 +578,8 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             if (rc == SQLITE_OK)
                 rc = sqlite3_bind_int64(st, 3, now);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
-            if (rc == SQLITE_DONE) rc = SQLITE_OK;
+            if (rc == SQLITE_DONE)
+                rc = sqlite3_changes(reward_db) == 1 ? SQLITE_OK : SQLITE_CONSTRAINT;
         }
         if (st) sqlite3_finalize(st);
         st = NULL;
@@ -441,8 +587,8 @@ static int reward_apply_internal(const char *target, const char *source, int poi
 
     if (rc == SQLITE_OK && !duplicate) {
         rc = sqlite3_prepare_v2(reward_db,
-            "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at)"
-            " VALUES(?,?,?,?,?,?,?)", -1, &st, NULL);
+            "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,expires_at,voluntary_choice)"
+            " VALUES(?,?,?,?,?,?,?,?)", -1, &st, NULL);
         if (rc == SQLITE_OK) {
             rc = sqlite3_bind_text(st, 1, target, -1, SQLITE_TRANSIENT);
             if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, source, -1, SQLITE_TRANSIENT);
@@ -451,6 +597,7 @@ static int reward_apply_internal(const char *target, const char *source, int poi
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
             if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 6, modifier);
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, expires);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 8, voluntary_choice ? 1 : 0);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
             if (rc == SQLITE_DONE) {
                 if (sqlite3_changes(reward_db) != 1)
@@ -461,6 +608,22 @@ static int reward_apply_internal(const char *target, const char *source, int poi
                 }
             }
         }
+        if (st) sqlite3_finalize(st);
+        st = NULL;
+    }
+
+    if (rc == SQLITE_OK && apply_once && !duplicate) {
+        /* The key and event pointer must commit atomically. */
+        rc = sqlite3_prepare_v2(reward_db,
+            "UPDATE reward_once_keys SET reward_event_id=? "
+            "WHERE target=? AND source=? AND COALESCE(reward_event_id,0)=0",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, reward_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, target, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, source, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE)
+            rc = sqlite3_changes(reward_db) == 1 ? SQLITE_OK : SQLITE_CONSTRAINT;
         if (st) sqlite3_finalize(st);
         st = NULL;
     }
@@ -498,19 +661,9 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     if (rc != SQLITE_OK) return -1;
     if (duplicate) {
         if (!apply_once) return -1;
-        /* Repair the addiction-choice side effect if the prior process died
-           after committing the reward but before recording the choice. Its
-           stable reward_event_id makes the replay idempotent. */
-        if (voluntary_choice && prior_event.id > 0) {
-            char prior_summary[512], prior_details[REWARD_DETAILS_CAPACITY];
-            format_reward_event(&prior_event, prior_summary, sizeof(prior_summary),
-                                prior_details, sizeof(prior_details));
-            int choice_rc = r2_addiction_record_choice(prior_event.target, "activity",
-                prior_event.points >= 0 ? (50 + prior_event.points * 5)
-                                        : (50 + prior_event.points * 4),
-                "reinforcement", prior_details);
-            if (choice_rc != 0) return -1;
-        }
+        /* The durable old intent, not the caller's current preference,
+           determines whether an interrupted cross-organ write needs replay. */
+        if (reward_deliver_addiction_choice(&prior_event) != 0) return -1;
         return 1;
     }
     if (reward_id <= 0) return -1;
@@ -526,6 +679,8 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     event.occurred_at = now;
     event.modifier = modifier;
     event.expires_at = expires;
+    event.voluntary_choice = voluntary_choice ? 1 : 0;
+    event.addiction_choice_indexed = 0;
     char summary[512], details[REWARD_DETAILS_CAPACITY];
     format_reward_event(&event, summary, sizeof(summary), details, sizeof(details));
 
@@ -538,10 +693,11 @@ static int reward_apply_internal(const char *target, const char *source, int poi
         }
     }
 
-    if (voluntary_choice)
-        (void)r2_addiction_record_choice(target, "activity",
-            points >= 0 ? (50 + points * 5) : (50 + points * 4),
-            "reinforcement", details);
+    if (voluntary_choice && reward_deliver_addiction_choice(&event) != 0)
+        fprintf(stderr,
+            "[R2 Reward] Reward committed; Addiction choice for event %lld "
+            "is pending durable retry during history reconciliation.\n",
+            (long long)event.id);
     return 0;
 }
 
@@ -563,7 +719,7 @@ int r2_reward_reconnect_history(int limit)
 {
     PendingReward *pending = NULL;
     sqlite3_stmt *st = NULL;
-    int rc, count = 0, linked = 0;
+    int rc, count = 0, linked = 0, replay_failed = 0;
     sqlite3_int64 last_seen_id = 0;
     if (!r2_log_is_initialized()) return -1;
     if (limit <= 0) limit = 100;
@@ -574,72 +730,86 @@ int r2_reward_reconnect_history(int limit)
     /* Walk the entire legacy backlog in fixed-size pages. A failed early link
        must not permanently starve later historical events. */
     for (;;) {
-    count = 0;
-    pthread_mutex_lock(&reward_lock);
-    if (ensure_db_locked() != 0) {
-        pthread_mutex_unlock(&reward_lock);
-        free(pending);
-        return -1;
-    }
-    rc = sqlite3_prepare_v2(reward_db,
-        "SELECT id,COALESCE(log_event_id,0),memory_indexed,target,source,points,reason,occurred_at,modifier,expires_at "
-        "FROM reward_events WHERE (log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0) "
-        "AND id>? ORDER BY id LIMIT ?", -1, &st, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, last_seen_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, limit);
-    if (rc == SQLITE_OK) {
-        while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
-            PendingReward *item = &pending[count++];
-            const unsigned char *target_text = sqlite3_column_text(st, 3);
-            const unsigned char *source_text = sqlite3_column_text(st, 4);
-            const unsigned char *reason_text = sqlite3_column_text(st, 6);
-            item->id = sqlite3_column_int64(st, 0);
-            item->log_event_id = sqlite3_column_int64(st, 1);
-            item->memory_indexed = sqlite3_column_int(st, 2);
-            snprintf(item->target, sizeof(item->target), "%s",
-                target_text ? (const char *)target_text : "unknown");
-            snprintf(item->source, sizeof(item->source), "%s",
-                source_text ? (const char *)source_text : "unknown");
-            item->points = sqlite3_column_int(st, 5);
-            snprintf(item->reason, sizeof(item->reason), "%s",
-                reason_text ? (const char *)reason_text : "");
-            item->occurred_at = sqlite3_column_int64(st, 7);
-            item->modifier = sqlite3_column_int(st, 8);
-            item->expires_at = sqlite3_column_int64(st, 9);
-        }
-    }
-    if (st) sqlite3_finalize(st);
-    pthread_mutex_unlock(&reward_lock);
-    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
-        free(pending);
-        return -1;
-    }
-    if (count == 0) break;
-    last_seen_id = pending[count - 1].id;
-
-    for (int i = 0; i < count; ++i) {
-        PendingReward *item = &pending[i];
-        int64_t log_event_id = item->log_event_id > 0
-            ? item->log_event_id : find_existing_log_event(item->id);
-        if (log_event_id < 0) {
+        count = 0;
+        pthread_mutex_lock(&reward_lock);
+        if (ensure_db_locked() != 0) {
+            pthread_mutex_unlock(&reward_lock);
             free(pending);
             return -1;
         }
-        char summary[512], details[REWARD_DETAILS_CAPACITY];
-        format_reward_event(item, summary, sizeof(summary), details, sizeof(details));
-        if (log_event_id <= 0)
-            log_event_id = r2_log_event_with_memory(R2_LOG_WORLD,
-                "enjoyment_changed", summary, details, "Reward.c", 0);
-        if (log_event_id > 0) {
-            int memory_indexed = ensure_reward_memory_pointer(log_event_id, summary);
-            if (store_log_link(item->id, log_event_id, memory_indexed > 0) == 0 &&
-                memory_indexed > 0)
-                linked++;
+        rc = sqlite3_prepare_v2(reward_db,
+            "SELECT id,COALESCE(log_event_id,0),memory_indexed,target,source,points,reason,occurred_at,modifier,expires_at,"
+            "voluntary_choice,addiction_choice_indexed "
+            "FROM reward_events WHERE (log_event_id IS NULL OR log_event_id=0 OR memory_indexed=0 "
+            "OR (voluntary_choice=1 AND addiction_choice_indexed=0)) "
+            "AND id>? ORDER BY id LIMIT ?", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, last_seen_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, limit);
+        if (rc == SQLITE_OK) {
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW && count < limit) {
+                PendingReward *item = &pending[count++];
+                item->id = sqlite3_column_int64(st, 0);
+                item->log_event_id = sqlite3_column_int64(st, 1);
+                item->memory_indexed = sqlite3_column_int(st, 2);
+                item->points = sqlite3_column_int(st, 5);
+                if (copy_reward_text(st, 3, item->target, sizeof(item->target)) != 0 ||
+                    copy_reward_text(st, 4, item->source, sizeof(item->source)) != 0 ||
+                    copy_reward_text(st, 6, item->reason, sizeof(item->reason)) != 0 || !item->target[0]) {
+                    fprintf(stderr, "[R2 Reward] Event %lld text exceeds the replay format or is unreadable.\n",
+                            (long long)item->id);
+                    item->target[0] = '\0';
+                    replay_failed = 1;
+                    continue;
+                }
+                item->occurred_at = sqlite3_column_int64(st, 7);
+                item->modifier = sqlite3_column_int(st, 8);
+                item->expires_at = sqlite3_column_int64(st, 9);
+                item->voluntary_choice = sqlite3_column_int(st, 10);
+                item->addiction_choice_indexed = sqlite3_column_int(st, 11);
+            }
+        }
+        if (st) sqlite3_finalize(st);
+        pthread_mutex_unlock(&reward_lock);
+        if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            free(pending);
+            return -1;
+        }
+        if (count == 0) break;
+        last_seen_id = pending[count - 1].id;
+
+        for (int i = 0; i < count; ++i) {
+            PendingReward *item = &pending[i];
+            if (!item->target[0]) continue;
+            if (item->voluntary_choice && !item->addiction_choice_indexed) {
+                if (reward_deliver_addiction_choice(item) != 0) {
+                    fprintf(stderr,
+                        "[R2 Reward] Cross-organ Addiction replay remains pending "
+                        "for reward event %lld.\n", (long long)item->id);
+                    replay_failed = 1;
+                }
+            }
+            int64_t log_event_id = item->log_event_id > 0
+                ? item->log_event_id : find_existing_log_event(item->id);
+            if (log_event_id < 0) {
+                replay_failed = 1;
+                continue;
+            }
+            char summary[512], details[REWARD_DETAILS_CAPACITY];
+            format_reward_event(item, summary, sizeof(summary), details, sizeof(details));
+            if (log_event_id <= 0)
+                log_event_id = r2_log_event_with_memory(R2_LOG_WORLD,
+                    "enjoyment_changed", summary, details, "Reward.c", 0);
+            if (log_event_id > 0 &&
+                (!item->memory_indexed || item->log_event_id <= 0)) {
+                int memory_indexed = ensure_reward_memory_pointer(log_event_id, summary);
+                if (store_log_link(item->id, log_event_id, memory_indexed > 0) == 0 &&
+                    memory_indexed > 0)
+                    linked++;
+            }
         }
     }
-    }
     free(pending);
-    return linked;
+    return replay_failed ? -1 : linked;
 }
 
 static double reward_remaining(sqlite3_int64 start, sqlite3_int64 end,

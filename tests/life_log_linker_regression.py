@@ -34,10 +34,6 @@ for table in (
     if f"CREATE TABLE IF NOT EXISTS {table}" not in source:
         missing.append(f"schema missing: {table}")
 
-if missing:
-    print("\n".join(missing), file=sys.stderr)
-    raise SystemExit(1)
-
 activity_start = source[source.index("int64_t r2_log_activity_start("):source.index("int64_t r2_log_activity_end(")]
 assert "int step_rc = sqlite3_step(statement);" in activity_start, (
     "activity-start lookup must inspect the SQLite step result"
@@ -56,5 +52,9 @@ query_impl = source[query_start:query_end]
 for required_text in ("FROM r2_log_links l JOIN r2_log_events", "l.relationship", "l.notes", "Linked event", "event_id_seen"):
     if required_text not in query_impl:
         missing.append(f"link-aware search missing: {required_text}")
+
+if missing:
+    print("\n".join(missing), file=sys.stderr)
+    raise SystemExit(1)
 
 print("Life Log structured API regression checks passed.")

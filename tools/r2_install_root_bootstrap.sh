@@ -130,18 +130,30 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 
 wait_for_core_ready() {
-    local since="$1"
-    for attempt in $(seq 1 75); do
-        if root_run systemctl is-active --quiet r2-3po.service &&
-           root_run journalctl -u r2-3po.service --since "$since" -o cat --no-pager 2>/dev/null |
-               grep -Fq "[R2 READY] Core initialized; entering shell."; then
+    # The service runner allows two 180-second model requests per policy,
+    # plus model discovery, across the initial policy and up to eleven retries.
+    # Allow 90 minutes for that worst-case path and core initialization, but
+    # stop immediately if the invocation fails or is replaced.
+    local deadline=$((SECONDS + 90 * 60))
+    local invocation current
+    invocation="$(root_run systemctl show -p InvocationID --value r2-3po.service)" || return 1
+    [[ "$invocation" =~ ^[[:xdigit:]]{32}$ && "$invocation" != "00000000000000000000000000000000" ]] || return 1
+    while (( SECONDS < deadline )); do
+        root_run systemctl is-active --quiet r2-3po.service || return 1
+        current="$(root_run systemctl show -p InvocationID --value r2-3po.service)" || return 1
+        [[ "$current" == "$invocation" ]] || return 1
+        if root_run journalctl -u r2-3po.service "_SYSTEMD_INVOCATION_ID=$invocation" \
+                -o cat --no-pager 2>/dev/null |
+           grep -Fx "[R2 READY] Core initialized; entering shell." >/dev/null; then
+            # The service could have stopped while the journal was being read.
+            root_run systemctl is-active --quiet r2-3po.service || return 1
+            current="$(root_run systemctl show -p InvocationID --value r2-3po.service)" || return 1
+            [[ "$current" == "$invocation" ]] || return 1
             return 0
         fi
-        if root_run systemctl is-failed --quiet r2-3po.service; then
-            break
-        fi
-        sleep 1
+        sleep 2
     done
+    log "R2 core readiness was not observed before the 90-minute startup deadline."
     return 1
 }
 
@@ -167,13 +179,11 @@ rollback_previous_executable() {
     NEW_EXEC_INSTALLED=0
     log "Restored previous executable from $BACKUP_EXEC"
     root_run systemctl reset-failed r2-3po.service >/dev/null 2>&1 || true
-    local rollback_started_at
-    rollback_started_at="$(date '+%Y-%m-%d %H:%M:%S')"
     if ! root_run systemctl start r2-3po.service; then
         log "WARNING: previous executable is restored, but the service could not be started."
         return 1
     fi
-    if wait_for_core_ready "$rollback_started_at"; then
+    if wait_for_core_ready; then
         R2_ROLLBACK_RESTARTED=1
         log "Previous executable restored and core readiness marker observed."
     else
@@ -506,7 +516,6 @@ NEW_EXEC_INSTALLED=1
 run_as_r2 chmod 0755 "$R2_EXEC"
 
 log "Enabling R2 at boot and starting the overnight service..."
-STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 if ! root_run systemctl enable --now r2-3po.service; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
@@ -516,7 +525,7 @@ fi
 
 # Type=simple becomes active before ExecStart finishes its dependency checks.
 # Require a core-emitted readiness marker as well as active systemd state.
-if ! wait_for_core_ready "$STARTED_AT"; then
+if ! wait_for_core_ready; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
     rollback_previous_executable || log "WARNING: automatic executable rollback/restart was incomplete."

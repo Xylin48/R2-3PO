@@ -115,6 +115,14 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *samples, size_t bytes)
     return (ssize_t)bytes;
 }
 
+ssize_t __wrap_r2_ears_read_live_cancelable(R2Ears *receiver, void *samples,
+                                            size_t bytes, int (*cancelled)(void *),
+                                            void *userdata)
+{
+    if (cancelled && cancelled(userdata)) { errno = ECANCELED; return -1; }
+    return __wrap_r2_ears_read(receiver, samples, bytes);
+}
+
 void __wrap_r2_ears_close(R2Ears *receiver)
 {
     if (receiver == ears)

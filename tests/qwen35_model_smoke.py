@@ -316,21 +316,20 @@ require(
 
 
 require(
-    "shell_gameboy_sync_verified_events" in shell
-    and 'context=virtual' in shell
-    and "r2_log_event_exists" in shell
-    and "r2_log_event_exists" in log_header
-    and "int r2_log_event_exists(" in log,
-    "verified in-game events sync to Life Log with stable idempotency keys",
+    "r2_sync_gameboy_verified_events(device)" in shell
+    and "r2_sync_gameboy_verified_events(console_path)" in core
+    and "gameboy_find_life_event_for_console_event(source, event_id)" in core,
+    "shell and model sync verified in-game events through the same durable path",
 )
+gameboy_sync_start = core.index("static int gameboy_sync_verified_event(")
+gameboy_sync_end = core.index("static int r2_parse_control_positive_id(", gameboy_sync_start)
+gameboy_sync = core[gameboy_sync_start:gameboy_sync_end]
 require(
-    'r2_log_event(R2_LOG_MEDIA, "virtual_game_event"' in shell
-    and "does not change physical Reality" in shell
-    and 'r2_reality_' not in shell[shell.find("static const char *shell_gameboy_json_string"):shell.find("static int shell_gameboy(const char *arg)")],
+    '"context", ""), "virtual"' in gameboy_sync
+    and 'r2_log_event(R2_LOG_MEDIA, "virtual_game_event"' in gameboy_sync
+    and 'r2_reality_' not in gameboy_sync,
     "synced game events remain virtual and never mutate physical Reality",
 )
-
-
 require(
     'if (!reply || !*reply)' in shell
     and "Conversation backend returned no visible answer" in shell
@@ -372,7 +371,8 @@ require(
     "static void handle_completed_messages(void)" in core
     and '"[R2_INTERNAL_TOOL_RESULT]\\n"' in core
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
-    and "it was not inserted as user speech" in core,
+    and "its exact evidence is retained for retry" in core
+    and "completed_pending_handoff = result;" in core,
     "completed background tasks enter chat as explicitly marked internal results, not unmarked user turns",
 )
 
@@ -394,7 +394,8 @@ tool_pair_start = core.find('const char tool_result_prefix[] = "[R2_INTERNAL_TOO
 tool_pair_end = core.find("reply = chat_with_relevant_memories(message);", tool_pair_start)
 require(
     tool_pair_start >= 0 and tool_pair_end > tool_pair_start
-    and "The result was: %.1200s." in core[tool_pair_start:tool_pair_end]
+    and "Here is the recorded result:\\n%s" in core[tool_pair_start:tool_pair_end]
+    and "reply = tools;" in core[tool_pair_start:tool_pair_end]
     and core.find("free(tools);", tool_pair_start) > core.find("if (pair_rc != 0)", tool_pair_start),
     "if tool-history persistence fails, R2 retains and reports the actual tool result without rerunning the action",
 )

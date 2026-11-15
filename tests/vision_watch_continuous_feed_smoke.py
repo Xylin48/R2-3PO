@@ -46,8 +46,15 @@ assert "i == current_user_index" in core
 assert "strstr(content, ollama_authoritative_user_query)" in core
 assert "ollama_autonomous_sensory_input" in core
 assert "ollama_autonomous_sensory_input = 1;" in core
-assert "If Eyes is already open, a current image may be attached as raw visual input." in core
-assert "Its presence is not an instruction to describe the image" in core
+reflection_start = core.index("static void *autonomous_thinking(void *arg)")
+reflection = core[reflection_start:core.index("   MEMORY DECISION", reflection_start)]
+assert "A current image may be attached if Eyes is open." in reflection
+assert "Describe a frame only when relevant to the reflection." in reflection
+review = core[core.index("static char *generate_with_private_evidence("):reflection_start]
+assert review.index("ollama_autonomous_sensory_input = 0;") < review.index("r2_review_context(")
+assert review.index("r2_review_context(") < review.index(
+    "ollama_autonomous_sensory_input = previous_sensory_input;"
+)
 
 # The live image comes from the latest owned frame snapshot (or a fresh frame
 # from an explicitly open Eyes source), then undergoes encoding only.

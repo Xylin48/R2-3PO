@@ -86,7 +86,9 @@ static void verify_complete_reads(void)
     expect_contains(r2_visual_search("VISUAL-END", 20), visual_text);
     char *ctx = r2_diary_build_reflection_context(20);
     assert(ctx && strstr(ctx, diary_text) && strstr(ctx, visual_text) &&
-           strstr(ctx, memory_text) && strstr(ctx, "CONVERSATION-END")); free(ctx);
+           strstr(ctx, memory_text) && strstr(ctx, "Archived user message:\nactual user\n") &&
+           strstr(ctx, "Archived R2 reply:\nCONVERSATION-END\n"));
+    free(ctx);
 }
 int main(void)
 {
@@ -102,6 +104,12 @@ int main(void)
     assert(r2_diary_write(diary_text) == 0 && r2_diary_write("other diary row") == 0);
     assert(r2_log_sensory("visual_fixture", "complete reflection evidence", visual_text, "fixture") > 0);
     assert(r2_log_conversation_turn("actual user", "CONVERSATION-END") > 0);
+    sqlite3 *history = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &history) == SQLITE_OK);
+    assert(sqlite3_exec(history,
+        "UPDATE r2_log_events SET details='Legacy preview only' WHERE category='conversation'",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(history) == SQLITE_OK);
     char database[PATH_MAX], library[PATH_MAX];
     snprintf(database, sizeof(database), "%s/visual.db", R2_HOME);
     snprintf(library, sizeof(library), "%s/visual", R2_HOME);
@@ -111,12 +119,12 @@ int main(void)
     insert_visual(connection, visual_text, 1); insert_visual(connection, "another visual row", 2);
     verify_complete_reads();
 
-    char keywords[MAX_MEMORY_KEYWORDS][64] = {{"DIARY-END"}, {"DIARY"}};
+    const char *keywords[] = {"DIARY-END", "DIARY"};
     expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 1);
     assert(r2_diary_write(diary_text) == 0);
     expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 2);
-    snprintf(keywords[0], sizeof(keywords[0]), "VISUAL-END");
-    snprintf(keywords[1], sizeof(keywords[1]), "visual-source");
+    keywords[0] = "VISUAL-END";
+    keywords[1] = "visual-source";
     expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 1);
     insert_visual(connection, visual_text, 3);
     expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 2);
@@ -127,6 +135,19 @@ int main(void)
     assert(strstr(visual_context, "PRIOR VISUAL EXPERIENCES"));
     assert(strstr(visual_context, "another visual row"));
     expect_copies(visual_context, visual_text, 2);
+    char *long_pattern = make_text('j', 55000, "%_literal-long-pattern");
+    assert(r2_diary_write(long_pattern) == 0);
+    const char *literal_keywords[] = {long_pattern};
+    expect_copies(r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search), long_pattern, 1);
+    expect_copies(r2_diary_search("jj%_literal-long%pattern", 1), long_pattern, 1);
+    literal_keywords[0] = "jj%_literal-long%pattern";
+    empty = r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search);
+    assert(empty && !*empty);
+    free(empty);
+    assert(r2_log_conversation_turn(long_pattern, "This is its full receipt") > 0);
+    expect_copies(r2_log_search(long_pattern, 1), long_pattern, 1);
+    expect_copies(r2_sj_search(long_pattern, 1), long_pattern, 1);
+    free(long_pattern);
     expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel), "TAIL");
     expect_copies(r2_visual_search("not-in-the-fixture", 2), "(No visual experiences found.)\n", 1);
     char *assembled = strdup(memory_text); assert(assembled);
@@ -150,15 +171,15 @@ int main(void)
     /* Real queries must discard even a valid first row if their next step fails. */
     failed_sql = "SELECT entry,created_at,id FROM diary_entries"; allowed_rows = 1;
     assert(!r2_diary_recent(20));
-    allowed_rows = 1; assert(!r2_diary_search("%", 20));
+    allowed_rows = 1; assert(!r2_diary_search("DIARY-END", 20));
     allowed_rows = 1; assert(!r2_diary_build_reflection_context(20));
-    snprintf(keywords[0], sizeof(keywords[0]), "DIARY-END");
+    keywords[0] = "DIARY-END";
     allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_diary_visit_search));
-    failed_sql = "SELECT id,local_time,category,event_type"; allowed_rows = 1;
+    failed_sql = "SELECT e.id,e.local_time,e.category,e.event_type"; allowed_rows = 1;
     assert(!r2_diary_build_reflection_context(20));
     failed_sql = "SELECT created_utc,source,model,description"; allowed_rows = 1;
     assert(!r2_visual_recent(20));
-    snprintf(keywords[0], sizeof(keywords[0]), "VISUAL-END");
+    keywords[0] = "VISUAL-END";
     allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_visual_visit_search));
     failed_sql = NULL;
     assert(sqlite3_close(connection) == SQLITE_OK);

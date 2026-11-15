@@ -83,6 +83,14 @@ ssize_t __wrap_r2_audio_capture_read(R2AudioCapture *capture, void *pcm, size_t 
     errno = ECANCELED;
     return -1;
 }
+ssize_t __wrap_r2_audio_capture_read_cancelable(R2AudioCapture *capture, void *pcm,
+                                               size_t bytes, int (*cancelled)(void *),
+                                               void *userdata)
+{
+    assert(cancelled && !cancelled(userdata));
+    return __wrap_r2_audio_capture_read(capture, pcm, bytes);
+}
+
 int __wrap_r2_audio_discover_selected(R2AudioDiscovery *audio, unsigned scope,
                                        int (*cancelled)(void *), void *userdata)
 {

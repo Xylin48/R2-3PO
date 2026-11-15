@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
-prompt = core[core.index("static const char *SYSTEM_PROMPT ="):core.index("static const char r2_conversation_system_prompt[]")]
+prompt = core[core.index("static const char *SYSTEM_PROMPT ="):core.index("static const char r2_conversation_system_prompt[] =")]
 helper_start = core.index("static char *r2_process_ears_listen_request(const char *request)")
 helper_end = core.index("static char *process_tools_with_status(", helper_start)
 ears_helper = core[helper_start:helper_end]
@@ -41,7 +41,10 @@ assert "That source was left untouched" in ears_helper
 assert "Do not infer what was said." in ears_helper
 assert "r2_process_ears_listen_request(request)" in tool
 assert "r2_process_ears_listen_request(ears_request)" in core
-assert "AUTONOMOUS REFLECTION CONTEXT:" in core
+reflection = core[core.index("static void *autonomous_thinking(void *arg)"):
+                  core.index("   MEMORY DECISION")]
+assert "r2_diary_build_reflection_context(10)" in reflection
+assert "prompt, review_task, ctx, followup, &followup_archive" in reflection
 assert "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:" in core
 assert 'extract_marker(reflection, "[EARS_SOURCES]"' in core
 assert 'RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:' in core
