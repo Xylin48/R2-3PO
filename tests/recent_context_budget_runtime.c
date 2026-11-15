@@ -89,6 +89,13 @@ int main(void)
     assert(!reply_has_visible_text("[DIARY]\n```text\n[END DIARY]\n```\nbody\n[END DIARY]"));
     assert(reply_has_visible_text("[WORLD]building is a word, not a control."));
     assert(reply_has_visible_text("    [WORLD] read-only indentation example"));
+    const char *nested = "[DIARY]\n[WORLD] remove|example\n[END DIARY]\n[WORLD] look";
+    size_t tool_position = 0;
+    char *world = extract_marker(nested, "[WORLD]", "\n", &tool_position);
+    assert(world && !strcmp(world, "look"));
+    free(world);
+    assert(!find_control_marker_line("[WRITE] note.txt\n[WORLD] look", "[WORLD]", 0));
+    assert(!reply_has_visible_text("[DIARY]\n[WORLD] look\n[END DIARY]"));
     assert(reply_has_visible_text("Ordinary conversational text."));
 
     /* Model-generated Alternate-Self IDs must reject scanf-style overflow. */

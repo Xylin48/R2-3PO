@@ -7602,6 +7602,27 @@ static int r2_line_contains_token(const char *line, const char *line_end,
     return 0;
 }
 
+static const struct {
+    const char *open;
+    const char *close;
+} control_blocks[] = {
+    {"[ALTERNATE_CREATE]", "[END ALTERNATE_CREATE]"},
+    {"[DIARY]", "[END DIARY]"},
+    {"[WRITE]", "[END WRITE]"},
+    {"[HAND_REQUEST]", "[END HAND_REQUEST]"},
+    {"[RUN]", "[END RUN]"},
+    {"[IMAGINE]", "[END IMAGINE]"},
+    {"[IMAGINE_FEEDBACK]", "[END IMAGINE_FEEDBACK]"}
+};
+
+static int control_marker_matches(const char *content, const char *marker)
+{
+    size_t length = strlen(marker);
+    if (strncmp(content, marker, length)) return 0;
+    char after = content[length];
+    return !after || after == '\n' || after == '\r' || after == ' ' || after == '\t';
+}
+
 /* Recognize control markers only as standalone line prefixes outside
    Markdown fenced code. Otherwise a reply explaining a command could execute
    the example it is trying to show the user. */
@@ -7610,7 +7631,6 @@ static const char *find_control_marker_line(const char *reply,
                                             size_t from_position)
 {
     if (!reply || !marker) return NULL;
-    const size_t marker_len = strlen(marker);
     const char *line = reply;
     int in_fence = 0;
     char fence_char = '\0';
@@ -7621,6 +7641,7 @@ static const char *find_control_marker_line(const char *reply,
     int in_html_style = 0;
     int in_html_textarea = 0;
     int in_html_comment = 0;
+    const char *block_close = NULL;
 
     while (*line) {
         const char *content = line;
@@ -7725,11 +7746,24 @@ static const char *find_control_marker_line(const char *reply,
                     in_html_style = 0;
                 if (in_html_textarea && r2_line_contains_token(content, line_end, "</textarea"))
                     in_html_textarea = 0;
-            } else if ((size_t)(content - reply) >= from_position &&
-                       strncmp(content, marker, marker_len) == 0) {
-                char after = content[marker_len];
-                if (after == '\0' || after == '\n' || after == '\r' ||
-                    after == ' ' || after == '\t')
+            } else if (block_close) {
+                /* The contents of a tool block are data for that one tool.
+                   A second control line inside it cannot execute independently. */
+                if (control_marker_matches(content, block_close)) {
+                    block_close = NULL;
+                    if ((size_t)(content - reply) >= from_position &&
+                        control_marker_matches(content, marker))
+                        return content;
+                }
+            } else {
+                for (size_t i = 0; i < sizeof(control_blocks) / sizeof(control_blocks[0]); ++i) {
+                    if (control_marker_matches(content, control_blocks[i].open)) {
+                        block_close = control_blocks[i].close;
+                        break;
+                    }
+                }
+                if ((size_t)(content - reply) >= from_position &&
+                    control_marker_matches(content, marker))
                     return content;
             }
         }
@@ -14091,18 +14125,6 @@ static int reply_has_visible_text(const char *text)
      * executed; checking merely for non-whitespace would treat the command
      * itself as visible text and bypass that gate.
      */
-    static const struct {
-        const char *open;
-        const char *close;
-    } control_blocks[] = {
-        {"[ALTERNATE_CREATE]", "[END ALTERNATE_CREATE]"},
-        {"[DIARY]", "[END DIARY]"},
-        {"[WRITE]", "[END WRITE]"},
-        {"[HAND_REQUEST]", "[END HAND_REQUEST]"},
-        {"[RUN]", "[END RUN]"},
-        {"[IMAGINE]", "[END IMAGINE]"},
-        {"[IMAGINE_FEEDBACK]", "[END IMAGINE_FEEDBACK]"}
-    };
     static const char *const control_lines[] = {
         "[ALTERNATE_LIST]", "[ALTERNATE_SHOW]", "[ALTERNATE_COMPARE]",
         "[ALTERNATE_RETAIN]", "[ALTERNATE_DISCARD]", "[READ_DIARY]",

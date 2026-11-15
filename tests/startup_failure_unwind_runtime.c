@@ -49,6 +49,9 @@ static void test_world_and_welcome_replay(void)
     check_world_reply("[WORLD] tv_power|on|extra", "REAL WORLD ERROR");
     check_world_reply("[WORLD] tv_tune|99", "could not select RF channel 99");
     check_world_reply("[WORLD] gameboy_power_on|extra", "unsupported Game Boy console action");
+    check_world_reply("I can record what I imagined.\n[DIARY]\n"
+                      "Example of an action: \n[WORLD] remove|fixture book\n[END DIARY]",
+                      "REAL DIARY RESULT");
     check_world_reply("[WORLD] remove|fixture book", "REAL WORLD RESULT");
     char value[4001], evidence[8001], action[12500];
     memset(value, 'v', sizeof(value));
