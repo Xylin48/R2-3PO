@@ -213,9 +213,13 @@ class TVDisplaySmoke(unittest.TestCase):
                        (media,))
             db.execute("INSERT INTO r2_tv_vcr_tapes VALUES(?,?)", (media, 0.0))
         for stored in ("not-a-number", "inf", "-inf", "nan"):
-            with self.subTest(stored=stored), sqlite3.connect(self.db_path) as db:
-                db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=? WHERE media_path=?",
-                           (stored, media))
+            with self.subTest(stored=stored):
+                with sqlite3.connect(self.db_path) as db:
+                    db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=? WHERE media_path=?",
+                               (stored, media))
+                # Commit before opening the independent read-only connection.
+                # Otherwise SQLite correctly keeps the uncommitted fixture
+                # value invisible and the test examines the previous row.
                 with self.assertRaisesRegex(ValueError, "Saved VCR position"):
                     display.read_vcr_state()
         with sqlite3.connect(self.db_path) as db:
