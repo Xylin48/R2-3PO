@@ -355,6 +355,8 @@ int main(void)
            < (int)sizeof(moved_library));
     assert(rename(library, moved_library) == 0);
     assert(symlink(R2_HOME, library) == 0);
+    /* A replaced archive directory must not be accepted as a durable sync. */
+    assert(visual_sync_directory(library) != 0);
     R2VisionFrame archive_probe = {.timestamp=1234, .frame_number=1};
     char refused_path[PATH_MAX];
     assert(visual_create_archive(library, &archive_probe, refused_path,
