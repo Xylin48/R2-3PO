@@ -181,6 +181,50 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertEqual(TV.CRTDisplay.read_vcr_state(object.__new__(TV.CRTDisplay)),
                          (media, "pause", 42.75))
 
+    def test_invalid_saved_vcr_position_does_not_reach_playback(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        media = "/tmp/position-fixture.mp4"
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_state SET cassette_path=?,transport='play' WHERE id=1",
+                       (media,))
+            db.execute("INSERT INTO r2_tv_vcr_tapes VALUES(?,?)", (media, 0.0))
+        for stored in ("not-a-number", "inf", "-inf", "nan"):
+            with self.subTest(stored=stored), sqlite3.connect(self.db_path) as db:
+                db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=? WHERE media_path=?",
+                           (stored, media))
+                with self.assertRaisesRegex(ValueError, "Saved VCR position"):
+                    display.read_vcr_state()
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=-12.5 WHERE media_path=?",
+                       (media,))
+        self.assertEqual(display.read_vcr_state(), (media, "play", 0.0))
+
+    def test_invalid_saved_position_shows_unavailable_without_crashing_refresh(self) -> None:
+        class Widget:
+            def __init__(self):
+                self.props = {}
+                self.raised = False
+
+            def lift(self):
+                self.raised = True
+
+            def configure(self, **kwargs):
+                self.props.update(kwargs)
+
+        display = object.__new__(TV.CRTDisplay)
+        display._player = None
+        display._renderer_published = False
+        display.picture = Widget()
+        display.status = Widget()
+        display.read_state = lambda: (1, "input", 1, None)
+        display.read_vcr_state = lambda: (_ for _ in ()).throw(
+            ValueError("Saved VCR position is not finite"))
+        display._publish_renderer = lambda path: None
+        display.refresh(schedule=False)
+        self.assertTrue(display.picture.raised)
+        self.assertEqual(display.picture.props["text"], "TV STATE UNAVAILABLE")
+        self.assertIn("Saved VCR position", display.status.props["text"])
+
     def test_vcr_client_accepts_transport_and_media_commands(self) -> None:
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",
                         "vcr insert /tmp/example-film.mp4", "vcr position 42.750",
