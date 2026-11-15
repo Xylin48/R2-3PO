@@ -1278,7 +1278,7 @@ static int db_exec(const char *sql)
 }
 
 
-static int db_column_exists(const char *table, const char *column)
+static int db_column_exists(sqlite3 *connection, const char *table, const char *column)
 {
     if (!table || !column) return 0;
     char sql[256];
@@ -1287,7 +1287,7 @@ static int db_column_exists(const char *table, const char *column)
 
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(connection, sql, -1, &st, NULL) == SQLITE_OK) {
         while (sqlite3_step(st) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
             if (name && !strcasecmp((const char *)name, column)) {
@@ -1303,7 +1303,7 @@ static int db_column_exists(const char *table, const char *column)
 static int db_ensure_column(const char *table, const char *column,
                             const char *definition)
 {
-    if (db_column_exists(table, column)) return 0;
+    if (db_column_exists(db, table, column)) return 0;
     char sql[512];
     int n = snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;",
                      table, column, definition);
@@ -1326,7 +1326,7 @@ static int db_backfill_memory_column(const char *target,
     used = (size_t)n;
 
     for (size_t i = 0; i < alias_count; ++i) {
-        if (!db_column_exists("memories", aliases[i])) continue;
+        if (!db_column_exists(db, "memories", aliases[i])) continue;
         n = snprintf(expression + used, sizeof(expression) - used,
                      "NULLIF(%s,''),", aliases[i]);
         if (n < 0 || (size_t)n >= sizeof(expression) - used) return -1;
@@ -1381,7 +1381,7 @@ static int migrate_memory_schema(void)
 /* Insert into both canonical columns and any known legacy aliases that remain
    NOT NULL in an older memories table. ALTER TABLE is additive, so those
    legacy constraints still apply to new rows after migration. */
-static int db_insert_memory_compat(const char *memory, const char *category,
+static int db_insert_memory_compat(sqlite3 *connection, const char *memory, const char *category,
                                    const char *timestamp)
 {
     static const char *const memory_aliases[] =
@@ -1402,7 +1402,7 @@ static int db_insert_memory_compat(const char *memory, const char *category,
 
 #define ADD_LEGACY_COLUMNS(names, value) do { \
     for (size_t alias_i = 0; alias_i < sizeof(names) / sizeof((names)[0]); ++alias_i) { \
-        if (db_column_exists("memories", (names)[alias_i])) { \
+        if (db_column_exists(connection, "memories", (names)[alias_i])) { \
             if (count >= sizeof(columns) / sizeof(columns[0])) return SQLITE_TOOBIG; \
             columns[count] = (names)[alias_i]; \
             values[count++] = (value); \
@@ -1440,7 +1440,7 @@ static int db_insert_memory_compat(const char *memory, const char *category,
     if (n < 0 || (size_t)n >= sizeof(sql) - used) return SQLITE_TOOBIG;
 
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    int rc = sqlite3_prepare_v2(connection, sql, -1, &st, NULL);
     if (rc != SQLITE_OK) return rc;
     for (size_t i = 0; i < count && rc == SQLITE_OK; ++i)
         rc = sqlite3_bind_text(st, (int)i + 1, values[i], -1, SQLITE_TRANSIENT);
@@ -1510,17 +1510,14 @@ static int init_db(void)
    PERSISTENT MEMORY
    ============================================================ */
 
-static int save_memory(
-    const char *memory,
-    const char *category)
+/* The caller owns this connection for the complete write. */
+static int write_memory(sqlite3 *connection, const char *memory, const char *category)
 {
     sqlite3_stmt *st = NULL;
 
     char now[32];
 
     now_iso(now);
-
-    pthread_mutex_lock(&db_lock);
 
     /*
        Do not create unlimited duplicate records for the exact same
@@ -1537,7 +1534,7 @@ static int save_memory(
 
     int rc =
         sqlite3_prepare_v2(
-            db,
+            connection,
             update_sql,
             -1,
             &st,
@@ -1555,34 +1552,45 @@ static int save_memory(
 
     int changed =
         (rc == SQLITE_DONE)
-            ? sqlite3_changes(db)
+            ? sqlite3_changes(connection)
             : -1;
 
     sqlite3_finalize(st);
     st = NULL;
 
-    if (rc != SQLITE_DONE) {
-
-        pthread_mutex_unlock(&db_lock);
-
+    if (rc != SQLITE_DONE)
         return -1;
-    }
 
-    if (changed == 0) {
+    if (changed > 0) return 0;
 
-        rc = db_insert_memory_compat(memory, category, now);
-    }
+    /* Zero changed rows can also mean an ignored refresh of an exact match. */
+    rc = sqlite3_prepare_v2(connection,
+        "SELECT 1 FROM memories WHERE memory=? AND category=? LIMIT 1;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, memory, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, category, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
 
-    if (changed == 0 && rc == SQLITE_DONE && sqlite3_changes(db) != 1)
-        rc = SQLITE_CONSTRAINT;
-
-    pthread_mutex_unlock(&db_lock);
-
-    if (rc == SQLITE_DONE)
-        context_cache_invalidate();
-    return rc == SQLITE_DONE ? 0 : -1;
+    rc = db_insert_memory_compat(connection, memory, category, now);
+    return rc == SQLITE_DONE && sqlite3_changes(connection) == 1 ? 0 : -1;
 }
 
+static int save_memory(const char *memory, const char *category)
+{
+    int result = -1;
+    pthread_mutex_lock(&db_lock);
+    if (db && db_exec("BEGIN IMMEDIATE;") == 0) {
+        if (write_memory(db, memory, category) == 0 && db_exec("COMMIT;") == 0)
+            result = 0;
+        else if (!sqlite3_get_autocommit(db))
+            (void)db_exec("ROLLBACK;");
+    }
+    pthread_mutex_unlock(&db_lock);
+    if (result == 0) context_cache_invalidate();
+    return result;
+}
 
 /* ============================================================
    STARTUP MEMORY LOADER
@@ -13819,23 +13827,21 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                 char *memory = trim(sep + 1);
                 if (*memory && !shutting_down &&
                     atomic_load(&foreground_conversation_waiting) == 0) {
-                    if (save_memory(memory, category) == 0) {
-                        int64_t learning_event_id = r2_log_event(R2_LOG_MEMORY, "memory_saved",
-                            "A persistent memory was saved from an evaluated exchange or observation.",
-                            memory, category);
-                        if (source_event_id > 0 && learning_event_id > 0)
-                            r2_log_link(learning_event_id, source_event_id,
-                                        "memory_learned_from", "evidence evaluation");
+                    if (r2_log_save_learning(db, memory, category,
+                                             source_event_id, write_memory) == 0) {
+                        context_cache_invalidate();
                     } else {
-                        char details[1200];
-                        snprintf(details, sizeof(details),
-                                 "source_event_id=%lld; category=%s; proposed_memory=%.900s",
-                                 (long long)source_event_id, category, memory);
-                        fprintf(stderr, "[R2 Post-turn] Persistent memory write failed for event %lld.\n",
+                        char *details = NULL;
+                        if (asprintf(&details,
+                                     "source_event_id=%lld; category=%s; proposed_memory=%s",
+                                     (long long)source_event_id, category, memory) < 0)
+                            details = NULL;
+                        fprintf(stderr, "[R2 Post-turn] Persistent memory transaction failed for event %lld.\n",
                                 (long long)source_event_id);
                         (void)r2_log_event(R2_LOG_ERROR, "memory_save_failed",
                                            "A valid post-turn memory decision could not be persisted.",
                                            details, "preserve_evidence_memory");
+                        free(details);
                     }
                 }
             }

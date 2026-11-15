@@ -438,6 +438,59 @@ static void check_foreground_context_review(void)
     ollama_audit_stage = NULL;
 }
 
+static int memory_fixture_count(const char *query)
+{
+    sqlite3_stmt *statement = NULL;
+    assert(sqlite3_prepare_v2(db, query, -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW);
+    int count = sqlite3_column_int(statement, 0);
+    sqlite3_finalize(statement);
+    return count;
+}
+
+static void check_evaluated_memory_atomicity(void)
+{
+    assert(init_db() == 0);
+    int64_t source = r2_log_event(R2_LOG_CONVERSATION, "fixture_memory_source",
+        "A test exchange with exact learning evidence.", NULL, NULL);
+    assert(source > 0);
+    const char *memory_count =
+        "SELECT count(*) FROM memories WHERE memory='I prefer quiet music.' "
+        "AND category='preference';";
+    const char *log_count =
+        "SELECT count(*) FROM r2_log_events WHERE event_type='memory_saved' "
+        "AND details='I prefer quiet music.';";
+    set_response("preference | I prefer quiet music.", "stop", 1);
+    assert(db_exec("CREATE TRIGGER ignore_learning_link BEFORE INSERT ON r2_log_links "
+                   "WHEN NEW.relationship='memory_learned_from' "
+                   "BEGIN SELECT RAISE(IGNORE); END;") == 0);
+    preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(memory_fixture_count(memory_count) == 0 && memory_fixture_count(log_count) == 0);
+    assert(db_exec("DROP TRIGGER ignore_learning_link;") == 0);
+
+    assert(db_exec("CREATE TRIGGER ignore_learning_memory BEFORE INSERT ON memories "
+                   "WHEN NEW.category='preference' BEGIN SELECT RAISE(IGNORE); END;") == 0);
+    preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(memory_fixture_count(memory_count) == 0 && memory_fixture_count(log_count) == 0);
+    assert(db_exec("DROP TRIGGER ignore_learning_memory;") == 0);
+
+    preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 1);
+    assert(memory_fixture_count(
+        "SELECT count(*) FROM r2_log_links l JOIN r2_log_events from_event "
+        "ON from_event.id=l.from_event_id JOIN r2_log_events to_event ON to_event.id=l.to_event_id "
+        "WHERE l.relationship='memory_learned_from' AND from_event.event_type='memory_saved' "
+        "AND from_event.details='I prefer quiet music.' AND to_event.event_type='fixture_memory_source';") == 1);
+
+    assert(db_exec("CREATE TRIGGER ignore_learning_refresh BEFORE UPDATE ON memories "
+                   "WHEN OLD.category='preference' BEGIN SELECT RAISE(IGNORE); END;") == 0);
+    preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 1);
+    assert(db_exec("DROP TRIGGER ignore_learning_refresh;") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_staged_imagination(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
@@ -736,6 +789,7 @@ int main(void)
     stored = r2_log_search("ollama_output_limit_reached", 10);
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
+    check_evaluated_memory_atomicity();
     check_staged_imagination();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);

@@ -84,6 +84,13 @@ int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
                                 const char *summary, const char *details, const char *source,
                                 int (*save)(struct sqlite3 *, int64_t, void *), void *context);
 
+/* Commit an evaluated memory and its Life Log evidence together. The callback
+ * writes the memory through the supplied connection inside the transaction.
+ * Return 0 from the callback on success. The callback must not reenter Life Log. */
+int r2_log_save_learning(struct sqlite3 *peer, const char *memory, const char *category,
+                         int64_t source_event_id,
+                         int (*save)(struct sqlite3 *, const char *, const char *));
+
 /* Resolve or publish a detached Visual observation by its persisted archive key. */
 int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source);
 

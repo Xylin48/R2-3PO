@@ -1068,6 +1068,34 @@ int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char
     return 0;
 }
 
+int r2_log_save_learning(sqlite3 *peer, const char *memory, const char *category,
+                         int64_t source_event_id,
+                         int (*save)(sqlite3 *, const char *, const char *))
+{
+    if (!peer || !save || !valid_text(memory) || !valid_text(category))
+        return -1;
+    pthread_mutex_lock(&log_lock);
+    const char *life_path = log_initialized && log_db
+        ? sqlite3_db_filename(log_db, "main") : NULL;
+    const char *peer_path = sqlite3_db_filename(peer, "main");
+    if (!life_path || !*life_path || !peer_path || strcmp(life_path, peer_path) != 0 ||
+        exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    int64_t learning = log_insert_event_locked(R2_LOG_MEMORY, "memory_saved",
+        "A persistent memory was saved from an evaluated exchange or observation.",
+        memory, category);
+    int saved = learning > 0 &&
+        (source_event_id <= 0 || log_link_locked(learning, source_event_id,
+            "memory_learned_from", "evidence evaluation") == 0) &&
+        save(log_db, memory, category) == 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
 int64_t r2_log_save_visual_once(const char *archive_key, const char *description, const char *source)
 {
     const char *type = "visual_experience";

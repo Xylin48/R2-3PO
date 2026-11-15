@@ -129,7 +129,7 @@ for init_failure in (
     assert init_failure in core, f"core startup silently degrades instead of requiring {init_failure}"
 assert "r2_sj_recent((int)limit)" in core
 assert "r2_sj_search(arg1, (int)limit)" in core
-memory_save_start = core.find("int save_memory(")
+memory_save_start = core.find("static int write_memory(")
 memory_save_end = core.find("\nstatic ", memory_save_start + 1)
 if memory_save_start < 0 or memory_save_end < 0:
     raise SystemExit("Could not locate persistent memory save implementation.")
