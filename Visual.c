@@ -371,12 +371,16 @@ static int visual_create_archive(const char *directory, const R2VisionFrame *fra
     int dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (dirfd < 0) return -1;
     struct stat pinned, current;
-    if (fstat(dirfd, &pinned) != 0 || lstat(directory, &current) != 0 ||
-        !S_ISDIR(pinned.st_mode) || !S_ISDIR(current.st_mode) ||
-        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
-        int error = errno ? errno : ESTALE;
+    if (fstat(dirfd, &pinned) != 0 || lstat(directory, &current) != 0) {
+        int error = errno;
         close(dirfd);
         errno = error;
+        return -1;
+    }
+    if (!S_ISDIR(pinned.st_mode) || !S_ISDIR(current.st_mode) ||
+        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
+        close(dirfd);
+        errno = ESTALE;
         return -1;
     }
     const char *separator = directory[strlen(directory) - 1] == '/' ? "" : "/";
