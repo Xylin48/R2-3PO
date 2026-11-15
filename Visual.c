@@ -1315,7 +1315,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
        separators before checking the final component for symlinks. */
     size_t library_length = strlen(visual_directory);
     while (library_length > 1 && visual_directory[library_length - 1] == '/')
-        visual_directory[--library_length] = '\\0';
+        visual_directory[--library_length] = 0;
     const char *configured = getenv("R2_VISION_MODEL");
     if (configured && *configured &&
         strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0) {
