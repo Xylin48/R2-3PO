@@ -300,6 +300,32 @@ static int visual_sync_directory(const char *path)
     return rc;
 }
 
+/* Check each existing path component before creating or canonicalizing the
+ * library. A final-component lstat alone misses "link/." and "link/..". */
+static int visual_reject_library_symlinks(const char *path)
+{
+    char prefix[PATH_MAX];
+    size_t n = strlen(path);
+    if (n >= sizeof(prefix)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(prefix, path, n + 1);
+    for (size_t i = 0; i < n; ++i) {
+        if (prefix[i] != '/' || i == 0) continue;
+        char saved = prefix[i];
+        prefix[i] = 0;
+        struct stat st;
+        int rc = lstat(prefix, &st);
+        int error = errno;
+        prefix[i] = saved;
+        if (rc == 0 && S_ISLNK(st.st_mode)) { errno = ELOOP; return -1; }
+        if (rc != 0 && error != ENOENT) { errno = error; return -1; }
+    }
+    struct stat st;
+    if (lstat(prefix, &st) == 0) {
+        if (S_ISLNK(st.st_mode)) { errno = ELOOP; return -1; }
+    } else if (errno != ENOENT) return -1;
+    return 0;
+}
+
 static int visual_prepare_directory(const char *path)
 {
     if (mkdir(path, 0750) != 0) {
@@ -1324,7 +1350,8 @@ int r2_visual_init(const char *database_path, const char *library_directory)
                 configured, R2_VISION_DEFAULT_MODEL);
     }
     snprintf(visual_model, sizeof(visual_model), "%s", R2_VISION_DEFAULT_MODEL);
-    if (visual_prepare_directory(visual_directory) != 0) {
+    if (visual_reject_library_symlinks(visual_directory) != 0 ||
+        visual_prepare_directory(visual_directory) != 0) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
