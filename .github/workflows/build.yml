@@ -653,6 +653,8 @@ jobs:
           /tmp/r2-startup-unwind-test hands
           rm -rf "$ROOT"
           /tmp/r2-startup-unwind-test diary
+          rm -rf "$ROOT"
+          /tmp/r2-startup-unwind-test welcome
 
       - name: Verify complete cleanup after either startup thread creation fails
         run: |

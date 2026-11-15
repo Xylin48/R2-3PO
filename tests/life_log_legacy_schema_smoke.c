@@ -17,6 +17,8 @@
 #endif
 
 static int journal_index_calls = 0;
+static int reject_welcome = 0;
+static int welcome_attempts = 0;
 
 void r2_sj_index_event(int64_t event_id, const char *category,
                        const char *event_type, const char *source)
@@ -27,7 +29,11 @@ void r2_sj_index_event(int64_t event_id, const char *category,
 
 int r2_save_memory(const char *memory, const char *category)
 {
-    (void)memory; (void)category;
+    if (strcmp(category, "private_notification") == 0) {
+        assert(strcmp(memory, "Welcome Home. You have returned home after being away.") == 0);
+        ++welcome_attempts;
+        if (reject_welcome) return -1;
+    }
     return 0;
 }
 
@@ -82,6 +88,9 @@ int main(void)
         "activity_name TEXT,started_utc TEXT,status TEXT);"
         "INSERT INTO r2_log_activity_sessions VALUES(1,'legacy-game','Legacy Game',"
         "'2020-01-01T00:00:00Z','closed');"
+        "CREATE TABLE r2_log_location_state(id INTEGER PRIMARY KEY,current_location TEXT,"
+        "is_home INTEGER,was_away INTEGER,updated_utc TEXT);"
+        "INSERT INTO r2_log_location_state VALUES(1,'home',1,0,'2020-01-01T00:00:00Z');"
         "CREATE TABLE r2_log_milestones(id INTEGER PRIMARY KEY,milestone_key TEXT,description TEXT);"
         "INSERT INTO r2_log_milestones VALUES(1,'legacy-first','Old milestone');"
         "CREATE TABLE r2_log_conversations(id INTEGER PRIMARY KEY,user_text TEXT,assistant_text TEXT);"
@@ -196,7 +205,10 @@ int main(void)
     assert(r2_log_milestone("test-first", "Milestone fixture", NULL) == 0);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE source='test-first';") == 1);
     assert(r2_log_location_transition("park", 0) == 0);
-    assert(r2_log_location_transition("home", 1) == 0);
+    reject_welcome = 1;
+    assert(r2_log_location_transition("home", 1) < 0);
+    assert(welcome_attempts == 1);
+    assert(scalar(writer, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1;") == 1);
     assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) > 0);
     assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) < 0);
     assert(sqlite3_exec(writer,
@@ -211,6 +223,22 @@ int main(void)
     assert(sqlite3_exec(writer, "DROP TRIGGER ignore_activity_end;", NULL, NULL, NULL) == SQLITE_OK);
     r2_log_shutdown();
     assert(r2_log_init() == 0);
+    reject_welcome = 0;
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER ignore_welcome_ack BEFORE UPDATE OF welcome_pending "
+        "ON r2_log_location_state WHEN NEW.welcome_pending=0 "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_location_transition("home", 1) < 0);
+    assert(welcome_attempts == 2);
+    assert(scalar(writer, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1;") == 1);
+    assert(sqlite3_exec(writer, "DROP TRIGGER ignore_welcome_ack;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_location_transition("home", 1) == 0);
+    assert(welcome_attempts == 3);
+    assert(scalar(writer, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1;") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events "
+                          "WHERE event_type='internal_notification';") == 1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events "
+                          "WHERE event_type='location_changed';") == 2);
     assert(r2_log_activity_end("restart-fixture", "ready", "fixture", NULL) > 0);
     assert(scalar(writer, "SELECT duration_ms FROM r2_log_activity_sessions "
                           "WHERE activity_key='restart-fixture';") >= 3600000);

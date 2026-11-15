@@ -229,7 +229,7 @@ for bind in (
     if bind not in activity_end_body:
         raise SystemExit(f"Life Log activity-end persistence ignores a binding result: {bind}")
 
-location_start = log.find("int r2_log_location_transition(")
+location_start = log.find("static int log_stage_location_transition(")
 location_end = log.find("\nint64_t r2_log_", location_start + 1)
 if location_start < 0 or location_end < 0:
     raise SystemExit("Could not locate Life Log location persistence.")

@@ -3495,6 +3495,8 @@ int r2_reality_transition_location(const char *location, int home)
         rc = sqlite3_bind_text(st, 1, location, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, home);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
+        rc = SQLITE_CONSTRAINT;
     if (st) sqlite3_finalize(st);
     st = NULL;
     if (rc == SQLITE_DONE)
@@ -3523,12 +3525,12 @@ int r2_reality_transition_location(const char *location, int home)
 #ifdef R2_INVENTORY_TEST_FAILURE_INJECTION
     if (getenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT")) {
         pthread_mutex_unlock(&location_transition_lock);
-        return -1;
+        return 1;
     }
 #endif
     result = location_delivery_replay_locked();
     pthread_mutex_unlock(&location_transition_lock);
-    return result;
+    return result == 0 ? 0 : 1;
 }
 
 int r2_reality_set_location(int home)

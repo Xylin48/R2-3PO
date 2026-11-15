@@ -549,9 +549,27 @@ static void verify_location_delivery_replay(void)
     sqlite3_stmt *st = NULL;
     if (r2_log_init() != 0)
         fail("could not initialize the real Life Log for location recovery");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
+        sqlite3_exec(reality,
+            "CREATE TRIGGER ignore_location_stage BEFORE INSERT ON r2_location_delivery "
+            "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not reject a location staging write");
+    if (r2_reality_transition_location("sample library", 0) == 0 ||
+        sqlite3_prepare_v2(reality,
+            "SELECT value FROM r2_reality_meta WHERE key='current_location'",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "home"))
+        fail("an ignored location stage modified the current location");
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_exec(reality, "DROP TRIGGER ignore_location_stage;",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not restore location staging");
+    sqlite3_close(reality); reality = NULL;
+
     if (setenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT", "1", 1) != 0)
         fail("could not inject interrupted location write");
-    if (r2_reality_transition_location("sample library", 0) == 0)
+    if (r2_reality_transition_location("sample library", 0) != 1)
         fail("injected interruption after Reality commit reported success");
     unsetenv("R2_TEST_LOCATION_STOP_AFTER_REALITY_COMMIT");
     /* A direct legacy state setter must not overwrite an unacknowledged
@@ -607,7 +625,7 @@ static void verify_location_delivery_replay(void)
 
     if (setenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT", "1", 1) != 0)
         fail("could not inject interrupted Life Log acknowledgement");
-    if (r2_reality_transition_location("home", 1) == 0)
+    if (r2_reality_transition_location("sample park", 0) != 1)
         fail("injected interruption after Life Log commit reported success");
     unsetenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT");
     r2_reality_shutdown();
@@ -616,16 +634,14 @@ static void verify_location_delivery_replay(void)
     if (sqlite3_open(R2_HOME "/r2_memory.db", &memory) != SQLITE_OK ||
         sqlite3_prepare_v2(memory,
             "SELECT current_location,is_home,"
-            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed'),"
-            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='internal_notification') "
+            "(SELECT COUNT(*) FROM r2_log_events WHERE event_type='location_changed') "
             "FROM r2_log_location_state WHERE id=1",
             -1, &st, NULL) != SQLITE_OK ||
         sqlite3_step(st) != SQLITE_ROW ||
-        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
-        sqlite3_column_int(st, 1) != 1 ||
-        sqlite3_column_int(st, 2) != 2 ||
-        sqlite3_column_int(st, 3) != 1)
-        fail("replayed acknowledgement duplicated a movement or Welcome Home");
+        strcmp((const char *)sqlite3_column_text(st, 0), "sample park") ||
+        sqlite3_column_int(st, 1) != 0 ||
+        sqlite3_column_int(st, 2) != 2)
+        fail("replayed acknowledgement duplicated a movement");
     sqlite3_finalize(st); st = NULL;
     sqlite3_close(memory); memory = NULL;
     if (sqlite3_open(R2_HOME "/r2_reality.db", &reality) != SQLITE_OK ||
@@ -634,7 +650,7 @@ static void verify_location_delivery_replay(void)
             "FROM r2_reality_meta WHERE key='current_location'",
             -1, &st, NULL) != SQLITE_OK ||
         sqlite3_step(st) != SQLITE_ROW ||
-        strcmp((const char *)sqlite3_column_text(st, 0), "home") ||
+        strcmp((const char *)sqlite3_column_text(st, 0), "outside") ||
         sqlite3_column_int(st, 1) != 0)
         fail("replayed named movement did not reconcile Reality");
     sqlite3_finalize(st);

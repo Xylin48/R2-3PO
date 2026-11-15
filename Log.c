@@ -58,6 +58,7 @@
 
 static sqlite3 *log_db = NULL;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t log_location_lock = PTHREAD_MUTEX_INITIALIZER;
 static int log_initialized = 0;
 static int64_t current_session_id = 0;
 static struct timespec process_start_time;
@@ -325,6 +326,7 @@ static int migrate_legacy_log_schema(void)
         {"r2_log_location_state","current_location","TEXT NOT NULL DEFAULT 'home'"},
         {"r2_log_location_state","is_home","INTEGER NOT NULL DEFAULT 1"},
         {"r2_log_location_state","was_away","INTEGER NOT NULL DEFAULT 0"},
+        {"r2_log_location_state","welcome_pending","INTEGER NOT NULL DEFAULT 0"},
         {"r2_log_location_state","updated_utc","TEXT NOT NULL DEFAULT ''"},
 
         {"r2_log_milestones","milestone_key","TEXT NOT NULL DEFAULT ''"},
@@ -482,6 +484,7 @@ static int ensure_tables(void)
         " current_location TEXT NOT NULL,"
         " is_home INTEGER NOT NULL DEFAULT 1,"
         " was_away INTEGER NOT NULL DEFAULT 0,"
+        " welcome_pending INTEGER NOT NULL DEFAULT 0,"
         " updated_utc TEXT NOT NULL"
         ");"
         "CREATE TABLE IF NOT EXISTS r2_log_milestones ("
@@ -1830,13 +1833,44 @@ int64_t r2_log_activity_end(const char *activity_key,
 /* ------------------------------------------------------------
  * PERSISTENT LOCATION TRANSITIONS
  * ------------------------------------------------------------ */
-int r2_log_location_transition(const char *location, int is_home)
+/* The caller holds log_location_lock, but not log_lock while writing memory. */
+static int log_deliver_welcome_home(void)
+{
+    const char *query = "SELECT welcome_pending FROM r2_log_location_state WHERE id=1";
+    sqlite3_stmt *statement = NULL;
+    pthread_mutex_lock(&log_lock);
+    int pending = -1;
+    if (log_initialized && log_db &&
+        sqlite3_prepare_v2(log_db, query, -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW)
+        pending = sqlite3_column_int(statement, 0);
+    sqlite3_finalize(statement);
+    pthread_mutex_unlock(&log_lock);
+    if (pending <= 0) return pending;
+
+    /* The memory writer deduplicates the exact memory and category. Replay
+       after a committed write only refreshes the existing memory. */
+    if (r2_save_memory("Welcome Home. You have returned home after being away.",
+                       "private_notification") != 0)
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    int result = -1;
+    if (log_initialized && log_db &&
+        exec_sql("UPDATE r2_log_location_state SET welcome_pending=0 "
+                 "WHERE id=1 AND welcome_pending=1;") == 0 &&
+        sqlite3_changes(log_db) == 1)
+        result = 0;
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
+static int log_stage_location_transition(const char *location, int is_home)
 {
     sqlite3_stmt *statement = NULL;
     char previous[257] = "home";
     int previous_home = 1, was_away = 0, should_welcome = 0, rc;
     char summary[640], details[1200];
-    if (!valid_text(location) || strlen(location) > 256) return -1;
     pthread_mutex_lock(&log_lock);
     if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
@@ -1868,11 +1902,13 @@ int r2_log_location_transition(const char *location, int is_home)
     should_welcome = is_home && !previous_home && was_away;
     rc = sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_location_state SET current_location=?,is_home=?,"
-        "was_away=?,updated_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=1",
+        "was_away=?,welcome_pending=?,"
+        "updated_utc=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=1",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, location, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, is_home ? 1 : 0);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, is_home ? 0 : 1);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 4, should_welcome);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
@@ -1890,13 +1926,18 @@ int r2_log_location_transition(const char *location, int is_home)
                            "world_location") > 0;
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
-    if (result != 0) return -1;
-    if (should_welcome) {
-        (void)r2_save_memory(
-            "Welcome Home. You have returned home after being away.",
-            "private_notification");
-    }
-    return 0;
+    return result;
+}
+
+int r2_log_location_transition(const char *location, int is_home)
+{
+    if (!valid_text(location) || strlen(location) > 256) return -1;
+    pthread_mutex_lock(&log_location_lock);
+    int result = log_deliver_welcome_home();
+    if (result == 0) result = log_stage_location_transition(location, is_home);
+    if (result == 0) result = log_deliver_welcome_home();
+    pthread_mutex_unlock(&log_location_lock);
+    return result;
 }
 
 

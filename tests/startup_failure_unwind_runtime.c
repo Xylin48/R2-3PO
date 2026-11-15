@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#include <assert.h>
 #include <fcntl.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -11,11 +13,64 @@
 
 int r2_init(void);
 void r2_shutdown(void);
+char *r2_process_tools(const char *input);
+
+static int query_count(sqlite3 *db, const char *query)
+{
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(db, query, -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    int count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+static void check_location_reply(const char *action, const char *expected)
+{
+    char *reply = r2_process_tools(action);
+    assert(reply && strstr(reply, expected));
+    free(reply);
+}
+
+static void test_welcome_replay(void)
+{
+    assert(r2_init() == 0);
+    sqlite3 *memory = NULL;
+    assert(sqlite3_open_v2(R2_DIARY_DATABASE, &memory,
+                          SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+    check_location_reply("[WORLD] location|library|outside|extra", "LOCATION ERROR");
+    assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
+                               "WHERE event_type='location_changed'") == 0);
+    check_location_reply("[WORLD] location|library|outside", "LOCATION RESULT");
+    assert(sqlite3_exec(memory,
+        "CREATE TRIGGER ignore_welcome BEFORE INSERT ON memories "
+        "WHEN NEW.category='private_notification' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    check_location_reply("[WORLD] location|home|home", "LOCATION PENDING");
+    const char *welcome_count = "SELECT count(*) FROM memories "
+        "WHERE category='private_notification' AND memory LIKE 'Welcome Home.%'";
+    assert(query_count(memory, welcome_count) == 0);
+    r2_shutdown();
+
+    assert(sqlite3_exec(memory, "DROP TRIGGER ignore_welcome;",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_init() == 0);
+    assert(query_count(memory, welcome_count) == 1);
+    assert(query_count(memory, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1") == 0);
+    check_location_reply("[WORLD] location|home|home", "LOCATION RESULT");
+    assert(query_count(memory, welcome_count) == 1);
+    assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
+                               "WHERE event_type='location_changed'") == 2);
+    assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
+                               "WHERE event_type='internal_notification'") == 1);
+    sqlite3_close(memory);
+    r2_shutdown();
+}
 
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s hands|diary|locked\n", argv[0]);
+        fprintf(stderr, "usage: %s hands|diary|locked|welcome\n", argv[0]);
         return 2;
     }
 
@@ -38,6 +93,11 @@ int main(int argc, char **argv)
             return 1;
         }
         close(lock);
+        return 0;
+    }
+
+    if (!strcmp(argv[1], "welcome")) {
+        test_welcome_replay();
         return 0;
     }
 

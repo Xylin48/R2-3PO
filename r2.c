@@ -9192,15 +9192,21 @@ static char *process_tools_with_status(
                              summary, NULL, "GameBoyAdvance");
             }
             if (console_json) json_object_put(console_json);
-        } else if (nf >= 3 && !strcasecmp(fields[0], "location")) {
-            int home = !strcasecmp(fields[2], "home");
-            int away = !strcasecmp(fields[2], "outside") || !strcasecmp(fields[2], "away");
-            int rc = (home || away)
-                ? r2_reality_transition_location(fields[1], home) : -1;
-            APPEND("LOCATION %s: %s.\n",
-                   rc == 0 ? "RESULT" : "ERROR",
-                   rc == 0 ? "verified world location transition persisted" :
-                             "transition failed; specify location|home or location|outside");
+        } else if (nf > 0 && !strcasecmp(fields[0], "location")) {
+            int home = nf == 3 && !strcasecmp(fields[2], "home");
+            int away = nf == 3 && (!strcasecmp(fields[2], "outside") ||
+                                   !strcasecmp(fields[2], "away"));
+            if ((!home && !away) || !fields[1][0] || strlen(fields[1]) > 256) {
+                APPEND("LOCATION ERROR: specify a location name and home or outside.\n");
+            } else {
+                int rc = r2_reality_transition_location(fields[1], home);
+                if (rc == 0)
+                    APPEND("LOCATION RESULT: verified world location transition persisted.\n");
+                else if (rc > 0)
+                    APPEND("LOCATION PENDING: Reality recorded the move; its history delivery is pending.\n");
+                else
+                    APPEND("LOCATION ERROR: the requested move could not be committed.\n");
+            }
         } else if (nf > 0 && !strcasecmp(fields[0], "look")) {
             char *view = r2_reality_room_look();
             APPEND("REAL WORLD RESULT:\n%s\n", view ? view : "Could not read room state.");
