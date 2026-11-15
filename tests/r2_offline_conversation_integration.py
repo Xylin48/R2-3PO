@@ -43,6 +43,7 @@ EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal:
 
 
 STOPPED_REQUEST = "R2_OFFLINE_INTERRUPT_ACTIVE_81842"
+LONG_FOREGROUND_REQUEST = "R2_OFFLINE_LONG_FOREGROUND_24126"
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
 
@@ -79,6 +80,8 @@ class LocalOllama(BaseHTTPRequestHandler):
             self.slow_started.set()
             self.slow_release.wait(timeout=25)
             return
+        if current_index >= 0 and user_messages[current_index] == LONG_FOREGROUND_REQUEST and payload.get("think"):
+            time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -584,6 +587,42 @@ def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
     print("PASS: interactive SIGTERM cancelled active inference and preserved the accepted user turn.")
 
 
+def reflection_after_long_foreground_turn(binary: Path, workspace: Path, url: str) -> None:
+    log_path = workspace.parent / "long-foreground-idle.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {LONG_FOREGROUND_REQUEST}\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 30
+            with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+                while process.poll() is None and time.monotonic() < deadline:
+                    row = db.execute(
+                        "SELECT idle.monotonic_ms-turn.monotonic_ms "
+                        "FROM r2_log_conversations c JOIN r2_log_events turn ON turn.id=c.event_id "
+                        "JOIN r2_log_events idle ON idle.id>turn.id AND idle.event_type='cycle_started' "
+                        "WHERE c.user_text=? ORDER BY idle.id LIMIT 1", (LONG_FOREGROUND_REQUEST,),
+                    ).fetchone()
+                    if row is not None:
+                        assert row[0] >= 4000, row
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(log_path.read_text(encoding="utf-8", errors="replace")[-20000:])
+            process.terminate()
+            assert process.wait(timeout=15) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    print("PASS: autonomous reflection waited a full idle interval after a long foreground turn.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -621,6 +660,7 @@ def main() -> int:
             autonomous_cycle(binary, workspace, url)
             interrupt_partial_terminal_line(binary, workspace, url)
             interrupt_foreground_reply(binary, workspace, url)
+            reflection_after_long_foreground_turn(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

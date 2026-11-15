@@ -9822,6 +9822,15 @@ cleanup:
     return reply;
 }
 
+static void record_conversation_activity(uint_fast64_t activity_ms)
+{
+    uint_fast64_t previous = atomic_load(&last_conversation_activity_ms);
+    while (previous < activity_ms &&
+           !atomic_compare_exchange_weak(&last_conversation_activity_ms, &previous, activity_ms)) {
+        /* A concurrent caller may already have published a newer timestamp. */
+    }
+}
+
 static void *autonomous_thinking(void *arg)
 {
     (void)arg;
@@ -9853,8 +9862,8 @@ static void *autonomous_thinking(void *arg)
         uint64_t last_activity_ms =
             atomic_load(&last_conversation_activity_ms);
         if (!last_activity_ms) {
-            atomic_store(&last_conversation_activity_ms, now_ms);
-            last_activity_ms = now_ms;
+            record_conversation_activity(now_ms);
+            last_activity_ms = atomic_load(&last_conversation_activity_ms);
         }
 
         /* Reality ticking and deterministic needs safeguards keep their
@@ -14808,13 +14817,10 @@ char *r2_talk(const char *message)
 {
     /* Reset autonomous-reflection idleness before waiting for the turn lock,
        so queued user turns also take priority over background thought. */
-    uint64_t activity_ms = r2_log_elapsed_ms();
-    if (activity_ms > 0)
-        atomic_store(&last_conversation_activity_ms, activity_ms);
-
     /* Announce foreground intent before waiting for the turn lock. Background
        inference/actions can then yield even while this caller is queued. */
     atomic_fetch_add(&foreground_conversation_waiting, 1);
+    record_conversation_activity(r2_log_elapsed_ms());
     pthread_mutex_lock(&conversation_turn_lock);
     int previous_turn_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
@@ -14853,6 +14859,8 @@ char *r2_talk(const char *message)
     r2_audio_turn_evidence = previous_evidence;
     free(speech_evidence.events);
     ollama_foreground_turn_mode = previous_turn_mode;
+    /* A long active conversation must still be followed by a full idle interval. */
+    record_conversation_activity(r2_log_elapsed_ms());
     pthread_mutex_unlock(&conversation_turn_lock);
     atomic_fetch_sub(&foreground_conversation_waiting, 1);
     return reply;
