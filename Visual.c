@@ -366,19 +366,38 @@ static int visual_archive_matches_claim(int fd, const char *path)
 static int visual_create_archive(const char *directory, const R2VisionFrame *frame,
                                  char *path, size_t capacity)
 {
+    /* Pin the archive directory before creating a file. If the pathname is
+       replaced after initialization, openat cannot follow it elsewhere. */
+    int dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0) return -1;
+    struct stat pinned, current;
+    if (fstat(dirfd, &pinned) != 0 || lstat(directory, &current) != 0 ||
+        !S_ISDIR(pinned.st_mode) || !S_ISDIR(current.st_mode) ||
+        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
+        int error = errno ? errno : ESTALE;
+        close(dirfd);
+        errno = error;
+        return -1;
+    }
     const char *separator = directory[strlen(directory) - 1] == '/' ? "" : "/";
     for (;;) {
         uint64_t nonce;
-        if (getentropy(&nonce, sizeof(nonce)) != 0) return -1;
-        int length = snprintf(path, capacity, "%s%svisual_%llu_%llu_%016llx.jpg",
-                              directory, separator, (unsigned long long)frame->timestamp,
-                              (unsigned long long)frame->frame_number, (unsigned long long)nonce);
-        if (length < 0 || (size_t)length >= capacity) {
+        if (getentropy(&nonce, sizeof(nonce)) != 0) { close(dirfd); return -1; }
+        char name[128];
+        int name_length = snprintf(name, sizeof(name), "visual_%llu_%llu_%016llx.jpg",
+                                   (unsigned long long)frame->timestamp,
+                                   (unsigned long long)frame->frame_number,
+                                   (unsigned long long)nonce);
+        int length = snprintf(path, capacity, "%s%s%s", directory, separator, name);
+        if (name_length < 0 || (size_t)name_length >= sizeof(name) ||
+            length < 0 || (size_t)length >= capacity) {
+            close(dirfd);
             errno = ENAMETOOLONG;
             return -1;
         }
-        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+        int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0640);
         if (fd >= 0) {
+            close(dirfd);
             if (flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
             int error = errno;
             if (visual_archive_matches_claim(fd, path)) unlink(path);
@@ -386,7 +405,7 @@ static int visual_create_archive(const char *directory, const R2VisionFrame *fra
             errno = error;
             return -1;
         }
-        if (errno != EEXIST) return -1;
+        if (errno != EEXIST) { int error = errno; close(dirfd); errno = error; return -1; }
     }
 }
 
