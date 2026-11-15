@@ -77,6 +77,35 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertEqual(TV.CRTDisplay.read_state(object.__new__(TV.CRTDisplay)),
                          (1, "input", 1, None))
 
+    def test_each_read_only_poll_closes_its_sqlite_connection(self) -> None:
+        self.set_state(0, "input", 1)
+        opened = []
+        closed = []
+        original_connect = sqlite3.connect
+
+        class TrackedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                opened.append(self)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def close(self):
+                closed.append(self)
+                self.connection.close()
+
+        def tracked_connect(*args, **kwargs):
+            return TrackedConnection(original_connect(*args, **kwargs))
+
+        with patch.object(TV.sqlite3, "connect", side_effect=tracked_connect):
+            display = object.__new__(TV.CRTDisplay)
+            for _ in range(3):
+                self.assertEqual(display.read_state(), (0, "input", 1, None))
+                self.assertEqual(display.read_vcr_state(), (None, "stop", 0.0))
+        self.assertEqual(len(opened), 6)
+        self.assertEqual(closed, opened)
+
     def test_read_only_database_uris_escape_question_and_fragment_characters(self) -> None:
         # A raw "file:" URI misparses '#' as a fragment and '?' as options.
         # Both display readers must open this exact database, never a
