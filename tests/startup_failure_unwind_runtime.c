@@ -25,7 +25,7 @@ static int query_count(sqlite3 *db, const char *query)
     return count;
 }
 
-static void check_location_reply(const char *action, const char *expected)
+static void check_world_reply(const char *action, const char *expected)
 {
     char *reply = r2_process_tools(action);
     assert(reply && strstr(reply, expected));
@@ -38,27 +38,41 @@ static void test_world_and_welcome_replay(void)
     sqlite3 *memory = NULL;
     assert(sqlite3_open_v2(R2_DIARY_DATABASE, &memory,
                           SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
-    check_location_reply("[WORLD] add|fixture book|A sample book|pockets", "REAL WORLD RESULT");
-    check_location_reply("[WORLD] remove|fixture book|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] move|fixture book|shelf|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] self|fixture|value|evidence|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] activity_start|fixture|Sample|details|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] money_withdraw|1.00|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] eat|fixture book|auto|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] sleep|8|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] tv_power|on|extra", "REAL WORLD ERROR");
-    check_location_reply("[WORLD] tv_tune|99", "could not select RF channel 99");
-    check_location_reply("[WORLD] gameboy_power_on|extra", "unsupported Game Boy console action");
-    check_location_reply("[WORLD] remove|fixture book", "REAL WORLD RESULT");
-    check_location_reply("[WORLD] location|library|outside|extra", "LOCATION ERROR");
+    check_world_reply("[WORLD] add|fixture book|A sample book|pockets", "REAL WORLD RESULT");
+    check_world_reply("[WORLD] remove|fixture book|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] move|fixture book|shelf|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] self|fixture|value|evidence|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] activity_start|fixture|Sample|details|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] money_withdraw|1.00|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] eat|fixture book|auto|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] sleep|8|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] tv_power|on|extra", "REAL WORLD ERROR");
+    check_world_reply("[WORLD] tv_tune|99", "could not select RF channel 99");
+    check_world_reply("[WORLD] gameboy_power_on|extra", "unsupported Game Boy console action");
+    check_world_reply("[WORLD] remove|fixture book", "REAL WORLD RESULT");
+    char value[4001], evidence[8001], action[12500];
+    memset(value, 'v', sizeof(value));
+    strcpy(value + sizeof(value) - sizeof("VALUE-TAIL"), "VALUE-TAIL");
+    memset(evidence, 'e', sizeof(evidence));
+    strcpy(evidence + sizeof(evidence) - sizeof("EVIDENCE-TAIL"), "EVIDENCE-TAIL");
+    int length = snprintf(action, sizeof(action), "[WORLD] self|fixture-long|%s|%s", value, evidence);
+    assert(length > 0 && (size_t)length < sizeof(action));
+    check_world_reply(action, "REAL SELF-CONTINUITY RESULT");
+    assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
+        "WHERE event_type='self_state_updated' AND instr(summary,'VALUE-TAIL')>0 "
+        "AND instr(details,'VALUE-TAIL')>0 AND details LIKE '%EVIDENCE-TAIL' "
+        "AND length(details)>12000") == 1);
+    assert(query_count(memory, "SELECT count(*) FROM memories WHERE category='experience' "
+        "AND memory LIKE '%fixture-long%VALUE-TAIL.' AND length(memory)>4000") == 1);
+    check_world_reply("[WORLD] location|library|outside|extra", "LOCATION ERROR");
     assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
                                "WHERE event_type='location_changed'") == 0);
-    check_location_reply("[WORLD] location|library|outside", "LOCATION RESULT");
+    check_world_reply("[WORLD] location|library|outside", "LOCATION RESULT");
     assert(sqlite3_exec(memory,
         "CREATE TRIGGER ignore_welcome BEFORE INSERT ON memories "
         "WHEN NEW.category='private_notification' BEGIN SELECT RAISE(IGNORE); END;",
         NULL, NULL, NULL) == SQLITE_OK);
-    check_location_reply("[WORLD] location|home|home", "LOCATION PENDING");
+    check_world_reply("[WORLD] location|home|home", "LOCATION PENDING");
     const char *welcome_count = "SELECT count(*) FROM memories "
         "WHERE category='private_notification' AND memory LIKE 'Welcome Home.%'";
     assert(query_count(memory, welcome_count) == 0);
@@ -69,7 +83,7 @@ static void test_world_and_welcome_replay(void)
     assert(r2_init() == 0);
     assert(query_count(memory, welcome_count) == 1);
     assert(query_count(memory, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1") == 0);
-    check_location_reply("[WORLD] location|home|home", "LOCATION RESULT");
+    check_world_reply("[WORLD] location|home|home", "LOCATION RESULT");
     assert(query_count(memory, welcome_count) == 1);
     assert(query_count(memory, "SELECT count(*) FROM r2_log_events "
                                "WHERE event_type='location_changed'") == 2);

@@ -903,6 +903,22 @@ static void bridge_event(const char *type, const char *summary, const char *deta
         r2_diary_write(summary);
 }
 
+static void bridge_eventf(const char *type, const char *summary, int remember,
+                          int diary, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    char *details = NULL;
+    int length = vasprintf(&details, format, args);
+    va_end(args);
+    if (length < 0) {
+        fprintf(stderr, "[R2 Reality] Could not allocate complete details for '%s'.\n", type);
+        return;
+    }
+    bridge_event(type, summary, details, remember, diary);
+    free(details);
+}
+
 static int bind_text(sqlite3_stmt *st, int n, const char *s)
 {
     return sqlite3_bind_text(st, n, s ? s : "", -1, SQLITE_TRANSIENT) == SQLITE_OK ? 0 : -1;
@@ -2303,15 +2319,11 @@ static int inventory_transfer_recover_locked(void)
     }
     inventory_transfer_snapshot_free(&snapshot);
     if (inventory_transfer_journal_clear_locked() != 0) return -1;
-    char summary[512], details[1024];
-    snprintf(summary, sizeof(summary),
-             "Recovered interrupted inventory transfer for %.300s; the previous state was restored.",
-             snapshot.name);
-    snprintf(details, sizeof(details),
-             "Operation=%s; recovery=rollback to the persisted pre-transfer snapshot; "
-             "both Reality and fridge databases were restored.",
-             snapshot.operation);
-    bridge_event("inventory_transfer_recovered", summary, details, 0, 0);
+    bridge_eventf("inventory_transfer_recovered",
+                  "R2 restored the prior state of an interrupted inventory transfer.", 0, 0,
+                  "Object=%s; operation=%s; recovery=rollback to the persisted pre-transfer "
+                  "snapshot; both Reality and fridge databases were restored.",
+                  snapshot.name, snapshot.operation);
     fprintf(stderr, "[R2 Reality] Rolled back interrupted %s transfer for '%s' to its pre-transfer state.\n",
             snapshot.operation, snapshot.name);
     return 0;
@@ -2398,10 +2410,11 @@ int r2_fridge_take(const char *food)
     if (inventory_transfer_journal_clear() != 0)
         fprintf(stderr, "[R2 Fridge] Committed take journal retained for startup cleanup ('%s').\n", food);
 
-    char summary[512], details[1024];
+    char summary[REALITY_MAX_TEXT + 128];
     snprintf(summary, sizeof(summary), "R2 took %s from the fridge into his pockets.", food);
-    snprintf(details, sizeof(details), "Food=%s; source=fridge database; destination=pockets; one verified stock unit consumed.", food);
-    bridge_event("fridge_item_taken", summary, details, 1, 0);
+    bridge_eventf("fridge_item_taken", summary, 1, 0,
+                  "Food=%s; source=fridge database; destination=pockets; one verified stock unit consumed.",
+                  food);
     pthread_mutex_unlock(&purchase_lock);
     return 0;
 }
@@ -2499,12 +2512,11 @@ int r2_reality_fridge_eat(const char *food, double fullness)
 
     if (inventory_transfer_journal_clear() != 0)
         fprintf(stderr, "[R2 Fridge] Committed meal journal retained for startup cleanup ('%s').\n", food);
-    char summary[512], details[1024];
+    char summary[REALITY_MAX_TEXT + 128];
     snprintf(summary, sizeof(summary), "R2 ate %s directly from the fridge.", food);
-    snprintf(details, sizeof(details),
-             "Food=%s; source=fridge database; fullness=%.1f; an empty fridge remains empty.",
-             food, stored_fullness);
-    bridge_event("fridge_food_consumed", summary, details, 1, 0);
+    bridge_eventf("fridge_food_consumed", summary, 1, 0,
+                  "Food=%s; source=fridge database; fullness=%.1f; an empty fridge remains empty.",
+                  food, stored_fullness);
     pthread_mutex_unlock(&purchase_lock);
     return 0;
 }
@@ -4208,15 +4220,13 @@ static int reality_add_item_internal(const char *name,const char *description,co
     if (*old_container) mirror_remove(name, old_container);
     if (mirror_write(name, description, total_quantity, container) != 0)
         fprintf(stderr, "[R2 Reality] Database saved, but room mirror file could not be updated for '%s'.\n", name);
-    char *summary = NULL, *details = NULL;
-    if (asprintf(&summary, "R2 recorded item '%s' in %s.", name, container) >= 0) {
-        if (asprintf(&details, "Item=%s; description=%s; container=%s; quantity=%d",
-                     name, description ? description : "", container, quantity) >= 0) {
-            bridge_event("object_added", summary, details, 1, 1);
-            free(details);
-        }
-        free(summary);
-    }
+    char summary[REALITY_MAX_TEXT + 128];
+    int length = snprintf(summary, sizeof(summary), "R2 recorded item '%s' in %s.", name, container);
+    if (length < 0 || (size_t)length >= sizeof(summary))
+        snprintf(summary, sizeof(summary), "R2 recorded item '%s' in his tracked world.", name);
+    bridge_eventf("object_added", summary, 1, 1,
+                  "Item=%s; description=%s; container=%s; quantity=%d",
+                  name, description ? description : "", container, quantity);
     return 0;
 }
 int r2_reality_add_item(const char *name, const char *description,
@@ -4294,13 +4304,12 @@ static int reality_move_item_to_fridge(const char *name)
     if (inventory_transfer_journal_clear() != 0)
         fprintf(stderr, "[R2 Reality] Committed transfer journal retained for startup cleanup ('%s').\n", name);
 
-    char summary[512], details[1024];
+    char summary[REALITY_MAX_TEXT + 128];
     snprintf(summary, sizeof(summary), "R2 stored %s in the fridge.", name);
-    snprintf(details, sizeof(details),
-             "Object=%.300s; source container=%.200s; quantity=%d; destination=separate fridge database.",
-             name, snapshot.reality_container, snapshot.reality_quantity);
+    bridge_eventf("fridge_item_stored", summary, 1, 0,
+                  "Object=%s; source container=%s; quantity=%d; destination=separate fridge database.",
+                  name, snapshot.reality_container, snapshot.reality_quantity);
     inventory_transfer_snapshot_free(&snapshot);
-    bridge_event("fridge_item_stored", summary, details, 1, 0);
     return 0;
 }
 
@@ -4382,10 +4391,11 @@ static int reality_move_item_internal(const char *name,const char *container)
     if (*old_container) mirror_remove(name, old_container);
     if (mirror_write(name, old_description, old_quantity, container) != 0)
         fprintf(stderr, "[R2 Reality] Database saved, but room mirror file could not be updated for '%s'.\n", name);
-    char summary[512],details[2048];
-    snprintf(summary,sizeof(summary),"R2 moved '%.200s' to %.200s.",name,container);
-    snprintf(details,sizeof(details),"Object=%.800s; destination=%.800s",name,container);
-    bridge_event("object_moved",summary,details,1,1);
+    char summary[REALITY_MAX_TEXT + 128];
+    int length = snprintf(summary, sizeof(summary), "R2 moved '%s' to %s.", name, container);
+    if (length < 0 || (size_t)length >= sizeof(summary))
+        snprintf(summary, sizeof(summary), "R2 moved '%s'.", name);
+    bridge_eventf("object_moved", summary, 1, 1, "Object=%s; destination=%s", name, container);
     return 0;
 }
 
@@ -4400,18 +4410,20 @@ int r2_reality_move_item(const char *name, const char *container)
 static int reality_remove_item_internal(const char *name)
 {
     if(!name||!*name||!r2_reality_is_initialized())return -1;
-    char old_container[REALITY_MAX_TEXT + 1] = {0};
+    char *old_container = NULL;
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *prior = NULL;
     int prior_rc = sqlite3_prepare_v2(reality_db, "SELECT container FROM r2_reality_objects WHERE name=? COLLATE NOCASE", -1, &prior, NULL);
     if (prior_rc == SQLITE_OK) prior_rc = bind_text(prior, 1, name) == 0 ? sqlite3_step(prior) : SQLITE_ERROR;
     if (prior_rc == SQLITE_ROW) {
-        const unsigned char *oc = sqlite3_column_text(prior, 0);
-        if (oc) snprintf(old_container, sizeof(old_container), "%s", (const char *)oc);
+        if (inventory_read_text(prior, 0, &old_container) != SQLITE_OK)
+            prior_rc = SQLITE_ERROR;
     }
     if (prior) sqlite3_finalize(prior);
-    if (!*old_container || !container_accessible(old_container)) {
+    if (prior_rc != SQLITE_ROW || !old_container || !*old_container ||
+        !container_accessible(old_container)) {
         pthread_mutex_unlock(&reality_lock);
+        free(old_container);
         return -1;
     }
     sqlite3_stmt *st=NULL;
@@ -4420,11 +4432,18 @@ static int reality_remove_item_internal(const char *name)
     if(rc==SQLITE_DONE&&sqlite3_changes(reality_db)==0)rc=SQLITE_NOTFOUND;
     if(st)sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
-    if(rc!=SQLITE_DONE)return -1;
-    if (*old_container) mirror_remove(name, old_container);
-    char summary[512];snprintf(summary,sizeof(summary),"R2 removed '%s' from his tracked world.",name);
-    bridge_event("object_removed",summary,"The object was removed from R2's persistent object inventory.",1,1);
-    return 0;
+    if (rc == SQLITE_DONE) {
+        mirror_remove(name, old_container);
+        char summary[REALITY_MAX_TEXT + 128];
+        int length = snprintf(summary, sizeof(summary),
+                              "R2 removed '%s' from his tracked world.", name);
+        bridge_eventf("object_removed",
+                      length >= 0 && (size_t)length < sizeof(summary)
+                          ? summary : "R2 removed an object from his tracked world.",
+                      1, 1, "Object=%s; previous container=%s", name, old_container);
+    }
+    free(old_container);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 
@@ -4634,20 +4653,26 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             fprintf(stderr, "[R2 Reality] Food state saved, but mirror could not be updated for '%s'.\n", food);
     }
 
-    char summary[512], details[1024];
-    snprintf(summary, sizeof(summary), "R2 ate %s; fullness increased by the food's %.1f-point value.", food, fullness);
-    snprintf(details, sizeof(details), "Food=%s; modeled fullness increase=%.1f points (maximum 100); satisfaction increase=%.1f points (maximum 150); tracked object consumed=%s; these are simulated need values, not measured biological quantities.",
-             food, fullness, fullness, consumed_tracked_item ? "yes" : "no");
-    bridge_event("food_consumed", summary, details, 1, 0);
+    char summary[REALITY_MAX_TEXT + 128];
+    int length = snprintf(summary, sizeof(summary),
+                          "R2 ate %s, a food with a configured %.1f-point fullness value.",
+                          food, fullness);
+    bridge_eventf("food_consumed",
+                  length >= 0 && (size_t)length < sizeof(summary) ? summary : "R2 ate a meal.",
+                  1, 0, "Food=%s; modeled fullness and satisfaction credit=%.1f points; "
+                  "fullness is capped at 100 and satisfaction at 150; tracked object consumed=%s.",
+                  food, fullness, consumed_tracked_item ? "yes" : "no");
     /* A real eating choice feeds the shared habit evaluator using R2's
        accumulated subjective ratings for this food; unrated food is neutral. */
     int learned_enjoyment = food_preference_enjoyment_score(food);
-    char habit_details[1400];
-    snprintf(habit_details, sizeof(habit_details),
-             "%s; learned food enjoyment=%d/100 (0-100 mapping from -2..+2 preference ratings).",
-             details, learned_enjoyment);
-    (void)r2_addiction_record_choice(food, "food", learned_enjoyment,
-                                    "eating", habit_details);
+    char *habit_details = NULL;
+    if (asprintf(&habit_details, "Food=%s; configured fullness=%.1f; "
+                 "learned food enjoyment=%d/100 from -2..+2 preference ratings.",
+                 food, fullness, learned_enjoyment) >= 0) {
+        (void)r2_addiction_record_choice(food, "food", learned_enjoyment,
+                                        "eating", habit_details);
+        free(habit_details);
+    }
     (void)r2_reward_apply(food, "food_consumed", 2,
         "Food consumption completed and modeled fullness/satisfaction state was updated.", 0);
     return 0;
@@ -5347,10 +5372,11 @@ int r2_reality_buy_item(const char *name, const char *description,
     }
     money_mirror_write(cash,bank);
     pthread_mutex_unlock(&purchase_lock);
-    char summary[512], details[1024];
-    snprintf(summary,sizeof(summary),"R2 purchased %.350s for $%.2f.",name,cents/100.0);
-    snprintf(details,sizeof(details),"Item=%.400s; price=$%.2f; destination=%.200s; wallet cash paid first, then piggybank.",name,cents/100.0,destination);
-    bridge_event("purchase",summary,details,1,1);
+    char summary[REALITY_MAX_TEXT + 128];
+    snprintf(summary, sizeof(summary), "R2 purchased %s for $%.2f.", name, cents / 100.0);
+    bridge_eventf("purchase", summary, 1, 1,
+                  "Item=%s; price=$%.2f; destination=%s; wallet cash paid first, then piggybank.",
+                  name, cents / 100.0, destination);
     return 0;
 }
 
@@ -5360,15 +5386,21 @@ int r2_reality_set_self(const char *key,const char *value,const char *evidence)
     pthread_mutex_lock(&reality_lock);
     sqlite3_stmt *st=NULL;
     int rc=sqlite3_prepare_v2(reality_db,"INSERT INTO r2_reality_self_facts(key,value,evidence) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,evidence=excluded.evidence,updated_at=CURRENT_TIMESTAMP",-1,&st,NULL);
-    if(rc==SQLITE_OK){bind_text(st,1,key);bind_text(st,2,value);bind_text(st,3,evidence);rc=sqlite3_step(st);}
+    if (rc == SQLITE_OK && (bind_text(st, 1, key) != 0 ||
+                            bind_text(st, 2, value) != 0 ||
+                            bind_text(st, 3, evidence) != 0))
+        rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
         rc = SQLITE_CONSTRAINT;
-    if(st)sqlite3_finalize(st);
+    if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
-    if(rc!=SQLITE_DONE)return -1;
-    char summary[512],details[2048];snprintf(summary,sizeof(summary),"R2 self-continuity updated: %s = %s.",key,value);
-    snprintf(details,sizeof(details),"State key=%s; value=%s; evidence=%s",key,value,evidence?evidence:"not supplied");
-    bridge_event("self_state_updated",summary,details,1,0);
+    if (rc != SQLITE_DONE) return -1;
+    char summary[REALITY_MAX_TEXT + 384];
+    snprintf(summary, sizeof(summary), "R2 self-continuity updated: %s = %s.", key, value);
+    bridge_eventf("self_state_updated", summary, 1, 0,
+                  "State key=%s; value=%s; evidence=%s", key, value,
+                  evidence ? evidence : "not supplied");
     return 0;
 }
 

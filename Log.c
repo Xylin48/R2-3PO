@@ -1194,12 +1194,14 @@ int64_t r2_log_event_with_memory(
      * The full factual event remains in r2_log_events.
      * This call happens outside log_lock to avoid lock coupling.
      */
-    char memory[2048];
-    snprintf(memory, sizeof(memory),
-             "Life Log event %" PRId64 ": [%s/%s] %s",
-             event_id, category_name(category), event_type, summary);
+    char *memory = NULL;
+    if (asprintf(&memory, "Life Log event %" PRId64 ": [%s/%s] %s",
+                 event_id, category_name(category), event_type, summary) < 0)
+        return event_id;
+    int memory_result = r2_save_memory(memory, "experience");
+    free(memory);
 
-    if (r2_save_memory(memory, "experience") == 0) {
+    if (memory_result == 0) {
         sqlite3_stmt *statement = NULL;
         int update_rc = SQLITE_ERROR;
         int updated_rows = 0;
