@@ -27,6 +27,9 @@ REFLECTION = "I closed Eyes deliberately and kept the earlier evidence separate.
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
+FRIDGE_INGREDIENTS = "pear,ginger"
+FRIDGE_TASTE = "Soft pear with sharp ginger."
+RATING_REASON = "I liked the ginger in this particular modeled meal."
 DREAM = "In the dream I watched a paper moon drift across the room."
 
 
@@ -75,6 +78,11 @@ class LocalOllama(BaseHTTPRequestHandler):
                      else "[SENSE] eyes|close")
         elif "private, simulated dream" in system:
             reply = DREAM
+        elif "modeled subjective reaction to a food" in system and any(
+            FRIDGE_TASTE in message and FRIDGE_INGREDIENTS in message and "incompatible XML" not in message
+            for message in user_messages
+        ):
+            reply = "SCORE: 1\nREASON: " + RATING_REASON
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
             "message": {"role": "assistant", "content": reply},
@@ -202,7 +210,13 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
     with sqlite3.connect(home / "r2_reality.db") as db:
         db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=0 WHERE id=1")
     with sqlite3.connect(home / "r2_fridge.db") as db:
-        db.execute("INSERT INTO r2_fridge_items(name,quantity,fullness) VALUES (?,1,65)", (FRIDGE_FOOD,))
+        db.execute(
+            "INSERT INTO r2_fridge_items(name,quantity,fullness,energy,ingredients,taste) VALUES (?,1,65,12,?,?)",
+            (FRIDGE_FOOD, FRIDGE_INGREDIENTS, FRIDGE_TASTE),
+        )
+    with (workspace / "room" / "food_metrics.xml").open("a", encoding="utf-8") as metrics:
+        metrics.write(f'<food name="{FRIDGE_FOOD}" fullness="23" ingredients="incompatible XML" '
+                      'taste="incompatible XML" />\n')
 
     run_idle_service(binary, workspace, url)
 
@@ -222,6 +236,17 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
             archived_inputs.append(original.encode("utf-8"))
     with sqlite3.connect(home / "r2_fridge.db") as db:
         assert db.execute("SELECT COUNT(*) FROM r2_fridge_items WHERE name=?", (FRIDGE_FOOD,)).fetchone() == (0,)
+    with sqlite3.connect(home / "r2_reality.db") as db:
+        consumed = db.execute(
+            "SELECT ingredients,taste,fullness,energy_bonus,satisfaction,notes FROM r2_food_experiences "
+            "WHERE food_name=?", (FRIDGE_FOOD,),
+        ).fetchone()
+        assert consumed == (FRIDGE_INGREDIENTS, FRIDGE_TASTE, 65.0, 12.0, 1, RATING_REASON), consumed
+        ratings = db.execute(
+            "SELECT ingredient,satisfaction_sum,rating_count FROM r2_food_ingredient_preferences "
+            "WHERE ingredient IN ('ginger','pear','incompatible XML') ORDER BY ingredient",
+        ).fetchall()
+        assert ratings == [("ginger", 1.0, 1), ("pear", 1.0, 1)], ratings
 
     seen_review = bytearray()
     for request in LocalOllama.requests:

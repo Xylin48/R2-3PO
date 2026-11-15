@@ -39,7 +39,9 @@ static pthread_mutex_t purchase_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t location_transition_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int reality_ready = 0;
-static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override, const char *fridge_ingredients);
+static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override,
+                                const char *fridge_ingredients, const char *fridge_taste,
+                                int64_t *experience_out);
 static int purchase_journal_recover(void);
 static int location_delivery_replay(void);
 static int reality_add_item_internal(const char *name, const char *description,
@@ -2540,6 +2542,13 @@ int r2_fridge_take(const char *food)
 }
 int r2_reality_fridge_eat(const char *food, double fullness)
 {
+    return r2_reality_fridge_eat_with_experience(food, fullness, NULL);
+}
+
+int r2_reality_fridge_eat_with_experience(const char *food, double fullness,
+                                        int64_t *experience_out)
+{
+    if (experience_out) *experience_out = 0;
     /* Keep the legacy parameter for ABI compatibility; stock metrics are authoritative. */
     (void)fullness;
     if (!food || !*food || strlen(food) > REALITY_MAX_TEXT ||
@@ -2613,7 +2622,9 @@ int r2_reality_fridge_eat(const char *food, double fullness)
     }
 #endif
 
-    rc = reality_eat_internal(food, stored_fullness, 0, energy, snapshot.fridge_ingredients);
+    int64_t experience_id = 0;
+    rc = reality_eat_internal(food, stored_fullness, 0, energy,
+                              snapshot.fridge_ingredients, snapshot.fridge_taste, &experience_id);
     inventory_transfer_snapshot_free(&snapshot);
     if (rc != 0) {
         if (inventory_transfer_recover() != 0)
@@ -2638,6 +2649,7 @@ int r2_reality_fridge_eat(const char *food, double fullness)
                   "Food=%s; source=fridge database; fullness=%.1f; an empty fridge remains empty.",
                   food, stored_fullness);
     pthread_mutex_unlock(&purchase_lock);
+    if (experience_out) *experience_out = experience_id;
     return 0;
 }
 
@@ -2825,8 +2837,8 @@ static int migrate_legacy_reality(void)
     const char *item_memory_cols[] = {"item_name","description","exact_quantity","approximate_quantity","precision","collected_at","last_decay_at"};
     const char *item_memory_defaults[] = {NULL,"NULL","NULL","NULL","'exact'",legacy_collected_at_default,legacy_decay_at_default};
     const char *item_memory_required[] = {"item_name"};
-    const char *food_experience_cols[] = {"food_name","ingredients","fullness","energy_bonus","satisfaction","notes","eaten_at","rated_at"};
-    const char *food_experience_defaults[] = {NULL,"NULL",NULL,"0.0","NULL","NULL",NULL,"NULL"};
+    const char *food_experience_cols[] = {"food_name","ingredients","fullness","energy_bonus","satisfaction","notes","eaten_at","rated_at","taste"};
+    const char *food_experience_defaults[] = {NULL,"NULL",NULL,"0.0","NULL","NULL",NULL,"NULL","NULL"};
     const char *food_experience_required[] = {"food_name","fullness","eaten_at"};
     const char *food_meta_cols[] = {"key","value"};
     const char *food_meta_defaults[] = {NULL,NULL};
@@ -3034,6 +3046,7 @@ static int migrate_existing_reality_schema(void)
         {"r2_reality_item_memory","last_decay_at","INTEGER NOT NULL DEFAULT 0"},
 
         {"r2_food_experiences","ingredients","TEXT"},
+        {"r2_food_experiences","taste","TEXT"},
         {"r2_food_experiences","fullness","REAL NOT NULL DEFAULT 0"},
         {"r2_food_experiences","energy_bonus","REAL NOT NULL DEFAULT 0"},
         {"r2_food_experiences","satisfaction","INTEGER"},
@@ -3233,7 +3246,7 @@ int r2_reality_init(void)
         "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('initial_cash_seeded','0');"
         "CREATE TABLE IF NOT EXISTS r2_reality_item_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT NOT NULL COLLATE NOCASE, description TEXT, exact_quantity INTEGER, approximate_quantity INTEGER, precision TEXT NOT NULL DEFAULT 'exact' CHECK(precision IN ('exact','approximate','vague')), collected_at INTEGER NOT NULL, last_decay_at INTEGER NOT NULL);"
         "CREATE INDEX IF NOT EXISTS r2_reality_item_memory_age_idx ON r2_reality_item_memory(collected_at);"
-        "CREATE TABLE IF NOT EXISTS r2_food_experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, food_name TEXT NOT NULL COLLATE NOCASE, ingredients TEXT, fullness REAL NOT NULL, energy_bonus REAL NOT NULL, satisfaction INTEGER, notes TEXT, eaten_at INTEGER NOT NULL, rated_at INTEGER);"
+        "CREATE TABLE IF NOT EXISTS r2_food_experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, food_name TEXT NOT NULL COLLATE NOCASE, ingredients TEXT, fullness REAL NOT NULL, energy_bonus REAL NOT NULL, satisfaction INTEGER, notes TEXT, eaten_at INTEGER NOT NULL, rated_at INTEGER, taste TEXT);"
         "CREATE INDEX IF NOT EXISTS r2_food_experiences_food_idx ON r2_food_experiences(food_name,eaten_at);"
         "CREATE TABLE IF NOT EXISTS r2_food_ingredient_preferences (ingredient TEXT PRIMARY KEY COLLATE NOCASE, satisfaction_sum REAL NOT NULL DEFAULT 0, rating_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);"
         "CREATE TABLE IF NOT EXISTS r2_food_preferences (food_name TEXT PRIMARY KEY COLLATE NOCASE, satisfaction_sum REAL NOT NULL DEFAULT 0, rating_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);"
@@ -4610,7 +4623,9 @@ static int food_preference_enjoyment_score(const char *food)
     return score;
 }
 
-static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override, const char *fridge_ingredients)
+static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override,
+                                const char *fridge_ingredients, const char *fridge_taste,
+                                int64_t *experience_out)
 {
     if (!food || !*food || !r2_reality_is_initialized()) return -1;
     R2FoodMetric metric = {0};
@@ -4713,20 +4728,24 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             rc = SQLITE_CONSTRAINT;
         if (st) sqlite3_finalize(st);
     }
+    int64_t experience_id = 0;
     if (rc == SQLITE_DONE) {
         st = NULL;
         if (sqlite3_prepare_v2(reality_db,
-            "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) VALUES(?,?,?,?,?)",
+            "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at,taste) VALUES(?,?,?,?,?,?)",
             -1, &st, NULL) == SQLITE_OK) {
             rc = bind_text(st, 1, food) == 0 ? SQLITE_OK : SQLITE_ERROR;
             if (rc == SQLITE_OK) rc = bind_text(st, 2, fridge_ingredients ? fridge_ingredients : metric.ingredients) == 0 ? SQLITE_OK : SQLITE_ERROR;
             if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, fullness);
             if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 4, energy_bonus);
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, (sqlite3_int64)time(NULL));
+            if (rc == SQLITE_OK) rc = bind_text(st, 6, fridge_taste ? fridge_taste : metric.taste) == 0 ? SQLITE_OK : SQLITE_ERROR;
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
         } else rc = SQLITE_ERROR;
-        if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
-            rc = SQLITE_CONSTRAINT;
+        if (rc == SQLITE_DONE) {
+            if (sqlite3_changes(reality_db) == 1) experience_id = sqlite3_last_insert_rowid(reality_db);
+            else rc = SQLITE_CONSTRAINT;
+        }
         if (st) sqlite3_finalize(st);
     }
     free(metric.line);
@@ -4759,6 +4778,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
     free(container);
     free(description);
     if (rc != SQLITE_OK) return -1;
+    if (experience_out) *experience_out = experience_id;
 
     char summary[REALITY_MAX_TEXT + 128];
     int length = snprintf(summary, sizeof(summary),
@@ -4788,8 +4808,14 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
 
 int r2_reality_eat(const char *food, double fullness)
 {
+    return r2_reality_eat_with_experience(food, fullness, NULL);
+}
+
+int r2_reality_eat_with_experience(const char *food, double fullness, int64_t *experience_out)
+{
+    if (experience_out) *experience_out = 0;
     pthread_mutex_lock(&purchase_lock);
-    int rc = reality_eat_internal(food, fullness, 1, -1.0, NULL);
+    int rc = reality_eat_internal(food, fullness, 1, -1.0, NULL, NULL, experience_out);
     pthread_mutex_unlock(&purchase_lock);
     return rc;
 }
@@ -4890,9 +4916,39 @@ char *r2_reality_autonomous_food_context(void)
 
 char *r2_reality_food_context(const char *food)
 {
-    if (!food || !*food || !r2_reality_is_initialized()) return NULL;
-    R2FoodMetric metric;
-    if (load_food_metric(food, &metric) < 0) return NULL;
+    return r2_reality_food_experience_context(food, 0);
+}
+
+char *r2_reality_food_experience_context(const char *food, int64_t experience_id)
+{
+    if (!food || !*food || experience_id < 0 || !r2_reality_is_initialized()) return NULL;
+    R2FoodMetric metric = {0};
+    char *ingredients = NULL, *taste = NULL;
+    if (experience_id) {
+        pthread_mutex_lock(&reality_lock);
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(reality_db,
+            "SELECT ingredients,taste,fullness,energy_bonus FROM r2_food_experiences "
+            "WHERE id=? AND food_name=? COLLATE NOCASE AND satisfaction IS NULL;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, experience_id);
+        if (rc == SQLITE_OK && bind_text(st, 2, food) != 0) rc = SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            metric.fullness = sqlite3_column_double(st, 2);
+            metric.energy = sqlite3_column_double(st, 3);
+            rc = inventory_read_text(st, 0, &ingredients);
+            if (rc == SQLITE_OK) rc = inventory_read_text(st, 1, &taste);
+        }
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&reality_lock);
+        if (rc != SQLITE_OK || !isfinite(metric.fullness) || !isfinite(metric.energy)) {
+            free(ingredients);
+            free(taste);
+            return NULL;
+        }
+        metric.ingredients = ingredients;
+        metric.taste = taste;
+    } else if (load_food_metric(food, &metric) < 0) return NULL;
     char fullness_text[64] = {0};
     if (metric.fullness < 0) snprintf(fullness_text, sizeof(fullness_text), "not configured");
     else snprintf(fullness_text, sizeof(fullness_text), "%.1f/100", metric.fullness);
@@ -4903,7 +4959,9 @@ char *r2_reality_food_context(const char *food)
     char *food_pref = query_text(
         "SELECT food_name,printf('average enjoyment rating %.2f/2',satisfaction_sum/rating_count),printf('%d ratings',rating_count) FROM r2_food_preferences WHERE food_name=? COLLATE NOCASE AND rating_count>0", food);
     if (!preferences || !history || !food_pref) {
-        free(preferences); free(history); free(food_pref); free(metric.line); return NULL;
+        free(preferences); free(history); free(food_pref);
+        free(metric.line); free(ingredients); free(taste);
+        return NULL;
     }
     char *out = NULL;
     if (asprintf(&out,
@@ -4919,18 +4977,25 @@ char *r2_reality_food_context(const char *food)
         out = NULL;
     free(preferences); free(history); free(food_pref);
     free(metric.line);
+    free(ingredients);
+    free(taste);
     return out;
 }
 
 int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
 {
-    if (!food || !*food || satisfaction < -2 || satisfaction > 2 ||
+    return r2_reality_rate_food_experience(food, 0, satisfaction, notes);
+}
+
+int r2_reality_rate_food_experience(const char *food, int64_t requested_id,
+                                   int satisfaction, const char *notes)
+{
+    if (!food || !*food || requested_id < 0 || satisfaction < -2 || satisfaction > 2 ||
         !r2_reality_is_initialized()) return -1;
 
-    R2FoodMetric metric;
-    int config_result = load_food_metric(food, &metric);
     char *ingredient_copy = NULL;
     char *rated_ingredients = NULL;
+    char *rated_taste = NULL;
 
     /*
      * One rating updates the experience and both levels of learned preference.
@@ -4944,20 +5009,26 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
 
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(reality_db,
-            "SELECT id,ingredients FROM r2_food_experiences WHERE food_name=? COLLATE NOCASE AND satisfaction IS NULL ORDER BY eaten_at DESC,id DESC LIMIT 1",
+            "SELECT id,ingredients,taste FROM r2_food_experiences "
+            "WHERE food_name=?1 COLLATE NOCASE AND satisfaction IS NULL AND (?2=0 OR id=?2) "
+            "ORDER BY eaten_at DESC,id DESC LIMIT 1",
             -1, &st, NULL);
     if (rc == SQLITE_OK)
         rc = bind_text(st, 1, food);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, requested_id);
     if (rc == SQLITE_OK) {
         int step_rc = sqlite3_step(st);
         if (step_rc == SQLITE_ROW) {
             experience_id = sqlite3_column_int64(st, 0);
-            if (sqlite3_column_type(st, 1) == SQLITE_NULL) {
-                if (config_result < 0) rc = SQLITE_IOERR;
+            if (sqlite3_column_type(st, 1) == SQLITE_NULL && !requested_id) {
+                R2FoodMetric metric;
+                if (load_food_metric(food, &metric) < 0) rc = SQLITE_IOERR;
                 else ingredient_copy = strdup(metric.ingredients);
+                free(metric.line);
             } else {
                 rc = inventory_read_text(st, 1, &ingredient_copy);
             }
+            if (rc == SQLITE_OK) rc = inventory_read_text(st, 2, &rated_taste);
             if (rc == SQLITE_OK) {
                 if (ingredient_copy) rated_ingredients = strdup(ingredient_copy);
                 if (!rated_ingredients) rc = SQLITE_NOMEM;
@@ -5051,7 +5122,7 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
         fprintf(stderr, "[R2 Reality] Food rating transaction failed: %s\n",
                 error_message[0] ? error_message : "unknown SQLite error");
         free(rated_ingredients);
-        free(metric.line);
+        free(rated_taste);
         return -1;
     }
 
@@ -5059,14 +5130,14 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     if (asprintf(&details, "Food=%s; ingredients=%s; sensory description=%s; "
                 "enjoyment_rating=%d/2; reason=%s. This is a learned subjective simulation.",
                 food, *rated_ingredients ? rated_ingredients : "not specified",
-                *metric.taste ? metric.taste : "not specified", satisfaction,
+                *rated_taste ? rated_taste : "not specified", satisfaction,
                 notes ? notes : "not supplied") < 0)
         details = NULL;
     bridge_event("food_preference_learned", "R2 recorded a modeled enjoyment rating.",
                  details, 1, 0);
     free(details);
     free(rated_ingredients);
-    free(metric.line);
+    free(rated_taste);
     int learned_enjoyment = food_preference_enjoyment_score(food);
     (void)r2_addiction_rate_enjoyment(food, "food", learned_enjoyment,
                                       "food_feedback", notes);

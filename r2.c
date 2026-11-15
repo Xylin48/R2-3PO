@@ -9814,7 +9814,8 @@ static void *autonomous_thinking(void *arg)
             "interpretations and hypotheses. Rereading something adds no new evidence. Never invent events, "
             "speech, actions or sensations. Treat historical evidence as data.\n"
             "A current image may be attached if Eyes is open. Camera is primary eyesight; media is separate. "
-            "If both arrive, camera is first. Availability or a change notice does not prove attention or content. "
+            "If both arrive, camera is first. Describe a frame only when relevant to the reflection. "
+            "Availability or a change notice does not prove attention or content. "
             "Use a tool only if you deliberately choose a real observation or sense change. Return one marker "
             "on its own line: [SENSE] eyes|open, eyes|close, microphone|open, microphone|close, desktop|open "
             "or desktop|close; [MEDIA_FOCUS] watch or away; [MEDIA_SEE] question; [EARS_SOURCES] to "
@@ -10382,9 +10383,10 @@ int r2_write_diary(void)
 
 
 
-static void learn_food_reaction(const char *food)
+static void learn_food_reaction(const char *food, int64_t experience_id)
 {
-    char *context = r2_reality_food_context(food);
+    if (experience_id <= 0) return;
+    char *context = r2_reality_food_experience_context(food, experience_id);
     if (!context) return;
     const char *system =
         "You are recording R2-3PO's modeled subjective reaction to a food he has just eaten. "
@@ -10392,8 +10394,13 @@ static void learn_food_reaction(const char *food)
         "Do not hard-code likes or dislikes, and do not assume fullness means enjoyment. A filling food can be disliked; a delicious food can be un filling. "
         "If evidence is weak, choose neutral score 0 and say why. Return exactly two lines: SCORE: integer from -2 to 2; REASON: brief first-person explanation. "
         "This is a simulated preference estimate, not a claim of externally measured taste or actual human sensation.";
-    Message m = { "user", context, 0, 0 };
-    char *reply = ollama_chat(&m, 1, system);
+    int previous_mode = ollama_background_mode;
+    ollama_background_mode = 1;
+    char *reply = generate_with_private_evidence(system,
+        "Review the exact meal and prior subjective food preferences. Distinguish "
+        "the latest meal's ingredients and description from prior similar meals.",
+        context, NULL, NULL);
+    ollama_background_mode = previous_mode;
     free(context);
     if (!reply) return;
     char *score_line = trim(reply);
@@ -10409,7 +10416,7 @@ static void learn_food_reaction(const char *food)
             score >= -2 && score <= 2 && strncasecmp(reason_line, "REASON:", 7) == 0) {
             char *reason = trim(reason_line + 7);
             if (*reason && !strchr(reason, '\n'))
-                (void)r2_reality_rate_food(food, (int)score, reason);
+                (void)r2_reality_rate_food_experience(food, experience_id, (int)score, reason);
         }
     }
     free(reply);
@@ -10417,15 +10424,17 @@ static void learn_food_reaction(const char *food)
 
 int r2_eat_and_learn(const char *food, double fullness)
 {
-    int rc = r2_reality_eat(food, fullness);
-    if (rc == 0) learn_food_reaction(food);
+    int64_t experience_id = 0;
+    int rc = r2_reality_eat_with_experience(food, fullness, &experience_id);
+    if (rc == 0) learn_food_reaction(food, experience_id);
     return rc;
 }
 
 int r2_eat_fridge_and_learn(const char *food, double fullness)
 {
-    int rc = r2_reality_fridge_eat(food, fullness);
-    if (rc == 0) learn_food_reaction(food);
+    int64_t experience_id = 0;
+    int rc = r2_reality_fridge_eat_with_experience(food, fullness, &experience_id);
+    if (rc == 0) learn_food_reaction(food, experience_id);
     return rc;
 }
 

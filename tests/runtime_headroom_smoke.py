@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Guard foreground scheduling, RAM-aware context, and additive memory migration."""
 from pathlib import Path
-import re
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
@@ -20,7 +19,8 @@ required = {
     "Legacy content aliases are preserved": '"content", "memory_text", "text", "description", "value"',
     "Current-turn reserve prevents old context crowding it out": "size_t current_user_reserve = 1500;",
     "Live history has a byte ceiling": "#define MAX_LIVE_MESSAGE_BYTES (32U * 1024U * 1024U)",
-    "Autonomous reflection uses the background scheduler": "previous_background_mode = ollama_background_mode",
+    "Autonomous reflection uses the background scheduler":
+        "ollama_background_mode = 1;\n    ollama_reflection_worker = 1;",
     "cgroup RAM reads distinguish zero from unreadable": "static unsigned long long read_uint_file(const char *path, int *valid)",
     "cgroup RAM exhaustion forces minimal headroom": "(!cgroup_used_valid || cgroup_used >= cgroup_max)",
     "unlimited cgroup v1 sentinel is not treated as real headroom": "v1_max < (1ULL << 60)",
@@ -42,24 +42,11 @@ reflection_end = core.find("/* =================================================
 if reflection_start < 0:
     raise SystemExit("Could not find autonomous reflection worker")
 reflection = core[reflection_start:reflection_end if reflection_end > reflection_start else reflection_start + 12000]
-if not re.search(
-    r"ollama_background_mode\s*=\s*1;[\s\S]{0,500}ollama_chat_with_limit\(",
-    reflection,
-):
-    raise SystemExit(
-        "Autonomous reflection does not mark its model call as background work; "
-        "it could block a live conversation."
-    )
-if not re.search(
-    r"static void \*autonomous_thinking\([\s\S]{0,350}ollama_background_mode\s*=\s*1;",
-    core,
-):
-    raise SystemExit(
-        "Autonomous post-reflection extraction is not kept in background mode; "
-        "it could block a live conversation after the reflection itself yields."
-    )
-if "int previous_background_mode = ollama_background_mode;" not in reflection:
-    raise SystemExit("Autonomous reflection must restore the thread's previous mode")
+background = reflection.index("ollama_background_mode = 1;")
+generation = reflection.index("generate_with_private_evidence(")
+learning = reflection.index("log_structured_self_report(")
+if not background < generation < learning or reflection.count("ollama_background_mode =") != 1:
+    raise SystemExit("Reflection generation and derived learning must share the worker's background mode.")
 
 talk_start = core.find("static char *r2_talk_impl(const char *message)")
 talk_end = core.find("\nchar *r2_talk(const char *message)", talk_start)

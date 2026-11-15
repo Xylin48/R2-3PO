@@ -707,20 +707,35 @@ static void verify_complete_food_metrics(void)
         if (r2_reality_remove_item(unconfigured[i]) != 0)
             fail("rejected meal removed its tracked item");
     }
-    if (r2_reality_add_item(food, "", "fridge", 1) != 0 ||
-        r2_reality_fridge_eat(food, -1.0) != 0 || r2_reality_rate_food(food, 1, "test") != 0)
-        fail("configured long metadata could not reach the real fridge learning path");
+    int64_t older_meal = 0, newer_meal = 0;
+    if (r2_reality_add_item(food, "", "fridge", 2) != 0 ||
+        r2_reality_fridge_eat_with_experience(food, -1.0, &older_meal) != 0 || older_meal <= 0 ||
+        r2_reality_fridge_eat_with_experience(food, -1.0, &newer_meal) != 0 || newer_meal <= older_meal)
+        fail("could not preserve distinct fridge meal identities");
+    context = r2_reality_food_experience_context(food, older_meal);
+    if (!context || !strstr(context, ingredients) || !strstr(context, taste))
+        fail("exact meal context shortened authoritative ingredients or taste");
+    free(context);
+    if (r2_reality_rate_food_experience(food, older_meal, 1, "test") != 0 ||
+        r2_reality_rate_food_experience(food, older_meal, 1, "duplicate") == 0)
+        fail("an explicit meal rating failed or could be repeated");
     sqlite3 *db = NULL;
     sqlite3_stmt *st = NULL;
     if (sqlite3_open(R2_HOME "/r2_reality.db", &db) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
-            "SELECT e.ingredients,p.ingredient FROM r2_food_experiences e "
+            "SELECT e.ingredients,p.ingredient,e.taste,e.id,p.rating_count, "
+            "(SELECT satisfaction FROM r2_food_experiences WHERE id=?1) "
+            "FROM r2_food_experiences e "
             "JOIN r2_food_ingredient_preferences p ON p.ingredient=e.ingredients "
             "WHERE e.food_name='metric_complete' AND e.satisfaction=1",
             -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 1, newer_meal) != SQLITE_OK ||
         sqlite3_step(st) != SQLITE_ROW ||
         strcmp((const char *)sqlite3_column_text(st, 0), ingredients) ||
-        strcmp((const char *)sqlite3_column_text(st, 1), ingredients))
+        strcmp((const char *)sqlite3_column_text(st, 1), ingredients) ||
+        strcmp((const char *)sqlite3_column_text(st, 2), taste) ||
+        sqlite3_column_int64(st, 3) != older_meal || sqlite3_column_int(st, 4) != 1 ||
+        sqlite3_column_type(st, 5) != SQLITE_NULL)
         fail("food experience and ingredient preference did not keep complete metadata");
     sqlite3_finalize(st);
     st = NULL;
