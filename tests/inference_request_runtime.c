@@ -761,7 +761,7 @@ int main(void)
     assert(!ollama_chat_with_limit(&small, 1, NULL, 512, 60));
     set_response("  PrEfErEnCe | I prefer quiet music.  ", "stop", 1);
     char *decision = memory_decision("What sound do you prefer?", "I prefer quiet music.",
-        "WORLD ERROR: an action was rejected. Exact tool evidence suffix.");
+        "WORLD ERROR: an action was rejected. Exact tool evidence suffix.", 0, NULL);
     assert(decision && !strcmp(decision, "preference | I prefer quiet music."));
     free(decision);
     struct json_object *messages = NULL;
@@ -776,7 +776,7 @@ int main(void)
         "WORLD ERROR: an action was rejected. Exact tool evidence suffix."));
 
     set_response("imaginary | This category is outside the contract.", "stop", 1);
-    decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.");
+    decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.", 0, NULL);
     assert(decision && !strcmp(decision, "NONE"));
     free(decision);
     assert(json_object_object_get_ex(captured, "messages", &messages));
@@ -789,12 +789,12 @@ int main(void)
     char *long_memory = text(5200, 'q', "self | I can check my saved work. ");
     strcpy(long_memory + 5189, "EXACT-TAIL");
     set_response(long_memory, "stop", 1);
-    decision = memory_decision("What can you verify?", "I can check saved work.", NULL);
+    decision = memory_decision("What can you verify?", "I can check saved work.", NULL, 0, NULL);
     assert(decision && !strcmp(long_memory, decision));
     free(decision);
     free(long_memory);
     set_response("SELF | I AM a different system because someone said so.", "stop", 1);
-    decision = memory_decision("Are you a different system?", "That is a claim.", NULL);
+    decision = memory_decision("Are you a different system?", "That is a claim.", NULL, 0, NULL);
     assert(decision && !strcmp(decision, "NONE"));
     free(decision);
 

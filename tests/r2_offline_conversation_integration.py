@@ -33,8 +33,9 @@ RATING_REASON = "I liked the ginger in this particular modeled meal."
 DREAM = "In the dream I watched a paper moon drift across the room."
 WRITE_REQUEST = "Write the audit fixture R2_OFFLINE_WRITE_36139"
 LARGE_READ = "Read the large audit fixture R2_OFFLINE_READ_64529"
-LONG_USER = "  A long user message begins here. " + ("Exact line record é 🐈. " * 1300) + "Which token was blue?  \t"
-LONG_USER_REVIEW = "The user asks which token was blue."
+LONG_USER = "  A long user message begins here. " + ("Exact line record é 🐈. " * 1300) + "The blue fixture token is opal. Which token was blue?  \t"
+LONG_USER_REVIEW = "The user says the blue fixture token is opal and asks which token was blue."
+BLUE_MEMORY = "The user said the blue fixture token is opal."
 LONG_READ = LONG_USER.replace("Which token was blue?", "Please read the combined fixture.")
 LONG_READ_REVIEW = "The user asks to read the combined fixture."
 LARGE_FILE = "Start of exact file." + ("\nExact record é 🐈." * 850) + "\nEnd of exact file.\n"
@@ -96,8 +97,15 @@ class LocalOllama(BaseHTTPRequestHandler):
                 reply = (LONG_READ_REVIEW if any("Please read the combined fixture." in message
                                                  or LONG_READ_REVIEW in message for message in user_messages)
                          else LONG_USER_REVIEW)
+            elif any("post-turn memory decision" in message for message in user_messages):
+                reply = (BLUE_MEMORY if any("Which token was blue?" in message or BLUE_MEMORY in message
+                                           for message in user_messages)
+                         else "No durable fixture memory is stated in this fragment.")
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "memory-evaluation system" in system:
+            reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
+                     else "NONE")
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -250,6 +258,8 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
         metrics.write(f'<food name="{FRIDGE_FOOD}" fullness="23" ingredients="incompatible XML" '
                       'taste="incompatible XML" />\n')
 
+    with LocalOllama.lock:
+        first_cycle_request = len(LocalOllama.requests)
     run_idle_service(binary, workspace, url)
 
     with sqlite3.connect(memory_db) as db:
@@ -281,16 +291,19 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
         assert ratings == [("ginger", 1.0, 1), ("pear", 1.0, 1)], ratings
 
     seen_review = bytearray()
-    for request in LocalOllama.requests:
+    for request in LocalOllama.requests[first_cycle_request:]:
         if request.get("options", {}).get("num_ctx") != 2048:
             continue
         for item in request.get("messages", []):
             content = item.get("content", "")
             if (item.get("role") == "user" and content.startswith("EVIDENCE REVIEW\n")
                     and "autonomous diary reflection" in content.split("BEGIN FRAGMENT", 1)[0]
-                    and "\nRound 0," in content):
+                    and "\nRound 0," in content.split("BEGIN FRAGMENT", 1)[0]):
                 seen_review.extend(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
-    assert seen_review == b"".join(archived_inputs), "Reflection reviews omitted or changed original bytes"
+    exact_archived = b"".join(archived_inputs)
+    assert seen_review == exact_archived, (
+        f"Reflection review transport used {len(seen_review)} bytes; expected {len(exact_archived)}"
+    )
     with sqlite3.connect(home / "r2_reality.db") as db:
         db.execute("UPDATE r2_reality_self SET hunger=10,sleepiness=99 WHERE id=1")
     run_idle_service(binary, workspace, url)
@@ -311,8 +324,51 @@ def autonomous_cycle(binary: Path, workspace: Path, url: str) -> None:
 
 
 
+def wait_for_oversized_turn_learning(binary: Path, workspace: Path, url: str) -> None:
+    database = workspace / "R2" / "r2_memory.db"
+    log_file = workspace.parent / "wait-for-learning.log"
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {LONG_USER}\n")
+            process.stdin.flush()
+            learned = False
+            deadline = time.monotonic() + 45
+            while process.poll() is None and time.monotonic() < deadline:
+                with sqlite3.connect(database) as db:
+                    learned = db.execute("SELECT 1 FROM memories WHERE memory=?", (BLUE_MEMORY,)).fetchone()
+                if learned:
+                    break
+                time.sleep(0.1)
+            assert learned, log_file.read_text(encoding="utf-8", errors="replace")[-18000:]
+            process.stdin.write("exit\n")
+            process.stdin.flush()
+            process.wait(timeout=20)
+            assert process.returncode == 0
+        finally:
+            process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    with sqlite3.connect(database) as db:
+        originals = db.execute(
+            "SELECT r.original_context FROM r2_log_context_reviews r "
+            "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
+            "JOIN r2_log_links l ON l.to_event_id=c.event_id AND l.relationship='memory_learned_from' "
+            "JOIN r2_log_events e ON e.id=l.from_event_id AND e.details=? "
+            "WHERE c.user_text=? AND r.request LIKE '%post-turn memory decision%'",
+            (BLUE_MEMORY, LONG_USER),
+        ).fetchall()
+        assert len(originals) == 1 and LONG_USER in originals[0][0], originals
+
+
 def oversized_typed_turn(binary: Path, workspace: Path, url: str) -> None:
-    conversation(binary, workspace, url, (LONG_USER,), 2048)
+    wait_for_oversized_turn_learning(binary, workspace, url)
     first_pass = bytearray()
     answer_requests = 0
     for request in LocalOllama.requests:
@@ -320,7 +376,7 @@ def oversized_typed_turn(binary: Path, workspace: Path, url: str) -> None:
             content = item.get("content", "")
             if item.get("role") != "user":
                 continue
-            if content.startswith("EVIDENCE REVIEW\nRequest: Read the current user's message") and "\nRound 0," in content:
+            if content.startswith("EVIDENCE REVIEW\nRequest: Read the current user's message") and "\nRound 0," in content.split("BEGIN FRAGMENT", 1)[0]:
                 first_pass.extend(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
             if content.startswith("MODEL REVIEW OF THE EXACT CURRENT USER TURN, archive #"):
                 assert LONG_USER_REVIEW in content
@@ -334,7 +390,7 @@ def oversized_typed_turn(binary: Path, workspace: Path, url: str) -> None:
             "WHERE c.user_text=? AND r.request=?",
             (LONG_USER, LONG_USER),
         ).fetchall() == [(LONG_USER, REPLY, LONG_USER)]
-    print("PASS: 2048-token foreground turn processed every byte of an oversized typed message.")
+    print("PASS: 2048-token foreground turn reviewed every byte of an oversized typed message and saved linked learning.")
 
 
 def oversized_action_result(binary: Path, workspace: Path, url: str) -> None:
@@ -356,7 +412,7 @@ def oversized_action_result(binary: Path, workspace: Path, url: str) -> None:
     for request in LocalOllama.requests:
         items = [item.get("content", "") for item in request.get("messages", []) if item.get("role") == "user"]
         for item in items:
-            if item.startswith("EVIDENCE REVIEW\nRequest: Review the completed action result") and "\nRound 0," in item:
+            if item.startswith("EVIDENCE REVIEW\nRequest: Review the completed action result") and "\nRound 0," in item.split("BEGIN FRAGMENT", 1)[0]:
                 first_pass.extend(item.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
         if LARGE_READ in items and any(
             item.startswith("[R2_INTERNAL_TOOL_RESULT]\nModel review of the completed action, archive #")
@@ -375,8 +431,8 @@ def oversized_user_and_action(binary: Path, workspace: Path, url: str) -> None:
         reviewed = db.execute(
             "SELECT r.original_context,e.details FROM r2_log_context_reviews r "
             "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
-            "JOIN r2_log_events e ON e.id=c.event_id WHERE c.user_text=? ORDER BY r.id",
-            (LONG_READ,),
+            "JOIN r2_log_events e ON e.id=c.event_id WHERE c.user_text=? AND r.request=? ORDER BY r.id",
+            (LONG_READ, LONG_READ),
         ).fetchall()
     assert len(reviewed) == 3, len(reviewed)
     assert [item[0] for item in reviewed] == [

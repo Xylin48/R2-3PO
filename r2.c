@@ -10112,7 +10112,9 @@ static void *autonomous_thinking(void *arg)
 static char *memory_decision(
     const char *user,
     const char *reply,
-    const char *tool_result)
+    const char *tool_result,
+    int64_t source_event_id,
+    int64_t *archive_id)
 {
     const char *sys =
         "You are R2-3PO's memory-evaluation system.\n"
@@ -10198,14 +10200,19 @@ static char *memory_decision(
         0
     };
 
-    char *res =
-        ollama_chat_with_limit(
-            &m,
-            1,
-            sys,
-            128,
-            90L
-        );
+    int budget = 128;
+    char *res;
+    if (r2_fit_complete_input(strlen(sys) + strlen(u), r2_ollama_context_tokens(), &budget) == 0) {
+        res = ollama_chat_with_limit(&m, 1, sys, budget, 90L);
+    } else {
+        char task[320];
+        snprintf(task, sizeof(task),
+            "Review evidence for the post-turn memory decision from Life Log event %lld. "
+            "Keep actual user statements, R2 replies, verified tool results and speculation distinct. "
+            "Preserve specific durable learning and uncertainty.",
+            (long long)source_event_id);
+        res = generate_with_private_evidence(sys, task, u, NULL, archive_id);
+    }
 
     free(u);
 
@@ -13926,9 +13933,22 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     snprintf(input, n, "%s%s", prefix, reply);
 
     Message m = { "user", input, 0, 0 };
-    char *json_text = ollama_chat_with_limit(&m, 1,
-        "You are a strict structured data extractor. Output only valid JSON.",
-        768, 180L);
+    const char *system = "You are a strict structured data extractor. Output only valid JSON.";
+    int num_ctx = r2_ollama_context_tokens();
+    int budget = num_ctx > 2048 ? 768 : 384;
+    char *json_text;
+    if (r2_fit_complete_input(strlen(input) + strlen(system), num_ctx, &budget) == 0) {
+        json_text = ollama_chat_with_limit(&m, 1, system, budget, 180L);
+    } else {
+        /* The extractor still validates all proposed quotes against the
+           original response after using the review to find candidates. */
+        char task[288];
+        snprintf(task, sizeof(task),
+            "Review R2's exact response from Life Log event %lld. Preserve short verbatim quotations and "
+            "distinguish explicit self-reports, beliefs, continuity and clearly hypothetical scenarios.",
+            (long long)parent_event_id);
+        json_text = generate_with_private_evidence(prefix, task, reply, NULL, NULL);
+    }
     free(input);
     if (!json_text) {
         r2_log_event(R2_LOG_ERROR, "self_state_extraction_failed",
@@ -14080,7 +14100,12 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                                      const char *tool_result, int64_t source_event_id)
 {
     if (!shutting_down) {
-        char *decision = memory_decision(user, reply, tool_result);
+        int64_t archive_id = 0;
+        char *decision = memory_decision(user, reply, tool_result, source_event_id, &archive_id);
+        if (user && archive_id > 0 && source_event_id > 0 &&
+            r2_log_link_context_review(archive_id, source_event_id) != 0)
+            fprintf(stderr, "[R2 Post-turn] Memory review archive #%lld could not be linked to conversation #%lld.\n",
+                    (long long)archive_id, (long long)source_event_id);
         if (!decision) {
             char details[160];
             snprintf(details, sizeof(details),
