@@ -38,6 +38,12 @@ def is_observer_event(category: str, event_type: str) -> bool:
 # Rebuild the exact event-ID index from complete, newline-terminated records
 # rather than guessing from a 4096-byte suffix or an in-memory session cursor.
 ACTIVITY_EVENT_MARKER = re.compile(rb" \(event #([1-9][0-9]*)\)\n$")
+ACTIVITY_HEADER = (
+    b"R2-3PO Activity Log\n"
+    b"Factual observer events only; private thoughts and notifications excluded.\n"
+    + b"-" * 72 + b"\n"
+)
+
 
 
 class ActivityWriter:
@@ -47,29 +53,60 @@ class ActivityWriter:
         self._offset = 0
         self._saved_ids = set()
 
+    @staticmethod
+    def _append_and_sync(stream, data: bytes) -> int:
+        if stream.write(data) != len(data):
+            raise OSError(errno.EIO, "Activity.txt short write")
+        stream.flush()
+        os.fsync(stream.fileno())
+        return stream.tell()
+
     def append(self, local_time: str, summary: str, event_id: int) -> None:
         if event_id <= 0:
             raise ValueError("Activity event ID must be positive")
+        clean_time = " ".join((local_time or "time unavailable").split())
+        clean_summary = " ".join((summary or "").split())
+        record = f"[{clean_time}] {clean_summary} (event #{event_id})\n".encode("utf-8")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stat = os.fstat(stream.fileno())
             identity = (stat.st_dev, stat.st_ino)
             if identity != self._identity or stat.st_size < self._offset:
-                # An operator may rotate or truncate the log. Never reuse an
-                # index from a different file or earlier generation.
+                # Do not carry cached event IDs across a log rotation or truncation.
                 self._identity = identity
                 self._offset = 0
                 self._saved_ids.clear()
+
+            # A crash can interrupt initial header creation. If every existing
+            # byte is its exact prefix, repair by appending the missing suffix.
+            if self._offset == 0 and 0 < stat.st_size < len(ACTIVITY_HEADER):
+                stream.seek(0)
+                prefix = stream.read(stat.st_size)
+                if ACTIVITY_HEADER.startswith(prefix):
+                    self._offset = self._append_and_sync(stream, ACTIVITY_HEADER[len(prefix):])
+
             stream.seek(self._offset)
             while True:
+                line_start = stream.tell()
                 line = stream.readline()
                 if not line:
                     break
                 if not line.endswith(b"\n"):
-                    # An interrupted append is preserved exactly for repair,
-                    # not combined with a later line or silently discarded.
-                    raise OSError(errno.EIO, "Activity.txt ends with an incomplete line")
+                    if event_id in self._saved_ids:
+                        # An earlier replay row is complete. Leave the partial
+                        # tail for the exact Life Log row that can repair it.
+                        if line_start != self._offset:
+                            os.fsync(stream.fileno())
+                        self._offset = line_start
+                        return
+                    if not record.startswith(line):
+                        raise OSError(errno.EIO, "Activity.txt ends with an incomplete line")
+                    # Compare bytes before decoding. A torn UTF-8 character can
+                    # still match its authoritative public event byte for byte.
+                    self._offset = self._append_and_sync(stream, record[len(line):])
+                    self._saved_ids.add(event_id)
+                    return
                 try:
                     line.decode("utf-8")
                 except UnicodeDecodeError as exc:
@@ -77,21 +114,14 @@ class ActivityWriter:
                 marker = ACTIVITY_EVENT_MARKER.search(line)
                 if marker:
                     self._saved_ids.add(int(marker.group(1)))
-            self._offset = stream.tell()
+            end = stream.tell()
             if event_id in self._saved_ids:
+                if end != self._offset:
+                    os.fsync(stream.fileno())
+                self._offset = end
                 return
-            if self._offset == 0:
-                stream.write(b"R2-3PO Activity Log\n")
-                stream.write(b"Factual observer events only; private thoughts and notifications excluded.\n")
-                stream.write(("-" * 72 + "\n").encode("utf-8"))
-            clean_time = " ".join((local_time or "time unavailable").split())
-            clean_summary = " ".join((summary or "").split())
-            stream.write(f"[{clean_time}] {clean_summary} (event #{event_id})\n".encode("utf-8"))
-            stream.flush()
-            # Mark an event complete only after its entire record is durable.
-            # A failed fsync leaves it discoverable in the next full/delta scan.
-            os.fsync(stream.fileno())
-            self._offset = stream.tell()
+            payload = (ACTIVITY_HEADER if end == 0 else b"") + record
+            self._offset = self._append_and_sync(stream, payload)
             self._saved_ids.add(event_id)
 
 

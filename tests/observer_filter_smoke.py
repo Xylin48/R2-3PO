@@ -114,3 +114,27 @@ with tempfile.TemporaryDirectory() as directory:
     assert output.read_bytes() == before
     db.close()
 print("Observer restart backfill, full-file dedupe, and torn-log refusal passed.")
+
+with tempfile.TemporaryDirectory() as directory:
+    output = Path(directory) / "Activity.txt"
+    writer = module.ActivityWriter(output)
+    output.write_bytes(module.ACTIVITY_HEADER[:21])
+    writer.append("2026-11-14", "First archived event", 1)
+    complete = output.read_bytes()
+    assert complete.startswith(module.ACTIVITY_HEADER)
+    assert complete.count(b"(event #1)\n") == 1
+
+    exact = "[2026-11-14] A camera event 🐈 was observed. (event #2)\n".encode("utf-8")
+    cutoff = exact.index("🐈".encode("utf-8")) + 2
+    with output.open("ab") as stream:
+        stream.write(exact[:cutoff])
+    torn = output.read_bytes()
+    writer = module.ActivityWriter(output)
+    writer.append("2026-11-14", "First archived event", 1)
+    assert output.read_bytes() == torn
+    writer.append("2026-11-14", "A camera event 🐈 was observed.", 2)
+    assert output.read_bytes() == complete + exact
+    writer.append("2026-11-14", "A camera event 🐈 was observed.", 2)
+    writer.append("2026-11-14", "Another event", 3)
+    assert output.read_bytes() == complete + exact + b"[2026-11-14] Another event (event #3)\n"
+print("Observer repaired known interrupted header and UTF-8 event bytes without rewriting history.")
