@@ -984,145 +984,168 @@ static int mirror_write(const char *name, const char *description,
 
 
 
-static int xml_attribute(const char *line, const char *key, char *out, size_t cap)
+/* The room format stores one complete food tag per line. The attribute
+ * strings point into that owned line so names and evidence keep every byte. */
+typedef struct {
+    char *line;
+    const char *name;
+    const char *ingredients;
+    const char *taste;
+    double fullness;
+    double energy;
+} R2FoodMetric;
+
+static int parse_food_metric(char *line, int *in_comment, R2FoodMetric *metric)
 {
-    char pattern[64];
-    if (snprintf(pattern, sizeof(pattern), "%s=", key) <= 0) return -1;
-    const char *p = strcasestr(line, pattern);
-    if (!p) return -1;
-    p += strlen(pattern);
-    while (*p && isspace((unsigned char)*p)) p++;
-    if (*p != '"' && *p != '\'') return -1;
-    char quote = *p++;
-    const char *end = strchr(p, quote);
-    if (!end) return -1;
-    size_t n = (size_t)(end - p);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return 0;
+    char *p = line;
+    for (;;) {
+        while (isspace((unsigned char)*p)) ++p;
+        if (!*in_comment && strncmp(p, "<!--", 4)) break;
+        if (!*in_comment) p += 4;
+        char *end = strstr(p, "-->");
+        *in_comment = !end;
+        if (!end) return 0;
+        p = end + 3;
+    }
+    if (strncasecmp(p, "<food", 5) || !isspace((unsigned char)p[5])) {
+        const char *comment = strstr(p, "<!--");
+        if (comment && !strstr(comment + 4, "-->")) *in_comment = 1;
+        return 0;
+    }
+    p += 5;
+    char *name = NULL, *full = NULL, *energy = NULL, *ingredients = NULL, *taste = NULL;
+    for (;;) {
+        while (isspace((unsigned char)*p)) ++p;
+        if (*p == '>' || (p[0] == '/' && p[1] == '>')) break;
+        char *key = p;
+        while (isalnum((unsigned char)*p) || *p == '_' || *p == '-' ||
+               *p == ':' || *p == '.') ++p;
+        size_t key_len = (size_t)(p - key);
+        while (isspace((unsigned char)*p)) ++p;
+        if (!key_len || *p != '=') return 0;
+        ++p;
+        while (isspace((unsigned char)*p)) ++p;
+        if (*p != '"' && *p != '\'') return 0;
+        char quote = *p++;
+        char *end = strchr(p, quote);
+        if (!end) return 0;
+        *end = '\0';
+        char **value = NULL;
+        if (key_len == 4 && !strncasecmp(key, "name", key_len)) value = &name;
+        else if (key_len == 8 && !strncasecmp(key, "fullness", key_len)) value = &full;
+        else if (key_len == 6 && !strncasecmp(key, "energy", key_len)) value = &energy;
+        else if (key_len == 11 && !strncasecmp(key, "ingredients", key_len)) value = &ingredients;
+        else if (key_len == 5 && !strncasecmp(key, "taste", key_len)) value = &taste;
+        if (value) {
+            if (*value) return 0;
+            *value = p;
+        }
+        p = end + 1;
+    }
+    const char *comment = strstr(p + (*p == '/' ? 2 : 1), "<!--");
+    if (comment && !strstr(comment + 4, "-->")) *in_comment = 1;
+    if (!name || !*name) return 0;
+    *metric = (R2FoodMetric){
+        .name = name, .ingredients = ingredients ? ingredients : "",
+        .taste = taste ? taste : "", .fullness = -1.0
+    };
+    if (full) {
+        char *end = NULL;
+        double value = strtod(full, &end);
+        if (end != full && !*end && isfinite(value) && value >= 0.0 && value <= 100.0) {
+            metric->fullness = value;
+            metric->energy = value * 0.1;
+        }
+    }
+    if (energy && metric->fullness >= 0.0) {
+        char *end = NULL;
+        double value = strtod(energy, &end);
+        if (end != energy && !*end && isfinite(value) && value >= 0.0 && value <= 100.0)
+            metric->energy = value;
+    }
+    return 1;
 }
 
-/* Food metrics are data, not hard-coded guesses. Each XML <food> entry
- * supplies a name and fullness value; energy is optional. */
+static int load_food_metric(const char *food, R2FoodMetric *metric)
+{
+    *metric = (R2FoodMetric){.ingredients = "", .taste = "", .fullness = -1.0};
+    FILE *fp = fopen(R2_ROOT "/room/food_metrics.xml", "r");
+    if (!fp) return errno == ENOENT ? 0 : -1;
+    char *line = NULL;
+    size_t capacity = 0;
+    int in_comment = 0;
+    int result = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, fp)) >= 0) {
+        R2FoodMetric candidate;
+        if (memchr(line, '\0', (size_t)length)) { result = -1; break; }
+        if (!parse_food_metric(line, &in_comment, &candidate) ||
+            strcasecmp(candidate.name, food)) continue;
+        if (candidate.fullness < 0.0 && result > 0) continue;
+        free(metric->line);
+        candidate.line = line;
+        *metric = candidate;
+        line = NULL;
+        capacity = 0;
+        result = 1;
+        if (metric->fullness >= 0.0) break;
+    }
+    if (metric->fullness < 0.0 && !feof(fp)) result = -1;
+    if (fclose(fp) != 0) result = -1;
+    free(line);
+    if (result < 0) {
+        free(metric->line);
+        *metric = (R2FoodMetric){.ingredients = "", .taste = "", .fullness = -1.0};
+    }
+    return result;
+}
+
 static int food_metric(const char *food, double *fullness, double *energy)
 {
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/room/food_metrics.xml", R2_ROOT);
-    FILE *fp = fopen(path, "r");
-    if (!fp) return -1;
-    char line[4096];
-    int found = -1;
-    while (fgets(line, sizeof(line), fp)) {
-        const char *tag = strcasestr(line, "<food");
-        const char *comment = strstr(line, "<!--");
-        if (!tag || (comment && comment < tag)) continue; /* Ignore XML comments/examples. */
-        char name[512] = {0}, full[128] = {0}, en[128] = {0};
-        if (xml_attribute(line, "name", name, sizeof(name)) != 0 ||
-            strcasecmp(name, food) != 0 ||
-            xml_attribute(line, "fullness", full, sizeof(full)) != 0)
-            continue;
-        char *end = NULL;
-        double f = strtod(full, &end);
-        /* Reject NaN/infinity explicitly: comparisons alone do not reject NaN,
-           which could otherwise poison persistent need values during eating. */
-        if (end == full || *end || !isfinite(f) || f < 0.0 || f > 100.0) continue;
-        double e = f * 0.1;
-        if (xml_attribute(line, "energy", en, sizeof(en)) == 0) {
-            end = NULL;
-            double parsed = strtod(en, &end);
-            if (end != en && !*end && isfinite(parsed) &&
-                parsed >= 0.0 && parsed <= 100.0) e = parsed;
-        }
-        if (fullness) *fullness = f;
-        if (energy) *energy = e;
-        found = 0;
-        break;
+    R2FoodMetric metric;
+    int found = load_food_metric(food, &metric);
+    int valid = found > 0 && metric.fullness >= 0.0;
+    if (valid) {
+        if (fullness) *fullness = metric.fullness;
+        if (energy) *energy = metric.energy;
     }
-    fclose(fp);
-    return found;
-}
-
-
-
-static void food_attributes(const char *food, char *ingredients, size_t ingredients_cap,
-                           char *taste, size_t taste_cap)
-{
-    if (ingredients && ingredients_cap) ingredients[0] = '\0';
-    if (taste && taste_cap) taste[0] = '\0';
-    if (!food || !*food) return;
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/room/food_metrics.xml", R2_ROOT);
-    FILE *fp = fopen(path, "r");
-    if (!fp) return;
-    char line[4096];
-    while (fgets(line, sizeof(line), fp)) {
-        const char *tag = strcasestr(line, "<food");
-        const char *comment = strstr(line, "<!--");
-        if (!tag || (comment && comment < tag)) continue;
-        char name[512] = {0};
-        if (xml_attribute(line, "name", name, sizeof(name)) != 0 ||
-            strcasecmp(name, food) != 0) continue;
-        if (ingredients && ingredients_cap)
-            (void)xml_attribute(line, "ingredients", ingredients, ingredients_cap);
-        if (taste && taste_cap)
-            (void)xml_attribute(line, "taste", taste, taste_cap);
-        break;
-    }
-    fclose(fp);
+    free(metric.line);
+    return valid ? 0 : -1;
 }
 
 static char *food_metrics_context(void)
 {
-    char path[1200];
-    snprintf(path, sizeof(path), "%s/room/food_metrics.xml", R2_ROOT);
-    FILE *fp = fopen(path, "r");
-    size_t cap = 4096, len = 0;
-    char *out = malloc(cap);
-    if (!out) { if (fp) fclose(fp); return NULL; }
-    out[0] = '\0';
-    if (!fp) {
-        snprintf(out, cap, "No food metric file is available.\n");
-        return out;
-    }
-    char line[4096];
-    int count = 0;
-    while (fgets(line, sizeof(line), fp) && count < 100) {
-        const char *tag = strcasestr(line, "<food");
-        const char *comment = strstr(line, "<!--");
-        if (!tag || (comment && comment < tag)) continue;
-        char name[512] = {0}, full[128] = {0}, en[128] = {0};
-        char ingredients[1024] = {0}, taste[1024] = {0};
-        if (xml_attribute(line, "name", name, sizeof(name)) != 0 ||
-            xml_attribute(line, "fullness", full, sizeof(full)) != 0)
-            continue;
-        (void)xml_attribute(line, "ingredients", ingredients, sizeof(ingredients));
-        (void)xml_attribute(line, "taste", taste, sizeof(taste));
-        char *end = NULL;
-        double f = strtod(full, &end);
-        if (end == full || *end || !isfinite(f) || f < 0.0 || f > 100.0) continue;
-        double e = f * 0.1;
-        if (xml_attribute(line, "energy", en, sizeof(en)) == 0) {
-            end = NULL;
-            double parsed = strtod(en, &end);
-            if (end != en && !*end && isfinite(parsed) &&
-                parsed >= 0.0 && parsed <= 100.0) e = parsed;
+    FILE *fp = fopen(R2_ROOT "/room/food_metrics.xml", "r");
+    if (!fp) return errno == ENOENT ? strdup("No food metric file is available.\n") : NULL;
+    char *out = NULL;
+    size_t out_size = 0;
+    FILE *output = open_memstream(&out, &out_size);
+    if (!output) { fclose(fp); return NULL; }
+    char *line = NULL;
+    size_t capacity = 0;
+    int in_comment = 0, seen = 0, failed = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, fp)) >= 0) {
+        R2FoodMetric metric;
+        if (memchr(line, '\0', (size_t)length)) { failed = 1; break; }
+        if (!parse_food_metric(line, &in_comment, &metric) || metric.fullness < 0.0) continue;
+        if (fprintf(output,
+                    "%s: fullness %.1f/100, energy bonus %.1f; ingredients: %s; sensory description: %s\n",
+                    metric.name, metric.fullness, metric.energy,
+                    *metric.ingredients ? metric.ingredients : "not specified",
+                    *metric.taste ? metric.taste : "not specified") < 0) {
+            failed = 1;
+            break;
         }
-        char entry[1024];
-        int n = snprintf(entry, sizeof(entry), "%s: fullness %.1f/100, energy bonus %.1f; ingredients: %s; sensory description: %s\n", name, f, e, *ingredients ? ingredients : "not specified", *taste ? taste : "not specified");
-        if (n <= 0 || (size_t)n >= sizeof(entry)) continue;
-        if (len + (size_t)n + 1 > cap) {
-            size_t next = cap * 2;
-            char *grown = realloc(out, next);
-            if (!grown) break;
-            out = grown; cap = next;
-        }
-        memcpy(out + len, entry, (size_t)n);
-        len += (size_t)n; out[len] = '\0';
-        count++;
+        seen = 1;
     }
-    fclose(fp);
-    if (!len) snprintf(out, cap, "No food metrics are configured in room/food_metrics.xml.\n");
+    if (!feof(fp)) failed = 1;
+    if (!seen && fputs("No food metrics are configured in room/food_metrics.xml.\n", output) < 0)
+        failed = 1;
+    free(line);
+    if (fclose(fp) != 0) failed = 1;
+    if (fclose(output) != 0) failed = 1;
+    if (failed) { free(out); return NULL; }
     return out;
 }
 
@@ -4046,11 +4069,13 @@ static int reality_add_item_internal(const char *name,const char *description,co
     container = canonical_container;
     if (!strcasecmp(container, "fridge")) {
         if (!r2_reality_is_initialized() || !reality_is_home()) return -1;
-        char ingredients[1024] = {0}, taste[1024] = {0};
-        double fullness = 0.0, energy = 0.0;
-        if (food_metric(name, &fullness, &energy) != 0) return -1;
-        food_attributes(name, ingredients, sizeof(ingredients), taste, sizeof(taste));
-        return fridge_add_item_internal(name, description, quantity, fullness, energy, ingredients, taste);
+        R2FoodMetric metric;
+        int rc = -1;
+        if (load_food_metric(name, &metric) > 0 && metric.fullness >= 0.0)
+            rc = fridge_add_item_internal(name, description, quantity,
+                    metric.fullness, metric.energy, metric.ingredients, metric.taste);
+        free(metric.line);
+        return rc;
     }
     if(!r2_reality_is_initialized() || !container_accessible(container)) return -1;
     char old_container[REALITY_MAX_TEXT + 1] = {0};
@@ -4212,10 +4237,11 @@ static int reality_move_item_to_fridge(const char *name)
         !container_accessible("fridge"))
         return -1;
 
-    double fullness = 0.0, energy = 0.0;
-    char ingredients[1024] = {0}, taste[1024] = {0};
-    if (food_metric(name, &fullness, &energy) != 0) return -1;
-    food_attributes(name, ingredients, sizeof(ingredients), taste, sizeof(taste));
+    R2FoodMetric metric;
+    if (load_food_metric(name, &metric) <= 0 || metric.fullness < 0.0) {
+        free(metric.line);
+        return -1;
+    }
 
     InventoryTransferSnapshot snapshot = {0};
     pthread_mutex_lock(&reality_lock);
@@ -4231,11 +4257,13 @@ static int reality_move_item_to_fridge(const char *name)
     pthread_mutex_unlock(&reality_lock);
     if (rc != 0) {
         inventory_transfer_snapshot_free(&snapshot);
+        free(metric.line);
         return -1;
     }
     rc = fridge_add_item_internal(name, snapshot.reality_description,
-                           snapshot.reality_quantity, fullness, energy,
-                           ingredients, taste);
+                           snapshot.reality_quantity, metric.fullness, metric.energy,
+                           metric.ingredients, metric.taste);
+    free(metric.line);
     if (rc != 0) {
         inventory_transfer_snapshot_free(&snapshot);
         if (inventory_transfer_recover() != 0)
@@ -4438,37 +4466,33 @@ static int food_preference_enjoyment_score(const char *food)
 static int reality_eat_internal(const char *food, double fullness, int consume_tracked_item, double energy_override, const char *fridge_ingredients)
 {
     if (!food || !*food || !r2_reality_is_initialized()) return -1;
-    double energy_bonus = 0.0;
-    if (consume_tracked_item) {
-        /* Tracked inventory must use the configured authoritative metric.
-           Never let a model-supplied numeric override turn an unknown object
-           or a zero-fullness item into a meal. */
-        if (food_metric(food, &fullness, &energy_bonus) != 0) {
+    R2FoodMetric metric = {0};
+    if (!fridge_ingredients && load_food_metric(food, &metric) < 0)
+        return -1;
+
+    double energy_bonus;
+    /* Tracked food always uses its complete configured row. */
+    if (consume_tracked_item || !(fullness >= 0.0)) {
+        if (metric.fullness < 0.0) {
             fprintf(stderr, "[R2 Reality] No food metric found for '%s' in room/food_metrics.xml.\n", food);
+            free(metric.line);
             return -1;
         }
-    } else if (fullness >= 0.0) {
-        if (!isfinite(fullness)) return -1;
-        if (fullness > 100.0) fullness = 100.0;
-        energy_bonus = fullness * 0.1;
+        fullness = metric.fullness;
+        energy_bonus = metric.energy;
     } else {
-        if (food_metric(food, &fullness, &energy_bonus) != 0) {
-            fprintf(stderr, "[R2 Reality] No food metric found for '%s' in room/food_metrics.xml.\n", food);
-            return -1;
-        }
+        if (isfinite(fullness) && fullness > 100.0) fullness = 100.0;
+        energy_bonus = fullness * 0.1;
     }
-    /* A zero-fullness item is not a meal: it must not reset the meal clock
-       or clear the prolonged-starvation marker without restoring fullness. */
-    if (!isfinite(fullness) || fullness <= 0.0) return -1;
+    /* A zero-fullness item is not a meal and cannot reset the meal clock. */
     if (energy_override >= 0.0) energy_bonus = energy_override;
-    if (fullness > 100.0) fullness = 100.0;
-    if (!isfinite(energy_bonus)) return -1;
+    if (!isfinite(fullness) || fullness <= 0.0 || !isfinite(energy_bonus) ||
+        (!fridge_ingredients && r2_reality_tick() != 0)) {
+        free(metric.line);
+        return -1;
+    }
     if (energy_bonus < 0.0) energy_bonus = 0.0;
     if (energy_bonus > 100.0) energy_bonus = 100.0;
-    if (!fridge_ingredients && r2_reality_tick() != 0) return -1;
-    char ingredients[1024] = {0}, taste[1024] = {0};
-    if (!fridge_ingredients)
-        food_attributes(food, ingredients, sizeof(ingredients), taste, sizeof(taste));
 
     char container[REALITY_MAX_TEXT + 1] = {0};
     char description[REALITY_MAX_TEXT + 1] = {0};
@@ -4477,6 +4501,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
     pthread_mutex_lock(&reality_lock);
     if (sqlite3_exec(reality_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
         pthread_mutex_unlock(&reality_lock);
+        free(metric.line);
         return -1;
     }
     sqlite3_stmt *st = NULL;
@@ -4499,6 +4524,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             if (st) sqlite3_finalize(st);
             (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
             pthread_mutex_unlock(&reality_lock);
+            free(metric.line);
             return -1;
         }
     }
@@ -4507,6 +4533,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
     if (consume_tracked_item && (quantity < 1 || !container_accessible(container))) {
         (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
         pthread_mutex_unlock(&reality_lock);
+        free(metric.line);
         return -1;
     }
 
@@ -4566,7 +4593,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             "INSERT INTO r2_food_experiences(food_name,ingredients,fullness,energy_bonus,eaten_at) VALUES(?,?,?,?,?)",
             -1, &st, NULL) == SQLITE_OK) {
             rc = bind_text(st, 1, food) == 0 ? SQLITE_OK : SQLITE_ERROR;
-            if (rc == SQLITE_OK) rc = bind_text(st, 2, fridge_ingredients ? fridge_ingredients : ingredients) == 0 ? SQLITE_OK : SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = bind_text(st, 2, fridge_ingredients ? fridge_ingredients : metric.ingredients) == 0 ? SQLITE_OK : SQLITE_ERROR;
             if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 3, fullness);
             if (rc == SQLITE_OK) rc = sqlite3_bind_double(st, 4, energy_bonus);
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, (sqlite3_int64)time(NULL));
@@ -4576,6 +4603,7 @@ static int reality_eat_internal(const char *food, double fullness, int consume_t
             rc = SQLITE_CONSTRAINT;
         if (st) sqlite3_finalize(st);
     }
+    free(metric.line);
     if (rc == SQLITE_DONE && fridge_ingredients) {
         st = NULL;
         rc = sqlite3_prepare_v2(reality_db,
@@ -4691,13 +4719,11 @@ int r2_reality_autonomous_food_available(void)
 char *r2_reality_food_context(const char *food)
 {
     if (!food || !*food || !r2_reality_is_initialized()) return NULL;
-    char ingredients[1024] = {0}, taste[1024] = {0};
-    double fullness = -1.0, energy = 0.0;
-    (void)food_metric(food, &fullness, &energy);
-    food_attributes(food, ingredients, sizeof(ingredients), taste, sizeof(taste));
+    R2FoodMetric metric;
+    if (load_food_metric(food, &metric) < 0) return NULL;
     char fullness_text[64] = {0};
-    if (fullness < 0) snprintf(fullness_text, sizeof(fullness_text), "not configured");
-    else snprintf(fullness_text, sizeof(fullness_text), "%.1f/100", fullness);
+    if (metric.fullness < 0) snprintf(fullness_text, sizeof(fullness_text), "not configured");
+    else snprintf(fullness_text, sizeof(fullness_text), "%.1f/100", metric.fullness);
     char *preferences = query_text(
         "SELECT ingredient,printf('average enjoyment rating %.2f/2',satisfaction_sum/rating_count),printf('%d ratings',rating_count) FROM r2_food_ingredient_preferences WHERE rating_count>0 ORDER BY satisfaction_sum*1.0/rating_count DESC", NULL);
     char *history = query_text(
@@ -4705,20 +4731,22 @@ char *r2_reality_food_context(const char *food)
     char *food_pref = query_text(
         "SELECT food_name,printf('average enjoyment rating %.2f/2',satisfaction_sum/rating_count),printf('%d ratings',rating_count) FROM r2_food_preferences WHERE food_name=? COLLATE NOCASE AND rating_count>0", food);
     if (!preferences || !history || !food_pref) {
-        free(preferences); free(history); free(food_pref); return NULL;
+        free(preferences); free(history); free(food_pref); free(metric.line); return NULL;
     }
-    size_t n = strlen(food)+strlen(ingredients)+strlen(taste)+strlen(preferences)+strlen(history)+strlen(food_pref)+1024;
-    char *out = malloc(n);
-    if (out) snprintf(out,n,
+    char *out = NULL;
+    if (asprintf(&out,
         "FOOD EXPERIENCE CONTEXT (learned subjective preferences; not hard-coded):\n"
         "Food: %s\nConfigured fullness: %s\nConfigured energy bonus: %.1f\nIngredients: %s\nSensory description: %s\n"
         "Past experiences with this food:\n%sFood preference summary:\n%sIngredient preference summaries:\n%s"
         "Food enjoyment is a subjective modeled rating from -2 (strong dislike) to +2 (strong enjoyment); 0 means neutral/uncertain. "
         "Fullness and satisfaction are independent. Ingredient summaries are learned only from rated eating experiences.",
-        food, fullness_text, energy,
-        *ingredients ? ingredients : "not specified", *taste ? taste : "not specified",
-        history, food_pref, preferences);
+        food, fullness_text, metric.energy,
+        *metric.ingredients ? metric.ingredients : "not specified",
+        *metric.taste ? metric.taste : "not specified",
+        history, food_pref, preferences) < 0)
+        out = NULL;
     free(preferences); free(history); free(food_pref);
+    free(metric.line);
     return out;
 }
 
@@ -4727,9 +4755,10 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     if (!food || !*food || satisfaction < -2 || satisfaction > 2 ||
         !r2_reality_is_initialized()) return -1;
 
-    char ingredients[1024] = {0}, taste[1024] = {0};
-    food_attributes(food, ingredients, sizeof(ingredients), taste, sizeof(taste));
+    R2FoodMetric metric;
+    int config_result = load_food_metric(food, &metric);
     char *ingredient_copy = NULL;
+    char *rated_ingredients = NULL;
 
     /*
      * One rating updates the experience and both levels of learned preference.
@@ -4751,11 +4780,16 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
         int step_rc = sqlite3_step(st);
         if (step_rc == SQLITE_ROW) {
             experience_id = sqlite3_column_int64(st, 0);
-            if (sqlite3_column_type(st, 1) == SQLITE_NULL)
-                ingredient_copy = strdup(ingredients);
-            else
+            if (sqlite3_column_type(st, 1) == SQLITE_NULL) {
+                if (config_result < 0) rc = SQLITE_IOERR;
+                else ingredient_copy = strdup(metric.ingredients);
+            } else {
                 rc = inventory_read_text(st, 1, &ingredient_copy);
-            if (rc == SQLITE_OK && !ingredient_copy) rc = SQLITE_NOMEM;
+            }
+            if (rc == SQLITE_OK) {
+                if (ingredient_copy) rated_ingredients = strdup(ingredient_copy);
+                if (!rated_ingredients) rc = SQLITE_NOMEM;
+            }
         } else if (step_rc == SQLITE_DONE) {
             rc = SQLITE_NOTFOUND;
         } else {
@@ -4844,14 +4878,23 @@ int r2_reality_rate_food(const char *food, int satisfaction, const char *notes)
     if (rc != SQLITE_OK) {
         fprintf(stderr, "[R2 Reality] Food rating transaction failed: %s\n",
                 error_message[0] ? error_message : "unknown SQLite error");
+        free(rated_ingredients);
+        free(metric.line);
         return -1;
     }
 
-    char summary[512], details[2048];
-    snprintf(summary,sizeof(summary),"R2's modeled enjoyment rating for %.200s was %+d/2.",food,satisfaction);
-    snprintf(details,sizeof(details),"Food=%.160s; ingredients=%.400s; sensory description=%.400s; enjoyment_rating=%d/2; reason=%.400s. This is a learned subjective simulation, not an externally verified reaction.",
-        food,*ingredients?ingredients:"not specified",*taste?taste:"not specified",satisfaction,notes?notes:"not supplied");
-    bridge_event("food_preference_learned",summary,details,1,0);
+    char *details = NULL;
+    if (asprintf(&details, "Food=%s; ingredients=%s; sensory description=%s; "
+                "enjoyment_rating=%d/2; reason=%s. This is a learned subjective simulation.",
+                food, *rated_ingredients ? rated_ingredients : "not specified",
+                *metric.taste ? metric.taste : "not specified", satisfaction,
+                notes ? notes : "not supplied") < 0)
+        details = NULL;
+    bridge_event("food_preference_learned", "R2 recorded a modeled enjoyment rating.",
+                 details, 1, 0);
+    free(details);
+    free(rated_ingredients);
+    free(metric.line);
     int learned_enjoyment = food_preference_enjoyment_score(food);
     (void)r2_addiction_rate_enjoyment(food, "food", learned_enjoyment,
                                       "food_feedback", notes);

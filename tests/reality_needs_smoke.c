@@ -658,6 +658,59 @@ static void verify_location_delivery_replay(void)
     r2_log_shutdown();
 }
 
+static void verify_complete_food_metrics(void)
+{
+    static const char food[] = "metric_complete";
+    char ingredients[5008], taste[5006];
+    memset(ingredients, 'i', sizeof(ingredients));
+    strcpy(ingredients + sizeof(ingredients) - sizeof("END-I"), "END-I");
+    memset(taste, 't', sizeof(taste));
+    strcpy(taste + sizeof(taste) - sizeof("END-T"), "END-T");
+    FILE *fp = fopen(R2_ROOT "/room/food_metrics.xml", "a");
+    if (!fp) fail("could not append complete nutrition fixture");
+    fputs("<!--\n <food name='metric_comment' fullness='90' />\n-->\n"
+          "<food nickname='metric_alias' fullness='90' />\n"
+          "<food name='metric_no_fullness' default-fullness='90' />\n"
+          "<food name='metric_complete' fullness='bad' />\n", fp);
+    for (int i = 0; i < 105; ++i)
+        fprintf(fp, "<food name='metric_padding_%d' fullness='30' />\n", i);
+    if (fprintf(fp, "<food name = '%s' fullness='30' energy='6' ingredients='%s' taste='%s' />\n",
+                food, ingredients, taste) < 0 || fclose(fp) != 0)
+        fail("could not write complete nutrition fixture");
+
+    char *context = r2_reality_context();
+    if (!context || !strstr(context, ingredients) || !strstr(context, taste) ||
+        strstr(context, "metric_comment") || strstr(context, "metric_alias") ||
+        strstr(context, "metric_no_fullness"))
+        fail("Reality context did not preserve exact and validated food metrics");
+    free(context);
+    const char *unconfigured[] = {"metric_comment", "metric_alias", "metric_no_fullness"};
+    for (size_t i = 0; i < sizeof(unconfigured) / sizeof(unconfigured[0]); ++i) {
+        if (r2_reality_add_item(unconfigured[i], "", "pockets", 1) != 0 ||
+            r2_reality_eat(unconfigured[i], -1.0) == 0)
+            fail("a comment or unrelated XML attribute authorized food consumption");
+        if (r2_reality_remove_item(unconfigured[i]) != 0)
+            fail("rejected meal removed its tracked item");
+    }
+    if (r2_reality_add_item(food, "", "fridge", 1) != 0 ||
+        r2_reality_fridge_eat(food, -1.0) != 0 || r2_reality_rate_food(food, 1, "test") != 0)
+        fail("configured long metadata could not reach the real fridge learning path");
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &db) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+            "SELECT e.ingredients,p.ingredient FROM r2_food_experiences e "
+            "JOIN r2_food_ingredient_preferences p ON p.ingredient=e.ingredients "
+            "WHERE e.food_name='metric_complete' AND e.satisfaction=1",
+            -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW ||
+        strcmp((const char *)sqlite3_column_text(st, 0), ingredients) ||
+        strcmp((const char *)sqlite3_column_text(st, 1), ingredients))
+        fail("food experience and ingredient preference did not keep complete metadata");
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
 int main(void)
 {
     seed_legacy_fridge_schema();
@@ -1788,6 +1841,7 @@ int main(void)
     read_needs(&hunger, &sleepiness, &energy, &satisfaction, &since_meal);
     if (hunger < 79.9 || hunger > 80.1)
         fail("hunger semantics migration must not invert state again on later restarts");
+    verify_complete_food_metrics();
     verify_location_delivery_replay();
     r2_reality_shutdown();
 

@@ -52,8 +52,14 @@ for rule in required_rules:
     if rule.lower() not in reality.lower():
         raise SystemExit(f"Reality.c is missing the explicit fridge rule: {rule}")
 
-if reality.count("!isfinite(f)") < 2 or reality.count("isfinite(parsed)") < 2:
-    raise SystemExit("food metric parsing and context must reject non-finite numeric values")
+metric_parser = reality[reality.index("static int parse_food_metric("):
+                        reality.index("static int load_food_metric(")]
+if metric_parser.count("isfinite(value)") != 2:
+    raise SystemExit("the shared food metric parser must validate both numeric attributes")
+metrics_context = reality[reality.index("static char *food_metrics_context("):
+                          reality.index("static int update_hunger_locked(")]
+if "parse_food_metric(" not in metrics_context or "metric.fullness < 0.0" not in metrics_context:
+    raise SystemExit("the context must use the same validated food metrics as consumption")
 new_fridge_schema = next(
     (line for line in reality.splitlines()
      if '"CREATE TABLE IF NOT EXISTS r2_fridge_items(' in line),
