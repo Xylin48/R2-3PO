@@ -306,6 +306,21 @@ static void check_imagination_persistence_and_feedback(void)
         NULL, NULL, NULL) == SQLITE_OK);
     assert(r2_altself_create_imagination("Ignored branch", "Hypothetical", "Possible", context) < 0);
     assert(sqlite3_exec(fixture, "DROP TRIGGER ignore_new_branch;", NULL, NULL, NULL) == SQLITE_OK);
+    int64_t evidence = r2_log_event(R2_LOG_WORLD, "branch_evidence", "Branch evidence", NULL, "fixture");
+    assert(evidence > 0);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER ignore_new_branch_evidence BEFORE INSERT ON r2_log_links "
+        "WHEN NEW.relationship='evidence_for_hypothesis' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_altself_create("Branch", "Ignored branch evidence", NULL, NULL, NULL, evidence) < 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER ignore_new_branch_evidence;", NULL, NULL, NULL) == SQLITE_OK);
+    char *uncommitted = r2_log_search("Ignored branch", 10);
+    assert(uncommitted && strstr(uncommitted, "No Life Log events matched"));
+    free(uncommitted);
+    assert(r2_altself_create("Branch", "Linked branch evidence", NULL, NULL, NULL, evidence) > 0);
+    char *linked_branch = r2_log_search("Linked branch evidence", 10);
+    assert(linked_branch && strstr(linked_branch, "evidence_for_hypothesis"));
+    free(linked_branch);
     r2_altself_shutdown();
     assert(r2_altself_init() == 0);
     char *archived = r2_altself_show(branch);

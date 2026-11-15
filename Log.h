@@ -284,6 +284,12 @@ int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assu
                                           const char *predicted_outcome, const char *conclusion,
                                           const char *origin, int64_t parent_event_id,
                                           const char *evidence);
+/* Write the branch on the Life Log database connection within its transaction.
+ * The callback must return SQLITE_DONE after inserting exactly one row. */
+int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
+                                        const char *predicted_outcome, const char *conclusion,
+                                        int64_t evidence_event_id,
+                                        int (*save_branch)(struct sqlite3 *, int64_t, void *), void *branch);
 
 /* Complete inference snapshots use an archive outside ordinary event recall.
  * Returned text is caller-owned. Missing or unreadable snapshots return NULL. */

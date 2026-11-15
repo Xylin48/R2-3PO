@@ -271,64 +271,64 @@ void r2_altself_shutdown(void)
     pthread_mutex_unlock(&as_lock);
 }
 
+typedef struct {
+    const char *name;
+    const char *scenario;
+    const char *assumptions;
+    const char *predicted_outcome;
+    const char *conclusion;
+    const char *imagination_context;
+    int64_t evidence_event_id;
+    int64_t id;
+} AlternateSelfBranch;
+
+static int write_branch(sqlite3 *db, int64_t event_id, void *context)
+{
+    AlternateSelfBranch *branch = context;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "INSERT INTO r2_alternate_self_branches"
+        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind,imagination_context)"
+        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?);", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, branch->name, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, branch->scenario, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = branch->assumptions ? sqlite3_bind_text(st, 3, branch->assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
+    if (rc == SQLITE_OK) rc = branch->predicted_outcome ? sqlite3_bind_text(st, 4, branch->predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = branch->conclusion ? sqlite3_bind_text(st, 5, branch->conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);
+    if (rc == SQLITE_OK) rc = branch->evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, branch->evidence_event_id) : sqlite3_bind_null(st, 6);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 8,
+        branch->imagination_context ? "imagination" : "counterfactual", -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = branch->imagination_context
+        ? sqlite3_bind_text64(st, 9, branch->imagination_context, strlen(branch->imagination_context),
+                             SQLITE_TRANSIENT, SQLITE_UTF8)
+        : sqlite3_bind_null(st, 9);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(db) == 1)
+        branch->id = sqlite3_last_insert_rowid(db);
+    sqlite3_finalize(st);
+    return rc;
+}
+
 static int64_t create_branch(const char *name, const char *scenario,
                              const char *assumptions, const char *predicted_outcome,
                              const char *conclusion, int64_t evidence_event_id,
                              const char *imagination_context)
 {
     if (!name || !*name || !scenario || !*scenario) return -1;
+    AlternateSelfBranch branch = {
+        .name = name, .scenario = scenario, .assumptions = assumptions,
+        .predicted_outcome = predicted_outcome, .conclusion = conclusion,
+        .imagination_context = imagination_context, .evidence_event_id = evidence_event_id,
+        .id = -1,
+    };
     pthread_mutex_lock(&as_lock);
-    if (!as_ready || !as_db) {
-        pthread_mutex_unlock(&as_lock);
-        return -1;
-    }
-    if (evidence_event_id > 0) {
-        sqlite3_stmt *check = NULL;
-        int check_rc = sqlite3_prepare_v2(as_db,
-            "SELECT 1 FROM r2_log_events WHERE id=?;", -1, &check, NULL);
-        if (check_rc == SQLITE_OK) check_rc = sqlite3_bind_int64(check, 1, evidence_event_id);
-        if (check_rc == SQLITE_OK) check_rc = sqlite3_step(check);
-        sqlite3_finalize(check);
-        if (check_rc != SQLITE_ROW) {
-            pthread_mutex_unlock(&as_lock);
-            return -1;
-        }
-    }
+    int64_t event_id = (as_ready && as_db)
+        ? r2_log_hypothetical_with_branch(scenario, assumptions, predicted_outcome, conclusion,
+                                          evidence_event_id, write_branch, &branch)
+        : -1;
     pthread_mutex_unlock(&as_lock);
-
-    int64_t event_id = r2_log_hypothetical(scenario, assumptions,
-        predicted_outcome, conclusion, "Alternate-Self Lab; hypothetical only");
-    if (event_id < 0) return -1;
-
-    pthread_mutex_lock(&as_lock);
-    if (!as_ready || !as_db) { pthread_mutex_unlock(&as_lock); return -1; }
-    sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(as_db,
-        "INSERT INTO r2_alternate_self_branches"
-        "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind,imagination_context)"
-        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?);", -1, &st, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
-    if (rc == SQLITE_OK) rc = predicted_outcome ? sqlite3_bind_text(st, 4, predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
-    if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 5, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);
-    if (rc == SQLITE_OK) rc = evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, evidence_event_id) : sqlite3_bind_null(st, 6);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, event_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 8,
-        imagination_context ? "imagination" : "counterfactual", -1, SQLITE_STATIC);
-    if (rc == SQLITE_OK) rc = imagination_context
-        ? sqlite3_bind_text64(st, 9, imagination_context, strlen(imagination_context),
-                             SQLITE_TRANSIENT, SQLITE_UTF8)
-        : sqlite3_bind_null(st, 9);
-    if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    int64_t id = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1
-        ? sqlite3_last_insert_rowid(as_db) : -1;
-    sqlite3_finalize(st);
-    pthread_mutex_unlock(&as_lock);
-    if (id > 0 && evidence_event_id > 0)
-        r2_log_link(evidence_event_id, event_id, "evidence_for_hypothesis",
-                    "Evidence is referenced for comparison; it is not altered by this branch.");
-    return id;
+    return event_id > 0 ? branch.id : -1;
 }
 
 int64_t r2_altself_create(const char *name, const char *scenario,
@@ -390,21 +390,26 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
         "AND COALESCE(predicted_outcome,'')=COALESCE(?,'') "
         "AND COALESCE(conclusion,'')=COALESCE(?,'') AND status!='discarded' "
         "AND branch_kind='counterfactual' "
+        "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?5) "
+        "AND (?6<=0 OR EXISTS(SELECT 1 FROM r2_log_events WHERE id=?6)) "
         "ORDER BY id LIMIT 1;", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 2, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 2);
     if (rc == SQLITE_OK) rc = predicted_outcome ? sqlite3_bind_text(st, 3, predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
     if (rc == SQLITE_OK) rc = conclusion ? sqlite3_bind_text(st, 4, conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, hypothetical_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 6, evidence_event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
         int64_t existing = sqlite3_column_int64(st, 0);
         int64_t original_event = sqlite3_column_int64(st, 1);
         sqlite3_finalize(st);
         pthread_mutex_unlock(&as_lock);
-        if (original_event > 0 && original_event != hypothetical_event_id)
+        if (original_event > 0 && original_event != hypothetical_event_id &&
             r2_log_link(hypothetical_event_id, original_event,
                         "same_hypothesis_as",
-                        "The same counterfactual was already retained as a branch; this occurrence remains in the Life Log.");
+                        "The same counterfactual was already retained as a branch; this occurrence remains in the Life Log.") != 0)
+            return -1;
         return existing;
     }
     sqlite3_finalize(st);
@@ -416,7 +421,9 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_branches"
         "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind)"
-        " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'counterfactual');", -1, &st, NULL);
+        " SELECT ?1,?2,?3,?4,?5,'active',?6,?7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,'counterfactual' "
+        "WHERE EXISTS(SELECT 1 FROM r2_log_events WHERE id=?7) "
+        "AND (?6 IS NULL OR EXISTS(SELECT 1 FROM r2_log_events WHERE id=?6));", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = assumptions ? sqlite3_bind_text(st, 3, assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
@@ -430,10 +437,14 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
         sqlite3_stmt *existing = NULL;
         int existing_rc = sqlite3_prepare_v2(as_db,
             "SELECT id FROM r2_alternate_self_branches "
-            "WHERE log_event_id=? AND branch_kind='counterfactual';",
+            "WHERE log_event_id=?1 AND branch_kind='counterfactual' "
+            "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?1) "
+            "AND (?2<=0 OR EXISTS(SELECT 1 FROM r2_log_events WHERE id=?2));",
             -1, &existing, NULL);
         if (existing_rc == SQLITE_OK)
             existing_rc = sqlite3_bind_int64(existing, 1, hypothetical_event_id);
+        if (existing_rc == SQLITE_OK)
+            existing_rc = sqlite3_bind_int64(existing, 2, evidence_event_id);
         if (existing_rc == SQLITE_OK) existing_rc = sqlite3_step(existing);
         if (existing_rc == SQLITE_ROW)
             id = sqlite3_column_int64(existing, 0);

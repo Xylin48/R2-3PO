@@ -2443,10 +2443,11 @@ int r2_log_replay_reflections(void)
     }
 }
 
-int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
-                                          const char *predicted_outcome, const char *conclusion,
-                                          const char *origin, int64_t parent_event_id,
-                                          const char *evidence)
+static int64_t log_hypothetical_record(const char *scenario, const char *assumptions,
+                                       const char *predicted_outcome, const char *conclusion,
+                                       const char *origin, int64_t parent_event_id,
+                                       const char *relationship, const char *evidence,
+                                       int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
 {
     if (!valid_text(scenario) || strlen(scenario) > 8192 ||
         (assumptions && strlen(assumptions) > R2_LOG_MAX_TEXT) ||
@@ -2481,8 +2482,33 @@ int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assu
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, origin);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
+    if (save_branch && rc == SQLITE_DONE && sqlite3_changes(log_db) == 1) {
+        sqlite3_finalize(st);
+        st = NULL;
+        rc = save_branch(log_db, event_id, branch);
+    }
     return log_finish_structured(event_id, st, rc, "hypothetical", parent_event_id,
-                                 "contains_hypothetical", evidence);
+                                 relationship, evidence);
+}
+
+int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence)
+{
+    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+                                   origin, parent_event_id, "contains_hypothetical", evidence, NULL, NULL);
+}
+
+int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
+                                        const char *predicted_outcome, const char *conclusion,
+                                        int64_t evidence_event_id,
+                                        int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
+{
+    if (!save_branch) return -1;
+    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+        "Alternate-Self Lab; hypothetical only", evidence_event_id, "evidence_for_hypothesis",
+        "Evidence is referenced for comparison; it is not altered by this branch.", save_branch, branch);
 }
 
 int64_t r2_log_hypothetical(const char *scenario, const char *assumptions,
