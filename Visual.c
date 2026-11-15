@@ -291,7 +291,8 @@ static int visual_sync(int fd)
 
 static int visual_sync_directory(const char *path)
 {
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    /* Never sync a replacement symlink instead of the archive directory. */
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     int rc = visual_sync(fd);
     int error = errno;
