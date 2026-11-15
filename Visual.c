@@ -1404,7 +1404,11 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     }
     /* Resolve parent components only after verifying the final archive
        component is a real directory. This also normalizes trailing slashes. */
-    if (!realpath(library_directory, visual_directory)) {
+    /* Recheck after mkdir: the directory may have been replaced while
+       its parent was synchronized. Archive creation and recovery also pin
+       directory handles independently for their own I/O boundaries. */
+    if (visual_reject_library_symlinks(visual_directory) != 0 ||
+        !realpath(visual_directory, visual_directory)) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
