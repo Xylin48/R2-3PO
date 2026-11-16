@@ -44,7 +44,7 @@ if reflection_start < 0:
 reflection = core[reflection_start:reflection_end if reflection_end > reflection_start else reflection_start + 12000]
 background = reflection.index("ollama_background_mode = 1;")
 generation = reflection.index("generate_with_private_evidence(")
-learning = reflection.index("log_structured_self_report(")
+learning = reflection.index("publish_structured_self_report(")
 if not background < generation < learning or reflection.count("ollama_background_mode =") != 1:
     raise SystemExit("Reflection generation and derived learning must share the worker's background mode.")
 

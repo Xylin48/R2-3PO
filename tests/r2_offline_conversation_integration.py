@@ -26,6 +26,7 @@ REPLY = "I received your message and can respond in this conversation."
 REFLECTION = ("I closed Eyes deliberately and kept the earlier evidence separate. "
               "The literal `[SENSE]` label records how I made that choice.\n"
               "```text\n[EARS_LISTEN] is only a quoted example.\n```")
+PRIVATE_REFLECTION_QUOTE = "I closed Eyes deliberately and kept the earlier evidence separate."
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
@@ -132,7 +133,13 @@ class LocalOllama(BaseHTTPRequestHandler):
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
         elif "strict structured data extractor" in system:
-            reply = SELF_REPORT_EXTRACTION if any(SELF_REPORT_REPLY in m for m in user_messages) else "{}"
+            if any(SELF_REPORT_REPLY in m for m in user_messages):
+                reply = SELF_REPORT_EXTRACTION
+            elif any("Private diary reflection." in m and REFLECTION in m for m in user_messages):
+                reply = json.dumps({"states": [{"kind": "self_assessment",
+                    "description": "Kept earlier evidence separate.", "evidence": PRIVATE_REFLECTION_QUOTE}]})
+            else:
+                reply = "{}"
         elif "memory-evaluation system" in system:
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
@@ -690,13 +697,44 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
                 "WHERE l.diary_entry_id=? ORDER BY r.ordinal", (diary_id,),
             ).fetchall() == archives
             assert daily.read_text(encoding="utf-8").count(marker) == 1
+            source = db.execute(
+                "SELECT event_id FROM r2_sensory_journal_reflection_links WHERE diary_entry_id=?",
+                (diary_id,),
+            ).fetchone()[0]
+            assert db.execute(
+                "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
+                (source,),
+            ).fetchone() == (REFLECTION, None)
             process.terminate()
             assert process.wait(timeout=15) == 0
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    print("PASS: live service recovered exact reflection links and acknowledged the existing mirror once.")
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            wait_for(lambda: not db.execute(
+                "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?", (source,),
+            ).fetchone())
+            assert db.execute(
+                "SELECT s.description,s.origin,l.notes FROM r2_log_links l "
+                "JOIN r2_log_inner_states s ON s.event_id=l.to_event_id "
+                "WHERE l.from_event_id=? AND l.relationship='extracts_self_state'", (source,),
+            ).fetchall() == [("Kept earlier evidence separate.",
+                               "private R2 diary reflection; model-extracted with quoted evidence",
+                               PRIVATE_REFLECTION_QUOTE)]
+            process.terminate()
+            assert process.wait(timeout=15) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            assert process.stdin is not None
+            process.stdin.close()
+    print("PASS: live service recovered reflection links and its mirror, then recovered private extraction after restart.")
 
 
 def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> None:

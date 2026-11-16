@@ -438,7 +438,8 @@ static int r2_context_turn_record(int64_t archive_id)
     return 0;
 }
 
-static void log_structured_self_report(const char *reply, int64_t parent_event_id);
+static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
+                                           const char *saved_extraction, int private_reflection);
 static char *append_reality_context(char *base);
 static void autonomous_needs_check(void);
 
@@ -10086,7 +10087,7 @@ static void *autonomous_thinking(void *arg)
         const int64_t reviews[] = {initial_archive, followup_archive};
         int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
-            log_structured_self_report(reflection, reflection_event_id);
+            publish_structured_self_report(reflection, reflection_event_id, NULL, 1);
             if (reflection_tool_result && *reflection_tool_result)
                 preserve_evidence_memory(NULL, reflection, reflection_tool_result, reflection_event_id);
             r2_log_continuity("r2_private_reflection", "routine",
@@ -13915,17 +13916,18 @@ static const char *structured_report_evidence(json_object *item, const char *rep
     return NULL;
 }
 
-static char *extract_structured_self_report(const char *reply, int64_t parent_event_id)
+static char *extract_structured_self_report(const char *reply, int64_t parent_event_id,
+                                            int private_reflection)
 {
     if (!reply || !*reply || parent_event_id <= 0 || !r2_log_is_initialized())
         return NULL;
 
     char *input = NULL;
     const char *prefix =
-        "Extract structured records from R2's visible response below. "
-        "Only record claims explicitly present in the response; do not infer "
+        "Extract structured records from the quoted source text. "
+        "Only record claims explicitly present in the source; do not infer "
         "unstated feelings or beliefs. Evidence must be a short exact quote "
-        "from the response. Do not treat hypothetical examples as real events. "
+        "from the source. Do not treat hypothetical examples as real events. "
         "Return ONLY valid JSON with this schema: "
         "{\"states\":[{\"kind\":\"emotion|motivation|uncertainty|question|intention|preference|self_assessment\","
         "\"description\":\"...\",\"evidence\":\"exact quote\",\"confidence\":0.0}],"
@@ -13937,22 +13939,24 @@ static char *extract_structured_self_report(const char *reply, int64_t parent_ev
         "\"hypotheticals\":[{\"scenario\":\"...\",\"assumptions\":\"...\","
         "\"predicted_outcome\":\"...\",\"conclusion\":\"...\",\"evidence\":\"exact quote explicitly marking the scenario as hypothetical\"}]}. "
         "Use empty arrays when there is no evidence. Include hypotheticals only when R2 explicitly labels a scenario as hypothetical or counterfactual. Confidence is evidence "
-        "strength, not a measure of consciousness. Never invent exact quotes.\n\n"
-        "R2 visible response:\n";
-    size_t n = strlen(prefix) + strlen(reply) + 1;
+        "strength, not a measure of consciousness. Never invent exact quotes.\n\n";
+    const char *heading = private_reflection
+        ? "Private diary reflection. Preserve uncertainty and speculation as such:\n"
+        : "R2 visible response:\n";
+    size_t n = strlen(prefix) + strlen(heading) + strlen(reply) + 1;
     input = malloc(n);
     if (!input) {
         char details[160];
         snprintf(details, sizeof(details),
-                 "conversation_event_id=%lld; structured extraction input allocation failed.",
+                 "source_event_id=%lld; structured extraction input allocation failed.",
                  (long long)parent_event_id);
         fprintf(stderr, "[R2 Post-turn] Could not allocate structured self-state extraction input.\n");
         (void)r2_log_event(R2_LOG_ERROR, "self_state_extraction_allocation_failed",
                            "Structured self-state extraction could not start because input allocation failed.",
-                           details, "log_structured_self_report");
+                           details, "publish_structured_self_report");
         return NULL;
     }
-    snprintf(input, n, "%s%s", prefix, reply);
+    snprintf(input, n, "%s%s%s", prefix, heading, reply);
 
     Message m = { "user", input, 0, 0 };
     const char *system = "You are a strict structured data extractor. Output only valid JSON.";
@@ -13966,8 +13970,9 @@ static char *extract_structured_self_report(const char *reply, int64_t parent_ev
            original response after using the review to find candidates. */
         char task[288];
         snprintf(task, sizeof(task),
-            "Review R2's exact response from Life Log event %lld. Preserve short verbatim quotations and "
+            "Review R2's exact %s from Life Log event %lld. Preserve short verbatim quotations and "
             "distinguish explicit self-reports, beliefs, continuity and clearly hypothetical scenarios.",
+            private_reflection ? "private diary reflection" : "visible response",
             (long long)parent_event_id);
         json_text = generate_with_private_evidence(prefix, task, reply, NULL, NULL);
     }
@@ -13976,7 +13981,7 @@ static char *extract_structured_self_report(const char *reply, int64_t parent_ev
         if (post_turn_deferred && *post_turn_deferred) return NULL;
         r2_log_event(R2_LOG_ERROR, "self_state_extraction_failed",
                      "Structured self-state extraction did not return a response.",
-                     NULL, "log_structured_self_report");
+                     NULL, "publish_structured_self_report");
         return NULL;
     }
 
@@ -13984,9 +13989,10 @@ static char *extract_structured_self_report(const char *reply, int64_t parent_ev
 }
 
 static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
-                                           const char *saved_extraction, int durable)
+                                           const char *saved_extraction, int private_reflection)
 {
-    char *generated = saved_extraction ? NULL : extract_structured_self_report(reply, parent_event_id);
+    char *generated = saved_extraction ? NULL
+        : extract_structured_self_report(reply, parent_event_id, private_reflection);
     const char *extraction = saved_extraction ? saved_extraction : generated;
     if (!extraction) return;
 
@@ -13995,11 +14001,11 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
         free(generated);
         r2_log_event(R2_LOG_ERROR, "self_state_json_invalid",
                      "Structured self-state extraction returned invalid JSON.",
-                     NULL, "log_structured_self_report");
+                     NULL, "publish_structured_self_report");
         return;
     }
 
-    if (durable && generated && r2_log_save_self_report(parent_event_id, generated) != 0) {
+    if (generated && r2_log_save_self_report(parent_event_id, generated) != 0) {
         fprintf(stderr, "[R2 Post-turn] Could not stage the self-report extraction.\n");
         free(generated);
         json_object_put(root);
@@ -14008,6 +14014,12 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
     free(generated);
 
     int complete = 1;
+    const char *origin = private_reflection
+        ? "private R2 diary reflection; model-extracted with quoted evidence"
+        : "explicit R2 response; model-extracted with quoted evidence";
+    const char *concise_origin = private_reflection
+        ? "private R2 diary reflection; model-extracted"
+        : "explicit R2 response; model-extracted";
     /* Receipts use the original array position and record type. */
     struct json_object *arr = NULL, *item = NULL, *v = NULL;
     if (json_object_object_get_ex(root, "states", &arr) &&
@@ -14028,8 +14040,8 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (description && *description && evidence) {
                 if (r2_log_inner_state_record(kind, description, evidence, confidence,
-                        "explicit R2 response; model-extracted with quoted evidence",
-                        parent_event_id, durable ? (int64_t)i * 4 : -1) < 0)
+                        origin,
+                        parent_event_id, (int64_t)i * 4) < 0)
                     complete = 0;
             }
         }
@@ -14055,8 +14067,8 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (key && *key && belief && *belief && evidence) {
                 if (r2_log_belief_record(key, belief, evidence, confidence, status,
-                        "explicit R2 response; model-extracted with quoted evidence",
-                        parent_event_id, durable ? (int64_t)i * 4 + 1 : -1) < 0)
+                        origin,
+                        parent_event_id, (int64_t)i * 4 + 1) < 0)
                     complete = 0;
             }
         }
@@ -14084,8 +14096,8 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
             const char *evidence = structured_report_evidence(item, reply);
             if (key && *key && title && *title && evidence) {
                 if (r2_log_continuity_record(key, type, title, description, status, next_action,
-                        "explicit R2 response; model-extracted", parent_event_id, evidence,
-                        durable ? (int64_t)i * 4 + 2 : -1) < 0)
+                        concise_origin, parent_event_id, evidence,
+                        (int64_t)i * 4 + 2) < 0)
                     complete = 0;
             }
         }
@@ -14116,8 +14128,8 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
             if (scenario && *scenario && evidence) {
                 int64_t child = r2_log_hypothetical_record(
                     scenario, assumptions, predicted, conclusion,
-                    "explicit R2 response; model-extracted", parent_event_id, evidence,
-                    durable ? (int64_t)i * 4 + 3 : -1);
+                    concise_origin, parent_event_id, evidence,
+                    (int64_t)i * 4 + 3);
                 if (child < 0 || r2_altself_import_hypothesis(
                         scenario, assumptions, predicted, conclusion, child, 0) < 0)
                     complete = 0;
@@ -14126,14 +14138,9 @@ static void publish_structured_self_report(const char *reply, int64_t parent_eve
     }
 
     json_object_put(root);
-    if (durable && (!complete || r2_log_ack_self_report(parent_event_id) != 0))
+    if (!complete || r2_log_ack_self_report(parent_event_id) != 0)
         fprintf(stderr, "[R2 Post-turn] Self-report for event %lld remains pending.\n",
                 (long long)parent_event_id);
-}
-
-static void log_structured_self_report(const char *reply, int64_t parent_event_id)
-{
-    publish_structured_self_report(reply, parent_event_id, NULL, 0);
 }
 
 typedef struct {
@@ -14144,6 +14151,7 @@ typedef struct {
     int64_t event_id;
     int self_report_pending;
     int memory_pending;
+    int private_reflection;
 } R2PostTurnJob;
 
 static void preserve_evidence_memory(const char *user, const char *reply,
@@ -14221,7 +14229,8 @@ static void run_post_turn_job(R2PostTurnJob *job)
         if (atomic_load(&foreground_conversation_waiting) > 0) continue;
         deferred = 0;
         if (stage == 0 && job->self_report_pending)
-            publish_structured_self_report(job->reply, job->event_id, job->extraction, 1);
+            publish_structured_self_report(job->reply, job->event_id, job->extraction,
+                                           job->private_reflection);
         if (stage == 1 && job->memory_pending)
             preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
         if (!deferred) stage++;
@@ -14296,8 +14305,9 @@ static void *replay_pending_learning(void *opaque)
             "SELECT MIN(event_id) AS event_id FROM r2_log_pending_learning WHERE event_id>?1 AND event_id<=?2 "
             "UNION ALL SELECT MIN(event_id) FROM r2_log_pending_self_reports WHERE event_id>?1 AND event_id<=?2)) "
             "SELECT n.event_id,m.user_text,COALESCE(s.assistant_text,m.assistant_text),m.tool_result,"
-            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL "
-            "FROM next n LEFT JOIN r2_log_pending_learning m USING(event_id) "
+            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL,e.event_type='reflection_completed' "
+            "FROM next n JOIN r2_log_events e ON e.id=n.event_id "
+            "LEFT JOIN r2_log_pending_learning m USING(event_id) "
             "LEFT JOIN r2_log_pending_self_reports s USING(event_id) "
             "WHERE n.event_id IS NOT NULL;", -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
@@ -14308,6 +14318,7 @@ static void *replay_pending_learning(void *opaque)
             after = job.event_id = sqlite3_column_int64(st, 0);
             job.self_report_pending = sqlite3_column_int(st, 5);
             job.memory_pending = sqlite3_column_int(st, 6);
+            job.private_reflection = sqlite3_column_int(st, 7);
             const char *fields[4];
             if (memory_read_fields(st, 1, 4, fields) == 0 && fields[1]) {
                 job.user = fields[0] ? strdup(fields[0]) : NULL;

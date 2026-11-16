@@ -743,7 +743,9 @@ static void check_structured_report_evidence(void)
         "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
     sqlite3 *fixture = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
-    int64_t parent = r2_log_conversation_turn("Tell me what you think.", reply);
+    assert(r2_altself_init() == 0);
+    int64_t parent = r2_log_conversation_turn_for_learning(
+        "Tell me what you think.", reply, NULL, 0, NULL, 0, NULL);
     assert(parent > 0);
     assert(sqlite3_exec(fixture,
         "CREATE TRIGGER ignore_structured_row BEFORE INSERT ON r2_log_inner_states "
@@ -772,7 +774,7 @@ static void check_structured_report_evidence(void)
             "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
         set_response(phase ? report : invalid, "stop", 1);
         free(invalid);
-        log_structured_self_report(reply, parent);
+        publish_structured_self_report(reply, parent, phase == 2 ? report : NULL, 0);
         if (phase == 1) assert(sqlite3_exec(fixture,
             "DROP TRIGGER ignore_evidence_link", NULL, NULL, NULL) == SQLITE_OK);
         int valid = phase == 2;
@@ -790,6 +792,7 @@ static void check_structured_report_evidence(void)
         sqlite3_finalize(st);
     }
     assert(sqlite3_close(fixture) == SQLITE_OK);
+    r2_altself_shutdown();
 }
 
 int main(void)

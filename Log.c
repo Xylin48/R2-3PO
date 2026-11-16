@@ -575,8 +575,6 @@ static int ensure_tables(void)
         " FOREIGN KEY(from_event_id) REFERENCES r2_log_events(id),"
         " FOREIGN KEY(to_event_id) REFERENCES r2_log_events(id)"
         ");"
-        "CREATE INDEX IF NOT EXISTS r2_log_links_target_idx "
-        "ON r2_log_links(to_event_id,relationship,from_event_id);"
         "CREATE TABLE IF NOT EXISTS r2_sensory_journal_reflection_links ("
         " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
         " diary_entry_id INTEGER NOT NULL REFERENCES diary_entries(id)"
@@ -621,10 +619,11 @@ static int ensure_tables(void)
         " FOREIGN KEY(event_id) REFERENCES r2_log_events(id)"
         ");";
 
-    if (exec_sql(schema) != 0)
+    if (exec_sql(schema) != 0 || migrate_legacy_log_schema() != 0)
         return -1;
 
-    return migrate_legacy_log_schema();
+    return exec_sql("CREATE INDEX IF NOT EXISTS r2_log_links_target_idx "
+                    "ON r2_log_links(to_event_id,relationship,from_event_id);");
 }
 
 typedef struct R2LegacyLogLinkBackfill {
@@ -1427,6 +1426,21 @@ static void log_replay_conversation_archives(void)
 static const char log_conversation_tool_prefix[] =
     R2_LOG_CONVERSATION_TOOL_PREFIX;
 
+/* Queue the exact source text inside the authoritative event transaction. */
+static int log_stage_self_report_locked(int64_t event_id, const char *text)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "INSERT INTO r2_log_pending_self_reports(event_id,assistant_text) VALUES(?,?);",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 2, text, strlen(text), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    return saved;
+}
+
 static int64_t log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
                                                     const int64_t *speech_ids, size_t speech_count,
                                                     const int64_t *review_ids, size_t review_count,
@@ -1506,17 +1520,8 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
         saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
         sqlite3_finalize(statement);
     }
-    if (saved && stage_learning) {
-        statement = NULL;
-        rc = sqlite3_prepare_v2(log_db,
-            "INSERT INTO r2_log_pending_self_reports(event_id,assistant_text) VALUES(?,?);",
-            -1, &statement, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, assistant_text, assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
-        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
-        sqlite3_finalize(statement);
-    }
+    if (saved && stage_learning)
+        saved = log_stage_self_report_locked(event_id, assistant_text);
     saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
                     log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
@@ -2552,10 +2557,9 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
         ? log_insert_event_locked(R2_LOG_THINKING, type,
                                   "Private diary reflection was written.", entry, "internal_thinking")
         : -1;
+    int saved = event_id > 0 && log_stage_self_report_locked(event_id, entry);
     sqlite3_finalize(st);
     st = NULL;
-
-    int saved = event_id > 0;
     if (saved) {
         rc = sqlite3_prepare_v2(log_db,
             "INSERT INTO r2_sensory_journal_reflection_links(event_id,diary_entry_id) VALUES(?,?);",
