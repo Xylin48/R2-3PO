@@ -517,6 +517,15 @@ static int ensure_tables(void)
         " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
         " user_text TEXT NOT NULL, assistant_text TEXT NOT NULL, tool_result TEXT"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_pending_self_reports ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " assistant_text TEXT NOT NULL, extraction TEXT"
+        ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_self_report_records ("
+        " parent_event_id INTEGER NOT NULL REFERENCES r2_log_pending_self_reports(event_id) ON DELETE CASCADE,"
+        " ordinal INTEGER NOT NULL, child_event_id INTEGER NOT NULL REFERENCES r2_log_events(id),"
+        " PRIMARY KEY(parent_event_id,ordinal)"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_inner_states ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " event_id INTEGER NOT NULL,"
@@ -566,6 +575,8 @@ static int ensure_tables(void)
         " FOREIGN KEY(from_event_id) REFERENCES r2_log_events(id),"
         " FOREIGN KEY(to_event_id) REFERENCES r2_log_events(id)"
         ");"
+        "CREATE INDEX IF NOT EXISTS r2_log_links_target_idx "
+        "ON r2_log_links(to_event_id,relationship,from_event_id);"
         "CREATE TABLE IF NOT EXISTS r2_sensory_journal_reflection_links ("
         " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
         " diary_entry_id INTEGER NOT NULL REFERENCES diary_entries(id)"
@@ -1495,6 +1506,17 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
         saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
         sqlite3_finalize(statement);
     }
+    if (saved && stage_learning) {
+        statement = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_pending_self_reports(event_id,assistant_text) VALUES(?,?);",
+            -1, &statement, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, assistant_text, assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(statement);
+    }
     saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
                     log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
@@ -2104,12 +2126,64 @@ static void log_structured_insert_error(const char *record_type)
             record_type, log_db ? sqlite3_errmsg(log_db) : "database unavailable");
 }
 
-/* On success, leave the transaction and lock owned by the caller. */
-static int64_t log_begin_structured(R2LogCategory category, const char *event_type,
-                                   const char *summary, const char *details, const char *origin)
+/* Save the exact accepted extraction before writing any of its records. */
+int r2_log_save_self_report(int64_t event_id, const char *extraction)
+{
+    if (event_id <= 0 || !valid_text(extraction)) return -1;
+    pthread_mutex_lock(&log_lock);
+    sqlite3_stmt *st = NULL;
+    int rc = !log_initialized || !log_db ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
+        "UPDATE r2_log_pending_self_reports SET extraction=? WHERE event_id=? AND extraction IS NULL;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 1, extraction, strlen(extraction), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return saved ? 0 : -1;
+}
+
+int r2_log_ack_self_report(int64_t event_id)
 {
     pthread_mutex_lock(&log_lock);
+    sqlite3_stmt *st = NULL;
+    int rc = !log_initialized || !log_db ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
+        "DELETE FROM r2_log_pending_self_reports WHERE event_id=?;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return saved ? 0 : -1;
+}
+
+/* A new event leaves the transaction and lock owned by the caller. A receipt
+ * returns the original child ID with neither the transaction nor lock held. */
+static int64_t log_begin_structured(R2LogCategory category, const char *event_type,
+                                   const char *summary, const char *details, const char *origin,
+                                   int64_t parent, int64_t ordinal, int *replayed)
+{
+    *replayed = 0;
+    pthread_mutex_lock(&log_lock);
     if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0) {
+        if (ordinal >= 0) {
+            sqlite3_stmt *st = NULL;
+            int rc = sqlite3_prepare_v2(log_db,
+                "SELECT child_event_id FROM r2_log_self_report_records WHERE parent_event_id=? AND ordinal=?;",
+                -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, parent);
+            if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, ordinal);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            int64_t existing = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : -1;
+            sqlite3_finalize(st);
+            if (rc != SQLITE_DONE) {
+                (void)log_finish_write(0);
+                pthread_mutex_unlock(&log_lock);
+                *replayed = rc == SQLITE_ROW;
+                return existing;
+            }
+        }
         int64_t event_id = log_insert_event_locked(category, event_type, summary, details, origin);
         if (event_id > 0) return event_id;
         (void)log_finish_write(0);
@@ -2118,23 +2192,49 @@ static int64_t log_begin_structured(R2LogCategory category, const char *event_ty
     return -1;
 }
 
+/* A late extraction still records history. The current projection belongs
+ * to the newest source turn, or to a later direct update with no source turn. */
+static int log_projection_is_newer(const char *query, const char *key, int64_t parent)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db, query, -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, parent);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? 1 : rc == SQLITE_DONE ? 0 : -1;
+}
+
 static int64_t log_finish_structured(int64_t event_id, sqlite3_stmt *st, int rc,
                                     const char *record_type, int64_t parent_event_id,
-                                    const char *relationship, const char *evidence)
+                                    const char *relationship, const char *evidence, int64_t ordinal,
+                                    int history_only)
 {
-    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    int saved = history_only || (rc == SQLITE_DONE && sqlite3_changes(log_db) == 1);
     if (!saved) log_structured_insert_error(record_type);
     sqlite3_finalize(st);
     if (saved && parent_event_id > 0)
         saved = log_link_locked(parent_event_id, event_id, relationship, evidence) == 0;
+    if (saved && ordinal >= 0) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_self_report_records(parent_event_id,ordinal,child_event_id) VALUES(?,?,?);",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, parent_event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, ordinal);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(st);
+    }
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
     return result == 0 ? event_id : -1;
 }
 
-int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+int64_t r2_log_inner_state_record(const char *state_kind, const char *description,
                                          const char *evidence, double confidence,
-                                         const char *origin, int64_t parent_event_id)
+                                         const char *origin, int64_t parent_event_id, int64_t ordinal)
 {
     if (!valid_text(state_kind) || !valid_text(description) ||
         strlen(state_kind) > 128 || strlen(description) > 8192 ||
@@ -2142,10 +2242,15 @@ int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *des
         (origin && strlen(origin) > 512) || !valid_confidence(confidence))
         return -1;
 
+    int replayed;
     int64_t event_id = log_begin_structured(
         R2_LOG_THINKING, "inner_state_recorded",
-        description, evidence, origin);
-    if (event_id < 0) return -1;
+        description, evidence, origin, parent_event_id, ordinal, &replayed);
+    if (event_id < 0) return event_id;
+    if (replayed) {
+        r2_sj_index_event(event_id, "thinking", "inner_state_recorded", origin);
+        return event_id;
+    }
 
     sqlite3_stmt *st = NULL;
     int rc;
@@ -2163,9 +2268,16 @@ int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *des
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     event_id = log_finish_structured(event_id, st, rc, "inner state", parent_event_id,
-                                     "extracts_self_state", evidence);
+                                     "extracts_self_state", evidence, ordinal, 0);
     if (event_id > 0) r2_sj_index_event(event_id, "thinking", "inner_state_recorded", origin);
     return event_id;
+}
+
+int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id)
+{
+    return r2_log_inner_state_record(state_kind, description, evidence, confidence, origin, parent_event_id, -1);
 }
 
 int64_t r2_log_inner_state(const char *state_kind, const char *description,
@@ -2174,9 +2286,9 @@ int64_t r2_log_inner_state(const char *state_kind, const char *description,
     return r2_log_inner_state_with_evidence(state_kind, description, evidence, confidence, origin, 0);
 }
 
-int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+int64_t r2_log_belief_record(const char *belief_key, const char *belief,
                                     const char *evidence, double confidence,
-                                    const char *status, const char *origin, int64_t parent_event_id)
+                                    const char *status, const char *origin, int64_t parent_event_id, int64_t ordinal)
 {
     if (!valid_text(belief_key) || !valid_text(belief) ||
         !valid_text(status) || strlen(belief_key) > 512 ||
@@ -2188,10 +2300,22 @@ int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
     char *details = format_record_details(
         "Status: %s\nEvidence: %s", status, evidence ? evidence : "(none)");
     if (!details) return -1;
+    int replayed;
     int64_t event_id = log_begin_structured(
-        R2_LOG_BELIEF, "belief_updated", belief, details, origin);
+        R2_LOG_BELIEF, "belief_updated", belief, details, origin, parent_event_id, ordinal, &replayed);
     free(details);
-    if (event_id < 0) return -1;
+    if (event_id < 0 || replayed) return event_id;
+
+    if (ordinal >= 0) {
+        int newer = log_projection_is_newer(
+            "SELECT 1 FROM r2_log_beliefs p WHERE p.belief_key=?1 AND COALESCE("
+            "(SELECT MAX(from_event_id) FROM r2_log_links WHERE to_event_id=p.last_event_id "
+            "AND relationship='supports_belief_record'),p.last_event_id)>?2;",
+            belief_key, parent_event_id);
+        if (newer != 0)
+            return log_finish_structured(event_id, NULL, SQLITE_ERROR, "belief", parent_event_id,
+                                         "supports_belief_record", evidence, ordinal, newer > 0);
+    }
 
     char utc[40];
     timestamp_pair(utc, sizeof(utc), NULL, 0);
@@ -2220,7 +2344,14 @@ int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     return log_finish_structured(event_id, st, rc, "belief", parent_event_id,
-                                 "supports_belief_record", evidence);
+                                 "supports_belief_record", evidence, ordinal, 0);
+}
+
+int64_t r2_log_belief_with_evidence(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id)
+{
+    return r2_log_belief_record(belief_key, belief, evidence, confidence, status, origin, parent_event_id, -1);
 }
 
 int64_t r2_log_belief(const char *belief_key, const char *belief, const char *evidence,
@@ -2229,9 +2360,9 @@ int64_t r2_log_belief(const char *belief_key, const char *belief, const char *ev
     return r2_log_belief_with_evidence(belief_key, belief, evidence, confidence, status, origin, 0);
 }
 
-int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+int64_t r2_log_continuity_record(const char *item_key, const char *item_type, const char *title,
                                         const char *description, const char *status, const char *next_action,
-                                        const char *origin, int64_t parent_event_id, const char *evidence)
+                                        const char *origin, int64_t parent_event_id, const char *evidence, int64_t ordinal)
 {
     if (!valid_text(item_key) || !valid_text(item_type) ||
         !valid_text(title) || !valid_text(status) ||
@@ -2247,10 +2378,22 @@ int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_t
         status, description ? description : "(none)",
         next_action ? next_action : "(none)");
     if (!details) return -1;
+    int replayed;
     int64_t event_id = log_begin_structured(
-        R2_LOG_CONTINUITY, "continuity_updated", title, details, origin);
+        R2_LOG_CONTINUITY, "continuity_updated", title, details, origin, parent_event_id, ordinal, &replayed);
     free(details);
-    if (event_id < 0) return -1;
+    if (event_id < 0 || replayed) return event_id;
+
+    if (ordinal >= 0) {
+        int newer = log_projection_is_newer(
+            "SELECT 1 FROM r2_log_continuity p WHERE p.item_key=?1 AND COALESCE("
+            "(SELECT MAX(from_event_id) FROM r2_log_links WHERE to_event_id=p.last_event_id "
+            "AND relationship='updates_continuity'),p.last_event_id)>?2;",
+            item_key, parent_event_id);
+        if (newer != 0)
+            return log_finish_structured(event_id, NULL, SQLITE_ERROR, "continuity item", parent_event_id,
+                                         "updates_continuity", evidence, ordinal, newer > 0);
+    }
 
     char utc[40];
     timestamp_pair(utc, sizeof(utc), NULL, 0);
@@ -2291,7 +2434,14 @@ int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_t
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
     }
     return log_finish_structured(event_id, st, rc, "continuity item", parent_event_id,
-                                 "updates_continuity", evidence);
+                                 "updates_continuity", evidence, ordinal, 0);
+}
+
+int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence)
+{
+    return r2_log_continuity_record(item_key, item_type, title, description, status, next_action, origin, parent_event_id, evidence, -1);
 }
 
 int64_t r2_log_continuity(const char *item_key, const char *item_type, const char *title,
@@ -2511,7 +2661,7 @@ static int64_t log_hypothetical_record(const char *scenario, const char *assumpt
                                        const char *predicted_outcome, const char *conclusion,
                                        const char *origin, int64_t parent_event_id,
                                        const char *relationship, const char *evidence,
-                                       int (*save_branch)(sqlite3 *, int64_t, void *), void *branch)
+                                       int (*save_branch)(sqlite3 *, int64_t, void *), void *branch, int64_t ordinal)
 {
     if (!valid_text(scenario) || strlen(scenario) > 8192 ||
         (assumptions && strlen(assumptions) > R2_LOG_MAX_TEXT) ||
@@ -2526,10 +2676,11 @@ static int64_t log_hypothetical_record(const char *scenario, const char *assumpt
         predicted_outcome ? predicted_outcome : "(none)",
         conclusion ? conclusion : "(none)");
     if (!details) return -1;
+    int replayed;
     int64_t event_id = log_begin_structured(
-        R2_LOG_HYPOTHETICAL, "hypothetical_recorded", scenario, details, origin);
+        R2_LOG_HYPOTHETICAL, "hypothetical_recorded", scenario, details, origin, parent_event_id, ordinal, &replayed);
     free(details);
-    if (event_id < 0) return -1;
+    if (event_id < 0 || replayed) return event_id;
 
     sqlite3_stmt *st = NULL;
     int rc;
@@ -2552,7 +2703,16 @@ static int64_t log_hypothetical_record(const char *scenario, const char *assumpt
         rc = save_branch(log_db, event_id, branch);
     }
     return log_finish_structured(event_id, st, rc, "hypothetical", parent_event_id,
-                                 relationship, evidence);
+                                 relationship, evidence, ordinal, 0);
+}
+
+int64_t r2_log_hypothetical_record(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence, int64_t ordinal)
+{
+    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+                                   origin, parent_event_id, "contains_hypothetical", evidence, NULL, NULL, ordinal);
 }
 
 int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assumptions,
@@ -2560,8 +2720,8 @@ int64_t r2_log_hypothetical_with_evidence(const char *scenario, const char *assu
                                           const char *origin, int64_t parent_event_id,
                                           const char *evidence)
 {
-    return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
-                                   origin, parent_event_id, "contains_hypothetical", evidence, NULL, NULL);
+    return r2_log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
+                                   origin, parent_event_id, evidence, -1);
 }
 
 int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assumptions,
@@ -2572,7 +2732,7 @@ int64_t r2_log_hypothetical_with_branch(const char *scenario, const char *assump
     if (!save_branch) return -1;
     return log_hypothetical_record(scenario, assumptions, predicted_outcome, conclusion,
         "Alternate-Self Lab; hypothetical only", evidence_event_id, "evidence_for_hypothesis",
-        "Evidence is referenced for comparison; it is not altered by this branch.", save_branch, branch);
+        "Evidence is referenced for comparison; it is not altered by this branch.", save_branch, branch, -1);
 }
 
 int64_t r2_log_hypothetical(const char *scenario, const char *assumptions,

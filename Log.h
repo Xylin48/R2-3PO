@@ -247,6 +247,24 @@ int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *des
                                          const char *evidence, double confidence,
                                          const char *origin, int64_t parent_event_id);
 
+/* Durable model extraction. A nonnegative ordinal identifies a record in the
+ * original staged extraction and returns its existing event ID on replay. */
+int r2_log_save_self_report(int64_t event_id, const char *extraction);
+int r2_log_ack_self_report(int64_t event_id);
+int64_t r2_log_inner_state_record(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id, int64_t ordinal);
+int64_t r2_log_belief_record(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id, int64_t ordinal);
+int64_t r2_log_continuity_record(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence, int64_t ordinal);
+int64_t r2_log_hypothetical_record(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence, int64_t ordinal);
+
 /* Belief ledger retains current state and full revision history in events. */
 int64_t r2_log_belief(const char *belief_key,
                      const char *belief,

@@ -48,6 +48,15 @@ STOPPED_REQUEST = "R2_OFFLINE_INTERRUPT_ACTIVE_81842"
 LONG_FOREGROUND_REQUEST = "R2_OFFLINE_LONG_FOREGROUND_24126"
 LEARNING_RESTART_REQUEST = "Remember that the bridge fixture uses copper. R2_LEARNING_RESTART_71412"
 RESTART_MEMORY = "The bridge fixture uses copper."
+SELF_REPORT_REPLY = "I intend to inspect the copper bridge. Hypothetically, I could build a spare bridge."
+SELF_REPORT_SCENARIO = "Build a spare copper bridge."
+SELF_REPORT_EXTRACTION = json.dumps({
+    "states": [{"kind": "intention", "description": "Inspect the copper bridge.",
+                "evidence": "I intend to inspect the copper bridge."}],
+    "beliefs": [], "continuity": [],
+    "hypotheticals": [{"scenario": SELF_REPORT_SCENARIO,
+                        "evidence": "Hypothetically, I could build a spare bridge."}],
+})
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
 
@@ -88,6 +97,8 @@ class LocalOllama(BaseHTTPRequestHandler):
             time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
+        if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
+            reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
             reply = (REPLY + "\n[DELETE] hidden-sentinel.txt"
                       "\n[DIARY]\nFOLLOWUP_PRIVATE_CONTROL_SENTINEL\n[END DIARY]"
@@ -120,6 +131,8 @@ class LocalOllama(BaseHTTPRequestHandler):
                          else "No durable fixture memory is stated in this fragment.")
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "strict structured data extractor" in system:
+            reply = SELF_REPORT_EXTRACTION if any(SELF_REPORT_REPLY in m for m in user_messages) else "{}"
         elif "memory-evaluation system" in system:
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
@@ -691,8 +704,18 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
         db.executescript(
             "CREATE TRIGGER ignore_learning_ack BEFORE DELETE ON r2_log_pending_learning "
             "WHEN OLD.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER ignore_self_report_branch BEFORE INSERT ON r2_alternate_self_branches "
+            "WHEN NEW.scenario='Build a spare copper bridge.' BEGIN SELECT RAISE(IGNORE); END;"
         )
-        for phase in ("blocked", "restart"):
+        def extracted_requests():
+            with LocalOllama.lock:
+                return sum(
+                    any("strict structured data extractor" in m["content"] for m in r["messages"])
+                    and any(SELF_REPORT_REPLY in m["content"] for m in r["messages"])
+                    for r in LocalOllama.requests
+                )
+
+        for phase in ("blocked", "restart", "acknowledge"):
             log_path = workspace.parent / f"learning-{phase}.log"
             with log_path.open("w", encoding="utf-8") as log:
                 process = subprocess.Popen(
@@ -712,6 +735,10 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                             "SELECT 1 FROM memories WHERE memory=?", (RESTART_MEMORY,),
                         ).fetchone():
                             break
+                        if phase == "acknowledge" and not db.execute(
+                            "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?", (source,),
+                        ).fetchone():
+                            break
                         time.sleep(0.1)
                     else:
                         raise AssertionError(log_path.read_text(errors="replace")[-20000:])
@@ -721,9 +748,22 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                     ).fetchall()
                     stored = db.execute("SELECT count(*) FROM memories WHERE memory=?", (RESTART_MEMORY,)).fetchone()
                     if phase == "blocked":
-                        assert len(pending) == 1 and pending[0][1] == REPLY, pending
+                        assert len(pending) == 1 and pending[0][1] == SELF_REPORT_REPLY, pending
                         source = pending[0][0]
                         assert stored == (0,), stored
+                        assert db.execute(
+                            "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (SELF_REPORT_REPLY, SELF_REPORT_EXTRACTION)
+                        receipts = db.execute(
+                            "SELECT child_event_id FROM r2_log_self_report_records WHERE parent_event_id=? ORDER BY ordinal",
+                            (source,),
+                        ).fetchall()
+                        assert len(receipts) == 2, receipts
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_alternate_self_branches WHERE scenario=?",
+                            (SELF_REPORT_SCENARIO,),
+                        ).fetchone() == (0,)
                     else:
                         assert pending == [] and stored == (1,)
                         assert db.execute(
@@ -731,6 +771,23 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                             "WHERE l.relationship='memory_learned_from' AND l.to_event_id=? AND e.details=?",
                             (source, RESTART_MEMORY),
                         ).fetchone() == (1,)
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_log_pending_self_reports WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (int(phase == "restart"),)
+                        assert db.execute(
+                            "SELECT l.to_event_id,l.notes FROM r2_log_links l WHERE l.from_event_id=? "
+                            "AND l.relationship IN ('extracts_self_state','contains_hypothetical') ORDER BY l.id",
+                            (source,),
+                        ).fetchall() == [
+                            (receipts[0][0], "I intend to inspect the copper bridge."),
+                            (receipts[1][0], "Hypothetically, I could build a spare bridge."),
+                        ]
+                        assert db.execute(
+                            "SELECT log_event_id FROM r2_alternate_self_branches WHERE scenario=?",
+                            (SELF_REPORT_SCENARIO,),
+                        ).fetchall() == [receipts[1]]
+                    assert extracted_requests() == 1
                     process.terminate()
                     assert process.wait(timeout=15) == 0
                 finally:
@@ -739,8 +796,15 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                         process.wait()
                     process.stdin.close()
             if phase == "blocked":
-                db.executescript("DROP TRIGGER ignore_learning_ack;")
-    print("PASS: restart resumed exact pending learning and saved one memory with its source link.")
+                db.executescript(
+                    "DROP TRIGGER ignore_learning_ack; DROP TRIGGER ignore_self_report_branch;"
+                    "CREATE TRIGGER ignore_self_report_ack BEFORE DELETE ON r2_log_pending_self_reports "
+                    "WHEN OLD.assistant_text LIKE 'I intend to inspect the copper bridge.%' "
+                    "BEGIN SELECT RAISE(IGNORE); END;"
+                )
+            elif phase == "restart":
+                db.executescript("DROP TRIGGER ignore_self_report_ack;")
+    print("PASS: restart recovered learning, reused the staged extraction and completed the original hypothetical branch.")
 
 
 def main() -> int:

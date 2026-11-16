@@ -13915,10 +13915,10 @@ static const char *structured_report_evidence(json_object *item, const char *rep
     return NULL;
 }
 
-static void log_structured_self_report(const char *reply, int64_t parent_event_id)
+static char *extract_structured_self_report(const char *reply, int64_t parent_event_id)
 {
     if (!reply || !*reply || parent_event_id <= 0 || !r2_log_is_initialized())
-        return;
+        return NULL;
 
     char *input = NULL;
     const char *prefix =
@@ -13950,7 +13950,7 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
         (void)r2_log_event(R2_LOG_ERROR, "self_state_extraction_allocation_failed",
                            "Structured self-state extraction could not start because input allocation failed.",
                            details, "log_structured_self_report");
-        return;
+        return NULL;
     }
     snprintf(input, n, "%s%s", prefix, reply);
 
@@ -13973,22 +13973,42 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
     }
     free(input);
     if (!json_text) {
-        if (post_turn_deferred && *post_turn_deferred) return;
+        if (post_turn_deferred && *post_turn_deferred) return NULL;
         r2_log_event(R2_LOG_ERROR, "self_state_extraction_failed",
                      "Structured self-state extraction did not return a response.",
                      NULL, "log_structured_self_report");
-        return;
+        return NULL;
     }
 
-    struct json_object *root = r2_parse_complete_json_object(json_text, strlen(json_text));
-    free(json_text);
+    return json_text;
+}
+
+static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
+                                           const char *saved_extraction, int durable)
+{
+    char *generated = saved_extraction ? NULL : extract_structured_self_report(reply, parent_event_id);
+    const char *extraction = saved_extraction ? saved_extraction : generated;
+    if (!extraction) return;
+
+    struct json_object *root = r2_parse_complete_json_object(extraction, strlen(extraction));
     if (!root) {
+        free(generated);
         r2_log_event(R2_LOG_ERROR, "self_state_json_invalid",
                      "Structured self-state extraction returned invalid JSON.",
                      NULL, "log_structured_self_report");
         return;
     }
 
+    if (durable && generated && r2_log_save_self_report(parent_event_id, generated) != 0) {
+        fprintf(stderr, "[R2 Post-turn] Could not stage the self-report extraction.\n");
+        free(generated);
+        json_object_put(root);
+        return;
+    }
+    free(generated);
+
+    int complete = 1;
+    /* Receipts use the original array position and record type. */
     struct json_object *arr = NULL, *item = NULL, *v = NULL;
     if (json_object_object_get_ex(root, "states", &arr) &&
         json_object_is_type(arr, json_type_array)) {
@@ -14007,8 +14027,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (description && *description && evidence) {
-                r2_log_inner_state_with_evidence(kind, description, evidence, confidence,
-                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
+                if (r2_log_inner_state_record(kind, description, evidence, confidence,
+                        "explicit R2 response; model-extracted with quoted evidence",
+                        parent_event_id, durable ? (int64_t)i * 4 : -1) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14032,8 +14054,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (key && *key && belief && *belief && evidence) {
-                r2_log_belief_with_evidence(key, belief, evidence, confidence, status,
-                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
+                if (r2_log_belief_record(key, belief, evidence, confidence, status,
+                        "explicit R2 response; model-extracted with quoted evidence",
+                        parent_event_id, durable ? (int64_t)i * 4 + 1 : -1) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14059,8 +14083,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 json_object_is_type(v, json_type_string)) next_action = json_object_get_string(v);
             const char *evidence = structured_report_evidence(item, reply);
             if (key && *key && title && *title && evidence) {
-                r2_log_continuity_with_evidence(key, type, title, description, status, next_action,
-                    "explicit R2 response; model-extracted", parent_event_id, evidence);
+                if (r2_log_continuity_record(key, type, title, description, status, next_action,
+                        "explicit R2 response; model-extracted", parent_event_id, evidence,
+                        durable ? (int64_t)i * 4 + 2 : -1) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14088,25 +14114,36 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
 
             const char *evidence = structured_report_evidence(item, reply);
             if (scenario && *scenario && evidence) {
-                int64_t child = r2_log_hypothetical_with_evidence(
+                int64_t child = r2_log_hypothetical_record(
                     scenario, assumptions, predicted, conclusion,
-                    "explicit R2 response; model-extracted", parent_event_id, evidence);
-                if (child > 0)
-                    (void)r2_altself_import_hypothesis(
-                        scenario, assumptions, predicted, conclusion, child, 0);
+                    "explicit R2 response; model-extracted", parent_event_id, evidence,
+                    durable ? (int64_t)i * 4 + 3 : -1);
+                if (child < 0 || r2_altself_import_hypothesis(
+                        scenario, assumptions, predicted, conclusion, child, 0) < 0)
+                    complete = 0;
             }
         }
     }
 
     json_object_put(root);
+    if (durable && (!complete || r2_log_ack_self_report(parent_event_id) != 0))
+        fprintf(stderr, "[R2 Post-turn] Self-report for event %lld remains pending.\n",
+                (long long)parent_event_id);
 }
 
+static void log_structured_self_report(const char *reply, int64_t parent_event_id)
+{
+    publish_structured_self_report(reply, parent_event_id, NULL, 0);
+}
 
 typedef struct {
     char *user;
     char *reply;
     char *tool_result;
+    char *extraction;
     int64_t event_id;
+    int self_report_pending;
+    int memory_pending;
 } R2PostTurnJob;
 
 static void preserve_evidence_memory(const char *user, const char *reply,
@@ -14167,7 +14204,7 @@ static void preserve_evidence_memory(const char *user, const char *reply,
     }
 }
 
-static void run_post_turn_job(R2PostTurnJob *job, int first_stage)
+static void run_post_turn_job(R2PostTurnJob *job)
 {
     ollama_background_mode = 1;
 
@@ -14177,15 +14214,15 @@ static void run_post_turn_job(R2PostTurnJob *job, int first_stage)
     const struct timespec post_turn_pause = { .tv_sec = 0, .tv_nsec = 100000000L };
     int deferred = 0;
     post_turn_deferred = &deferred;
-    for (int stage = first_stage; stage < 2 && !shutting_down;) {
+    for (int stage = 0; stage < 2 && !shutting_down;) {
         if (deferred || atomic_load(&foreground_conversation_waiting) > 0)
             nanosleep(&post_turn_pause, NULL);
         if (shutting_down) break;
         if (atomic_load(&foreground_conversation_waiting) > 0) continue;
         deferred = 0;
-        if (stage == 0)
-            log_structured_self_report(job->reply, job->event_id);
-        else
+        if (stage == 0 && job->self_report_pending)
+            publish_structured_self_report(job->reply, job->event_id, job->extraction, 1);
+        if (stage == 1 && job->memory_pending)
             preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
         if (!deferred) stage++;
     }
@@ -14195,6 +14232,7 @@ static void run_post_turn_job(R2PostTurnJob *job, int first_stage)
     free(job->user);
     free(job->reply);
     free(job->tool_result);
+    free(job->extraction);
 }
 
 static void finish_post_turn_worker(void)
@@ -14208,7 +14246,7 @@ static void finish_post_turn_worker(void)
 static void *post_turn_worker(void *opaque)
 {
     R2PostTurnJob *job = opaque;
-    run_post_turn_job(job, 0);
+    run_post_turn_job(job);
     free(job);
     finish_post_turn_worker();
     return NULL;
@@ -14254,33 +14292,42 @@ static void *replay_pending_learning(void *opaque)
         sqlite3_stmt *st = NULL;
         pthread_mutex_lock(&db_lock);
         int rc = sqlite3_prepare_v2(db,
-            "SELECT event_id,user_text,assistant_text,tool_result FROM r2_log_pending_learning "
-            "WHERE event_id>?1 AND event_id<=?2 ORDER BY event_id LIMIT 1;", -1, &st, NULL);
+            "WITH next(event_id) AS (SELECT MIN(event_id) FROM ("
+            "SELECT MIN(event_id) AS event_id FROM r2_log_pending_learning WHERE event_id>?1 AND event_id<=?2 "
+            "UNION ALL SELECT MIN(event_id) FROM r2_log_pending_self_reports WHERE event_id>?1 AND event_id<=?2)) "
+            "SELECT n.event_id,m.user_text,COALESCE(s.assistant_text,m.assistant_text),m.tool_result,"
+            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL "
+            "FROM next n LEFT JOIN r2_log_pending_learning m USING(event_id) "
+            "LEFT JOIN r2_log_pending_self_reports s USING(event_id) "
+            "WHERE n.event_id IS NOT NULL;", -1, &st, NULL);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, through);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        int copied = 0;
         if (rc == SQLITE_ROW) {
             after = job.event_id = sqlite3_column_int64(st, 0);
-            const char *fields[3];
-            if (memory_read_fields(st, 1, 3, fields) == 0 && fields[0] && fields[1]) {
-                job.user = strdup(fields[0]);
+            job.self_report_pending = sqlite3_column_int(st, 5);
+            job.memory_pending = sqlite3_column_int(st, 6);
+            const char *fields[4];
+            if (memory_read_fields(st, 1, 4, fields) == 0 && fields[1]) {
+                job.user = fields[0] ? strdup(fields[0]) : NULL;
                 job.reply = strdup(fields[1]);
-                if (fields[2] && !(job.tool_result = strdup(fields[2]))) {
-                    free(job.user);
-                    job.user = NULL;
-                }
+                job.tool_result = fields[2] ? strdup(fields[2]) : NULL;
+                job.extraction = fields[3] ? strdup(fields[3]) : NULL;
+                copied = job.reply && (!job.memory_pending || job.user) &&
+                         (!fields[2] || job.tool_result) && (!fields[3] || job.extraction);
             }
         }
         sqlite3_finalize(st);
         pthread_mutex_unlock(&db_lock);
         if (rc == SQLITE_DONE) break;
-        if (rc != SQLITE_ROW || !job.user || !job.reply) {
-            free(job.user); free(job.reply); free(job.tool_result);
+        if (rc != SQLITE_ROW || !copied) {
+            free(job.user); free(job.reply); free(job.tool_result); free(job.extraction);
             fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay.\n");
             if (rc != SQLITE_ROW) break;
             continue;
         }
-        run_post_turn_job(&job, 1);
+        run_post_turn_job(&job);
     }
     finish_post_turn_worker();
     return NULL;
@@ -14292,7 +14339,8 @@ static void resume_post_turn_learning(void)
        have their own workers and must not also be picked up by startup. */
     sqlite3_stmt *st = NULL;
     pthread_mutex_lock(&db_lock);
-    int rc = sqlite3_prepare_v2(db, "SELECT MAX(event_id) FROM r2_log_pending_learning;", -1, &st, NULL);
+    int rc = sqlite3_prepare_v2(db, "SELECT MAX(COALESCE((SELECT MAX(event_id) FROM r2_log_pending_learning),0),"
+        "COALESCE((SELECT MAX(event_id) FROM r2_log_pending_self_reports),0));", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t through = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
     sqlite3_finalize(st);
@@ -14325,6 +14373,8 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->user = strdup(user);
     job->reply = strdup(reply);
     job->event_id = event_id;
+    job->self_report_pending = event_id > 0;
+    job->memory_pending = 1;
     job->tool_result = tool_result;
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);

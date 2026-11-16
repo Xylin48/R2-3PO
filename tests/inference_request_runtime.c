@@ -503,13 +503,15 @@ static void check_stale_needs_decision(void)
 static void check_post_turn_retry(void)
 {
     assert(init_db() == 0);
-    int64_t source = r2_log_conversation_turn("What do you remember?", "I remember the blue door.");
+    int64_t source = r2_log_conversation_turn_for_learning(
+        "What do you remember?", "I remember the blue door.", NULL, 0, NULL, 0, NULL);
     assert(source > 0);
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     assert(job);
     job->user = strdup("What do you remember?");
     job->reply = strdup("I remember the blue door.");
     job->event_id = source;
+    job->self_report_pending = job->memory_pending = 1;
     assert(job->user && job->reply);
     set_response("knowledge | The door was blue.", "stop", 1);
     const char *failures = "SELECT count(*) FROM r2_log_events WHERE event_type='post_turn_memory_decision_failed';";
@@ -521,6 +523,31 @@ static void check_post_turn_retry(void)
     assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
     assert(memory_fixture_count(failures) == initial_failures);
+    int64_t late = r2_log_conversation_turn_for_learning(
+        "Earlier log", "I still need to finish.", NULL, 0, NULL, 0, NULL);
+    int64_t newer = r2_log_conversation_turn_for_learning(
+        "Is the bridge done?", "The project is complete.", NULL, 0, NULL, 0, NULL);
+    assert(late > source && newer > late);
+    assert(r2_log_belief("bridge-direct", "It is complete", NULL, 0.9, "supported", NULL) > 0);
+    assert(r2_log_belief_record("bridge-direct", "It is incomplete", "I still need to finish.",
+                               0.8, "tentative", NULL, late, 0) > 0);
+    assert(r2_log_belief_record("bridge-second", "It is complete", "The project is complete.",
+                               0.9, "supported", NULL, newer, 0) > 0);
+    assert(r2_log_continuity_record("bridge-second", "project", "Bridge", NULL, "completed",
+                                   NULL, NULL, newer, "The project is complete.", 1) > 0);
+    int64_t old_belief = r2_log_belief_record("bridge-second", "It is incomplete",
+        "I still need to finish.", 0.6, "tentative", NULL, late, 1);
+    assert(old_belief > 0);
+    assert(r2_log_belief_record("bridge-second", "It is incomplete", "I still need to finish.",
+                               0.6, "tentative", NULL, late, 1) == old_belief);
+    assert(r2_log_continuity_record("bridge-second", "project", "Bridge", NULL, "open",
+                                   NULL, NULL, late, "I still need to finish.", 2) > 0);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_beliefs WHERE belief='It is complete' "
+                                "AND belief_key IN ('bridge-direct','bridge-second');") == 2);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_continuity "
+                                "WHERE item_key='bridge-second' AND status='completed';") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                "WHERE event_type='belief_updated' AND summary='It is incomplete';") == 2);
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;
 }
