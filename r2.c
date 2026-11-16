@@ -438,6 +438,9 @@ static int r2_context_turn_record(int64_t archive_id)
     return 0;
 }
 
+static void resume_post_turn_learning(void);
+static void begin_post_turn_work(void);
+static void finish_post_turn_worker(void);
 static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
                                            const char *saved_extraction, int private_reflection);
 static char *append_reality_context(char *base);
@@ -9853,6 +9856,7 @@ static void *autonomous_thinking(void *arg)
     const uint64_t interval_ms = (uint64_t)THINK_INTERVAL * 1000U;
     uint64_t last_periodic_check_ms = 0;
     uint64_t last_reflection_ms = 0;
+    int retry_learning = 0;
 
     while (!shutting_down && atomic_load(&diary_running)) {
         /* Poll once per real second so the idle timer resets immediately when
@@ -9860,6 +9864,13 @@ static void *autonomous_thinking(void *arg)
         sleep(1);
         if (shutting_down || !atomic_load(&diary_running))
             break;
+
+        /* Let the previous tick finish its own reflection and needs requests
+           before handing leftover work to a background replay worker. */
+        if (retry_learning) {
+            retry_learning = 0;
+            resume_post_turn_learning();
+        }
 
         uint64_t now_ms = r2_log_elapsed_ms();
         if (!now_ms)
@@ -9882,6 +9893,7 @@ static void *autonomous_thinking(void *arg)
         if (now_ms >= last_periodic_check_ms &&
             now_ms - last_periodic_check_ms >= interval_ms) {
             last_periodic_check_ms = now_ms;
+            retry_learning = 1;
             /* Retry durable work even if new reflections are deferred. */
             if (r2_log_replay_reflections() != 0)
                 fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
@@ -10085,6 +10097,8 @@ static void *autonomous_thinking(void *arg)
 
         int64_t reflection_event_id = 0;
         const int64_t reviews[] = {initial_archive, followup_archive};
+        /* Claim live publication before the event enters the replay queue. */
+        begin_post_turn_work();
         int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews,
                                              reflection_tool_result, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
@@ -10107,6 +10121,7 @@ static void *autonomous_thinking(void *arg)
                     "[R2 diary] Failed to write autonomous reflection.\n");
         }
 
+        finish_post_turn_worker();
         last_reflection_ms = r2_log_elapsed_ms();
         free(reflection);
         free(reflection_tool_result);
@@ -14278,11 +14293,16 @@ static void log_post_turn_start_failure(const char *stage, int64_t event_id)
                        details, "schedule_post_turn_processing");
 }
 
-static int start_post_turn_worker(void *(*worker)(void *), void *context)
+static void begin_post_turn_work(void)
 {
     pthread_mutex_lock(&post_turn_lock);
     post_turn_active++;
     pthread_mutex_unlock(&post_turn_lock);
+}
+
+/* Takes an active-work reservation, even if thread creation fails. */
+static int start_post_turn_worker(void *(*worker)(void *), void *context)
+{
     pthread_t thread;
     if (pthread_create(&thread, NULL, worker, context) != 0) {
         finish_post_turn_worker();
@@ -14348,16 +14368,31 @@ static void *replay_pending_learning(void *opaque)
 
 static void resume_post_turn_learning(void)
 {
-    /* Take the cutoff before the shell can accept new turns. Those turns
-       have their own workers and must not also be picked up by startup. */
+    /* A turn holds its lock from staging through worker registration. A
+       reflection reserves active work before staging. Exclude both while
+       taking the cutoff, then release the locks before any inference. */
+    if (shutting_down || atomic_load(&foreground_conversation_waiting) > 0 ||
+        pthread_mutex_trylock(&conversation_turn_lock) != 0)
+        return;
+
+    pthread_mutex_lock(&post_turn_lock);
+    if (shutting_down || post_turn_active != 0 || pthread_mutex_trylock(&db_lock) != 0) {
+        pthread_mutex_unlock(&post_turn_lock);
+        pthread_mutex_unlock(&conversation_turn_lock);
+        return;
+    }
+
     sqlite3_stmt *st = NULL;
-    pthread_mutex_lock(&db_lock);
     int rc = sqlite3_prepare_v2(db, "SELECT MAX(COALESCE((SELECT MAX(event_id) FROM r2_log_pending_learning),0),"
         "COALESCE((SELECT MAX(event_id) FROM r2_log_pending_self_reports),0));", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t through = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&db_lock);
+    if (through > 0) post_turn_active++;
+    pthread_mutex_unlock(&post_turn_lock);
+    pthread_mutex_unlock(&conversation_turn_lock);
+
     if (rc != SQLITE_ROW) log_post_turn_start_failure("pending learning lookup", 0);
     if (through <= 0) return;
     int64_t *cutoff = malloc(sizeof(*cutoff));
@@ -14365,6 +14400,8 @@ static void resume_post_turn_learning(void)
         *cutoff = through;
         if (start_post_turn_worker(replay_pending_learning, cutoff) == 0) return;
         free(cutoff);
+    } else {
+        finish_post_turn_worker();
     }
     log_post_turn_start_failure("pending learning replay", through);
 }
@@ -14395,6 +14432,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
         return;
     }
 
+    begin_post_turn_work();
     if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         log_post_turn_start_failure("thread creation", event_id);

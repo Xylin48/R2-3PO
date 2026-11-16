@@ -663,6 +663,11 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
             "BEGIN SELECT RAISE(ABORT,'fixture rejects reflection link'); END;"
             "CREATE TRIGGER block_mirror_ack BEFORE DELETE ON r2_diary_pending_mirrors "
             "BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER block_private_extraction BEFORE UPDATE OF extraction ON r2_log_pending_self_reports "
+            "WHEN OLD.event_id IN (SELECT id FROM r2_log_events WHERE event_type='reflection_completed') "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER block_private_learning BEFORE DELETE ON r2_log_pending_learning "
+            "WHEN OLD.user_text='' BEGIN SELECT RAISE(IGNORE); END;"
         )
         process = subprocess.Popen([str(binary)], cwd=workspace, env=env,
                                    stdout=log, stderr=subprocess.STDOUT)
@@ -720,19 +725,11 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
             assert not db.execute(
                 "SELECT 1 FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?", (diary_id,),
             ).fetchone()
-            process.terminate()
-            assert process.wait(timeout=15) == 0
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-        with LocalOllama.lock:
-            before_restart = len(LocalOllama.requests)
-        process = subprocess.Popen(
-            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
-            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
-        )
-        try:
+            wait_for(lambda: f"Persistent memory transaction failed for event {source}."
+                     in log_path.read_text(encoding="utf-8", errors="replace"))
+            with LocalOllama.lock:
+                before_recovery = len(LocalOllama.requests)
+            db.executescript("DROP TRIGGER block_private_extraction; DROP TRIGGER block_private_learning;")
             wait_for(lambda: not db.execute(
                 "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=? UNION ALL "
                 "SELECT 1 FROM r2_log_pending_learning WHERE event_id=?", (source, source),
@@ -754,7 +751,7 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
                     and any(("PRIVATE R2 REFLECTION" in m["content"] and REFLECTION in m["content"]
                              and tool[0] in m["content"] and "LATEST USER MESSAGE" not in m["content"])
                             for m in request["messages"])
-                    for request in LocalOllama.requests[before_restart:]
+                    for request in LocalOllama.requests[before_recovery:]
                 )
             process.terminate()
             assert process.wait(timeout=15) == 0
@@ -762,9 +759,7 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            assert process.stdin is not None
-            process.stdin.close()
-    print("PASS: live service recovered reflection links and its mirror, then recovered private extraction after restart.")
+    print("PASS: live service recovered reflection links, mirror, private extraction and learning without a restart.")
 
 
 def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> None:

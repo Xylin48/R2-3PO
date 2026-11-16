@@ -506,6 +506,16 @@ static void check_post_turn_retry(void)
     int64_t source = r2_log_conversation_turn_for_learning(
         "What do you remember?", "I remember the blue door.", NULL, 0, NULL, 0, NULL);
     assert(source > 0);
+    pthread_mutex_lock(&conversation_turn_lock);
+    resume_post_turn_learning();
+    assert(post_turn_active == 0);
+    pthread_mutex_unlock(&conversation_turn_lock);
+
+    begin_post_turn_work();
+    resume_post_turn_learning();
+    assert(post_turn_active == 1);
+    finish_post_turn_worker();
+
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     assert(job);
     job->user = strdup("What do you remember?");
@@ -518,7 +528,9 @@ static void check_post_turn_retry(void)
     int initial_failures = memory_fixture_count(failures);
     int before = perform_count;
     defer_post_turn_request = 2;
+    begin_post_turn_work();
     post_turn_worker(job);
+    assert(post_turn_active == 0);
     assert(perform_count == before + 3 && defer_post_turn_request == 0);
     assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
