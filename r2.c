@@ -9757,12 +9757,12 @@ static char *process_tools(const char *reply)
 /* Persist the actual diary row and exact evidence relationships together in
  * the existing stores; matching repeated reflection prose is unnecessary. */
 static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence *evidence,
-                                const int64_t reviews[2], int64_t *event_id_out)
+                                const int64_t reviews[2], const char *tool_result, int64_t *event_id_out)
 {
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
-    if (r2_diary_stage_reviewed_reflection(reflection, evidence ? evidence->events : NULL,
-                                           evidence ? evidence->count : 0, reviews, &diary_id) != 0)
+    if (r2_diary_stage_reflection_with_tool(reflection, evidence ? evidence->events : NULL,
+                                            evidence ? evidence->count : 0, reviews, tool_result, &diary_id) != 0)
         return -1;
     int64_t event_id = r2_log_complete_reflection(diary_id);
     if (event_id > 0) {
@@ -10085,7 +10085,8 @@ static void *autonomous_thinking(void *arg)
 
         int64_t reflection_event_id = 0;
         const int64_t reviews[] = {initial_archive, followup_archive};
-        int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews, &reflection_event_id);
+        int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews,
+                                             reflection_tool_result, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
             publish_structured_self_report(reflection, reflection_event_id, NULL, 1);
             if (reflection_tool_result && *reflection_tool_result)
@@ -10524,7 +10525,7 @@ int r2_write_diary(void)
     if (!reflection) return -1;
 
     const int64_t reviews[] = {archive_id, 0};
-    int rc = r2_store_reflection(reflection, NULL, reviews, NULL);
+    int rc = r2_store_reflection(reflection, NULL, reviews, NULL, NULL);
     free(reflection);
     return rc;
 }
@@ -14177,7 +14178,7 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                                details, "preserve_evidence_memory");
         } else {
             char *p = trim(decision);
-            if (user && source_event_id > 0 && !shutting_down && !strcasecmp(p, "NONE") &&
+            if (source_event_id > 0 && !shutting_down && !strcasecmp(p, "NONE") &&
                 r2_log_ack_learning(source_event_id) != 0)
                 fprintf(stderr, "[R2 Post-turn] Could not acknowledge the memory decision for event %lld.\n",
                         (long long)source_event_id);
@@ -14321,11 +14322,12 @@ static void *replay_pending_learning(void *opaque)
             job.private_reflection = sqlite3_column_int(st, 7);
             const char *fields[4];
             if (memory_read_fields(st, 1, 4, fields) == 0 && fields[1]) {
-                job.user = fields[0] ? strdup(fields[0]) : NULL;
+                job.user = fields[0] && !job.private_reflection ? strdup(fields[0]) : NULL;
                 job.reply = strdup(fields[1]);
                 job.tool_result = fields[2] ? strdup(fields[2]) : NULL;
                 job.extraction = fields[3] ? strdup(fields[3]) : NULL;
-                copied = job.reply && (!job.memory_pending || job.user) &&
+                copied = job.reply && (!job.memory_pending ||
+                         (job.private_reflection ? job.tool_result != NULL : job.user != NULL)) &&
                          (!fields[2] || job.tool_result) && (!fields[3] || job.extraction);
             }
         }

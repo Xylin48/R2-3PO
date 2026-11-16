@@ -1441,6 +1441,26 @@ static int log_stage_self_report_locked(int64_t event_id, const char *text)
     return saved;
 }
 
+/* Reflection rows use an empty user field in the existing queue schema.
+ * The authoritative source event determines whether this is private. */
+static int log_stage_learning_locked(int64_t event_id, const char *user,
+                                     const char *reply, const char *tool_result)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "INSERT INTO r2_log_pending_learning(event_id,user_text,assistant_text,tool_result) VALUES(?,?,?,?);",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 2, user, strlen(user), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 3, reply, strlen(reply), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK && tool_result)
+        rc = sqlite3_bind_text64(st, 4, tool_result, strlen(tool_result), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    return saved;
+}
+
 static int64_t log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
                                                     const int64_t *speech_ids, size_t speech_count,
                                                     const int64_t *review_ids, size_t review_count,
@@ -1507,21 +1527,9 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
-    if (saved && stage_learning) {
-        statement = NULL;
-        rc = sqlite3_prepare_v2(log_db,
-            "INSERT INTO r2_log_pending_learning(event_id,user_text,assistant_text,tool_result) VALUES(?,?,?,?);",
-            -1, &statement, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 2, user_text, user_len, SQLITE_TRANSIENT, SQLITE_UTF8);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(statement, 3, assistant_text, assistant_len, SQLITE_TRANSIENT, SQLITE_UTF8);
-        if (rc == SQLITE_OK) rc = bind_optional_text(statement, 4, tool_result);
-        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
-        sqlite3_finalize(statement);
-    }
     if (saved && stage_learning)
-        saved = log_stage_self_report_locked(event_id, assistant_text);
+        saved = log_stage_learning_locked(event_id, user_text, assistant_text, tool_result) &&
+                log_stage_self_report_locked(event_id, assistant_text);
     saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
                     log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
@@ -2539,8 +2547,10 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
 
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(log_db,
-        "SELECT d.entry,p.speech_count FROM r2_diary_pending_reflections p "
-        "LEFT JOIN diary_entries d ON d.id=p.diary_entry_id WHERE p.diary_entry_id=?;",
+        "SELECT d.entry,p.speech_count,t.result,t.diary_entry_id IS NOT NULL "
+        "FROM r2_diary_pending_reflections p LEFT JOIN diary_entries d ON d.id=p.diary_entry_id "
+        "LEFT JOIN r2_diary_pending_reflection_tool t ON t.diary_entry_id=p.diary_entry_id "
+        "WHERE p.diary_entry_id=?;",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
@@ -2557,7 +2567,11 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
         ? log_insert_event_locked(R2_LOG_THINKING, type,
                                   "Private diary reflection was written.", entry, "internal_thinking")
         : -1;
-    int saved = event_id > 0 && log_stage_self_report_locked(event_id, entry);
+    int has_tool = rc == SQLITE_ROW && sqlite3_column_int(st, 3);
+    const char *tool = has_tool ? (const char *)sqlite3_column_text(st, 2) : NULL;
+    int saved = event_id > 0 && log_stage_self_report_locked(event_id, entry) &&
+        (!has_tool || (tool && *tool && strlen(tool) == (size_t)sqlite3_column_bytes(st, 2) &&
+                       log_stage_learning_locked(event_id, "", entry, tool)));
     sqlite3_finalize(st);
     st = NULL;
     if (saved) {
@@ -2607,18 +2621,21 @@ int64_t r2_log_complete_reflection(int64_t diary_id)
         sqlite3_finalize(st);
     }
     if (saved) {
-        const char *deletions[] = {
-            "DELETE FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=?;",
-            "DELETE FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?;",
-            "DELETE FROM r2_diary_pending_reflections WHERE diary_entry_id=?;"
+        const struct {
+            const char *sql;
+            sqlite3_int64 count;
+        } deletions[] = {
+            {"DELETE FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=?;", reviewed},
+            {"DELETE FROM r2_diary_pending_reflection_speech WHERE diary_entry_id=?;", expected},
+            {"DELETE FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?;", has_tool},
+            {"DELETE FROM r2_diary_pending_reflections WHERE diary_entry_id=?;", 1}
         };
         for (size_t i = 0; saved && i < sizeof(deletions) / sizeof(deletions[0]); ++i) {
             st = NULL;
-            rc = sqlite3_prepare_v2(log_db, deletions[i], -1, &st, NULL);
+            rc = sqlite3_prepare_v2(log_db, deletions[i].sql, -1, &st, NULL);
             if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
             if (rc == SQLITE_OK) rc = sqlite3_step(st);
-            saved = rc == SQLITE_DONE &&
-                sqlite3_changes64(log_db) == (i == 0 ? reviewed : i == 1 ? expected : 1);
+            saved = rc == SQLITE_DONE && sqlite3_changes64(log_db) == deletions[i].count;
             sqlite3_finalize(st);
         }
     }

@@ -128,7 +128,7 @@ int main(void)
         "SELECT COUNT(*) FROM diary_entries WHERE entry='REFLECTION_WITH_NON_SPEECH_EVIDENCE'", 0) == 0);
     for (int i = 0; i < 2; ++i) {
         R2AudioTurnEvidence evidence = {.events = &speech[i], .count = 1};
-        assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", &evidence, NULL, &reflections[i]) == 0);
+        assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", &evidence, NULL, NULL, &reflections[i]) == 0);
         assert(reflections[i] > 0);
         diary_ids[i] = scalar(connection,
             "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", reflections[i]);
@@ -155,7 +155,7 @@ int main(void)
     int64_t review_id = r2_log_archive_context_review("fixture question", "exact original", "review trace");
     assert(review_id > 0);
     const int64_t reviews[] = {0, review_id};
-    assert(r2_store_reflection("REFLECTION_WITH_FAILED_EDGE", &both, reviews, &incomplete) == 0);
+    assert(r2_store_reflection("REFLECTION_WITH_FAILED_EDGE", &both, reviews, NULL, &incomplete) == 0);
     assert(incomplete == 0);
     assert(scalar(connection, "SELECT COUNT(*) FROM diary_entries WHERE entry='REFLECTION_WITH_FAILED_EDGE'", 0) == 1);
     assert(scalar(connection, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='reflection_completed'", 0) == 2);
@@ -183,7 +183,7 @@ int main(void)
        association must commit anyway and be discoverable after backfill. */
     r2_sj_shutdown();
     int64_t offline_reflection = 0;
-    assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", NULL, NULL, &offline_reflection) == 0);
+    assert(r2_store_reflection("DUPLICATE_REFLECTION_TEXT", NULL, NULL, NULL, &offline_reflection) == 0);
     assert(offline_reflection > 0);
     int64_t offline_diary = scalar(connection,
         "SELECT diary_entry_id FROM r2_sensory_journal_reflection_links WHERE event_id=?", offline_reflection);

@@ -28,6 +28,7 @@ REFLECTION = ("I closed Eyes deliberately and kept the earlier evidence separate
               "```text\n[EARS_LISTEN] is only a quoted example.\n```")
 PRIVATE_REFLECTION_QUOTE = "I closed Eyes deliberately and kept the earlier evidence separate."
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
+PRIVATE_TOOL_MEMORY = "I voluntarily closed Eyes."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
 FRIDGE_INGREDIENTS = "pear,ginger"
@@ -143,6 +144,9 @@ class LocalOllama(BaseHTTPRequestHandler):
         elif "memory-evaluation system" in system:
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
+            if any("PRIVATE R2 REFLECTION" in m and "RECORDED TOOL RESULT" in m
+                   and SENSE_RESULT in m for m in user_messages):
+                reply = "experience | " + PRIVATE_TOOL_MEMORY
             if any(LEARNING_RESTART_REQUEST in message for message in user_messages):
                 reply = "knowledge | " + RESTART_MEMORY
         elif "private first-person diary reflection" in system:
@@ -683,6 +687,10 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
                 (diary_id,),
             ).fetchall()
             assert entry == REFLECTION and len(archives) == 2
+            tool = db.execute(
+                "SELECT result FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?", (diary_id,),
+            ).fetchone()
+            assert tool is not None and SENSE_RESULT in tool[0], tool
             daily = workspace / "R2_Diary" / (timestamp[:10] + ".md")
             marker = f"\n\n## {timestamp}\n\n{entry}\n"
             wait_for(lambda: daily.exists() and marker in daily.read_text(encoding="utf-8"))
@@ -705,19 +713,29 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
                 "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
                 (source,),
             ).fetchone() == (REFLECTION, None)
+            assert db.execute(
+                "SELECT user_text,assistant_text,tool_result FROM r2_log_pending_learning WHERE event_id=?",
+                (source,),
+            ).fetchone() == ("", REFLECTION, tool[0])
+            assert not db.execute(
+                "SELECT 1 FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?", (diary_id,),
+            ).fetchone()
             process.terminate()
             assert process.wait(timeout=15) == 0
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
+        with LocalOllama.lock:
+            before_restart = len(LocalOllama.requests)
         process = subprocess.Popen(
             [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
             stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
         )
         try:
             wait_for(lambda: not db.execute(
-                "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?", (source,),
+                "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=? UNION ALL "
+                "SELECT 1 FROM r2_log_pending_learning WHERE event_id=?", (source, source),
             ).fetchone())
             assert db.execute(
                 "SELECT s.description,s.origin,l.notes FROM r2_log_links l "
@@ -726,6 +744,18 @@ def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -
             ).fetchall() == [("Kept earlier evidence separate.",
                                "private R2 diary reflection; model-extracted with quoted evidence",
                                PRIVATE_REFLECTION_QUOTE)]
+            assert db.execute(
+                "SELECT e.details FROM r2_log_links l JOIN r2_log_events e ON e.id=l.from_event_id "
+                "WHERE l.to_event_id=? AND l.relationship='memory_learned_from'", (source,),
+            ).fetchall() == [(PRIVATE_TOOL_MEMORY,)]
+            with LocalOllama.lock:
+                assert any(
+                    any("memory-evaluation system" in m["content"] for m in request["messages"])
+                    and any(("PRIVATE R2 REFLECTION" in m["content"] and REFLECTION in m["content"]
+                             and tool[0] in m["content"] and "LATEST USER MESSAGE" not in m["content"])
+                            for m in request["messages"])
+                    for request in LocalOllama.requests[before_restart:]
+                )
             process.terminate()
             assert process.wait(timeout=15) == 0
         finally:
