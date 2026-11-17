@@ -4,7 +4,7 @@ This checklist separates repository/CI evidence from checks that must run on the
 
 ## 1. Confirm the candidate and CI
 
-- Use the current head of [draft PR #185](https://github.com/Xylin48/R2-3PO/pull/185) on `audit/r2-consolidated-review-2026-11-12`. Record the exact SHA you plan to build and compare it with the workflow head.
+- Use [draft PR #187](https://github.com/Xylin48/R2-3PO/pull/187) on `integrate/r2-complete-consolidation-2026-11-15`. Record the exact source commit you plan to build and compare it with the workflow head.
 - Require the full `R2 build` GitHub Actions workflow on the production candidate. A later ledger-only commit can reference that run if its code and tests match.
 - Do not merge to `main` or call the candidate hardware-verified based on static smoke tests alone.
 

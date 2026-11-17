@@ -34,7 +34,7 @@ static void check_shutdown(const char *command)
     assert(pthread_create(&stopper, NULL, request_shutdown_after_delay, NULL) == 0);
     assert(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
 
-    execute_task("shutdown", command);
+    execute_task("shutdown", command, 0);
 
     assert(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
     assert(pthread_join(stopper, NULL) == 0);
@@ -61,7 +61,7 @@ static void check_complete_output_archive(void)
     int discard = open("/dev/null", O_WRONLY);
     assert(diagnostic >= 0 && discard >= 0 && dup2(discard, STDERR_FILENO) >= 0);
     close(discard);
-    execute_task("archive", "printf BEGIN; head -c 30000 /dev/zero; printf END");
+    execute_task("archive", "printf BEGIN; head -c 30000 /dev/zero; printf END", 0);
     assert(dup2(diagnostic, STDERR_FILENO) >= 0);
     close(diagnostic);
     CompletedTask *completed = completed_head;
@@ -131,6 +131,73 @@ static void check_workspace_path_with_spaces(void)
     free(result);
 }
 
+static int count_rows(sqlite3 *fixture, const char *sql)
+{
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(fixture, sql, -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    int count = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return count;
+}
+
+static void check_durable_receipts(void)
+{
+    assert(r2_log_init() == 0);
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER block_hands_accept BEFORE INSERT ON r2_log_pending_hands "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(!start_background_task("printf rejected") && !task_head);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_events WHERE details='printf rejected';") == 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER block_hands_accept;", NULL, NULL, NULL) == SQLITE_OK);
+
+    char *task_id = start_background_task("printf accepted-output");
+    assert(task_id && task_head && task_head->receipt > 0);
+    Task *task = task_head;
+    task_head = task_tail = NULL;
+    execute_task(task->id, task->command, task->receipt);
+    CompletedTask *completion = completed_head;
+    assert(completion && completion->return_code == 0 && !strcmp(completion->output, "accepted-output"));
+    unlink(completion->archive_path);
+    completed_head = completed_tail = NULL;
+    free(completion->command);
+    free(completion->output);
+    free(completion);
+    free(task_id);
+    free(task->command);
+    free(task);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 0);
+
+    int64_t queued = r2_log_accept_hands("queued-fixture", "touch should-not-exist");
+    int64_t interrupted = r2_log_accept_hands("active-fixture", "touch would-have-side-effects");
+    assert(queued > 0 && interrupted > queued);
+    assert(r2_log_arm_hands(interrupted, R2_HOME "/exact-output-archive") == 0);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER block_hands_outcome_ack BEFORE DELETE ON r2_log_pending_hands "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_recover_hands() == -1);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 2);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_events WHERE event_type='hands_task_outcome';") == 1);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER block_hands_outcome_ack;", NULL, NULL, NULL) == SQLITE_OK);
+    r2_log_shutdown();
+    assert(r2_log_init() == 0);
+    assert(r2_log_recover_hands() == 0 && r2_log_recover_hands() == 0);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 0);
+    assert(count_rows(fixture,
+        "SELECT count(*) FROM r2_log_links l JOIN r2_log_events e ON e.id=l.from_event_id "
+        "JOIN r2_log_events q ON q.id=l.to_event_id WHERE l.relationship='hands_outcome_for' AND ("
+        "(q.details='printf accepted-output' AND e.details LIKE 'Exit code: 0%') OR "
+        "(q.details='touch should-not-exist' AND e.summary LIKE '%before%launch%') OR "
+        "(q.details='touch would-have-side-effects' AND e.summary LIKE '%outcome is unknown%' "
+        "AND e.details LIKE '%exact-output-archive'));") == 3);
+    assert(access(R2_HOME "/should-not-exist", F_OK) != 0);
+    assert(access(R2_HOME "/would-have-side-effects", F_OK) != 0);
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+    r2_log_shutdown();
+}
+
 int main(void)
 {
     check_shutdown("printf started; sleep 30 & wait");
@@ -141,6 +208,8 @@ int main(void)
     check_workspace_path_with_spaces();
     check_console_shutdown("exec sleep 30");
     check_console_shutdown("exec >/dev/null; exec sleep 30");
-    puts("R2 active task shutdown and exact output archive smoke passed.");
+    atomic_store(&shutting_down, 0);
+    check_durable_receipts();
+    puts("R2 active task shutdown, exact output archive and durable receipt smoke passed.");
     return 0;
 }

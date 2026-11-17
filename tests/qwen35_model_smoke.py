@@ -384,7 +384,8 @@ require(
     and 'message_add_pair_locked(\n                    "assistant", tool_request_context, "user", tagged_tool_result)' in core
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
     and "Append the internal assistant tool-call and its tool-result as one logical" in core
-    and "Cannot fit complete assistant/tool history pair without evicting pinned context." in core
+    and "Cannot fit complete assistant/tool history pair without evicting protected context." in core
+    and "i != preserve_index && !evict[i] && !messages.items[i].pinned" in core
     and "raw [WORLD]/[RUN]/etc. commands into later model context" in core
     and "do not repeat it unless the user asks again" in core,
     "tool-result history stays atomic and trusted while executed control syntax is not replayed as dialogue",

@@ -77,6 +77,59 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertEqual(TV.CRTDisplay.read_state(object.__new__(TV.CRTDisplay)),
                          (1, "input", 1, None))
 
+    def test_each_read_only_poll_closes_its_sqlite_connection(self) -> None:
+        self.set_state(0, "input", 1)
+        opened = []
+        closed = []
+        original_connect = sqlite3.connect
+
+        class TrackedConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                opened.append(self)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def close(self):
+                closed.append(self)
+                self.connection.close()
+
+        def tracked_connect(*args, **kwargs):
+            return TrackedConnection(original_connect(*args, **kwargs))
+
+        with patch.object(TV.sqlite3, "connect", side_effect=tracked_connect):
+            display = object.__new__(TV.CRTDisplay)
+            for _ in range(3):
+                self.assertEqual(display.read_state(), (0, "input", 1, None))
+                self.assertEqual(display.read_vcr_state(), (None, "stop", 0.0))
+        self.assertEqual(len(opened), 6)
+        self.assertEqual(closed, opened)
+
+    def test_read_only_database_uris_escape_question_and_fragment_characters(self) -> None:
+        # A raw "file:" URI misparses '#' as a fragment and '?' as options.
+        # Both display readers must open this exact database, never a
+        # similarly prefixed path or an implicitly created replacement.
+        unusual = Path(self.tempdir.name) / "VCR?archive#2026.db"
+        with sqlite3.connect(unusual) as db:
+            db.executescript("""
+                CREATE TABLE r2_tv_state (
+                    id INTEGER PRIMARY KEY, power INTEGER NOT NULL,
+                    source_kind TEXT NOT NULL, source_value INTEGER NOT NULL);
+                CREATE TABLE r2_tv_vcr_state (
+                    id INTEGER PRIMARY KEY, cassette_path TEXT, transport TEXT NOT NULL);
+                CREATE TABLE r2_tv_vcr_tapes (
+                    media_path TEXT PRIMARY KEY, position_seconds REAL NOT NULL);
+                INSERT INTO r2_tv_state VALUES(1,0,'input',1);
+                INSERT INTO r2_tv_vcr_state VALUES(1,NULL,'stop');
+            """)
+        before = unusual.read_bytes()
+        with patch.object(TV, "DB_PATH", unusual):
+            display = object.__new__(TV.CRTDisplay)
+            self.assertEqual(display.read_state(), (0, "input", 1, None))
+            self.assertEqual(display.read_vcr_state(), (None, "stop", 0.0))
+        self.assertEqual(unusual.read_bytes(), before)
+
     def test_reader_does_not_mutate_reality_database(self) -> None:
         self.set_state(0, "input", 1)
         before = self.db_path.read_bytes()
@@ -180,6 +233,69 @@ class TVDisplaySmoke(unittest.TestCase):
                        (media,))
         self.assertEqual(TV.CRTDisplay.read_vcr_state(object.__new__(TV.CRTDisplay)),
                          (media, "pause", 42.75))
+
+    def test_invalid_saved_vcr_position_does_not_reach_playback(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        media = "/tmp/position-fixture.mp4"
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_state SET cassette_path=?,transport='play' WHERE id=1",
+                       (media,))
+            db.execute("INSERT INTO r2_tv_vcr_tapes VALUES(?,?)", (media, 0.0))
+        for stored in ("not-a-number", "inf", "-inf", "nan", "1e308", "604801"):
+            with self.subTest(stored=stored):
+                with sqlite3.connect(self.db_path) as db:
+                    db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=? WHERE media_path=?",
+                               (stored, media))
+                # Commit before opening the independent read-only connection.
+                # Otherwise SQLite correctly keeps the uncommitted fixture
+                # value invisible and the test examines the previous row.
+                with self.assertRaisesRegex(ValueError, "Saved VCR position"):
+                    display.read_vcr_state()
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=-12.5 WHERE media_path=?",
+                       (media,))
+        self.assertEqual(display.read_vcr_state(), (media, "play", 0.0))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=604800 WHERE media_path=?",
+                       (media,))
+        self.assertEqual(display.read_vcr_state(), (media, "play", 604800.0))
+
+    def test_invalid_saved_position_shows_unavailable_without_crashing_refresh(self) -> None:
+        class Widget:
+            def __init__(self):
+                self.props = {}
+                self.raised = False
+
+            def lift(self):
+                self.raised = True
+
+            def configure(self, **kwargs):
+                self.props.update(kwargs)
+
+        class Player:
+            def audio_set_mute(self, muted):
+                self.muted = muted
+
+            def set_pause(self, paused):
+                self.paused = paused
+
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Player()
+        display._last_transport = "play"
+        display._renderer_published = False
+        display.picture = Widget()
+        display.status = Widget()
+        display.read_state = lambda: (1, "input", 1, None)
+        display.read_vcr_state = lambda: (_ for _ in ()).throw(
+            ValueError("Saved VCR position is not finite"))
+        display._publish_renderer = lambda path: None
+        display.refresh(schedule=False)
+        self.assertTrue(display._player.muted)
+        self.assertEqual(display._player.paused, 1)
+        self.assertIsNone(display._last_transport)
+        self.assertTrue(display.picture.raised)
+        self.assertEqual(display.picture.props["text"], "TV STATE UNAVAILABLE")
+        self.assertIn("Saved VCR position", display.status.props["text"])
 
     def test_vcr_client_accepts_transport_and_media_commands(self) -> None:
         for command in ("display opened", "display closed", "vcr play", "vcr pause", "vcr stop", "vcr eject",

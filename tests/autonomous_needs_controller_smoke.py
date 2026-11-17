@@ -67,6 +67,7 @@ assert "process_tools_with_status(safe_action, &action_succeeded)" in function
 assert "action_succeeded ? R2_LOG_WORLD : R2_LOG_ERROR" in function
 assert "autonomous_needs_yielded_to_conversation" in function
 assert "pthread_mutex_trylock(&conversation_turn_lock)" in function
+assert "atomic_load(&last_conversation_activity_ms) != activity_at_snapshot" in function
 
 talk_start = source.index("char *r2_talk(const char *message)\n{")
 talk_end = source.index("\nint r2_conversation(void)", talk_start)
@@ -86,11 +87,11 @@ vision_abort_start = source.index("int r2_ollama_vision_request_should_abort(voi
 vision_abort_end = source.index("\n/* Estimate safe Ollama context", vision_abort_start)
 assert "!ollama_foreground_turn_mode" in source[vision_abort_start:vision_abort_end]
 
-worker_start = source.index("static void *post_turn_worker(void *opaque)\n{")
-worker_end = source.index("\n/* These model-assisted bookkeeping tasks", worker_start)
+worker_start = source.index("static void run_post_turn_job(R2PostTurnJob *job)\n{")
+worker_end = source.index("\nstatic void finish_post_turn_worker", worker_start)
 worker = source[worker_start:worker_end]
-assert "while (!shutting_down" in worker
+assert "stage < 2 && !shutting_down" in worker
 assert "atomic_load(&foreground_conversation_waiting) > 0" in worker
-assert worker.index("atomic_load(&foreground_conversation_waiting) > 0") < worker.index("log_structured_self_report")
+assert worker.index("atomic_load(&foreground_conversation_waiting) > 0") < worker.index("publish_structured_self_report")
 
 print("model-owned autonomous needs controller smoke passed")

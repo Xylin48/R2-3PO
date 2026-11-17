@@ -7,7 +7,9 @@ state changes to the running R2 shell over its private Unix socket.
 """
 from __future__ import annotations
 
+import math
 import os
+from contextlib import closing
 import socket
 import sqlite3
 import time
@@ -230,8 +232,8 @@ class CRTDisplay:
         self.control(f"tune {channel}")
 
     def read_state(self) -> tuple[int, str, int, str | None]:
-        uri = f"file:{DB_PATH}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
+        uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
             row = db.execute(
                 "SELECT power, source_kind, source_value FROM r2_tv_state WHERE id=1"
             ).fetchone()
@@ -256,8 +258,8 @@ class CRTDisplay:
             return power, kind, value, device
 
     def read_vcr_state(self) -> tuple[str | None, str, float]:
-        uri = f"file:{DB_PATH}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.5) as db:
+        uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
             row = db.execute(
                 "SELECT cassette_path, transport FROM r2_tv_vcr_state WHERE id=1"
             ).fetchone()
@@ -272,7 +274,17 @@ class CRTDisplay:
                     (path,),
                 ).fetchone()
                 if tape:
-                    position = max(0.0, float(tape[0]))
+                    try:
+                        saved_position = float(tape[0])
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError("Saved VCR position is invalid") from exc
+                    if not math.isfinite(saved_position):
+                        raise ValueError("Saved VCR position is not finite")
+                    # Match the validated control protocol: malformed legacy
+                    # values must not overflow VLC's millisecond seek.
+                    if saved_position > 604800:
+                        raise ValueError("Saved VCR position exceeds the supported range")
+                    position = max(0.0, saved_position)
             return path, transport, position
 
     def _ensure_player(self) -> bool:
@@ -320,7 +332,7 @@ class CRTDisplay:
             try:
                 current_path, current_transport, current_position = self.read_vcr_state()
                 power, kind, value, _device = self.read_state()
-            except (sqlite3.Error, OSError, RuntimeError, ValueError):
+            except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError):
                 self._player.audio_set_mute(True)
                 self._player.set_pause(1)
                 self.root.after(500, seek_and_apply)
@@ -522,7 +534,16 @@ class CRTDisplay:
                      + f"   |   VCR: {tape_name} [{transport}]"
                      + "   |   Reality-linked controls"
             )
-        except (sqlite3.Error, OSError, RuntimeError) as exc:
+        except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError) as exc:
+            # With no authoritative TV state, hold the existing media silent.
+            # Reapply the authoritative transport when reads recover.
+            if self._player:
+                self._last_transport = None
+                try:
+                    self._player.audio_set_mute(True)
+                    self._player.set_pause(1)
+                except (OSError, RuntimeError):
+                    pass
             self._publish_renderer(None)
             self.picture.lift()
             self.picture.configure(text="TV STATE UNAVAILABLE", fg="#b8c0b2")

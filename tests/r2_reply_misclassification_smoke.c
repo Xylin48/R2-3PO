@@ -617,6 +617,13 @@ int main(void)
                             "surviving earlier turn") &&
                     messages.items[0].pinned,
                     "failed oversize live-history append does not evict original conversation");
+        too_large[990] = '\0';
+        int hands_append = message_add_pair_preserving_locked(
+            "assistant", "x", "user", too_large, original_count - 1);
+        ok &= check(old_ok && hands_append != 0 &&
+                    messages.count == original_count &&
+                    !strcmp(messages.items[original_count - 1].content, "surviving earlier turn"),
+                    "optional Hands result cannot evict the authoritative current user turn");
     }
     free(pinned);
     free(too_large);

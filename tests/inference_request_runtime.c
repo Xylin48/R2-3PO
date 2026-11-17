@@ -22,6 +22,8 @@ static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
 static int foreground_after_response;
+static int completed_turn_after_response;
+static int defer_post_turn_request;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
 int __wrap_json_object_object_add(struct json_object *object, const char *key, struct json_object *value)
@@ -51,6 +53,12 @@ CURLcode __wrap_curl_easy_setopt(CURL *curl, CURLoption option, ...)
 CURLcode __wrap_curl_easy_perform(CURL *curl)
 {
     (void)curl; ++perform_count;
+    if (defer_post_turn_request && --defer_post_turn_request == 0) {
+        atomic_store(&foreground_conversation_waiting, 1);
+        assert(ollama_progress(NULL, 0, 0, 0, 0));
+        atomic_store(&foreground_conversation_waiting, 0);
+        return CURLE_ABORTED_BY_CALLBACK;
+    }
     if (perform_count == fail_transport_at) return CURLE_COULDNT_CONNECT;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
@@ -92,12 +100,20 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         }
         assert(request_bytes <= (size_t)(4096 - 512 - 512) * 32U / 10U);
     }
-    size_t n = strlen(response_body), split = n / 3;
-    assert(write_response(response_body, 1, split, write_data) == split);
-    assert(write_response(response_body + split, 1, n - split, write_data) == n - split);
+    char structured[] = "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+                        "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
+                        "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
+    char *body = defer_post_turn_request == 1 ? structured : response_body;
+    size_t n = strlen(body), split = n / 3;
+    assert(write_response(body, 1, split, write_data) == split);
+    assert(write_response(body + split, 1, n - split, write_data) == n - split);
     if (foreground_after_response) {
         foreground_after_response = 0;
         atomic_store(&foreground_conversation_waiting, 1);
+    }
+    if (completed_turn_after_response) {
+        completed_turn_after_response = 0;
+        atomic_fetch_add(&last_conversation_activity_ms, 1);
     }
     return CURLE_OK;
 }
@@ -468,6 +484,86 @@ static int memory_fixture_count(const char *query)
     return count;
 }
 
+static void check_stale_needs_decision(void)
+{
+    assert(init_db() == 0 && r2_reality_init() == 0);
+    int before = memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                      "WHERE event_type='autonomous_needs_yielded_to_conversation';");
+    set_response("[WORLD] sleep|8", "stop", 1);
+    completed_turn_after_response = 1;
+    autonomous_needs_check();
+    assert(!completed_turn_after_response);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                "WHERE event_type='autonomous_needs_yielded_to_conversation';") == before + 1);
+    r2_reality_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
+static void check_post_turn_retry(void)
+{
+    assert(init_db() == 0);
+    int64_t source = r2_log_conversation_turn_for_learning(
+        "What do you remember?", "I remember the blue door.", NULL, 0, NULL, 0, NULL);
+    assert(source > 0);
+    pthread_mutex_lock(&conversation_turn_lock);
+    resume_post_turn_learning();
+    assert(post_turn_active == 0);
+    pthread_mutex_unlock(&conversation_turn_lock);
+
+    begin_post_turn_work();
+    resume_post_turn_learning();
+    assert(post_turn_active == 1);
+    finish_post_turn_worker();
+
+    R2PostTurnJob *job = calloc(1, sizeof(*job));
+    assert(job);
+    job->user = strdup("What do you remember?");
+    job->reply = strdup("I remember the blue door.");
+    job->event_id = source;
+    job->self_report_pending = job->memory_pending = 1;
+    assert(job->user && job->reply);
+    set_response("knowledge | The door was blue.", "stop", 1);
+    const char *failures = "SELECT count(*) FROM r2_log_events WHERE event_type='post_turn_memory_decision_failed';";
+    int initial_failures = memory_fixture_count(failures);
+    int before = perform_count;
+    defer_post_turn_request = 2;
+    begin_post_turn_work();
+    post_turn_worker(job);
+    assert(post_turn_active == 0);
+    assert(perform_count == before + 3 && defer_post_turn_request == 0);
+    assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
+    assert(memory_fixture_count(failures) == initial_failures);
+    int64_t late = r2_log_conversation_turn_for_learning(
+        "Earlier log", "I still need to finish.", NULL, 0, NULL, 0, NULL);
+    int64_t newer = r2_log_conversation_turn_for_learning(
+        "Is the bridge done?", "The project is complete.", NULL, 0, NULL, 0, NULL);
+    assert(late > source && newer > late);
+    assert(r2_log_belief("bridge-direct", "It is complete", NULL, 0.9, "supported", NULL) > 0);
+    assert(r2_log_belief_record("bridge-direct", "It is incomplete", "I still need to finish.",
+                               0.8, "tentative", NULL, late, 0) > 0);
+    assert(r2_log_belief_record("bridge-second", "It is complete", "The project is complete.",
+                               0.9, "supported", NULL, newer, 0) > 0);
+    assert(r2_log_continuity_record("bridge-second", "project", "Bridge", NULL, "completed",
+                                   NULL, NULL, newer, "The project is complete.", 1) > 0);
+    int64_t old_belief = r2_log_belief_record("bridge-second", "It is incomplete",
+        "I still need to finish.", 0.6, "tentative", NULL, late, 1);
+    assert(old_belief > 0);
+    assert(r2_log_belief_record("bridge-second", "It is incomplete", "I still need to finish.",
+                               0.6, "tentative", NULL, late, 1) == old_belief);
+    assert(r2_log_continuity_record("bridge-second", "project", "Bridge", NULL, "open",
+                                   NULL, NULL, late, "I still need to finish.", 2) > 0);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_beliefs WHERE belief='It is complete' "
+                                "AND belief_key IN ('bridge-direct','bridge-second');") == 2);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_continuity "
+                                "WHERE item_key='bridge-second' AND status='completed';") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
+                                "WHERE event_type='belief_updated' AND summary='It is incomplete';") == 2);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_evaluated_memory_atomicity(void)
 {
     assert(init_db() == 0);
@@ -659,7 +755,9 @@ static void check_structured_report_evidence(void)
         "{\"scenario\":\"Unsupported\",\"evidence\":\"\\t \\n\"}]}";
     sqlite3 *fixture = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
-    int64_t parent = r2_log_conversation_turn("Tell me what you think.", reply);
+    assert(r2_altself_init() == 0);
+    int64_t parent = r2_log_conversation_turn_for_learning(
+        "Tell me what you think.", reply, NULL, 0, NULL, 0, NULL);
     assert(parent > 0);
     assert(sqlite3_exec(fixture,
         "CREATE TRIGGER ignore_structured_row BEFORE INSERT ON r2_log_inner_states "
@@ -688,7 +786,7 @@ static void check_structured_report_evidence(void)
             "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
         set_response(phase ? report : invalid, "stop", 1);
         free(invalid);
-        log_structured_self_report(reply, parent);
+        publish_structured_self_report(reply, parent, phase == 2 ? report : NULL, 0);
         if (phase == 1) assert(sqlite3_exec(fixture,
             "DROP TRIGGER ignore_evidence_link", NULL, NULL, NULL) == SQLITE_OK);
         int valid = phase == 2;
@@ -706,6 +804,7 @@ static void check_structured_report_evidence(void)
         sqlite3_finalize(st);
     }
     assert(sqlite3_close(fixture) == SQLITE_OK);
+    r2_altself_shutdown();
 }
 
 int main(void)
@@ -826,14 +925,22 @@ int main(void)
 
     set_response("imaginary | This category is outside the contract.", "stop", 1);
     decision = memory_decision(NULL, "Private hypothesis.", "The source could not be read.", 0, NULL);
-    assert(decision && !strcmp(decision, "NONE"));
-    free(decision);
+    assert(!decision);
     assert(json_object_object_get_ex(captured, "messages", &messages));
     evaluation = json_object_array_get_idx(messages, json_object_array_length(messages) - 1);
     assert(json_object_object_get_ex(evaluation, "content", &evaluation_text));
     assert(strstr(json_object_get_string(evaluation_text), "PRIVATE R2 REFLECTION"));
     assert(strstr(json_object_get_string(evaluation_text), "The source could not be read."));
     assert(!strstr(json_object_get_string(evaluation_text), "LATEST USER MESSAGE"));
+
+    set_response("I found something but omitted the category.", "stop", 1);
+    assert(!memory_decision("What did you find?", "I can check.", NULL, 0, NULL));
+    set_response("knowledge |   ", "stop", 1);
+    assert(!memory_decision("What did you find?", "I can check.", NULL, 0, NULL));
+    set_response("NONE", "stop", 1);
+    decision = memory_decision("What did you find?", "I can check.", NULL, 0, NULL);
+    assert(decision && !strcmp(decision, "NONE"));
+    free(decision);
 
     char *long_memory = text(5200, 'q', "self | I can check my saved work. ");
     strcpy(long_memory + 5189, "EXACT-TAIL");
@@ -852,7 +959,9 @@ int main(void)
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
+    check_post_turn_retry();
     check_staged_imagination();
+    check_stale_needs_decision();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);

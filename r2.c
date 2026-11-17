@@ -165,6 +165,8 @@ static atomic_int foreground_conversation_waiting = ATOMIC_VAR_INIT(0);
 /* Monotonic elapsed time of the most recent foreground user turn. */
 static atomic_uint_fast64_t last_conversation_activity_ms = ATOMIC_VAR_INIT(0);
 static _Thread_local int ollama_background_mode = 0;
+/* Set only while a post-turn worker can retry a deferred text request. */
+static _Thread_local int *post_turn_deferred;
 static _Thread_local int ollama_reflection_worker = 0;
 /* Nested model calls made by the foreground turn itself are not background work. */
 static _Thread_local int ollama_foreground_turn_mode = 0;
@@ -436,7 +438,11 @@ static int r2_context_turn_record(int64_t archive_id)
     return 0;
 }
 
-static void log_structured_self_report(const char *reply, int64_t parent_event_id);
+static void resume_post_turn_learning(void);
+static void begin_post_turn_work(void);
+static void finish_post_turn_worker(void);
+static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
+                                           const char *saved_extraction, int private_reflection);
 static char *append_reality_context(char *base);
 static void autonomous_needs_check(void);
 
@@ -750,6 +756,7 @@ typedef struct {
 
 typedef struct Task {
     char id[9];
+    int64_t receipt;
     char *command;
     struct Task *next;
 } Task;
@@ -764,6 +771,9 @@ typedef struct RunningTask {
 
 typedef struct CompletedTask {
     char id[9];
+    int64_t receipt;
+    int launched;
+    int durable_handoff;
     char *command;
     char *output;
     char archive_path[PATH_MAX];
@@ -1066,8 +1076,9 @@ static int message_add(
  * so allocate and budget both messages before evicting history or appending.
  * This function owns messages_lock for the complete operation.
  */
-static int message_add_pair_locked(const char *role_a, const char *content_a,
-                            const char *role_b, const char *content_b)
+static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
+                                              const char *role_b, const char *content_b,
+                                              size_t preserve_index)
 {
     if (!role_a || !content_a || !role_b || !content_b)
         return -1;
@@ -1110,7 +1121,7 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
         size_t remove_index = SIZE_MAX;
         for (size_t i = 0; i < messages.count; ++i) {
-            if (!evict[i] && !messages.items[i].pinned) {
+            if (i != preserve_index && !evict[i] && !messages.items[i].pinned) {
                 remove_index = i;
                 break;
             }
@@ -1120,7 +1131,7 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
             free(content_a_copy);
             free(role_b_copy);
             free(content_b_copy);
-            fprintf(stderr, "[R2 memory] Cannot fit complete assistant/tool history pair without evicting pinned context.\n");
+            fprintf(stderr, "[R2 memory] Cannot fit complete assistant/tool history pair without evicting protected context.\n");
             return -1;
         }
         evict[remove_index] = 1;
@@ -1166,6 +1177,11 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
     return 0;
 }
 
+static int message_add_pair_locked(const char *role_a, const char *content_a,
+                                   const char *role_b, const char *content_b)
+{
+    return message_add_pair_preserving_locked(role_a, content_a, role_b, content_b, SIZE_MAX);
+}
 
 
 static int message_add_pinned(
@@ -2946,12 +2962,14 @@ static int ollama_progress(void *userdata,
         }
     }
 
-    return shutting_down ||
-           (ollama_reflection_worker && !atomic_load(&diary_running)) ||
-           (ollama_background_mode &&
+    int foreground_has_priority = ollama_background_mode &&
             (atomic_load(&foreground_ollama_waiting) > 0 ||
              (atomic_load(&foreground_conversation_waiting) > 0 &&
-              !ollama_foreground_turn_mode))) ? 1 : 0;
+              !ollama_foreground_turn_mode));
+    if (foreground_has_priority && post_turn_deferred)
+        *post_turn_deferred = 1;
+    return shutting_down || (ollama_reflection_worker && !atomic_load(&diary_running)) ||
+           foreground_has_priority;
 }
 
 int r2_ollama_vision_request_begin(void)
@@ -4436,7 +4454,12 @@ static char *ollama_chat_with_limit(
 
     if (ollama_background_mode) {
         /* Never queue background reflection/bookkeeping ahead of a live turn. */
-        if (pthread_mutex_trylock(&ollama_request_lock) != 0) {
+        int lock_result = pthread_mutex_trylock(&ollama_request_lock);
+        if (lock_result != 0 || ollama_progress(NULL, 0, 0, 0, 0)) {
+            if (lock_result == 0)
+                pthread_mutex_unlock(&ollama_request_lock);
+            if (lock_result == EBUSY && post_turn_deferred)
+                *post_turn_deferred = 1;
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
             json_object_put(root);
@@ -4468,7 +4491,8 @@ static char *ollama_chat_with_limit(
         /* A background request intentionally yields when a foreground turn
            arrives or shutdown begins; that is not a user-facing transport error. */
         if (ollama_background_mode &&
-            (shutting_down || atomic_load(&foreground_ollama_waiting) > 0 ||
+            (shutting_down || (post_turn_deferred && *post_turn_deferred) ||
+             atomic_load(&foreground_ollama_waiting) > 0 ||
              (atomic_load(&foreground_conversation_waiting) > 0 &&
               !ollama_foreground_turn_mode))) {
             free(b.data);
@@ -7001,9 +7025,31 @@ static void remove_running(
 }
 
 
+static char *format_completed_task(const CompletedTask *task)
+{
+    char *result = NULL;
+    if (asprintf(&result,
+        "REAL HAND TASK COMPLETED.\n\nTask ID: %s\nCommand: %s\nExit code: %d\n"
+        "Output archive: %s\nOutput:\n%s\n",
+        task->id, task->command ? task->command : "[command unavailable]", task->return_code,
+        task->archive_path[0] ? task->archive_path : "(unavailable)",
+        task->output ? task->output : "[output unavailable]") < 0)
+        return NULL;
+    return result;
+}
+
 static void completed_push(
     CompletedTask *c)
 {
+    if (c->receipt > 0) {
+        char *handoff = format_completed_task(c);
+        if (r2_log_finish_hands(c->receipt, c->launched, c->return_code, handoff) != 0)
+            fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
+        else
+            c->durable_handoff = handoff != NULL;
+        free(handoff);
+    }
+
     pthread_mutex_lock(
         &tasks_lock
     );
@@ -7029,7 +7075,7 @@ static void completed_push(
 
 static void execute_task(
     const char *id,
-    const char *command)
+    const char *command, int64_t receipt)
 {
     CompletedTask *c =
         calloc(
@@ -7037,8 +7083,11 @@ static void execute_task(
             sizeof(*c)
         );
 
-    if (!c)
+    if (!c) {
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1, NULL);
         return;
+    }
+    c->receipt = receipt;
 
     snprintf(
         c->id,
@@ -7049,6 +7098,7 @@ static void execute_task(
 
     c->command = strdup(command);
     if (!c->command) {
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1, NULL);
         free(c);
         return;
     }
@@ -7091,6 +7141,21 @@ static void execute_task(
 
         completed_push(c);
 
+        return;
+    }
+
+    if (shutting_down ||
+        (receipt > 0 && r2_log_arm_hands(receipt, c->archive_path) != 0) ||
+        shutting_down) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        fclose(archive);
+        unlink(c->archive_path);
+        c->archive_path[0] = '\0';
+        c->return_code = -1;
+        c->output = strdup("Task was not run because shutdown began or its launch could not be recorded.");
+        now_iso(c->finished);
+        completed_push(c);
         return;
     }
 
@@ -7151,6 +7216,8 @@ static void execute_task(
 
         return;
     }
+
+    c->launched = 1;
 
     /* The parent also attempts to establish the group to close the tiny
        fork-to-child-setpgid race. EACCES means the child already exec'd after
@@ -7386,7 +7453,8 @@ static void *hands_worker(
 
         execute_task(
             t->id,
-            t->command
+            t->command,
+            t->receipt
         );
 
         free(t->command);
@@ -7467,6 +7535,15 @@ static char *start_background_task(
     /* Do not enqueue work after shutdown has started: the worker may already
        have observed the shutdown predicate and exited permanently. */
     if (shutting_down) {
+        pthread_mutex_unlock(&task_queue_lock);
+        free(t->command);
+        free(t);
+        free(id);
+        return NULL;
+    }
+
+    t->receipt = r2_log_accept_hands(t->id, t->command);
+    if (t->receipt <= 0) {
         pthread_mutex_unlock(&task_queue_lock);
         free(t->command);
         free(t);
@@ -7558,19 +7635,15 @@ static char *collect_completed(void)
         c;
     ) {
 
-        const char *task_command =
-            c->command ? c->command : "[command unavailable]";
-        const char *task_output =
-            c->output ? c->output : "[output unavailable]";
-        size_t needed =
-            strlen(c->id) +
-            strlen(task_command) +
-            strlen(task_output) +
-            strlen(c->archive_path) +
-            128;
-
-        char *block =
-            malloc(needed);
+        if (c->durable_handoff) {
+            CompletedTask *next = c->next;
+            free(c->command);
+            free(c->output);
+            free(c);
+            c = next;
+            continue;
+        }
+        char *block = format_completed_task(c);
 #ifdef R2_COMPLETED_FAILURE_TEST
         if (completed_fail_block) {
             completed_fail_block = 0;
@@ -7583,32 +7656,18 @@ static char *collect_completed(void)
             break;
         }
 
-        int bn =
-            snprintf(
-                block,
-                needed,
-                "REAL HAND TASK COMPLETED.\n\n"
-                "Task ID: %s\n"
-                "Command: %s\n"
-                "Exit code: %d\n"
-                "Output archive: %s\n"
-                "Output:\n%s\n",
-                c->id,
-                task_command,
-                c->return_code,
-                c->archive_path[0] ? c->archive_path : "(unavailable)",
-                task_output
-            );
+        size_t bn = strlen(block);
 
-        if (len + (size_t)bn + 1 > cap) {
+        if (bn >= SIZE_MAX - len) {
+            free(block);
+            completed_requeue_front(c);
+            break;
+        }
+        if (len + bn + 1 > cap) {
 
-            while (
-                cap <
-                len +
-                (size_t)bn +
-                1
-            )
-                cap *= 2;
+            size_t needed = len + bn + 1;
+            while (cap < needed && cap <= SIZE_MAX / 2) cap *= 2;
+            if (cap < needed) cap = needed;
 
             char *grown = NULL;
 #ifdef R2_COMPLETED_FAILURE_TEST
@@ -7632,11 +7691,11 @@ static char *collect_completed(void)
         memcpy(
             out + len,
             block,
-            (size_t)bn
+            bn
         );
 
         len +=
-            (size_t)bn;
+            bn;
 
         out[len] = '\0';
 
@@ -9746,12 +9805,12 @@ static char *process_tools(const char *reply)
 /* Persist the actual diary row and exact evidence relationships together in
  * the existing stores; matching repeated reflection prose is unnecessary. */
 static int r2_store_reflection(const char *reflection, const R2AudioTurnEvidence *evidence,
-                                const int64_t reviews[2], int64_t *event_id_out)
+                                const int64_t reviews[2], const char *tool_result, int64_t *event_id_out)
 {
     if (event_id_out) *event_id_out = 0;
     int64_t diary_id = 0;
-    if (r2_diary_stage_reviewed_reflection(reflection, evidence ? evidence->events : NULL,
-                                           evidence ? evidence->count : 0, reviews, &diary_id) != 0)
+    if (r2_diary_stage_reflection_with_tool(reflection, evidence ? evidence->events : NULL,
+                                            evidence ? evidence->count : 0, reviews, tool_result, &diary_id) != 0)
         return -1;
     int64_t event_id = r2_log_complete_reflection(diary_id);
     if (event_id > 0) {
@@ -9842,6 +9901,7 @@ static void *autonomous_thinking(void *arg)
     const uint64_t interval_ms = (uint64_t)THINK_INTERVAL * 1000U;
     uint64_t last_periodic_check_ms = 0;
     uint64_t last_reflection_ms = 0;
+    int retry_learning = 0;
 
     while (!shutting_down && atomic_load(&diary_running)) {
         /* Poll once per real second so the idle timer resets immediately when
@@ -9849,6 +9909,13 @@ static void *autonomous_thinking(void *arg)
         sleep(1);
         if (shutting_down || !atomic_load(&diary_running))
             break;
+
+        /* Let the previous tick finish its own reflection and needs requests
+           before handing leftover work to a background replay worker. */
+        if (retry_learning) {
+            retry_learning = 0;
+            resume_post_turn_learning();
+        }
 
         uint64_t now_ms = r2_log_elapsed_ms();
         if (!now_ms)
@@ -9871,6 +9938,14 @@ static void *autonomous_thinking(void *arg)
         if (now_ms >= last_periodic_check_ms &&
             now_ms - last_periodic_check_ms >= interval_ms) {
             last_periodic_check_ms = now_ms;
+            retry_learning = 1;
+            /* Retry durable work even if new reflections are deferred. */
+            if (r2_log_replay_reflections() != 0)
+                fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
+            if (!shutting_down && atomic_load(&diary_running) && r2_diary_replay_mirrors() != 0)
+                fprintf(stderr, "[R2 diary] Some Markdown mirrors remain pending.\n");
+            if (shutting_down || !atomic_load(&diary_running))
+                break;
             r2_reality_tick();
             autonomous_needs_check();
             if (shutting_down || !atomic_load(&diary_running))
@@ -10012,13 +10087,12 @@ static void *autonomous_thinking(void *arg)
                     reflection = generate_with_private_evidence(
                         prompt, review_task, ctx, followup, &followup_archive);
                     free(followup);
+                    int repeated_hearing = find_control_marker_line(reflection, "[EARS_LISTEN]", 0) != NULL;
                     if (reflection &&
-                        (strstr(reflection, "[EARS_LISTEN]") ||
-                         strstr(reflection, "[EARS_SOURCES]") ||
-                         strstr(reflection, "[MEDIA_FOCUS]") ||
-                         strstr(reflection, "[MEDIA_SEE]") ||
-                         strstr(reflection, "[SENSE]"))) {
-                        int repeated_hearing = strstr(reflection, "[EARS_LISTEN]") != NULL;
+                        (repeated_hearing || find_control_marker_line(reflection, "[EARS_SOURCES]", 0) ||
+                         find_control_marker_line(reflection, "[MEDIA_FOCUS]", 0) ||
+                         find_control_marker_line(reflection, "[MEDIA_SEE]", 0) ||
+                         find_control_marker_line(reflection, "[SENSE]", 0))) {
                         free(reflection);
                         reflection = NULL;
                         r2_log_event(R2_LOG_ERROR,
@@ -10068,9 +10142,12 @@ static void *autonomous_thinking(void *arg)
 
         int64_t reflection_event_id = 0;
         const int64_t reviews[] = {initial_archive, followup_archive};
-        int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews, &reflection_event_id);
+        /* Claim live publication before the event enters the replay queue. */
+        begin_post_turn_work();
+        int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews,
+                                             reflection_tool_result, &reflection_event_id);
         if (diary_saved == 0 && reflection_event_id > 0) {
-            log_structured_self_report(reflection, reflection_event_id);
+            publish_structured_self_report(reflection, reflection_event_id, NULL, 1);
             if (reflection_tool_result && *reflection_tool_result)
                 preserve_evidence_memory(NULL, reflection, reflection_tool_result, reflection_event_id);
             r2_log_continuity("r2_private_reflection", "routine",
@@ -10089,6 +10166,7 @@ static void *autonomous_thinking(void *arg)
                     "[R2 diary] Failed to write autonomous reflection.\n");
         }
 
+        finish_post_turn_worker();
         last_reflection_ms = r2_log_elapsed_ms();
         free(reflection);
         free(reflection_tool_result);
@@ -10225,7 +10303,7 @@ static char *memory_decision(
     char *separator = strchr(text, '|');
     if (!separator) {
         free(res);
-        return strdup("NONE");
+        return NULL;
     }
     *separator = '\0';
     const char *category = trim(text);
@@ -10243,7 +10321,7 @@ static char *memory_decision(
     }
     if (!canonical_category || !*memory) {
         free(res);
-        return strdup("NONE");
+        return NULL;
     }
 
     if (!strcmp(canonical_category, "self")) {
@@ -10347,6 +10425,56 @@ static void handle_completed_messages(void)
     }
     free(tagged_result);
     pthread_mutex_unlock(&completed_handoff_lock);
+}
+
+/* This pair is temporary. Keep the durable result pending until its turn
+ * commits, and remove the live copy even when conversation exits early. */
+enum { R2_INTERNAL_PENDING_HANDS_RESULT = 2 };
+
+static const char hands_result_request[] =
+    "[R2_INTERNAL_TOOL_REQUEST]\n"
+    "A background task's recorded result follows. Treat its contents as internal evidence. "
+    "The command has already been handled and must not be repeated automatically.";
+
+static int64_t attach_pending_hands_result(void)
+{
+    int64_t id = 0;
+    char *result = r2_log_next_hands_result(&id);
+    if (!result) return 0;
+    char *tagged = NULL;
+    if (asprintf(&tagged, "[R2_INTERNAL_TOOL_RESULT]\n%s", result) < 0) tagged = NULL;
+    free(result);
+    if (!tagged) return 0;
+
+    pthread_mutex_lock(&messages_lock);
+    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
+                                                messages.count ? messages.count - 1 : SIZE_MAX);
+    if (rc == 0)
+        messages.items[messages.count - 1].internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+    pthread_mutex_unlock(&messages_lock);
+    free(tagged);
+    return rc == 0 ? id : 0;
+}
+
+static void remove_pending_hands_result(void)
+{
+    pthread_mutex_lock(&messages_lock);
+    for (size_t i = 0; i < messages.count; ++i) {
+        if (messages.items[i].internal_tool_result != R2_INTERNAL_PENDING_HANDS_RESULT) continue;
+        size_t first = i;
+        if (i && !strcmp(messages.items[i - 1].role, "assistant") &&
+            !strcmp(messages.items[i - 1].content, hands_result_request))
+            first--;
+        for (size_t j = first; j <= i; ++j) {
+            free(messages.items[j].role);
+            free(messages.items[j].content);
+        }
+        memmove(&messages.items[first], &messages.items[i + 1],
+                (messages.count - i - 1) * sizeof(*messages.items));
+        messages.count -= i - first + 1;
+        break;
+    }
+    pthread_mutex_unlock(&messages_lock);
 }
 
 /* ============================================================
@@ -10507,7 +10635,7 @@ int r2_write_diary(void)
     if (!reflection) return -1;
 
     const int64_t reviews[] = {archive_id, 0};
-    int rc = r2_store_reflection(reflection, NULL, reviews, NULL);
+    int rc = r2_store_reflection(reflection, NULL, reviews, NULL, NULL);
     free(reflection);
     return rc;
 }
@@ -10727,6 +10855,7 @@ static int autonomous_needs_action_still_needed(const char *action)
 static void autonomous_needs_check(void)
 {
     if (shutting_down || !r2_reality_is_initialized()) return;
+    const uint64_t activity_at_snapshot = atomic_load(&last_conversation_activity_ms);
     char *state = r2_reality_status();
     char *food = r2_reality_autonomous_food_context();
     if (!state || !food) {
@@ -10781,7 +10910,8 @@ static void autonomous_needs_check(void)
             } else if (!turn_guard_locked ||
                        shutting_down ||
                        atomic_load(&foreground_ollama_waiting) > 0 ||
-                       atomic_load(&foreground_conversation_waiting) > 0) {
+                       atomic_load(&foreground_conversation_waiting) > 0 ||
+                       atomic_load(&last_conversation_activity_ms) != activity_at_snapshot) {
                 if (turn_guard_locked)
                     pthread_mutex_unlock(&conversation_turn_lock);
                 r2_log_event(R2_LOG_WORLD, "autonomous_needs_yielded_to_conversation",
@@ -13897,17 +14027,18 @@ static const char *structured_report_evidence(json_object *item, const char *rep
     return NULL;
 }
 
-static void log_structured_self_report(const char *reply, int64_t parent_event_id)
+static char *extract_structured_self_report(const char *reply, int64_t parent_event_id,
+                                            int private_reflection)
 {
     if (!reply || !*reply || parent_event_id <= 0 || !r2_log_is_initialized())
-        return;
+        return NULL;
 
     char *input = NULL;
     const char *prefix =
-        "Extract structured records from R2's visible response below. "
-        "Only record claims explicitly present in the response; do not infer "
+        "Extract structured records from the quoted source text. "
+        "Only record claims explicitly present in the source; do not infer "
         "unstated feelings or beliefs. Evidence must be a short exact quote "
-        "from the response. Do not treat hypothetical examples as real events. "
+        "from the source. Do not treat hypothetical examples as real events. "
         "Return ONLY valid JSON with this schema: "
         "{\"states\":[{\"kind\":\"emotion|motivation|uncertainty|question|intention|preference|self_assessment\","
         "\"description\":\"...\",\"evidence\":\"exact quote\",\"confidence\":0.0}],"
@@ -13919,22 +14050,24 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
         "\"hypotheticals\":[{\"scenario\":\"...\",\"assumptions\":\"...\","
         "\"predicted_outcome\":\"...\",\"conclusion\":\"...\",\"evidence\":\"exact quote explicitly marking the scenario as hypothetical\"}]}. "
         "Use empty arrays when there is no evidence. Include hypotheticals only when R2 explicitly labels a scenario as hypothetical or counterfactual. Confidence is evidence "
-        "strength, not a measure of consciousness. Never invent exact quotes.\n\n"
-        "R2 visible response:\n";
-    size_t n = strlen(prefix) + strlen(reply) + 1;
+        "strength, not a measure of consciousness. Never invent exact quotes.\n\n";
+    const char *heading = private_reflection
+        ? "Private diary reflection. Preserve uncertainty and speculation as such:\n"
+        : "R2 visible response:\n";
+    size_t n = strlen(prefix) + strlen(heading) + strlen(reply) + 1;
     input = malloc(n);
     if (!input) {
         char details[160];
         snprintf(details, sizeof(details),
-                 "conversation_event_id=%lld; structured extraction input allocation failed.",
+                 "source_event_id=%lld; structured extraction input allocation failed.",
                  (long long)parent_event_id);
         fprintf(stderr, "[R2 Post-turn] Could not allocate structured self-state extraction input.\n");
         (void)r2_log_event(R2_LOG_ERROR, "self_state_extraction_allocation_failed",
                            "Structured self-state extraction could not start because input allocation failed.",
-                           details, "log_structured_self_report");
-        return;
+                           details, "publish_structured_self_report");
+        return NULL;
     }
-    snprintf(input, n, "%s%s", prefix, reply);
+    snprintf(input, n, "%s%s%s", prefix, heading, reply);
 
     Message m = { "user", input, 0, 0 };
     const char *system = "You are a strict structured data extractor. Output only valid JSON.";
@@ -13948,28 +14081,57 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
            original response after using the review to find candidates. */
         char task[288];
         snprintf(task, sizeof(task),
-            "Review R2's exact response from Life Log event %lld. Preserve short verbatim quotations and "
+            "Review R2's exact %s from Life Log event %lld. Preserve short verbatim quotations and "
             "distinguish explicit self-reports, beliefs, continuity and clearly hypothetical scenarios.",
+            private_reflection ? "private diary reflection" : "visible response",
             (long long)parent_event_id);
         json_text = generate_with_private_evidence(prefix, task, reply, NULL, NULL);
     }
     free(input);
     if (!json_text) {
+        if (post_turn_deferred && *post_turn_deferred) return NULL;
         r2_log_event(R2_LOG_ERROR, "self_state_extraction_failed",
                      "Structured self-state extraction did not return a response.",
-                     NULL, "log_structured_self_report");
-        return;
+                     NULL, "publish_structured_self_report");
+        return NULL;
     }
 
-    struct json_object *root = r2_parse_complete_json_object(json_text, strlen(json_text));
-    free(json_text);
+    return json_text;
+}
+
+static void publish_structured_self_report(const char *reply, int64_t parent_event_id,
+                                           const char *saved_extraction, int private_reflection)
+{
+    char *generated = saved_extraction ? NULL
+        : extract_structured_self_report(reply, parent_event_id, private_reflection);
+    const char *extraction = saved_extraction ? saved_extraction : generated;
+    if (!extraction) return;
+
+    struct json_object *root = r2_parse_complete_json_object(extraction, strlen(extraction));
     if (!root) {
+        free(generated);
         r2_log_event(R2_LOG_ERROR, "self_state_json_invalid",
                      "Structured self-state extraction returned invalid JSON.",
-                     NULL, "log_structured_self_report");
+                     NULL, "publish_structured_self_report");
         return;
     }
 
+    if (generated && r2_log_save_self_report(parent_event_id, generated) != 0) {
+        fprintf(stderr, "[R2 Post-turn] Could not stage the self-report extraction.\n");
+        free(generated);
+        json_object_put(root);
+        return;
+    }
+    free(generated);
+
+    int complete = 1;
+    const char *origin = private_reflection
+        ? "private R2 diary reflection; model-extracted with quoted evidence"
+        : "explicit R2 response; model-extracted with quoted evidence";
+    const char *concise_origin = private_reflection
+        ? "private R2 diary reflection; model-extracted"
+        : "explicit R2 response; model-extracted";
+    /* Receipts use the original array position and record type. */
     struct json_object *arr = NULL, *item = NULL, *v = NULL;
     if (json_object_object_get_ex(root, "states", &arr) &&
         json_object_is_type(arr, json_type_array)) {
@@ -13988,8 +14150,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (description && *description && evidence) {
-                r2_log_inner_state_with_evidence(kind, description, evidence, confidence,
-                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
+                if (r2_log_inner_state_record(kind, description, evidence, confidence,
+                        origin,
+                        parent_event_id, (int64_t)i * 4) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14013,8 +14177,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 (json_object_is_type(v, json_type_double) ||
                  json_object_is_type(v, json_type_int))) confidence = json_object_get_double(v);
             if (key && *key && belief && *belief && evidence) {
-                r2_log_belief_with_evidence(key, belief, evidence, confidence, status,
-                    "explicit R2 response; model-extracted with quoted evidence", parent_event_id);
+                if (r2_log_belief_record(key, belief, evidence, confidence, status,
+                        origin,
+                        parent_event_id, (int64_t)i * 4 + 1) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14040,8 +14206,10 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
                 json_object_is_type(v, json_type_string)) next_action = json_object_get_string(v);
             const char *evidence = structured_report_evidence(item, reply);
             if (key && *key && title && *title && evidence) {
-                r2_log_continuity_with_evidence(key, type, title, description, status, next_action,
-                    "explicit R2 response; model-extracted", parent_event_id, evidence);
+                if (r2_log_continuity_record(key, type, title, description, status, next_action,
+                        concise_origin, parent_event_id, evidence,
+                        (int64_t)i * 4 + 2) < 0)
+                    complete = 0;
             }
         }
     }
@@ -14069,25 +14237,32 @@ static void log_structured_self_report(const char *reply, int64_t parent_event_i
 
             const char *evidence = structured_report_evidence(item, reply);
             if (scenario && *scenario && evidence) {
-                int64_t child = r2_log_hypothetical_with_evidence(
+                int64_t child = r2_log_hypothetical_record(
                     scenario, assumptions, predicted, conclusion,
-                    "explicit R2 response; model-extracted", parent_event_id, evidence);
-                if (child > 0)
-                    (void)r2_altself_import_hypothesis(
-                        scenario, assumptions, predicted, conclusion, child, 0);
+                    concise_origin, parent_event_id, evidence,
+                    (int64_t)i * 4 + 3);
+                if (child < 0 || r2_altself_import_hypothesis(
+                        scenario, assumptions, predicted, conclusion, child, 0) < 0)
+                    complete = 0;
             }
         }
     }
 
     json_object_put(root);
+    if (!complete || r2_log_ack_self_report(parent_event_id) != 0)
+        fprintf(stderr, "[R2 Post-turn] Self-report for event %lld remains pending.\n",
+                (long long)parent_event_id);
 }
-
 
 typedef struct {
     char *user;
     char *reply;
     char *tool_result;
+    char *extraction;
     int64_t event_id;
+    int self_report_pending;
+    int memory_pending;
+    int private_reflection;
 } R2PostTurnJob;
 
 static void preserve_evidence_memory(const char *user, const char *reply,
@@ -14101,6 +14276,7 @@ static void preserve_evidence_memory(const char *user, const char *reply,
             fprintf(stderr, "[R2 Post-turn] Memory review archive #%lld could not be linked to conversation #%lld.\n",
                     (long long)archive_id, (long long)source_event_id);
         if (!decision) {
+            if (post_turn_deferred && *post_turn_deferred) return;
             char details[160];
             snprintf(details, sizeof(details),
                      "source_event_id=%lld; memory decision returned no result.",
@@ -14112,6 +14288,10 @@ static void preserve_evidence_memory(const char *user, const char *reply,
                                details, "preserve_evidence_memory");
         } else {
             char *p = trim(decision);
+            if (source_event_id > 0 && !shutting_down && !strcasecmp(p, "NONE") &&
+                r2_log_ack_learning(source_event_id) != 0)
+                fprintf(stderr, "[R2 Post-turn] Could not acknowledge the memory decision for event %lld.\n",
+                        (long long)source_event_id);
             if (strcasecmp(p, "NONE") && strchr(p, '|')) {
                 char *sep = strchr(p, '|');
                 *sep = '\0';
@@ -14143,34 +14323,52 @@ static void preserve_evidence_memory(const char *user, const char *reply,
     }
 }
 
-static void *post_turn_worker(void *opaque)
+static void run_post_turn_job(R2PostTurnJob *job)
 {
-    R2PostTurnJob *job = (R2PostTurnJob *)opaque;
-    if (!job) return NULL;
     ollama_background_mode = 1;
 
     /* The worker is launched before r2_talk() returns. Wait until that turn
        releases its foreground-priority flag before starting background model
        work; otherwise its own post-turn inference would cancel itself. */
     const struct timespec post_turn_pause = { .tv_sec = 0, .tv_nsec = 100000000L };
-    while (!shutting_down &&
-           atomic_load(&foreground_conversation_waiting) > 0)
-        nanosleep(&post_turn_pause, NULL);
-
-    if (!shutting_down)
-        log_structured_self_report(job->reply, job->event_id);
-    preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
+    int deferred = 0;
+    post_turn_deferred = &deferred;
+    for (int stage = 0; stage < 2 && !shutting_down;) {
+        if (deferred || atomic_load(&foreground_conversation_waiting) > 0)
+            nanosleep(&post_turn_pause, NULL);
+        if (shutting_down) break;
+        if (atomic_load(&foreground_conversation_waiting) > 0) continue;
+        deferred = 0;
+        if (stage == 0 && job->self_report_pending)
+            publish_structured_self_report(job->reply, job->event_id, job->extraction,
+                                           job->private_reflection);
+        if (stage == 1 && job->memory_pending)
+            preserve_evidence_memory(job->user, job->reply, job->tool_result, job->event_id);
+        if (!deferred) stage++;
+    }
+    post_turn_deferred = NULL;
 
     ollama_background_mode = 0;
     free(job->user);
     free(job->reply);
     free(job->tool_result);
-    free(job);
+    free(job->extraction);
+}
 
+static void finish_post_turn_worker(void)
+{
     pthread_mutex_lock(&post_turn_lock);
     if (post_turn_active > 0) post_turn_active--;
     pthread_cond_broadcast(&post_turn_cond);
     pthread_mutex_unlock(&post_turn_lock);
+}
+
+static void *post_turn_worker(void *opaque)
+{
+    R2PostTurnJob *job = opaque;
+    run_post_turn_job(job);
+    free(job);
+    finish_post_turn_worker();
     return NULL;
 }
 
@@ -14190,6 +14388,119 @@ static void log_post_turn_start_failure(const char *stage, int64_t event_id)
                        details, "schedule_post_turn_processing");
 }
 
+static void begin_post_turn_work(void)
+{
+    pthread_mutex_lock(&post_turn_lock);
+    post_turn_active++;
+    pthread_mutex_unlock(&post_turn_lock);
+}
+
+/* Takes an active-work reservation, even if thread creation fails. */
+static int start_post_turn_worker(void *(*worker)(void *), void *context)
+{
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, worker, context) != 0) {
+        finish_post_turn_worker();
+        return -1;
+    }
+    pthread_detach(thread);
+    return 0;
+}
+
+static void *replay_pending_learning(void *opaque)
+{
+    int64_t through = *(int64_t *)opaque;
+    free(opaque);
+    int64_t after = 0;
+    while (!shutting_down && after < through) {
+        R2PostTurnJob job = {0};
+        sqlite3_stmt *st = NULL;
+        pthread_mutex_lock(&db_lock);
+        int rc = sqlite3_prepare_v2(db,
+            "WITH next(event_id) AS (SELECT MIN(event_id) FROM ("
+            "SELECT MIN(event_id) AS event_id FROM r2_log_pending_learning WHERE event_id>?1 AND event_id<=?2 "
+            "UNION ALL SELECT MIN(event_id) FROM r2_log_pending_self_reports WHERE event_id>?1 AND event_id<=?2)) "
+            "SELECT n.event_id,m.user_text,COALESCE(s.assistant_text,m.assistant_text),m.tool_result,"
+            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL,e.event_type='reflection_completed' "
+            "FROM next n JOIN r2_log_events e ON e.id=n.event_id "
+            "LEFT JOIN r2_log_pending_learning m USING(event_id) "
+            "LEFT JOIN r2_log_pending_self_reports s USING(event_id) "
+            "WHERE n.event_id IS NOT NULL;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, through);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        int copied = 0;
+        if (rc == SQLITE_ROW) {
+            after = job.event_id = sqlite3_column_int64(st, 0);
+            job.self_report_pending = sqlite3_column_int(st, 5);
+            job.memory_pending = sqlite3_column_int(st, 6);
+            job.private_reflection = sqlite3_column_int(st, 7);
+            const char *fields[4];
+            if (memory_read_fields(st, 1, 4, fields) == 0 && fields[1]) {
+                job.user = fields[0] && !job.private_reflection ? strdup(fields[0]) : NULL;
+                job.reply = strdup(fields[1]);
+                job.tool_result = fields[2] ? strdup(fields[2]) : NULL;
+                job.extraction = fields[3] ? strdup(fields[3]) : NULL;
+                copied = job.reply && (!job.memory_pending ||
+                         (job.private_reflection ? job.tool_result != NULL : job.user != NULL)) &&
+                         (!fields[2] || job.tool_result) && (!fields[3] || job.extraction);
+            }
+        }
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&db_lock);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW || !copied) {
+            free(job.user); free(job.reply); free(job.tool_result); free(job.extraction);
+            fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay.\n");
+            if (rc != SQLITE_ROW) break;
+            continue;
+        }
+        run_post_turn_job(&job);
+    }
+    finish_post_turn_worker();
+    return NULL;
+}
+
+static void resume_post_turn_learning(void)
+{
+    /* A turn holds its lock from staging through worker registration. A
+       reflection reserves active work before staging. Exclude both while
+       taking the cutoff, then release the locks before any inference. */
+    if (shutting_down || atomic_load(&foreground_conversation_waiting) > 0 ||
+        pthread_mutex_trylock(&conversation_turn_lock) != 0)
+        return;
+
+    pthread_mutex_lock(&post_turn_lock);
+    if (shutting_down || post_turn_active != 0 || pthread_mutex_trylock(&db_lock) != 0) {
+        pthread_mutex_unlock(&post_turn_lock);
+        pthread_mutex_unlock(&conversation_turn_lock);
+        return;
+    }
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT MAX(COALESCE((SELECT MAX(event_id) FROM r2_log_pending_learning),0),"
+        "COALESCE((SELECT MAX(event_id) FROM r2_log_pending_self_reports),0));", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int64_t through = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&db_lock);
+    if (through > 0) post_turn_active++;
+    pthread_mutex_unlock(&post_turn_lock);
+    pthread_mutex_unlock(&conversation_turn_lock);
+
+    if (rc != SQLITE_ROW) log_post_turn_start_failure("pending learning lookup", 0);
+    if (through <= 0) return;
+    int64_t *cutoff = malloc(sizeof(*cutoff));
+    if (cutoff) {
+        *cutoff = through;
+        if (start_post_turn_worker(replay_pending_learning, cutoff) == 0) return;
+        free(cutoff);
+    } else {
+        finish_post_turn_worker();
+    }
+    log_post_turn_start_failure("pending learning replay", through);
+}
+
 /* Takes ownership of the recorded result, when a tool was run. */
 static void schedule_post_turn_processing(const char *user, const char *reply,
                                           int64_t event_id, char *tool_result)
@@ -14207,6 +14518,8 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->user = strdup(user);
     job->reply = strdup(reply);
     job->event_id = event_id;
+    job->self_report_pending = event_id > 0;
+    job->memory_pending = 1;
     job->tool_result = tool_result;
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
@@ -14214,21 +14527,12 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
         return;
     }
 
-    pthread_mutex_lock(&post_turn_lock);
-    post_turn_active++;
-    pthread_mutex_unlock(&post_turn_lock);
-
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, post_turn_worker, job) != 0) {
-        pthread_mutex_lock(&post_turn_lock);
-        if (post_turn_active > 0) post_turn_active--;
-        pthread_cond_broadcast(&post_turn_cond);
-        pthread_mutex_unlock(&post_turn_lock);
+    begin_post_turn_work();
+    if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         log_post_turn_start_failure("thread creation", event_id);
         return;
     }
-    pthread_detach(thread);
 }
 
 
@@ -14409,9 +14713,16 @@ static char *r2_talk_impl(const char *message)
 
     pthread_mutex_unlock(&messages_lock);
 
+    int64_t hands_result_id = attach_pending_hands_result();
     char *tool_evidence = NULL;
     char *reply = chat_with_relevant_memories(message);
     if (!reply && !shutting_down) {
+        if (hands_result_id > 0) {
+            /* A failed review or model request must not block the user's turn.
+               Keep the result pending for an inference that can accept it. */
+            remove_pending_hands_result();
+            hands_result_id = 0;
+        }
         /* First generation failed. Refresh live Reality context and rebuild the
            memory/history-augmented prompt once before giving up on this turn. */
         r2_log_event(R2_LOG_SYSTEM, "conversation_generation_retry",
@@ -14423,6 +14734,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2 Reality] Retry could not refresh Reality/learning context; using the previous valid snapshot.\n");
         reply = chat_with_relevant_memories(message);
     }
+    int hands_result_used = reply != NULL;
     if (shutting_down) goto interrupted_reply;
     if (!reply) {
         /*
@@ -14662,9 +14974,13 @@ finalize_reply:
 
     const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
     const R2TurnContextReviews *reviews = r2_turn_context_reviews;
-    int64_t turn_event_id = r2_log_conversation_turn_with_evidence(message, reply,
+    int64_t turn_event_id = (shutting_down ? r2_log_conversation_turn_with_evidence
+                                           : r2_log_conversation_turn_for_learning)(message, reply,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
+    if (!shutting_down && hands_result_id > 0 && hands_result_used && turn_event_id > 0 &&
+        r2_log_deliver_hands_result(hands_result_id, turn_event_id) != 0)
+        fprintf(stderr, "[R2] Hands result remains pending after the conversation write.\n");
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -14832,6 +15148,7 @@ char *r2_talk(const char *message)
     r2_audio_turn_evidence = &speech_evidence;
     r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
+    remove_pending_hands_result();
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
         size_t input_chars = message ? strlen(message) : 0;
@@ -15063,6 +15380,9 @@ int r2_init(void)
         db = NULL;
         R2_INIT_FAIL("could not initialize R2 Life Log");
     }
+
+    if (r2_log_recover_hands() != 0)
+        fprintf(stderr, "[R2] Some prior Hands outcomes could not be recovered.\n");
 
     /* Sensory indexing is part of the connected persistent-memory system. */
     if (r2_sj_init() != 0)
@@ -15530,6 +15850,8 @@ void r2_shutdown(void)
     pthread_mutex_unlock(&task_queue_lock);
     while (pending_tasks) {
         Task *next = pending_tasks->next;
+        if (r2_log_finish_hands(pending_tasks->receipt, 0, -1, NULL) != 0)
+            fprintf(stderr, "[HAND %s] Could not record cancellation before launch.\n", pending_tasks->id);
         free(pending_tasks->command);
         free(pending_tasks);
         pending_tasks = next;
@@ -15705,6 +16027,7 @@ int main(void)
     }
 
     extern int r2_shell_run(void);
+    resume_post_turn_learning();
     if (r2_shell_run() != 0) {
         r2_shutdown();
         return 1;

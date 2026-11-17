@@ -729,6 +729,9 @@ static int r2_diary_init_unlocked(void)
             "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflections ("
             " diary_entry_id INTEGER PRIMARY KEY REFERENCES diary_entries(id),"
             " speech_count INTEGER NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflection_tool ("
+            " diary_entry_id INTEGER PRIMARY KEY REFERENCES r2_diary_pending_reflections(diary_entry_id),"
+            " result TEXT NOT NULL);"
             "CREATE TABLE IF NOT EXISTS r2_diary_pending_reflection_speech ("
             " diary_entry_id INTEGER NOT NULL REFERENCES r2_diary_pending_reflections(diary_entry_id),"
             " ordinal INTEGER NOT NULL,"
@@ -1124,6 +1127,20 @@ static int diary_stage_reflection_reviews(int64_t diary_id, const int64_t review
     return rc == SQLITE_OK ? 0 : -1;
 }
 
+static int diary_stage_reflection_tool(int64_t diary_id, const char *result)
+{
+    if (!result || !*result) return 0;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(r2_diary_db,
+        "INSERT INTO r2_diary_pending_reflection_tool(diary_entry_id,result) VALUES(?,?);",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, diary_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 2, result, strlen(result), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(r2_diary_db) == 1 ? 0 : -1;
+}
+
 static int diary_stage_mirror(int64_t diary_id)
 {
     sqlite3_stmt *st = NULL;
@@ -1137,7 +1154,7 @@ static int diary_stage_mirror(int64_t diary_id)
 
 static int64_t diary_insert_entry_row(const char *entry, const char *timestamp,
                                       int reflection, const int64_t *speech_ids,
-                                      size_t speech_count, const int64_t reviews[2])
+                                      size_t speech_count, const int64_t reviews[2], const char *tool_result)
 {
     int present[sizeof(diary_time_aliases) / sizeof(diary_time_aliases[0])];
     char sql[1024] = "INSERT INTO diary_entries(entry,created_at";
@@ -1193,6 +1210,7 @@ static int64_t diary_insert_entry_row(const char *entry, const char *timestamp,
     if (id > 0 && diary_stage_mirror(id) == 0 &&
         (!reflection || diary_stage_reflection(id, speech_ids, speech_count) == 0) &&
         diary_stage_reflection_reviews(id, reviews) == 0 &&
+        diary_stage_reflection_tool(id, tool_result) == 0 &&
         sqlite3_exec(r2_diary_db, "COMMIT;", NULL, NULL, NULL) == SQLITE_OK)
         return id;
     if (!sqlite3_get_autocommit(r2_diary_db))
@@ -1412,7 +1430,7 @@ int r2_diary_replay_mirrors(void)
 
 static int r2_diary_write_unlocked(
     const char *entry, int64_t *entry_id_out, int reflection,
-    const int64_t *speech_ids, size_t speech_count, const int64_t reviews[2]
+    const int64_t *speech_ids, size_t speech_count, const int64_t reviews[2], const char *tool_result
 )
 {
     char timestamp[64];
@@ -1442,7 +1460,7 @@ static int r2_diary_write_unlocked(
      * --------------------------------------------------------
      */
 
-    diary_entry_id = diary_insert_entry_row(entry, timestamp, reflection, speech_ids, speech_count, reviews);
+    diary_entry_id = diary_insert_entry_row(entry, timestamp, reflection, speech_ids, speech_count, reviews, tool_result);
     if (diary_entry_id <= 0)
         return -1;
     if (entry_id_out) *entry_id_out = diary_entry_id;
@@ -1481,7 +1499,7 @@ int r2_diary_write_with_id(const char *entry, int64_t *entry_id_out)
 {
     if (entry_id_out) *entry_id_out = 0;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry, entry_id_out, 0, NULL, 0, NULL);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 0, NULL, 0, NULL, NULL);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
 }
@@ -1496,11 +1514,18 @@ int r2_diary_stage_reviewed_reflection(const char *entry, const int64_t *speech_
                                        size_t speech_count, const int64_t reviews[2],
                                        int64_t *entry_id_out)
 {
+    return r2_diary_stage_reflection_with_tool(entry, speech_ids, speech_count, reviews, NULL, entry_id_out);
+}
+
+int r2_diary_stage_reflection_with_tool(const char *entry, const int64_t *speech_ids,
+                                       size_t speech_count, const int64_t reviews[2],
+                                       const char *tool_result, int64_t *entry_id_out)
+{
     if (entry_id_out) *entry_id_out = 0;
     if ((speech_count && !speech_ids) || speech_count > (size_t)INT64_MAX)
         return -1;
     pthread_mutex_lock(&r2_diary_write_lock);
-    int rc = r2_diary_write_unlocked(entry, entry_id_out, 1, speech_ids, speech_count, reviews);
+    int rc = r2_diary_write_unlocked(entry, entry_id_out, 1, speech_ids, speech_count, reviews, tool_result);
     pthread_mutex_unlock(&r2_diary_write_lock);
     return rc;
 }

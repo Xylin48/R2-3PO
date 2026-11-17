@@ -23,8 +23,12 @@ FIRST = "R2_OFFLINE_SESSION_ONE_73628"
 FOLLOWUP = "What is in your pockets? R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
 REPLY = "I received your message and can respond in this conversation."
-REFLECTION = "I closed Eyes deliberately and kept the earlier evidence separate."
+REFLECTION = ("I closed Eyes deliberately and kept the earlier evidence separate. "
+              "The literal `[SENSE]` label records how I made that choice.\n"
+              "```text\n[EARS_LISTEN] is only a quoted example.\n```")
+PRIVATE_REFLECTION_QUOTE = "I closed Eyes deliberately and kept the earlier evidence separate."
 SENSE_RESULT = "SENSE RESULT: Eyes voluntarily closed; auto discovery will not reopen them."
+PRIVATE_TOOL_MEMORY = "I voluntarily closed Eyes."
 ARCHIVED_ENTRY = "Exact earlier diary evidence: " + ("évidence 🐈 " * 1000) + "final diary bytes."
 FRIDGE_FOOD = "Fixture pear"
 FRIDGE_INGREDIENTS = "pear,ginger"
@@ -44,7 +48,23 @@ EXACT_FILE = "\n  <think>literal markup</think>\n[R2_SOUND:beep:curious]\nFinal:
 
 STOPPED_REQUEST = "R2_OFFLINE_INTERRUPT_ACTIVE_81842"
 LONG_FOREGROUND_REQUEST = "R2_OFFLINE_LONG_FOREGROUND_24126"
+LEARNING_RESTART_REQUEST = "Remember that the bridge fixture uses copper. R2_LEARNING_RESTART_71412"
+RESTART_MEMORY = "The bridge fixture uses copper."
+SELF_REPORT_REPLY = "I intend to inspect the copper bridge. Hypothetically, I could build a spare bridge."
+SELF_REPORT_SCENARIO = "Build a spare copper bridge."
+SELF_REPORT_EXTRACTION = json.dumps({
+    "states": [{"kind": "intention", "description": "Inspect the copper bridge.",
+                "evidence": "I intend to inspect the copper bridge."}],
+    "beliefs": [], "continuity": [],
+    "hypotheticals": [{"scenario": SELF_REPORT_SCENARIO,
+                        "evidence": "Hypothetically, I could build a spare bridge."}],
+})
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
+
+
+HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
+HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
+HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
 
 
 class LocalOllama(BaseHTTPRequestHandler):
@@ -84,6 +104,10 @@ class LocalOllama(BaseHTTPRequestHandler):
             time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
+        if current_index >= 0 and user_messages[current_index] == HANDS_QUEUE_REQUEST:
+            reply = REPLY if has_tool_result else f"I will queue the test command.\n[HAND] printf {HANDS_RESULT}"
+        if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
+            reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
             reply = (REPLY + "\n[DELETE] hidden-sentinel.txt"
                       "\n[DIARY]\nFOLLOWUP_PRIVATE_CONTROL_SENTINEL\n[END DIARY]"
@@ -116,9 +140,22 @@ class LocalOllama(BaseHTTPRequestHandler):
                          else "No durable fixture memory is stated in this fragment.")
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "strict structured data extractor" in system:
+            if any(SELF_REPORT_REPLY in m for m in user_messages):
+                reply = SELF_REPORT_EXTRACTION
+            elif any("Private diary reflection." in m and REFLECTION in m for m in user_messages):
+                reply = json.dumps({"states": [{"kind": "self_assessment",
+                    "description": "Kept earlier evidence separate.", "evidence": PRIVATE_REFLECTION_QUOTE}]})
+            else:
+                reply = "{}"
         elif "memory-evaluation system" in system:
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
+            if any("PRIVATE R2 REFLECTION" in m and "RECORDED TOOL RESULT" in m
+                   and SENSE_RESULT in m for m in user_messages):
+                reply = "experience | " + PRIVATE_TOOL_MEMORY
+            if any(LEARNING_RESTART_REQUEST in message for message in user_messages):
+                reply = "knowledge | " + RESTART_MEMORY
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -623,6 +660,288 @@ def reflection_after_long_foreground_turn(binary: Path, workspace: Path, url: st
     print("PASS: autonomous reflection waited a full idle interval after a long foreground turn.")
 
 
+def recover_reflection_during_service(binary: Path, workspace: Path, url: str) -> None:
+    env = runtime_environment(workspace, url, 2048)
+    env["R2_SERVICE_MODE"] = "1"
+    log_path = workspace.parent / "live-reflection-recovery.log"
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db, log_path.open("w", encoding="utf-8") as log:
+        db.executescript(
+            "CREATE TRIGGER block_review BEFORE INSERT ON r2_log_reflection_reviews "
+            "BEGIN SELECT RAISE(ABORT,'fixture rejects reflection link'); END;"
+            "CREATE TRIGGER block_mirror_ack BEFORE DELETE ON r2_diary_pending_mirrors "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER block_private_extraction BEFORE UPDATE OF extraction ON r2_log_pending_self_reports "
+            "WHEN OLD.event_id IN (SELECT id FROM r2_log_events WHERE event_type='reflection_completed') "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER block_private_learning BEFORE DELETE ON r2_log_pending_learning "
+            "WHEN OLD.user_text='' BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        process = subprocess.Popen([str(binary)], cwd=workspace, env=env,
+                                   stdout=log, stderr=subprocess.STDOUT)
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 40
+            while process.poll() is None and time.monotonic() < deadline:
+                result = predicate()
+                if result:
+                    return result
+                time.sleep(0.1)
+            raise AssertionError(log_path.read_text(encoding="utf-8", errors="replace")[-20000:])
+
+        try:
+            diary_id, timestamp, entry = wait_for(lambda: db.execute(
+                "SELECT d.id,d.created_at,d.entry FROM r2_diary_pending_reflections p "
+                "JOIN diary_entries d ON d.id=p.diary_entry_id "
+                "JOIN r2_diary_pending_mirrors m ON m.diary_entry_id=d.id"
+            ).fetchone())
+            archives = db.execute(
+                "SELECT archive_id FROM r2_diary_pending_reflection_reviews WHERE diary_entry_id=? ORDER BY ordinal",
+                (diary_id,),
+            ).fetchall()
+            assert entry == REFLECTION and len(archives) == 2
+            tool = db.execute(
+                "SELECT result FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?", (diary_id,),
+            ).fetchone()
+            assert tool is not None and SENSE_RESULT in tool[0], tool
+            daily = workspace / "R2_Diary" / (timestamp[:10] + ".md")
+            marker = f"\n\n## {timestamp}\n\n{entry}\n"
+            wait_for(lambda: daily.exists() and marker in daily.read_text(encoding="utf-8"))
+            db.executescript("DROP TRIGGER block_review; DROP TRIGGER block_mirror_ack;")
+            wait_for(lambda: not db.execute(
+                "SELECT 1 FROM r2_diary_pending_reflections WHERE diary_entry_id=? UNION ALL "
+                "SELECT 1 FROM r2_diary_pending_mirrors WHERE diary_entry_id=?", (diary_id, diary_id),
+            ).fetchone())
+            assert db.execute(
+                "SELECT r.archive_id FROM r2_log_reflection_reviews r "
+                "JOIN r2_sensory_journal_reflection_links l ON l.event_id=r.event_id "
+                "WHERE l.diary_entry_id=? ORDER BY r.ordinal", (diary_id,),
+            ).fetchall() == archives
+            assert daily.read_text(encoding="utf-8").count(marker) == 1
+            source = db.execute(
+                "SELECT event_id FROM r2_sensory_journal_reflection_links WHERE diary_entry_id=?",
+                (diary_id,),
+            ).fetchone()[0]
+            assert db.execute(
+                "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
+                (source,),
+            ).fetchone() == (REFLECTION, None)
+            assert db.execute(
+                "SELECT user_text,assistant_text,tool_result FROM r2_log_pending_learning WHERE event_id=?",
+                (source,),
+            ).fetchone() == ("", REFLECTION, tool[0])
+            assert not db.execute(
+                "SELECT 1 FROM r2_diary_pending_reflection_tool WHERE diary_entry_id=?", (diary_id,),
+            ).fetchone()
+            wait_for(lambda: f"Persistent memory transaction failed for event {source}."
+                     in log_path.read_text(encoding="utf-8", errors="replace"))
+            with LocalOllama.lock:
+                before_recovery = len(LocalOllama.requests)
+            db.executescript("DROP TRIGGER block_private_extraction; DROP TRIGGER block_private_learning;")
+            wait_for(lambda: not db.execute(
+                "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=? UNION ALL "
+                "SELECT 1 FROM r2_log_pending_learning WHERE event_id=?", (source, source),
+            ).fetchone())
+            assert db.execute(
+                "SELECT s.description,s.origin,l.notes FROM r2_log_links l "
+                "JOIN r2_log_inner_states s ON s.event_id=l.to_event_id "
+                "WHERE l.from_event_id=? AND l.relationship='extracts_self_state'", (source,),
+            ).fetchall() == [("Kept earlier evidence separate.",
+                               "private R2 diary reflection; model-extracted with quoted evidence",
+                               PRIVATE_REFLECTION_QUOTE)]
+            assert db.execute(
+                "SELECT e.details FROM r2_log_links l JOIN r2_log_events e ON e.id=l.from_event_id "
+                "WHERE l.to_event_id=? AND l.relationship='memory_learned_from'", (source,),
+            ).fetchall() == [(PRIVATE_TOOL_MEMORY,)]
+            with LocalOllama.lock:
+                assert any(
+                    any("memory-evaluation system" in m["content"] for m in request["messages"])
+                    and any(("PRIVATE R2 REFLECTION" in m["content"] and REFLECTION in m["content"]
+                             and tool[0] in m["content"] and "LATEST USER MESSAGE" not in m["content"])
+                            for m in request["messages"])
+                    for request in LocalOllama.requests[before_recovery:]
+                )
+            process.terminate()
+            assert process.wait(timeout=15) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    print("PASS: live service recovered reflection links, mirror, private extraction and learning without a restart.")
+
+
+def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        db.executescript(
+            "CREATE TRIGGER ignore_learning_ack BEFORE DELETE ON r2_log_pending_learning "
+            "WHEN OLD.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER ignore_self_report_branch BEFORE INSERT ON r2_alternate_self_branches "
+            "WHEN NEW.scenario='Build a spare copper bridge.' BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        def extracted_requests():
+            with LocalOllama.lock:
+                return sum(
+                    any("strict structured data extractor" in m["content"] for m in r["messages"])
+                    and any(SELF_REPORT_REPLY in m["content"] for m in r["messages"])
+                    for r in LocalOllama.requests
+                )
+
+        for phase in ("blocked", "restart", "acknowledge"):
+            log_path = workspace.parent / f"learning-{phase}.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                process = subprocess.Popen(
+                    [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                    stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+                )
+                assert process.stdin is not None
+                try:
+                    if phase == "blocked":
+                        process.stdin.write(f"talk {LEARNING_RESTART_REQUEST}\n")
+                        process.stdin.flush()
+                    deadline = time.monotonic() + 30
+                    while process.poll() is None and time.monotonic() < deadline:
+                        if phase == "blocked" and "Persistent memory transaction failed" in log_path.read_text(errors="replace"):
+                            break
+                        if phase == "restart" and db.execute(
+                            "SELECT 1 FROM memories WHERE memory=?", (RESTART_MEMORY,),
+                        ).fetchone():
+                            break
+                        if phase == "acknowledge" and not db.execute(
+                            "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?", (source,),
+                        ).fetchone():
+                            break
+                        time.sleep(0.1)
+                    else:
+                        raise AssertionError(log_path.read_text(errors="replace")[-20000:])
+                    pending = db.execute(
+                        "SELECT event_id,assistant_text FROM r2_log_pending_learning WHERE user_text=?",
+                        (LEARNING_RESTART_REQUEST,),
+                    ).fetchall()
+                    stored = db.execute("SELECT count(*) FROM memories WHERE memory=?", (RESTART_MEMORY,)).fetchone()
+                    if phase == "blocked":
+                        assert len(pending) == 1 and pending[0][1] == SELF_REPORT_REPLY, pending
+                        source = pending[0][0]
+                        assert stored == (0,), stored
+                        assert db.execute(
+                            "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (SELF_REPORT_REPLY, SELF_REPORT_EXTRACTION)
+                        receipts = db.execute(
+                            "SELECT child_event_id FROM r2_log_self_report_records WHERE parent_event_id=? ORDER BY ordinal",
+                            (source,),
+                        ).fetchall()
+                        assert len(receipts) == 2, receipts
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_alternate_self_branches WHERE scenario=?",
+                            (SELF_REPORT_SCENARIO,),
+                        ).fetchone() == (0,)
+                    else:
+                        assert pending == [] and stored == (1,)
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_log_links l JOIN r2_log_events e ON e.id=l.from_event_id "
+                            "WHERE l.relationship='memory_learned_from' AND l.to_event_id=? AND e.details=?",
+                            (source, RESTART_MEMORY),
+                        ).fetchone() == (1,)
+                        assert db.execute(
+                            "SELECT count(*) FROM r2_log_pending_self_reports WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (int(phase == "restart"),)
+                        assert db.execute(
+                            "SELECT l.to_event_id,l.notes FROM r2_log_links l WHERE l.from_event_id=? "
+                            "AND l.relationship IN ('extracts_self_state','contains_hypothetical') ORDER BY l.id",
+                            (source,),
+                        ).fetchall() == [
+                            (receipts[0][0], "I intend to inspect the copper bridge."),
+                            (receipts[1][0], "Hypothetically, I could build a spare bridge."),
+                        ]
+                        assert db.execute(
+                            "SELECT log_event_id FROM r2_alternate_self_branches WHERE scenario=?",
+                            (SELF_REPORT_SCENARIO,),
+                        ).fetchall() == [receipts[1]]
+                    assert extracted_requests() == 1
+                    process.terminate()
+                    assert process.wait(timeout=15) == 0
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    process.stdin.close()
+            if phase == "blocked":
+                db.executescript(
+                    "DROP TRIGGER ignore_learning_ack; DROP TRIGGER ignore_self_report_branch;"
+                    "CREATE TRIGGER ignore_self_report_ack BEFORE DELETE ON r2_log_pending_self_reports "
+                    "WHEN OLD.assistant_text LIKE 'I intend to inspect the copper bridge.%' "
+                    "BEGIN SELECT RAISE(IGNORE); END;"
+                )
+            elif phase == "restart":
+                db.executescript("DROP TRIGGER ignore_self_report_ack;")
+    print("PASS: restart recovered learning, reused the staged extraction and completed the original hypothetical branch.")
+
+
+def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        logfile = workspace.parent / "durable-hands.log"
+        env = runtime_environment(workspace, url, 8192)
+        with logfile.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen([str(binary)], cwd=workspace, env=env, stdin=subprocess.PIPE,
+                                    stdout=out, stderr=subprocess.STDOUT, text=True)
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(f"talk {HANDS_QUEUE_REQUEST}\n")
+                proc.stdin.flush()
+                deadline = time.monotonic() + 20
+                while proc.poll() is None and time.monotonic() < deadline:
+                    result = db.execute(
+                        "SELECT outcome_id,result FROM r2_log_hands_results WHERE delivered_to IS NULL;"
+                    ).fetchone()
+                    if result:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(logfile.read_text(errors="replace")[-16000:])
+                outcome, exact = result
+                assert exact.endswith(f"Output:\n{HANDS_RESULT}\n"), exact
+                proc.kill()
+                assert proc.wait(timeout=10) < 0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdin.close()
+
+        db.executescript(
+            "CREATE TRIGGER block_hands_delivery BEFORE UPDATE OF delivered_to ON r2_log_hands_results "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        conversation(binary, workspace, url, (HANDS_READ_REQUEST,), 8192)
+        assert db.execute(
+            "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+        ).fetchone() == (None,)
+        assert db.execute(
+            "SELECT count(*) FROM r2_log_links WHERE to_event_id=? AND relationship='hands_result_in_context'",
+            (outcome,),
+        ).fetchone() == (0,)
+        db.executescript("DROP TRIGGER block_hands_delivery;")
+        with LocalOllama.lock:
+            cutoff = len(LocalOllama.requests)
+        conversation(binary, workspace, url, (HANDS_READ_REQUEST, "The next unrelated turn."), 8192)
+        with LocalOllama.lock:
+            requests = LocalOllama.requests[cutoff:]
+            tagged = "[R2_INTERNAL_TOOL_RESULT]\n" + exact
+            assert any(any(message["content"] == tagged for message in request["messages"])
+                       and any(message["content"] == HANDS_READ_REQUEST for message in request["messages"])
+                       for request in requests)
+            assert all(not any(message["content"] == tagged for message in request["messages"])
+                       for request in requests
+                       if any(message["content"] == "The next unrelated turn." for message in request["messages"]))
+        assert db.execute(
+            "SELECT r.result,c.user_text FROM r2_log_hands_results r "
+            "JOIN r2_log_links l ON l.to_event_id=r.outcome_id AND l.from_event_id=r.delivered_to "
+            "AND l.relationship='hands_result_in_context' "
+            "JOIN r2_log_conversations c ON c.event_id=r.delivered_to WHERE r.outcome_id=?", (outcome,),
+        ).fetchall() == [(exact, HANDS_READ_REQUEST)]
+    print("PASS: exact Hands output survived a crash and rejected acknowledgement, then reached one linked turn.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -661,6 +980,9 @@ def main() -> int:
             interrupt_partial_terminal_line(binary, workspace, url)
             interrupt_foreground_reply(binary, workspace, url)
             reflection_after_long_foreground_turn(binary, workspace, url)
+            recover_reflection_during_service(binary, workspace, url)
+            recover_learning_after_restart(binary, workspace, url)
+            recover_completed_hands_result(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

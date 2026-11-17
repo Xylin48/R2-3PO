@@ -88,6 +88,7 @@ int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
 /* Commit an evaluated memory and its Life Log evidence together. The callback
  * writes the memory through the supplied connection inside the transaction.
  * Return 0 from the callback on success. The callback must not reenter Life Log. */
+int r2_log_ack_learning(int64_t event_id);
 int r2_log_save_learning(struct sqlite3 *peer, const char *memory, const char *category,
                          int64_t source_event_id,
                          int (*save)(struct sqlite3 *, const char *, const char *));
@@ -155,6 +156,14 @@ int64_t r2_log_thinking(
     const char *summary,
     const char *details
 );
+
+/* Durable background command receipts. Recovery records outcomes without launching commands. */
+int64_t r2_log_accept_hands(const char *task_id, const char *command);
+int r2_log_arm_hands(int64_t event, const char *archive_path);
+int r2_log_finish_hands(int64_t event, int launched, int return_code, const char *handoff);
+char *r2_log_next_hands_result(int64_t *outcome);
+int r2_log_deliver_hands_result(int64_t outcome, int64_t turn);
+int r2_log_recover_hands(void);
 
 int64_t r2_log_file_event(
     const char *action,
@@ -225,6 +234,11 @@ int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char
                                                const int64_t *speech_ids, size_t speech_count,
                                                const int64_t *review_ids, size_t review_count,
                                                const char *tool_result);
+/* Also stage the exact evidence for the restartable memory evaluation. */
+int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char *assistant_text,
+                                              const int64_t *speech_ids, size_t speech_count,
+                                              const int64_t *review_ids, size_t review_count,
+                                              const char *tool_result);
 
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
@@ -240,6 +254,24 @@ int64_t r2_log_inner_state(const char *state_kind,
 int64_t r2_log_inner_state_with_evidence(const char *state_kind, const char *description,
                                          const char *evidence, double confidence,
                                          const char *origin, int64_t parent_event_id);
+
+/* Durable model extraction. A nonnegative ordinal identifies a record in the
+ * original staged extraction and returns its existing event ID on replay. */
+int r2_log_save_self_report(int64_t event_id, const char *extraction);
+int r2_log_ack_self_report(int64_t event_id);
+int64_t r2_log_inner_state_record(const char *state_kind, const char *description,
+                                         const char *evidence, double confidence,
+                                         const char *origin, int64_t parent_event_id, int64_t ordinal);
+int64_t r2_log_belief_record(const char *belief_key, const char *belief,
+                                    const char *evidence, double confidence,
+                                    const char *status, const char *origin, int64_t parent_event_id, int64_t ordinal);
+int64_t r2_log_continuity_record(const char *item_key, const char *item_type, const char *title,
+                                        const char *description, const char *status, const char *next_action,
+                                        const char *origin, int64_t parent_event_id, const char *evidence, int64_t ordinal);
+int64_t r2_log_hypothetical_record(const char *scenario, const char *assumptions,
+                                          const char *predicted_outcome, const char *conclusion,
+                                          const char *origin, int64_t parent_event_id,
+                                          const char *evidence, int64_t ordinal);
 
 /* Belief ledger retains current state and full revision history in events. */
 int64_t r2_log_belief(const char *belief_key,

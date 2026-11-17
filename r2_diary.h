@@ -79,6 +79,9 @@ int r2_diary_stage_reflection(const char *entry, const int64_t *speech_ids,
 int r2_diary_stage_reviewed_reflection(const char *entry, const int64_t *speech_ids,
                                        size_t speech_count, const int64_t reviews[2],
                                        int64_t *entry_id_out);
+int r2_diary_stage_reflection_with_tool(const char *entry, const int64_t *speech_ids,
+                                       size_t speech_count, const int64_t reviews[2],
+                                       const char *tool_result, int64_t *entry_id_out);
 
 /* Retry pending Markdown appends in order within each day. */
 int r2_diary_replay_mirrors(void);

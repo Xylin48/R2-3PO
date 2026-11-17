@@ -291,7 +291,8 @@ static int visual_sync(int fd)
 
 static int visual_sync_directory(const char *path)
 {
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    /* Never sync a replacement symlink instead of the archive directory. */
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return -1;
     int rc = visual_sync(fd);
     int error = errno;
@@ -300,12 +301,39 @@ static int visual_sync_directory(const char *path)
     return rc;
 }
 
+/* Check each existing path component before creating or canonicalizing the
+ * library. A final-component lstat alone misses "link/." and "link/..". */
+static int visual_reject_library_symlinks(const char *path)
+{
+    char prefix[PATH_MAX];
+    size_t n = strlen(path);
+    if (n >= sizeof(prefix)) { errno = ENAMETOOLONG; return -1; }
+    memcpy(prefix, path, n + 1);
+    for (size_t i = 0; i < n; ++i) {
+        if (prefix[i] != '/' || i == 0) continue;
+        char saved = prefix[i];
+        prefix[i] = 0;
+        struct stat st;
+        int rc = lstat(prefix, &st);
+        int error = errno;
+        prefix[i] = saved;
+        if (rc == 0 && S_ISLNK(st.st_mode)) { errno = ELOOP; return -1; }
+        if (rc != 0 && error != ENOENT) { errno = error; return -1; }
+    }
+    struct stat st;
+    if (lstat(prefix, &st) == 0) {
+        if (S_ISLNK(st.st_mode)) { errno = ELOOP; return -1; }
+    } else if (errno != ENOENT) return -1;
+    return 0;
+}
+
 static int visual_prepare_directory(const char *path)
 {
     if (mkdir(path, 0750) != 0) {
         if (errno != EEXIST) return -1;
         struct stat metadata;
-        if (stat(path, &metadata) != 0) return -1;
+        /* Never follow a replaced library directory into an unrelated tree. */
+        if (lstat(path, &metadata) != 0) return -1;
         if (S_ISDIR(metadata.st_mode)) return 0;
         errno = ENOTDIR;
         return -1;
@@ -339,19 +367,42 @@ static int visual_archive_matches_claim(int fd, const char *path)
 static int visual_create_archive(const char *directory, const R2VisionFrame *frame,
                                  char *path, size_t capacity)
 {
+    /* Pin the archive directory before creating a file. If the pathname is
+       replaced after initialization, openat cannot follow it elsewhere. */
+    int dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0) return -1;
+    struct stat pinned, current;
+    if (fstat(dirfd, &pinned) != 0 || lstat(directory, &current) != 0) {
+        int error = errno;
+        close(dirfd);
+        errno = error;
+        return -1;
+    }
+    if (!S_ISDIR(pinned.st_mode) || !S_ISDIR(current.st_mode) ||
+        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
+        close(dirfd);
+        errno = ESTALE;
+        return -1;
+    }
     const char *separator = directory[strlen(directory) - 1] == '/' ? "" : "/";
     for (;;) {
         uint64_t nonce;
-        if (getentropy(&nonce, sizeof(nonce)) != 0) return -1;
-        int length = snprintf(path, capacity, "%s%svisual_%llu_%llu_%016llx.jpg",
-                              directory, separator, (unsigned long long)frame->timestamp,
-                              (unsigned long long)frame->frame_number, (unsigned long long)nonce);
-        if (length < 0 || (size_t)length >= capacity) {
+        if (getentropy(&nonce, sizeof(nonce)) != 0) { close(dirfd); return -1; }
+        char name[128];
+        int name_length = snprintf(name, sizeof(name), "visual_%llu_%llu_%016llx.jpg",
+                                   (unsigned long long)frame->timestamp,
+                                   (unsigned long long)frame->frame_number,
+                                   (unsigned long long)nonce);
+        int length = snprintf(path, capacity, "%s%s%s", directory, separator, name);
+        if (name_length < 0 || (size_t)name_length >= sizeof(name) ||
+            length < 0 || (size_t)length >= capacity) {
+            close(dirfd);
             errno = ENAMETOOLONG;
             return -1;
         }
-        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0640);
+        int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0640);
         if (fd >= 0) {
+            close(dirfd);
             if (flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
             int error = errno;
             if (visual_archive_matches_claim(fd, path)) unlink(path);
@@ -359,7 +410,7 @@ static int visual_create_archive(const char *directory, const R2VisionFrame *fra
             errno = error;
             return -1;
         }
-        if (errno != EEXIST) return -1;
+        if (errno != EEXIST) { int error = errno; close(dirfd); errno = error; return -1; }
     }
 }
 
@@ -1174,12 +1225,33 @@ static int visual_managed_archive_path(const char *path, const R2VisionFrame *fr
  * existing, nonempty prefix. Conflicting files and active claims stay intact. */
 static int visual_restore_pending_image(const char *path, const unsigned char *jpeg, size_t length)
 {
+    /* A stored archive path is evidence, not authority to traverse arbitrary
+       directories. Pin the configured library and open only its leaf name. */
+    size_t root_length = strlen(visual_directory);
+    int root_is_slash = root_length == 1 && visual_directory[0] == '/';
+    size_t name_offset = root_length + (root_is_slash ? 0 : 1);
+    if (!path || strncmp(path, visual_directory, root_length) != 0 ||
+        (!root_is_slash && path[root_length] != '/') ||
+        !path[name_offset] || strchr(path + name_offset, '/')) {
+        errno = EINVAL; return -1;
+    }
+    const char *name = path + name_offset;
+    int dirfd = open(visual_directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0) return -1;
+    struct stat pinned, current;
+    if (fstat(dirfd, &pinned) != 0 || lstat(visual_directory, &current) != 0) {
+        int error = errno; close(dirfd); errno = error; return -1;
+    }
+    if (!S_ISDIR(current.st_mode) || !S_ISDIR(pinned.st_mode) ||
+        pinned.st_dev != current.st_dev || pinned.st_ino != current.st_ino) {
+        close(dirfd); errno = ESTALE; return -1;
+    }
     int flags = O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC;
-    int fd = open(path, O_RDWR | flags);
+    int fd = openat(dirfd, name, O_RDWR | flags);
     int writable = fd >= 0;
     if (fd < 0 && (errno == EACCES || errno == EROFS))
-        fd = open(path, O_RDONLY | flags);
-    if (fd < 0) return -1;
+        fd = openat(dirfd, name, O_RDONLY | flags);
+    if (fd < 0) { int error = errno; close(dirfd); errno = error; return -1; }
     struct stat st;
     int valid = flock(fd, LOCK_EX | LOCK_NB) == 0 && fstat(fd, &st) == 0 &&
         S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_size > 0 &&
@@ -1198,10 +1270,13 @@ static int visual_restore_pending_image(const char *path, const unsigned char *j
             lseek(fd, (off_t)present, SEEK_SET) == (off_t)present &&
             write_all(fd, jpeg + present, length - present) == 0;
     }
-    if (valid && visual_sync(fd) == 0 && visual_sync_directory(visual_directory) == 0 &&
-        visual_archive_matches_claim(fd, path))
+    if (valid && visual_sync(fd) == 0 && visual_sync(dirfd) == 0 &&
+        visual_archive_matches_claim(fd, path)) {
+        close(dirfd);
         return fd;
+    }
     close(fd);
+    close(dirfd);
     return -1;
 }
 
@@ -1310,6 +1385,11 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     if (visual_initialized) { pthread_mutex_unlock(&visual_lock); return 0; }
     if (visual_generation == UINT64_MAX) { pthread_mutex_unlock(&visual_lock); errno = EOVERFLOW; return -1; }
     snprintf(visual_directory, sizeof(visual_directory), "%s", library_directory);
+    /* lstat("dir/") follows the final link on Linux. Remove trailing
+       separators before checking the final component for symlinks. */
+    size_t library_length = strlen(visual_directory);
+    while (library_length > 1 && visual_directory[library_length - 1] == '/')
+        visual_directory[--library_length] = 0;
     const char *configured = getenv("R2_VISION_MODEL");
     if (configured && *configured &&
         strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0) {
@@ -1318,11 +1398,18 @@ int r2_visual_init(const char *database_path, const char *library_directory)
                 configured, R2_VISION_DEFAULT_MODEL);
     }
     snprintf(visual_model, sizeof(visual_model), "%s", R2_VISION_DEFAULT_MODEL);
-    if (visual_prepare_directory(visual_directory) != 0) {
+    if (visual_reject_library_symlinks(visual_directory) != 0 ||
+        visual_prepare_directory(visual_directory) != 0) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
-    if (!realpath(library_directory, visual_directory)) {
+    /* Resolve parent components only after verifying the final archive
+       component is a real directory. This also normalizes trailing slashes. */
+    /* Recheck after mkdir: the directory may have been replaced while
+       its parent was synchronized. Archive creation and recovery also pin
+       directory handles independently for their own I/O boundaries. */
+    if (visual_reject_library_symlinks(visual_directory) != 0 ||
+        !realpath(library_directory, visual_directory)) {
         pthread_mutex_unlock(&visual_lock);
         return -1;
     }
