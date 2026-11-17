@@ -290,23 +290,34 @@ class CRTDisplay:
     def _ensure_player(self) -> bool:
         if self._player is not None:
             return True
+        instance = None
+        player = None
         try:
             import vlc
-            self._vlc = vlc
-            self._vlc_instance = vlc.Instance("--no-video-title-show", "--quiet")
-            if self._vlc_instance is None:
+            instance = vlc.Instance("--no-video-title-show", "--quiet")
+            if instance is None:
                 raise RuntimeError("VLC could not initialize")
-            self._player = self._vlc_instance.media_player_new()
+            player = instance.media_player_new()
+            if player is None:
+                raise RuntimeError("VLC could not create a player")
             self.root.update_idletasks()
-            self._player.set_xwindow(self.video_surface.winfo_id())
-            return True
-        except (ImportError, OSError, RuntimeError) as exc:
+            player.set_xwindow(self.video_surface.winfo_id())
+        except (ImportError, OSError, RuntimeError, tk.TclError) as exc:
+            for resource in (player, instance):
+                if resource is not None:
+                    try:
+                        resource.release()
+                    except (OSError, RuntimeError):
+                        pass
             if not self._vlc_error_shown:
                 self.feedback.configure(
                     text=f"VCR playback needs VLC and python3-vlc: {exc}", fg="#e0b0a0"
                 )
                 self._vlc_error_shown = True
             return False
+        self._vlc, self._vlc_instance, self._player = vlc, instance, player
+        self._vlc_error_shown = False
+        return True
 
     def _prepare_media(self, path: str, position: float, transport: str,
                        audible: bool) -> None:

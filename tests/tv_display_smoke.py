@@ -5,11 +5,13 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import socket
+import sys
 import tempfile
 import time
 import threading
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "TV.py"
@@ -54,6 +56,33 @@ class TVDisplaySmoke(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO r2_tv_devices VALUES(?,?,?,?)",
                        (name, 1, kind, port))
+
+    def test_vlc_initialization_releases_failed_handles_and_retries(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._vlc = display._vlc_instance = display._player = None
+        display._vlc_error_shown = False
+        display.root = Mock()
+        display.video_surface = Mock()
+        display.video_surface.winfo_id.return_value = 421
+        display.feedback = Mock()
+        empty, broken, recovered = Mock(), Mock(), Mock()
+        empty.media_player_new.return_value = None
+        broken.media_player_new.return_value.set_xwindow.side_effect = RuntimeError("No X11 surface")
+        vlc = SimpleNamespace(Instance=Mock(side_effect=(empty, broken, recovered)))
+
+        with patch.dict(sys.modules, {"vlc": vlc}):
+            self.assertFalse(display._ensure_player())
+            empty.release.assert_called_once_with()
+            self.assertFalse(display._ensure_player())
+            self.assertIsNone(display._player)
+            broken.media_player_new.return_value.release.assert_called_once_with()
+            broken.release.assert_called_once_with()
+            self.assertTrue(display._ensure_player())
+            self.assertTrue(display._ensure_player())
+
+        self.assertIs(display._player, recovered.media_player_new.return_value)
+        display._player.set_xwindow.assert_called_once_with(421)
+        self.assertEqual(vlc.Instance.call_count, 3)
 
     def test_empty_rf_channel_has_no_device(self) -> None:
         self.set_state(1, "rf", 3)
