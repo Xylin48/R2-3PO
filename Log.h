@@ -160,7 +160,9 @@ int64_t r2_log_thinking(
 /* Durable background command receipts. Recovery records outcomes without launching commands. */
 int64_t r2_log_accept_hands(const char *task_id, const char *command);
 int r2_log_arm_hands(int64_t event, const char *archive_path);
-int r2_log_finish_hands(int64_t event, int launched, int return_code);
+int r2_log_finish_hands(int64_t event, int launched, int return_code, const char *handoff);
+char *r2_log_next_hands_result(int64_t *outcome);
+int r2_log_deliver_hands_result(int64_t outcome, int64_t turn);
 int r2_log_recover_hands(void);
 
 int64_t r2_log_file_event(

@@ -62,6 +62,11 @@ SELF_REPORT_EXTRACTION = json.dumps({
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
 
+HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
+HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
+HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
+
+
 class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
     lock = threading.Lock()
@@ -99,6 +104,8 @@ class LocalOllama(BaseHTTPRequestHandler):
             time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
+        if current_index >= 0 and user_messages[current_index] == HANDS_QUEUE_REQUEST:
+            reply = REPLY if has_tool_result else f"I will queue the test command.\n[HAND] printf {HANDS_RESULT}"
         if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
             reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -870,6 +877,71 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
     print("PASS: restart recovered learning, reused the staged extraction and completed the original hypothetical branch.")
 
 
+def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        logfile = workspace.parent / "durable-hands.log"
+        env = runtime_environment(workspace, url, 8192)
+        with logfile.open("w", encoding="utf-8") as out:
+            proc = subprocess.Popen([str(binary)], cwd=workspace, env=env, stdin=subprocess.PIPE,
+                                    stdout=out, stderr=subprocess.STDOUT, text=True)
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(f"talk {HANDS_QUEUE_REQUEST}\n")
+                proc.stdin.flush()
+                deadline = time.monotonic() + 20
+                while proc.poll() is None and time.monotonic() < deadline:
+                    result = db.execute(
+                        "SELECT outcome_id,result FROM r2_log_hands_results WHERE delivered_to IS NULL;"
+                    ).fetchone()
+                    if result:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError(logfile.read_text(errors="replace")[-16000:])
+                outcome, exact = result
+                assert exact.endswith(f"Output:\n{HANDS_RESULT}\n"), exact
+                proc.kill()
+                assert proc.wait(timeout=10) < 0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdin.close()
+
+        db.executescript(
+            "CREATE TRIGGER block_hands_delivery BEFORE UPDATE OF delivered_to ON r2_log_hands_results "
+            "BEGIN SELECT RAISE(IGNORE); END;"
+        )
+        conversation(binary, workspace, url, (HANDS_READ_REQUEST,), 8192)
+        assert db.execute(
+            "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+        ).fetchone() == (None,)
+        assert db.execute(
+            "SELECT count(*) FROM r2_log_links WHERE to_event_id=? AND relationship='hands_result_in_context'",
+            (outcome,),
+        ).fetchone() == (0,)
+        db.executescript("DROP TRIGGER block_hands_delivery;")
+        with LocalOllama.lock:
+            cutoff = len(LocalOllama.requests)
+        conversation(binary, workspace, url, (HANDS_READ_REQUEST, "The next unrelated turn."), 8192)
+        with LocalOllama.lock:
+            requests = LocalOllama.requests[cutoff:]
+            tagged = "[R2_INTERNAL_TOOL_RESULT]\n" + exact
+            assert any(any(message["content"] == tagged for message in request["messages"])
+                       and any(message["content"] == HANDS_READ_REQUEST for message in request["messages"])
+                       for request in requests)
+            assert all(not any(message["content"] == tagged for message in request["messages"])
+                       for request in requests
+                       if any(message["content"] == "The next unrelated turn." for message in request["messages"]))
+        assert db.execute(
+            "SELECT r.result,c.user_text FROM r2_log_hands_results r "
+            "JOIN r2_log_links l ON l.to_event_id=r.outcome_id AND l.from_event_id=r.delivered_to "
+            "AND l.relationship='hands_result_in_context' "
+            "JOIN r2_log_conversations c ON c.event_id=r.delivered_to WHERE r.outcome_id=?", (outcome,),
+        ).fetchall() == [(exact, HANDS_READ_REQUEST)]
+    print("PASS: exact Hands output survived a crash and rejected acknowledgement, then reached one linked turn.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -910,6 +982,7 @@ def main() -> int:
             reflection_after_long_foreground_turn(binary, workspace, url)
             recover_reflection_during_service(binary, workspace, url)
             recover_learning_after_restart(binary, workspace, url)
+            recover_completed_hands_result(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

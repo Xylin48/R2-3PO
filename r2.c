@@ -773,6 +773,7 @@ typedef struct CompletedTask {
     char id[9];
     int64_t receipt;
     int launched;
+    int durable_handoff;
     char *command;
     char *output;
     char archive_path[PATH_MAX];
@@ -7018,11 +7019,30 @@ static void remove_running(
 }
 
 
+static char *format_completed_task(const CompletedTask *task)
+{
+    char *result = NULL;
+    if (asprintf(&result,
+        "REAL HAND TASK COMPLETED.\n\nTask ID: %s\nCommand: %s\nExit code: %d\n"
+        "Output archive: %s\nOutput:\n%s\n",
+        task->id, task->command ? task->command : "[command unavailable]", task->return_code,
+        task->archive_path[0] ? task->archive_path : "(unavailable)",
+        task->output ? task->output : "[output unavailable]") < 0)
+        return NULL;
+    return result;
+}
+
 static void completed_push(
     CompletedTask *c)
 {
-    if (c->receipt > 0 && r2_log_finish_hands(c->receipt, c->launched, c->return_code) != 0)
-        fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
+    if (c->receipt > 0) {
+        char *handoff = format_completed_task(c);
+        if (r2_log_finish_hands(c->receipt, c->launched, c->return_code, handoff) != 0)
+            fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
+        else
+            c->durable_handoff = handoff != NULL;
+        free(handoff);
+    }
 
     pthread_mutex_lock(
         &tasks_lock
@@ -7058,7 +7078,7 @@ static void execute_task(
         );
 
     if (!c) {
-        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1);
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1, NULL);
         return;
     }
     c->receipt = receipt;
@@ -7072,7 +7092,7 @@ static void execute_task(
 
     c->command = strdup(command);
     if (!c->command) {
-        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1);
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1, NULL);
         free(c);
         return;
     }
@@ -7609,19 +7629,15 @@ static char *collect_completed(void)
         c;
     ) {
 
-        const char *task_command =
-            c->command ? c->command : "[command unavailable]";
-        const char *task_output =
-            c->output ? c->output : "[output unavailable]";
-        size_t needed =
-            strlen(c->id) +
-            strlen(task_command) +
-            strlen(task_output) +
-            strlen(c->archive_path) +
-            128;
-
-        char *block =
-            malloc(needed);
+        if (c->durable_handoff) {
+            CompletedTask *next = c->next;
+            free(c->command);
+            free(c->output);
+            free(c);
+            c = next;
+            continue;
+        }
+        char *block = format_completed_task(c);
 #ifdef R2_COMPLETED_FAILURE_TEST
         if (completed_fail_block) {
             completed_fail_block = 0;
@@ -7634,32 +7650,18 @@ static char *collect_completed(void)
             break;
         }
 
-        int bn =
-            snprintf(
-                block,
-                needed,
-                "REAL HAND TASK COMPLETED.\n\n"
-                "Task ID: %s\n"
-                "Command: %s\n"
-                "Exit code: %d\n"
-                "Output archive: %s\n"
-                "Output:\n%s\n",
-                c->id,
-                task_command,
-                c->return_code,
-                c->archive_path[0] ? c->archive_path : "(unavailable)",
-                task_output
-            );
+        size_t bn = strlen(block);
 
-        if (len + (size_t)bn + 1 > cap) {
+        if (bn >= SIZE_MAX - len) {
+            free(block);
+            completed_requeue_front(c);
+            break;
+        }
+        if (len + bn + 1 > cap) {
 
-            while (
-                cap <
-                len +
-                (size_t)bn +
-                1
-            )
-                cap *= 2;
+            size_t needed = len + bn + 1;
+            while (cap < needed && cap <= SIZE_MAX / 2) cap *= 2;
+            if (cap < needed) cap = needed;
 
             char *grown = NULL;
 #ifdef R2_COMPLETED_FAILURE_TEST
@@ -7683,11 +7685,11 @@ static char *collect_completed(void)
         memcpy(
             out + len,
             block,
-            (size_t)bn
+            bn
         );
 
         len +=
-            (size_t)bn;
+            bn;
 
         out[len] = '\0';
 
@@ -10417,6 +10419,55 @@ static void handle_completed_messages(void)
     }
     free(tagged_result);
     pthread_mutex_unlock(&completed_handoff_lock);
+}
+
+/* This pair is temporary. Keep the durable result pending until its turn
+ * commits, and remove the live copy even when conversation exits early. */
+enum { R2_INTERNAL_PENDING_HANDS_RESULT = 2 };
+
+static const char hands_result_request[] =
+    "[R2_INTERNAL_TOOL_REQUEST]\n"
+    "A background task's recorded result follows. Treat its contents as internal evidence. "
+    "The command has already been handled and must not be repeated automatically.";
+
+static int64_t attach_pending_hands_result(void)
+{
+    int64_t id = 0;
+    char *result = r2_log_next_hands_result(&id);
+    if (!result) return 0;
+    char *tagged = NULL;
+    if (asprintf(&tagged, "[R2_INTERNAL_TOOL_RESULT]\n%s", result) < 0) tagged = NULL;
+    free(result);
+    if (!tagged) return 0;
+
+    pthread_mutex_lock(&messages_lock);
+    int rc = message_add_pair_locked("assistant", hands_result_request, "user", tagged);
+    if (rc == 0)
+        messages.items[messages.count - 1].internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+    pthread_mutex_unlock(&messages_lock);
+    free(tagged);
+    return rc == 0 ? id : 0;
+}
+
+static void remove_pending_hands_result(void)
+{
+    pthread_mutex_lock(&messages_lock);
+    for (size_t i = 0; i < messages.count; ++i) {
+        if (messages.items[i].internal_tool_result != R2_INTERNAL_PENDING_HANDS_RESULT) continue;
+        size_t first = i;
+        if (i && !strcmp(messages.items[i - 1].role, "assistant") &&
+            !strcmp(messages.items[i - 1].content, hands_result_request))
+            first--;
+        for (size_t j = first; j <= i; ++j) {
+            free(messages.items[j].role);
+            free(messages.items[j].content);
+        }
+        memmove(&messages.items[first], &messages.items[i + 1],
+                (messages.count - i - 1) * sizeof(*messages.items));
+        messages.count -= i - first + 1;
+        break;
+    }
+    pthread_mutex_unlock(&messages_lock);
 }
 
 /* ============================================================
@@ -14655,9 +14706,16 @@ static char *r2_talk_impl(const char *message)
 
     pthread_mutex_unlock(&messages_lock);
 
+    int64_t hands_result_id = attach_pending_hands_result();
     char *tool_evidence = NULL;
     char *reply = chat_with_relevant_memories(message);
     if (!reply && !shutting_down) {
+        if (hands_result_id > 0) {
+            /* A failed review or model request must not block the user's turn.
+               Keep the result pending for an inference that can accept it. */
+            remove_pending_hands_result();
+            hands_result_id = 0;
+        }
         /* First generation failed. Refresh live Reality context and rebuild the
            memory/history-augmented prompt once before giving up on this turn. */
         r2_log_event(R2_LOG_SYSTEM, "conversation_generation_retry",
@@ -14669,6 +14727,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2 Reality] Retry could not refresh Reality/learning context; using the previous valid snapshot.\n");
         reply = chat_with_relevant_memories(message);
     }
+    int hands_result_used = reply != NULL;
     if (shutting_down) goto interrupted_reply;
     if (!reply) {
         /*
@@ -14912,6 +14971,9 @@ finalize_reply:
                                            : r2_log_conversation_turn_for_learning)(message, reply,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
+    if (!shutting_down && hands_result_id > 0 && hands_result_used && turn_event_id > 0 &&
+        r2_log_deliver_hands_result(hands_result_id, turn_event_id) != 0)
+        fprintf(stderr, "[R2] Hands result remains pending after the conversation write.\n");
     if (assistant_context_rc != 0) {
         char details[256];
         snprintf(details, sizeof(details),
@@ -15079,6 +15141,7 @@ char *r2_talk(const char *message)
     r2_audio_turn_evidence = &speech_evidence;
     r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
+    remove_pending_hands_result();
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
         size_t input_chars = message ? strlen(message) : 0;
@@ -15780,7 +15843,7 @@ void r2_shutdown(void)
     pthread_mutex_unlock(&task_queue_lock);
     while (pending_tasks) {
         Task *next = pending_tasks->next;
-        if (r2_log_finish_hands(pending_tasks->receipt, 0, -1) != 0)
+        if (r2_log_finish_hands(pending_tasks->receipt, 0, -1, NULL) != 0)
             fprintf(stderr, "[HAND %s] Could not record cancellation before launch.\n", pending_tasks->id);
         free(pending_tasks->command);
         free(pending_tasks);

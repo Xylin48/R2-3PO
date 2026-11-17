@@ -47,8 +47,8 @@ require("if (dup2(pipefd[1], STDOUT_FILENO) < 0" in task
         "child output redirection failures terminate with a nonzero status")
 require("if (!c->command)" in task,
         "task command allocation failure is handled before launching a child")
-require('c->command ? c->command : "[command unavailable]"' in core
-        and 'c->output ? c->output : "[output unavailable]"' in core,
+require('task->command ? task->command : "[command unavailable]"' in core
+        and 'task->output ? task->output : "[output unavailable]"' in core,
         "completed-task collection remains safe if diagnostic allocations fail")
 require("output_read_failed = 1;\n            (void)kill(-pid, SIGKILL);" in task,
         "output capture failure terminates the complete task process group")
