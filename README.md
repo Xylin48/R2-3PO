@@ -37,10 +37,11 @@ ollama run qwen3.5:9b
 At the Ollama prompt, test a short message and then enter `/bye`. The launch script
 also reports the expected model name. Qwen 3.5 9B uses the same model for text and image input; it does not accept raw microphone PCM as a chat input. Ears therefore remains a format-agnostic PCM capture layer, and speech transcription requires a separate audio/ASR component;
 visual inference shares the Ollama request lock with conversation and yields when a
-foreground conversation is waiting. Ordinary conversation does not trigger a new frame
-analysis unless the user asks about visual context; ongoing Eyes/VLC observation can
-continue through its existing watcher. If a vision request cannot run, its incomplete
-result is discarded rather than being treated as a valid observation.
+foreground conversation is waiting. Active model turns can receive an available camera
+frame and a separate display frame while R2 has chosen to watch. The request labels the
+sources actually attached. A selected display can supply the only image when the camera
+is unavailable. Watch continues capturing frames independently of model interpretation.
+The visual library records a result after a completed analysis.
 
 R2 builds a completed conversational response from the current user message and
 relevant memories/perceptions. A separate intent-summary inference is not used as an
