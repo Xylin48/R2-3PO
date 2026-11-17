@@ -1076,8 +1076,9 @@ static int message_add(
  * so allocate and budget both messages before evicting history or appending.
  * This function owns messages_lock for the complete operation.
  */
-static int message_add_pair_locked(const char *role_a, const char *content_a,
-                            const char *role_b, const char *content_b)
+static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
+                                              const char *role_b, const char *content_b,
+                                              size_t preserve_index)
 {
     if (!role_a || !content_a || !role_b || !content_b)
         return -1;
@@ -1120,7 +1121,7 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
         size_t remove_index = SIZE_MAX;
         for (size_t i = 0; i < messages.count; ++i) {
-            if (!evict[i] && !messages.items[i].pinned) {
+            if (i != preserve_index && !evict[i] && !messages.items[i].pinned) {
                 remove_index = i;
                 break;
             }
@@ -1130,7 +1131,7 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
             free(content_a_copy);
             free(role_b_copy);
             free(content_b_copy);
-            fprintf(stderr, "[R2 memory] Cannot fit complete assistant/tool history pair without evicting pinned context.\n");
+            fprintf(stderr, "[R2 memory] Cannot fit complete assistant/tool history pair without evicting protected context.\n");
             return -1;
         }
         evict[remove_index] = 1;
@@ -1176,6 +1177,11 @@ static int message_add_pair_locked(const char *role_a, const char *content_a,
     return 0;
 }
 
+static int message_add_pair_locked(const char *role_a, const char *content_a,
+                                   const char *role_b, const char *content_b)
+{
+    return message_add_pair_preserving_locked(role_a, content_a, role_b, content_b, SIZE_MAX);
+}
 
 
 static int message_add_pinned(
@@ -10441,7 +10447,8 @@ static int64_t attach_pending_hands_result(void)
     if (!tagged) return 0;
 
     pthread_mutex_lock(&messages_lock);
-    int rc = message_add_pair_locked("assistant", hands_result_request, "user", tagged);
+    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
+                                                messages.count ? messages.count - 1 : SIZE_MAX);
     if (rc == 0)
         messages.items[messages.count - 1].internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
     pthread_mutex_unlock(&messages_lock);
