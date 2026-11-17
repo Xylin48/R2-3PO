@@ -10,6 +10,7 @@ No emulator save-state or rewind commands are exposed by this interface.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -18,9 +19,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 ROOT = Path(os.environ.get("R2_GAMEBOY_ROOT", os.environ.get("R2_GAMEBOY_DIR", str(Path(__file__).resolve().parent)))).resolve()
 CARTRIDGES = ROOT / "Cartridges"
@@ -55,6 +57,23 @@ def ensure_dirs() -> None:
     for path in (CARTRIDGES, SAVES, STATE, STATE / "mgba-config" / "mgba",
                  DB_PATH.parent, STATE_DB_PATH.parent):
         path.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def console_lock() -> Iterator[None]:
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / ".console.lock").open("a+b") as lock:
+        deadline = time.monotonic() + 3.0
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("The Game Boy Advance is busy. Retry the command.") from exc
+                time.sleep(min(0.025, remaining))
+        yield
 
 
 def _table_columns(db: sqlite3.Connection, schema: str, table: str) -> list[str]:
@@ -324,19 +343,20 @@ def record_verified_game_event(db: sqlite3.Connection, event_type: str,
     This API is intentionally not exposed as an R2 [WORLD] action. A model
     statement alone is not evidence that a character performed an action.
     """
-    row = reconcile(db)
-    if row["power_state"] != "on" or not row["emulator_pid"]:
-        raise ValueError("No active game session; virtual events cannot be recorded.")
-    if event_type not in VERIFIED_GAME_EVENT_TYPES:
-        raise ValueError("Unsupported verified game event type.")
-    if not summary or len(summary) > 1000 or len(details or "") > 3000:
-        raise ValueError("Event summary/details are empty or too long.")
-    if not evidence_source or not evidence_source.startswith("adapter:"):
-        raise ValueError("A game adapter evidence source is required.")
-    record_event(db, "virtual", event_type, summary, details,
-                 row["cartridge_title"], row["session_id"],
-                 evidence_source=evidence_source, verified=True)
-    return int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+    with console_lock():
+        row = reconcile(db)
+        if row["power_state"] != "on" or not row["emulator_pid"]:
+            raise ValueError("No active game session; virtual events cannot be recorded.")
+        if event_type not in VERIFIED_GAME_EVENT_TYPES:
+            raise ValueError("Unsupported verified game event type.")
+        if not summary or len(summary) > 1000 or len(details or "") > 3000:
+            raise ValueError("Event summary/details are empty or too long.")
+        if not evidence_source or not evidence_source.startswith("adapter:"):
+            raise ValueError("A game adapter evidence source is required.")
+        record_event(db, "virtual", event_type, summary, details,
+                     row["cartridge_title"], row["session_id"],
+                     evidence_source=evidence_source, verified=True)
+        return int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 
 def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -370,7 +390,7 @@ def process_start_ticks(pid: int) -> int | None:
         raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
         tail = raw[raw.rfind(")") + 2:].split()
         # tail starts at proc stat field 3; starttime is field 22.
-        return int(tail[19])
+        return None if tail[0] in {"Z", "X", "x"} else int(tail[19])
     except (OSError, ValueError, IndexError):
         return None
 
@@ -936,39 +956,39 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     command = args.command or "power"
     state = args.state if args.command == "power" else "on"
-    db = connect()
     try:
-        if command == "status":
-            result = status_data(db)
-        elif command == "verify":
-            result = verify_console(db)
-        elif command == "list":
-            result = list_cartridges(db)
-        elif command == "move":
-            result = move_cartridge(db, args.filename, args.location)
-        elif command == "insert":
-            result = insert_cartridge(db, args.filename)
-        elif command == "eject":
-            result = eject_cartridge(db)
-        elif command == "press":
-            result = press_button(db, args.button, args.duration_ms)
-        elif command == "events":
-            result = pending_verified_events(db)
-        elif command == "ack_event":
-            acknowledged = acknowledge_verified_event(db, args.event_id)
-            result = {
-                "ok": acknowledged,
-                "message": ("Verified event acknowledged." if acknowledged else
-                            "No matching pending verified event was acknowledged."),
-            }
-        elif command == "power":
-            result = power_on(db) if state == "on" else power_off(db)
-        else:
-            result = {"ok": False, "message": f"Unsupported command: {command}"}
-        print_result(result, args.json)
-        return 0 if not isinstance(result, dict) or result.get("ok", True) else 1
-    finally:
-        db.close()
+        with console_lock(), closing(connect()) as db:
+            if command == "status":
+                result = status_data(db)
+            elif command == "verify":
+                result = verify_console(db)
+            elif command == "list":
+                result = list_cartridges(db)
+            elif command == "move":
+                result = move_cartridge(db, args.filename, args.location)
+            elif command == "insert":
+                result = insert_cartridge(db, args.filename)
+            elif command == "eject":
+                result = eject_cartridge(db)
+            elif command == "press":
+                result = press_button(db, args.button, args.duration_ms)
+            elif command == "events":
+                result = pending_verified_events(db)
+            elif command == "ack_event":
+                acknowledged = acknowledge_verified_event(db, args.event_id)
+                result = {
+                    "ok": acknowledged,
+                    "message": ("Verified event acknowledged." if acknowledged else
+                                "No matching pending verified event was acknowledged."),
+                }
+            elif command == "power":
+                result = power_on(db) if state == "on" else power_off(db)
+            else:
+                result = {"ok": False, "message": f"Unsupported command: {command}"}
+    except TimeoutError as exc:
+        result = {"ok": False, "message": str(exc)}
+    print_result(result, args.json)
+    return 0 if not isinstance(result, dict) or result.get("ok", True) else 1
 
 
 if __name__ == "__main__":
