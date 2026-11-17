@@ -696,7 +696,7 @@ static const char *SYSTEM_PROMPT =
 "Use [IMAGINE] question or scenario [END IMAGINE] to explore a hypothetical using relevant experience. Give evidence-based feedback only with [IMAGINE_FEEDBACK] branch_id|accurate/partial/incorrect/unresolved|notes [END IMAGINE_FEEDBACK]. Imagined events are never facts or real-world actions.\n"
 "Use [SENSORY_JOURNAL] recent|limit, [SENSORY_JOURNAL] search|query|limit, or [SENSORY_JOURNAL] note|note text|details to inspect or annotate the index of original Life Log events; do not duplicate raw sensory data.\n"
 "Your primary Eyes are the physical camera, not a movie window. Movies and playing video are separate displays that remain available independently; never replace camera vision to view a screen. Raw pixel changes can be noticed without interpretation. You decide whether to attend to the camera, a media display, or neither. A playing movie never obliges you to watch it. To deliberately close or reopen a sense, emit [SENSE] eyes|close/open, [SENSE] microphone|close/open, or [SENSE] desktop|close/open as a standalone line (write one exact operation, not both choices). Closed senses remain closed until you decide otherwise. Use [MEDIA_FOCUS] watch to choose sustained attention to an available separate display across active model turns, or [MEDIA_FOCUS] away to look away without stopping playback. If you are watching and two images are attached, the first image is physical camera eyesight and the second is the separate media display; camera priority and both sources are preserved. Do not claim to have experienced every frame of a movie just because one display frame was available. To deliberately examine currently available media pixels, emit [MEDIA_SEE] question on its own line; unavailable media is not evidence about content. "
-"Eyes and Ears receive sensory input continuously only while an input source is active; input itself does not mean you are attending to or interpreting it. Microphone and desktop playback can be heard simultaneously but have separate histories. Different computer playback outputs also remain independent: a movie never overrides your real-world microphone, and the presence of a noise does not require you to investigate it. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] recent|seconds or [EARS_LISTEN] live|seconds for microphone, or [EARS_LISTEN] desktop_recent|seconds or [EARS_LISTEN] desktop_live|seconds for primary computer playback (1-15). You may ask [EARS_SOURCES] as a standalone line to learn every currently captured desktop output's exact monitor identity without listening to it. To choose a different output explicitly, emit [EARS_LISTEN] desktop_source_recent|exact-monitor-name|seconds or [EARS_LISTEN] desktop_source_live|exact-monitor-name|seconds. These listening actions locally recognize speech; they are not general non-speech sound classifiers. Do not use them for hypothetical situations or merely because Ears is active. Use real sensory evidence to decide what matters, and never assume attention simply from source availability.\n"
+"Eyes and Ears receive sensory input continuously only while an input source is active; input itself does not mean you are attending to or interpreting it. Microphone and desktop playback can be heard simultaneously but have separate histories. Different computer playback outputs also remain independent: a movie never overrides your real-world microphone, and the presence of a noise does not require you to investigate it. If a real sound is relevant and you choose to listen, emit [EARS_LISTEN] recent|seconds or [EARS_LISTEN] live|seconds for microphone, or [EARS_LISTEN] desktop_recent|seconds or [EARS_LISTEN] desktop_live|seconds for primary computer playback. Recent audio must still be in the chosen source buffer. You may ask [EARS_SOURCES] as a standalone line to learn every currently captured desktop output's exact monitor identity without listening to it. To choose a different output explicitly, emit [EARS_LISTEN] desktop_source_recent|exact-monitor-name|seconds or [EARS_LISTEN] desktop_source_live|exact-monitor-name|seconds. These listening actions locally recognize speech; they are not general non-speech sound classifiers. Do not use them for hypothetical situations or merely because Ears is active. Use real sensory evidence to decide what matters, and never assume attention simply from source availability.\n"
 "When a proposed purchase has no user-supplied or otherwise evidenced price, do not invent a price or pretend a store has stock. Ask for the price or wait for explicit price information. Only execute [WORLD] buy|item name|price|description|destination after the item, price, and intended destination are established; report failure if funds or the transaction are insufficient.\n"
 "Use [WORLD] location|location name|home or [WORLD] location|location name|outside only when simulated movement is actually being carried out, not merely planned. Use home only for the actual home; stores and other away places use outside. The location transition persists, and private Welcome Home memory is created only after an away-to-home transition.\n"
 "For a real activity/device session, use [WORLD] activity_start|activity key|activity or game name|optional details only when it actually starts, and [WORLD] activity_end|activity key|last verified state|stop reason|optional details when it actually ends. Use a stable generic key such as gameboy:game-title; never assume a device exists or invent gameplay. If the last in-game state or reason is not known, record unknown rather than guessing.\n"
@@ -4786,7 +4786,7 @@ static const char r2_compact_conversation_policy[] =
     "Use a documented action marker on its own line when a real action is justified, alongside a visible reply. "
     "Check preconditions and require authorization for destructive, external or irreversible actions. "
     "Inspect the room with [WORLD] look. Use [EARS_SOURCES] to identify inputs, "
-    "[EARS_LISTEN] recent|seconds or [EARS_LISTEN] live|seconds to listen to the microphone for 1 to 15 seconds, "
+    "[EARS_LISTEN] recent|seconds or [EARS_LISTEN] live|seconds to inspect retained microphone audio or capture a selected live interval, "
     "[MEDIA_FOCUS] watch or [MEDIA_FOCUS] away to choose display attention, "
     "and [MEDIA_SEE] question to inspect a real display. "
     "Never infer active hardware or a successful action from mere availability.";
@@ -8530,10 +8530,10 @@ static char *r2_process_ears_listen_request(const char *request)
     errno = 0;
     seconds = strtoul(seconds_text, &end, 10);
     valid = valid && !errno && end != seconds_text && end && *end == '\0' &&
-            seconds >= 1UL && seconds <= 15UL;
+            seconds >= 1UL && seconds <= R2_EARS_MAX_WAV_SECONDS;
     if (!valid) {
         free(copy);
-        return strdup("EARS LISTEN ERROR: use recent|seconds, live|seconds, desktop_recent|seconds, desktop_live|seconds, or desktop_source_recent/live|exact-monitor|seconds (1..15). No capture was started.");
+        return strdup("EARS LISTEN ERROR: use recent|seconds, live|seconds, desktop_recent|seconds, desktop_live|seconds, or desktop_source_recent/live|exact-monitor|seconds. Specify a positive duration that fits a PCM WAV; recent audio must be retained by the chosen source. No capture was started.");
     }
     if (!extra_monitor && recent &&
         !(desktop ? atomic_load(&ears_desktop_capture_running)
@@ -12191,8 +12191,7 @@ static uint64_t r2_ears_new_watch_token(void)
     return (uint64_t)atomic_fetch_add(&ears_watch_next_token, 1);
 }
 #define R2_EARS_RECENT_SECONDS 16U
-#define R2_EARS_BYTES_PER_SECOND (48000U * 2U * 2U)
-#define R2_EARS_RECENT_CAPACITY ((size_t)R2_EARS_BYTES_PER_SECOND * R2_EARS_RECENT_SECONDS)
+#define R2_EARS_RECENT_CAPACITY ((size_t)R2_EARS_PCM_BYTES_PER_SECOND * R2_EARS_RECENT_SECONDS)
 static unsigned char ears_recent_audio[R2_EARS_RECENT_CAPACITY];
 static pthread_mutex_t ears_recent_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t ears_recent_length = 0;
@@ -12821,75 +12820,94 @@ fail:
     return NULL;
 }
 
-/* Caller-selected independent output audio. This function deliberately
- * does not infer whether the audio is speech or what caused a sound.
- * The exact source generation must survive the entire requested interval.
- */
+/* Called under the source history lock with a retained span. */
+static void r2_ears_copy_ring_span(unsigned char *output, const unsigned char *ring,
+                                  uint64_t cursor, size_t count)
+{
+    size_t start = (size_t)(cursor % R2_EARS_RECENT_CAPACITY);
+    size_t first = R2_EARS_RECENT_CAPACITY - start;
+    if (first > count) first = count;
+    memcpy(output, ring + start, first);
+    if (count > first) memcpy(output + first, ring, count - first);
+}
+
+static int r2_ears_copy_recent_monitor(const char *monitor, uint32_t bytes, FILE *wav,
+                                       int (*cancelled)(void *), void *userdata)
+{
+    if (bytes > R2_EARS_RECENT_CAPACITY || shutting_down ||
+        (cancelled && cancelled(userdata))) return -1;
+    unsigned char *snapshot = malloc(bytes);
+    if (!snapshot) return -1;
+    int rc = r2_ears_extra_copy_recent(monitor, bytes, snapshot);
+    if (rc == 0 && (shutting_down || (cancelled && cancelled(userdata)))) {
+        errno = ECANCELED;
+        rc = -1;
+    }
+    if (rc == 0 && fwrite(snapshot, 1, bytes, wav) != bytes) rc = -1;
+    free(snapshot);
+    return rc;
+}
+
+/* Stream one chosen monitor to the private WAV. Each chunk reacquires the
+ * published source by name and checks its generation before taking bytes. */
 static int r2_ears_extra_write_pcm(const char *monitor, uint32_t bytes,
                                    FILE *wav, int recent,
                                    int (*cancelled)(void *), void *userdata)
 {
-    if (!monitor || !*monitor || !wav || !bytes ||
-        bytes > R2_EARS_RECENT_CAPACITY || bytes % 4U) {
+    if (!monitor || !*monitor || !wav || !bytes || bytes % 4U ||
+        bytes > UINT32_MAX - 36U) {
         errno = EINVAL;
         return -1;
     }
-    unsigned char *snapshot = malloc(bytes);
-    if (!snapshot) return -1;
-    uint64_t generation = 0, start_total = 0;
-    int copied = 0, seen_source = 0;
-    for (;;) {
+    if (recent) return r2_ears_copy_recent_monitor(monitor, bytes, wav, cancelled, userdata);
+
+    unsigned char chunk[65536];
+    uint64_t generation = 0, cursor = 0;
+    uint32_t written = 0;
+    while (written < bytes) {
         if (shutting_down || (cancelled && cancelled(userdata))) {
             errno = ECANCELED;
-            break;
+            return -1;
         }
         pthread_mutex_lock(&extra_desktop_lock);
         R2ExtraDesktop *entry = extra_desktop_head;
         for (; entry && strcmp(entry->monitor, monitor); entry = entry->next) {}
-        if (!entry || !atomic_load(&entry->running) ||
-            (generation && generation != entry->generation)) {
+        if (!entry || (generation && generation != entry->generation)) {
             pthread_mutex_unlock(&extra_desktop_lock);
-            errno = seen_source ? ECANCELED : ENOENT;
-            break;
+            errno = generation ? ECANCELED : ENOENT;
+            return -1;
         }
-        seen_source = 1;
         pthread_mutex_lock(&entry->history_lock);
-        if (!generation) {
+        int running = atomic_load(&entry->running);
+        if (!generation && running) {
             generation = entry->generation;
-            start_total = entry->total_bytes;
+            cursor = entry->total_bytes;
         }
-        uint64_t since_start = entry->total_bytes >= start_total
-            ? entry->total_bytes - start_total : UINT64_MAX;
-        int ready = recent ? entry->length >= bytes
-                           : since_start >= bytes && since_start <= R2_EARS_RECENT_CAPACITY;
-        if (ready) {
-            size_t start = recent ?
-                (entry->position + R2_EARS_RECENT_CAPACITY - bytes) %
-                    R2_EARS_RECENT_CAPACITY
-                : (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
-            size_t first = R2_EARS_RECENT_CAPACITY - start;
-            if (first > bytes) first = bytes;
-            memcpy(snapshot, entry->recent + start, first);
-            if (bytes > first)
-                memcpy(snapshot + first, entry->recent, bytes - first);
-            copied = 1;
+        uint64_t available = entry->total_bytes >= cursor ? entry->total_bytes - cursor : UINT64_MAX;
+        size_t count = 0;
+        if (generation && available <= entry->length) {
+            count = bytes - written;
+            if (count > sizeof(chunk)) count = sizeof(chunk);
+            if (count > available) count = (size_t)available;
+            if (count) r2_ears_copy_ring_span(chunk, entry->recent, cursor, count);
         }
-        int overrun = !recent && since_start > R2_EARS_RECENT_CAPACITY;
+        int overrun = available > entry->length;
         pthread_mutex_unlock(&entry->history_lock);
         pthread_mutex_unlock(&extra_desktop_lock);
-        if (copied) break;
-        if (recent || overrun) {
-            errno = recent ? EAGAIN : EOVERFLOW;
-            break;
+        if (!generation || overrun || (!count && !running)) {
+            errno = !generation ? ENOENT : overrun ? EOVERFLOW : ECANCELED;
+            return -1;
         }
-        struct timespec pause = {0, 100000000L};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR)
-            if (shutting_down || (cancelled && cancelled(userdata))) break;
+        if (!count) {
+            const struct timespec pause = {0, 100000000L};
+            (void)nanosleep(&pause, NULL);
+            continue;
+        }
+        if (fwrite(chunk, 1, count, wav) != count) return -1;
+        cursor += count;
+        written += (uint32_t)count;
     }
-    int rc = copied && (!cancelled || !cancelled(userdata)) &&
-        !shutting_down && fwrite(snapshot, 1, bytes, wav) == bytes ? 0 : -1;
-    free(snapshot);
-    return rc;
+    return 0;
 }
 
 static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
@@ -12918,62 +12936,64 @@ static int r2_ears_write_buffered_audio(uint32_t bytes_needed, FILE *wav)
     return rc;
 }
 
-/* Copy a requested live PCM interval without consuming or interpreting it. */
+/* A live interval can exceed the history ring. Drain it into the
+ * private WAV in chunks and never splice a replacement source into it. */
+static int r2_ears_write_live_interval(uint32_t bytes, uint64_t cursor,
+                                      uint64_t generation, int desktop, FILE *wav,
+                                      int (*cancelled)(void *), void *userdata)
+{
+    if (!wav || !bytes || bytes % 4U || bytes > UINT32_MAX - 36U) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_t *lock = desktop ? &ears_desktop_recent_lock : &ears_recent_lock;
+    const unsigned char *ring = desktop ? ears_desktop_recent_audio : ears_recent_audio;
+    const uint64_t *total = desktop ? &ears_desktop_recent_total_bytes : &ears_recent_total_bytes;
+    const uint64_t *current_generation = desktop ? &ears_desktop_recent_generation : &ears_recent_generation;
+    const size_t *retained = desktop ? &ears_desktop_recent_length : &ears_recent_length;
+    atomic_int *running = desktop ? &ears_desktop_capture_running : &ears_capture_running;
+    unsigned char chunk[65536];
+    uint32_t written = 0;
+    while (written < bytes) {
+        if (shutting_down || (cancelled && cancelled(userdata))) {
+            errno = ECANCELED;
+            return -1;
+        }
+        pthread_mutex_lock(lock);
+        uint64_t available = *total >= cursor ? *total - cursor : UINT64_MAX;
+        if (*current_generation != generation || available > *retained) {
+            errno = *current_generation != generation ? ECANCELED : EOVERFLOW;
+            pthread_mutex_unlock(lock);
+            return -1;
+        }
+        size_t count = bytes - written;
+        if (count > sizeof(chunk)) count = sizeof(chunk);
+        if (count > available) count = (size_t)available;
+        int active = atomic_load(running);
+        if (count) r2_ears_copy_ring_span(chunk, ring, cursor, count);
+        pthread_mutex_unlock(lock);
+        if (!count) {
+            if (!active) {
+                errno = ECANCELED;
+                return -1;
+            }
+            const struct timespec pause = {0, 100000000L};
+            (void)nanosleep(&pause, NULL);
+            continue;
+        }
+        if (fwrite(chunk, 1, count, wav) != count) return -1;
+        cursor += count;
+        written += (uint32_t)count;
+    }
+    return 0;
+}
+
 static int r2_ears_write_recent_audio(uint32_t bytes_needed, uint64_t start_total,
                                       uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
-        return -1;
-    unsigned char *snapshot = malloc(bytes_needed);
-    if (!snapshot) return -1;
-    for (;;) {
-        if (shutting_down || (cancelled && cancelled(userdata))) {
-            free(snapshot);
-            return -1;
-        }
-        pthread_mutex_lock(&ears_recent_lock);
-        if (ears_recent_generation != generation) {
-            pthread_mutex_unlock(&ears_recent_lock);
-            free(snapshot);
-            errno = ECANCELED;
-            return -1;
-        }
-        uint64_t captured_since_request = ears_recent_total_bytes >= start_total
-            ? ears_recent_total_bytes - start_total : 0;
-        if (captured_since_request >= bytes_needed &&
-            captured_since_request <= R2_EARS_RECENT_CAPACITY) {
-            size_t start = (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
-            size_t first = R2_EARS_RECENT_CAPACITY - start;
-            if (first > bytes_needed) first = bytes_needed;
-            memcpy(snapshot, ears_recent_audio + start, first);
-            if (bytes_needed > first)
-                memcpy(snapshot + first, ears_recent_audio, bytes_needed - first);
-            pthread_mutex_unlock(&ears_recent_lock);
-            break;
-        }
-        int overrun = captured_since_request > R2_EARS_RECENT_CAPACITY;
-        int still_capturing = atomic_load(&ears_capture_running);
-        pthread_mutex_unlock(&ears_recent_lock);
-        if (overrun) {
-            free(snapshot);
-            return -1;
-        }
-        if (!still_capturing) {
-            free(snapshot);
-            return -1;
-        }
-        struct timespec pause = {0, 100000000L};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
-            if (shutting_down || (cancelled && cancelled(userdata))) {
-                free(snapshot);
-                return -1;
-            }
-        }
-    }
-    int rc = fwrite(snapshot, 1, bytes_needed, wav) == bytes_needed ? 0 : -1;
-    free(snapshot);
-    return rc;
+    return r2_ears_write_live_interval(bytes_needed, start_total, generation,
+                                       0, wav, cancelled, userdata);
 }
 
 /* Desktop samples are independently available to R2's chosen attention. */
@@ -13003,66 +13023,17 @@ static int r2_ears_write_desktop_buffered_audio(uint32_t bytes_needed, FILE *wav
     return rc;
 }
 
-/* Copy a requested live PCM interval without consuming or interpreting it. */
 static int r2_ears_write_desktop_recent_audio(uint32_t bytes_needed, uint64_t start_total,
                                       uint64_t generation,
                                       FILE *wav, int (*cancelled)(void *), void *userdata)
 {
-    if (!wav || bytes_needed == 0 || bytes_needed % 4U || bytes_needed > R2_EARS_RECENT_CAPACITY)
-        return -1;
-    unsigned char *snapshot = malloc(bytes_needed);
-    if (!snapshot) return -1;
-    for (;;) {
-        if (shutting_down || (cancelled && cancelled(userdata))) {
-            free(snapshot);
-            return -1;
-        }
-        pthread_mutex_lock(&ears_desktop_recent_lock);
-        if (ears_desktop_recent_generation != generation) {
-            pthread_mutex_unlock(&ears_desktop_recent_lock);
-            free(snapshot);
-            errno = ECANCELED;
-            return -1;
-        }
-        uint64_t captured_since_request = ears_desktop_recent_total_bytes >= start_total
-            ? ears_desktop_recent_total_bytes - start_total : 0;
-        if (captured_since_request >= bytes_needed &&
-            captured_since_request <= R2_EARS_RECENT_CAPACITY) {
-            size_t start = (size_t)(start_total % R2_EARS_RECENT_CAPACITY);
-            size_t first = R2_EARS_RECENT_CAPACITY - start;
-            if (first > bytes_needed) first = bytes_needed;
-            memcpy(snapshot, ears_desktop_recent_audio + start, first);
-            if (bytes_needed > first)
-                memcpy(snapshot + first, ears_desktop_recent_audio, bytes_needed - first);
-            pthread_mutex_unlock(&ears_desktop_recent_lock);
-            break;
-        }
-        int overrun = captured_since_request > R2_EARS_RECENT_CAPACITY;
-        int still_capturing = atomic_load(&ears_desktop_capture_running);
-        pthread_mutex_unlock(&ears_desktop_recent_lock);
-        if (overrun) {
-            free(snapshot);
-            return -1;
-        }
-        if (!still_capturing) {
-            free(snapshot);
-            return -1;
-        }
-        struct timespec pause = {0, 100000000L};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {
-            if (shutting_down || (cancelled && cancelled(userdata))) {
-                free(snapshot);
-                return -1;
-            }
-        }
-    }
-    int rc = fwrite(snapshot, 1, bytes_needed, wav) == bytes_needed ? 0 : -1;
-    free(snapshot);
-    return rc;
+    return r2_ears_write_live_interval(bytes_needed, start_total, generation,
+                                       1, wav, cancelled, userdata);
 }
 
 static int r2_ears_write_wav_header(FILE *fp, uint32_t pcm_bytes)
 {
+    if (!fp || pcm_bytes > UINT32_MAX - 36U) return -1;
     unsigned char header[44] = {0};
     memcpy(header, "RIFF", 4);
     r2_wav_put_u32(header + 4, pcm_bytes + 36U);
@@ -13092,10 +13063,11 @@ static int r2_ears_write_wav_header(FILE *fp, uint32_t pcm_bytes)
  * exact 3:1 downsampling; no partial transcript input is accepted.
  */
 static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
-                                      uint32_t raw_pcm_bytes)
+                                      uint32_t raw_pcm_bytes,
+                                      int (*cancelled)(void *), void *userdata)
 {
     if (!raw || !normalized || raw_pcm_bytes == 0 ||
-        raw_pcm_bytes % 12U != 0 || raw_pcm_bytes > 15U * 192000U)
+        raw_pcm_bytes % 12U != 0 || raw_pcm_bytes > UINT32_MAX - 36U)
         return -1;
 
     unsigned char source_header[44];
@@ -13139,6 +13111,7 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
     unsigned char output[2U * 512U];
     uint32_t remaining = raw_pcm_bytes / 12U;
     while (remaining > 0) {
+        if (shutting_down || (cancelled && cancelled(userdata))) return -1;
         size_t count = remaining > 512U ? 512U : (size_t)remaining;
         if (fread(input, 12U, count, raw) != count) return -1;
         for (size_t i = 0; i < count; ++i) {
@@ -13160,7 +13133,7 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
 }
 
 /*
- * Record a short, explicit microphone utterance and transcribe it with a
+ * Record an explicitly selected audio interval and transcribe it with a
  * locally installed whisper.cpp CLI. Qwen's chat endpoint accepts text/images,
  * not raw PCM; the ASR stage is therefore a real bridge, not a fake audio prompt.
  * R2_WHISPER_MODEL must name a readable local GGML Whisper model. No network is
@@ -13185,14 +13158,13 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
     FILE *wav = NULL, *whisper_input = NULL, *whisper_output = NULL;
     pid_t child = -1;
     unsigned char pcm[1920];
-    const uint32_t bytes_per_second = 48000U * 2U * 2U;
     uint32_t total_bytes;
     int capture_ok = 0;
     R2EarsOpenRequest request = r2_ears_open_request(r2_ears_desktop_requested, 0, cancelled, userdata);
 
     if (r2_ears_open_cancelled(&request)) return NULL;
-    if (seconds < 1U || seconds > 15U) {
-        fprintf(stderr, "[Ears] Listen duration must be between 1 and 15 seconds.\n");
+    if (seconds < 1U || seconds > R2_EARS_MAX_WAV_SECONDS) {
+        fprintf(stderr, "[Ears] Listen duration must be positive and fit a PCM WAV.\n");
         return NULL;
     }
     if (!cli || !*cli) cli = "whisper-cli";
@@ -13225,7 +13197,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
         tn < 0 || (size_t)tn >= sizeof(transcript_path))
         goto cleanup;
 
-    total_bytes = bytes_per_second * seconds;
+    total_bytes = R2_EARS_PCM_BYTES_PER_SECOND * seconds;
     wav_fd = open(wav_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (wav_fd < 0) goto cleanup;
     wav = fdopen(wav_fd, "wb");
@@ -13408,7 +13380,8 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
     if (!whisper_output) goto cleanup;
     whisper_fd = -1;
     int normalized_ok = r2_ears_write_whisper_wav(whisper_input,
-                                                   whisper_output, total_bytes) == 0;
+                                                   whisper_output, total_bytes,
+                                                   cancelled, userdata) == 0;
     if (fclose(whisper_input) != 0) normalized_ok = 0;
     whisper_input = NULL;
     if (fclose(whisper_output) != 0) normalized_ok = 0;
@@ -13426,7 +13399,9 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
     }
     if (child < 0) goto cleanup;
     struct timespec asr_start = {0}, asr_now = {0}, pause_time = {0, 100000000L};
-    (void)clock_gettime(CLOCK_MONOTONIC, &asr_start);
+    if (clock_gettime(CLOCK_MONOTONIC, &asr_start) != 0) goto cleanup;
+    /* Preserve the short-clip deadline and scale it for longer input. */
+    time_t asr_timeout = seconds > 15U ? (time_t)seconds * 6 : 90;
     for (;;) {
         pid_t waited = waitpid(child, &child_status, WNOHANG);
         if (waited == child) break;
@@ -13443,11 +13418,11 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
         }
         if (shutting_down || (cancelled && cancelled(userdata)) ||
             clock_gettime(CLOCK_MONOTONIC, &asr_now) != 0 ||
-            asr_now.tv_sec - asr_start.tv_sec >= 90) {
+            asr_now.tv_sec - asr_start.tv_sec >= asr_timeout) {
             (void)kill(child, SIGKILL);
             while (waitpid(child, &child_status, 0) < 0 && errno == EINTR) {}
             child = -1;
-            fprintf(stderr, "[Ears] Local speech recognition was cancelled, stopped during shutdown, or exceeded its 90-second limit.\n");
+            fprintf(stderr, "[Ears] Local speech recognition was cancelled, stopped during shutdown, or exceeded the transcription deadline for this clip.\n");
             goto cleanup;
         }
         struct timespec remaining_time;

@@ -57,6 +57,7 @@ int main(void)
         pthread_mutex_t *lock = desktop ? &ears_desktop_recent_lock : &ears_recent_lock;
         uint64_t *generation = desktop ? &ears_desktop_recent_generation : &ears_recent_generation;
         uint64_t *total = desktop ? &ears_desktop_recent_total_bytes : &ears_recent_total_bytes;
+        size_t *length = desktop ? &ears_desktop_recent_length : &ears_recent_length;
         unsigned char *pcm = desktop ? ears_desktop_recent_audio : ears_recent_audio;
         atomic_int *running = desktop ? &ears_desktop_capture_running : &ears_capture_running;
         atomic_store(running, 1);
@@ -73,7 +74,7 @@ int main(void)
         pthread_mutex_lock(lock);
         ++*generation;
         memset(pcm, 0x55, 1920);
-        *total = 1920;
+        *total = *length = 1920;
         pthread_mutex_unlock(lock);
         assert(pthread_join(thread, NULL) == 0);
         assert(request.result == -1 && request.error == ECANCELED);

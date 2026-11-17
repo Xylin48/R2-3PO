@@ -973,8 +973,8 @@ def gameboy_shell_cartridge_name(binary: Path, workspace: Path, url: str) -> Non
         assert db.execute(
             "SELECT details FROM console_events WHERE event_type='cartridge_moved' ORDER BY id"
         ).fetchall() == [
-            (f"Filename={filename}; destination=shelf",),
-            (f"Filename={filename}; destination=pockets",),
+            (f"Filename={filename}; destination=shelf.",),
+            (f"Filename={filename}; destination=pockets.",),
         ]
     print("PASS: production shell preserved a Game Boy cartridge filename through move and insert.")
 

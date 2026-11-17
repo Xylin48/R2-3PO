@@ -221,6 +221,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_primary_history_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-primary-history -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_log_sensory
           /tmp/r2-ears-primary-history
 
+      - name: Stream exact live Ears intervals longer than the rolling history
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_live_interval_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-live-interval -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          timeout 20s /tmp/r2-ears-live-interval
+
       - name: Exercise visual request response encoder and library session boundaries
         run: |
           VISUAL_ROOT="$(mktemp -d /tmp/r2-visual-request-XXXXXX)"
