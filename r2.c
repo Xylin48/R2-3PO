@@ -756,6 +756,7 @@ typedef struct {
 
 typedef struct Task {
     char id[9];
+    int64_t receipt;
     char *command;
     struct Task *next;
 } Task;
@@ -770,6 +771,8 @@ typedef struct RunningTask {
 
 typedef struct CompletedTask {
     char id[9];
+    int64_t receipt;
+    int launched;
     char *command;
     char *output;
     char archive_path[PATH_MAX];
@@ -7018,6 +7021,9 @@ static void remove_running(
 static void completed_push(
     CompletedTask *c)
 {
+    if (c->receipt > 0 && r2_log_finish_hands(c->receipt, c->launched, c->return_code) != 0)
+        fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
+
     pthread_mutex_lock(
         &tasks_lock
     );
@@ -7043,7 +7049,7 @@ static void completed_push(
 
 static void execute_task(
     const char *id,
-    const char *command)
+    const char *command, int64_t receipt)
 {
     CompletedTask *c =
         calloc(
@@ -7051,8 +7057,11 @@ static void execute_task(
             sizeof(*c)
         );
 
-    if (!c)
+    if (!c) {
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1);
         return;
+    }
+    c->receipt = receipt;
 
     snprintf(
         c->id,
@@ -7063,6 +7072,7 @@ static void execute_task(
 
     c->command = strdup(command);
     if (!c->command) {
+        if (receipt > 0) (void)r2_log_finish_hands(receipt, 0, -1);
         free(c);
         return;
     }
@@ -7105,6 +7115,21 @@ static void execute_task(
 
         completed_push(c);
 
+        return;
+    }
+
+    if (shutting_down ||
+        (receipt > 0 && r2_log_arm_hands(receipt, c->archive_path) != 0) ||
+        shutting_down) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        fclose(archive);
+        unlink(c->archive_path);
+        c->archive_path[0] = '\0';
+        c->return_code = -1;
+        c->output = strdup("Task was not run because shutdown began or its launch could not be recorded.");
+        now_iso(c->finished);
+        completed_push(c);
         return;
     }
 
@@ -7165,6 +7190,8 @@ static void execute_task(
 
         return;
     }
+
+    c->launched = 1;
 
     /* The parent also attempts to establish the group to close the tiny
        fork-to-child-setpgid race. EACCES means the child already exec'd after
@@ -7400,7 +7427,8 @@ static void *hands_worker(
 
         execute_task(
             t->id,
-            t->command
+            t->command,
+            t->receipt
         );
 
         free(t->command);
@@ -7481,6 +7509,15 @@ static char *start_background_task(
     /* Do not enqueue work after shutdown has started: the worker may already
        have observed the shutdown predicate and exited permanently. */
     if (shutting_down) {
+        pthread_mutex_unlock(&task_queue_lock);
+        free(t->command);
+        free(t);
+        free(id);
+        return NULL;
+    }
+
+    t->receipt = r2_log_accept_hands(t->id, t->command);
+    if (t->receipt <= 0) {
         pthread_mutex_unlock(&task_queue_lock);
         free(t->command);
         free(t);
@@ -15274,6 +15311,9 @@ int r2_init(void)
         R2_INIT_FAIL("could not initialize R2 Life Log");
     }
 
+    if (r2_log_recover_hands() != 0)
+        fprintf(stderr, "[R2] Some prior Hands outcomes could not be recovered.\n");
+
     /* Sensory indexing is part of the connected persistent-memory system. */
     if (r2_sj_init() != 0)
         R2_INIT_FAIL("could not initialize R2 Sensory Journal");
@@ -15740,6 +15780,8 @@ void r2_shutdown(void)
     pthread_mutex_unlock(&task_queue_lock);
     while (pending_tasks) {
         Task *next = pending_tasks->next;
+        if (r2_log_finish_hands(pending_tasks->receipt, 0, -1) != 0)
+            fprintf(stderr, "[HAND %s] Could not record cancellation before launch.\n", pending_tasks->id);
         free(pending_tasks->command);
         free(pending_tasks);
         pending_tasks = next;

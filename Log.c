@@ -513,6 +513,10 @@ static int ensure_tables(void)
         " target_id INTEGER NOT NULL CHECK(target_id>0),"
         " PRIMARY KEY(event_id,kind,target_id)"
         ");"
+        "CREATE TABLE IF NOT EXISTS r2_log_pending_hands ("
+        " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
+        " archive_path TEXT"
+        ");"
         "CREATE TABLE IF NOT EXISTS r2_log_pending_learning ("
         " event_id INTEGER PRIMARY KEY REFERENCES r2_log_events(id),"
         " user_text TEXT NOT NULL, assistant_text TEXT NOT NULL, tool_result TEXT"
@@ -1765,6 +1769,125 @@ int64_t r2_log_thinking(const char *thought_kind, const char *summary,
 
     return r2_log_event(R2_LOG_THINKING, thought_kind, summary,
                         details, "internal_thinking");
+}
+
+int64_t r2_log_accept_hands(const char *task_id, const char *command)
+{
+    if (!valid_text(task_id) || !valid_text(command)) return -1;
+    pthread_mutex_lock(&log_lock);
+    int64_t event = -1;
+    if (log_initialized && log_db && exec_sql("BEGIN IMMEDIATE;") == 0) {
+        char *summary = NULL;
+        if (asprintf(&summary, "Hands task %s was accepted into the background queue.", task_id) >= 0)
+            event = log_insert_event_locked(R2_LOG_FILESYSTEM, "hands_task_queued",
+                                            summary, command, task_id);
+        free(summary);
+        sqlite3_stmt *st = NULL;
+        int rc = event > 0 ? sqlite3_prepare_v2(log_db,
+            "INSERT INTO r2_log_pending_hands(event_id) VALUES(?);", -1, &st, NULL) : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(st);
+        if (log_finish_write(saved) != 0) event = -1;
+    }
+    pthread_mutex_unlock(&log_lock);
+    return event;
+}
+
+int r2_log_arm_hands(int64_t event, const char *archive_path)
+{
+    if (event <= 0 || !valid_text(archive_path)) return -1;
+    pthread_mutex_lock(&log_lock);
+    sqlite3_stmt *st = NULL;
+    int rc = log_initialized && log_db ? sqlite3_prepare_v2(log_db,
+        "UPDATE r2_log_pending_hands SET archive_path=? WHERE event_id=? AND archive_path IS NULL;",
+        -1, &st, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, archive_path, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return saved ? 0 : -1;
+}
+
+/* The outcome and removal of its pending receipt commit together. */
+static int log_finish_hands(int64_t event, int recovered, int launched, int return_code)
+{
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT p.archive_path,e.source FROM r2_log_pending_hands p "
+        "JOIN r2_log_events e ON e.id=p.event_id WHERE p.event_id=?;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int64_t outcome = -1;
+    if (rc == SQLITE_ROW) {
+        const char *archive = (const char *)sqlite3_column_text(st, 0);
+        const char *task_id = (const char *)sqlite3_column_text(st, 1);
+        const char *state = "The background command did not launch.";
+        if (recovered)
+            state = archive ? "The prior runtime ended near or after launch. Command outcome is unknown."
+                            : "The prior runtime ended before the background command could launch.";
+        else if (launched)
+            state = return_code >= 0 ? "The background command returned a confirmed exit status."
+                                     : "The background command launched, but a complete outcome could not be confirmed.";
+        char *details = NULL;
+        int n = 0;
+        if (archive && (recovered || (launched && return_code < 0)))
+            n = asprintf(&details, "Possible output archive: %s", archive);
+        else if (launched && !recovered)
+            n = asprintf(&details, "Exit code: %d\nOutput archive: %s", return_code,
+                         archive ? archive : "(unavailable)");
+        if (n >= 0)
+            outcome = log_insert_event_locked(R2_LOG_FILESYSTEM, "hands_task_outcome", state, details, task_id);
+        free(details);
+    }
+    sqlite3_finalize(st);
+    int saved = outcome > 0 && log_link_locked(outcome, event, "hands_outcome_for", NULL) == 0;
+    if (saved) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db, "DELETE FROM r2_log_pending_hands WHERE event_id=?;",
+                                -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(st);
+    }
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
+int r2_log_finish_hands(int64_t event, int launched, int return_code)
+{
+    return log_finish_hands(event, 0, launched, return_code);
+}
+
+int r2_log_recover_hands(void)
+{
+    int64_t after = 0;
+    int failed = 0;
+    for (;;) {
+        pthread_mutex_lock(&log_lock);
+        sqlite3_stmt *st = NULL;
+        int rc = log_initialized && log_db ? sqlite3_prepare_v2(log_db,
+            "SELECT event_id FROM r2_log_pending_hands WHERE event_id>? ORDER BY event_id LIMIT 1;",
+            -1, &st, NULL) : SQLITE_ERROR;
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, after);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) after = sqlite3_column_int64(st, 0);
+        sqlite3_finalize(st);
+        pthread_mutex_unlock(&log_lock);
+        if (rc != SQLITE_ROW) return rc == SQLITE_DONE && !failed ? 0 : -1;
+        if (log_finish_hands(after, 1, 0, -1) != 0) failed = 1;
+    }
 }
 
 int64_t r2_log_file_event(const char *action, const char *path,
