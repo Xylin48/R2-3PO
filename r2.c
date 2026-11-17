@@ -8030,6 +8030,26 @@ static const char *gameboy_console_path(void)
         ? configured : R2_ROOT "/Devices/GameBoyAdvance/GameBoyAdvance";
 }
 
+#ifndef R2_GAMEBOY_COMMAND_TIMEOUT_SECONDS
+#define R2_GAMEBOY_COMMAND_TIMEOUT_SECONDS 30
+#endif
+
+int r2_gameboy_command_deadline(struct timespec *deadline)
+{
+    if (clock_gettime(CLOCK_MONOTONIC, deadline) != 0) return -1;
+    /* Allow the device its database, X11, controller and graceful stop waits. */
+    deadline->tv_sec += R2_GAMEBOY_COMMAND_TIMEOUT_SECONDS;
+    return 0;
+}
+
+int r2_gameboy_command_expired(const struct timespec *deadline)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 1;
+    return now.tv_sec > deadline->tv_sec ||
+        (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
+}
+
 /* Game Boy console bridge: argv-based execution, never a shell command.
  * Read the complete response, including lists and pending event batches. */
 static int run_gameboy_console(const char *path, const char *subcommand,
@@ -8040,6 +8060,8 @@ static int run_gameboy_console(const char *path, const char *subcommand,
     char *response = NULL;
     size_t length = 0;
     *output = NULL;
+    struct timespec deadline;
+    if (r2_gameboy_command_deadline(&deadline) != 0) return -1;
     FILE *stream = open_memstream(&response, &length);
     if (!stream) return -1;
     if (pipe2(pipes, O_CLOEXEC) != 0) {
@@ -8057,6 +8079,7 @@ static int run_gameboy_console(const char *path, const char *subcommand,
         return -1;
     }
     if (pid == 0) {
+        if (setpgid(0, 0) != 0) _exit(126);
         char *argv[7];
         int n = 0;
         close(pipes[0]);
@@ -8078,10 +8101,11 @@ static int run_gameboy_console(const char *path, const char *subcommand,
         _exit(127);
     }
 
+    (void)setpgid(pid, pid);
     close(pipes[1]);
     int failed = 0;
     for (;;) {
-        if (r2_is_shutting_down()) {
+        if (r2_is_shutting_down() || r2_gameboy_command_expired(&deadline)) {
             failed = 1;
             break;
         }
@@ -8106,9 +8130,9 @@ static int run_gameboy_console(const char *path, const char *subcommand,
     if (fclose(stream) != 0) failed = 1;
     const struct timespec wait_pause = {.tv_nsec = 100000000L};
     for (;;) {
-        if (failed || r2_is_shutting_down()) {
+        if (failed || r2_is_shutting_down() || r2_gameboy_command_expired(&deadline)) {
             failed = 1;
-            (void)kill(pid, SIGKILL);
+            if (kill(-pid, SIGKILL) != 0) (void)kill(pid, SIGKILL);
         }
         pid_t waited = waitpid(pid, &status, WNOHANG);
         if (waited == pid) break;

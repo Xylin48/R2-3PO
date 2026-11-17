@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 #include "AudioDiscovery.h"
 
 /*
@@ -236,6 +237,8 @@ int r2_write_diary(void);
 
 /* Sync adapter-verified events from the console command the caller selected. */
 int r2_sync_gameboy_verified_events(const char *path);
+int r2_gameboy_command_deadline(struct timespec *deadline);
+int r2_gameboy_command_expired(const struct timespec *deadline);
 
 /* Simulate a sleep transition and generate/store a private dream report. */
 int r2_sleep_and_dream(double hours);

@@ -1,4 +1,5 @@
 /* Execute the real serializer, CURL setup and response handler without a server. */
+#define R2_GAMEBOY_COMMAND_TIMEOUT_SECONDS 2
 #define main r2_program_main
 #include "../r2.c"
 #undef main
@@ -661,6 +662,7 @@ static void check_gameboy_delivery(void)
                  "cd \"$(dirname \"$0\")\" || exit 1\n"
                  "case \"$2\" in\n"
                  "events) cat events.json ;;\n"
+                 "stall) printf '%s' '{\"incomplete\":'; sleep 20 & wait ;;\n"
                  "ack_event)\n"
                  "  [ \"$3\" = 350001 ] || exit 1\n"
                  "  if [ -e ack-attempted ]; then printf '%s\\n' '{\"ok\":true}';\n"
@@ -668,6 +670,10 @@ static void check_gameboy_delivery(void)
                  "*) exit 1 ;;\n"
                  "esac\n", script) >= 0);
     assert(fclose(script) == 0 && chmod(executable, 0700) == 0);
+
+    char *abandoned = NULL;
+    assert(run_gameboy_console(executable, "stall", NULL, NULL, &abandoned) == -1);
+    assert(abandoned == NULL);
 
     char *details = text(70000, 'd', "Complete adapter evidence ");
     memcpy(details + 70000 - sizeof("VERIFIED-TAIL") + 1, "VERIFIED-TAIL", sizeof("VERIFIED-TAIL"));

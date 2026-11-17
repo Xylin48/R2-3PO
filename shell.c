@@ -2328,32 +2328,52 @@ static int shell_gameboy(const char *arg)
 
     /* execv avoids interpreting user-supplied subcommands through a shell. */
     char *argv[10] = {0};
-    int argc = 0;
+    argv[0] = (char *)device;
     char *save = NULL;
-    char *part = strtok_r(copy, " \t", &save);
-    while (part) {
-        if (argc >= 8) {
-            printf("[Game Boy Advance] Too many command arguments.\n");
-            free(copy);
-            return 1;
-        }
-        argv[++argc] = part;
-        part = strtok_r(NULL, " \t", &save);
-    }
-    if (argc == 0) {
-        argv[0] = (char *)device;
+    argv[1] = strtok_r(copy, " \t", &save);
+    int argc = 1;
+    if (!argv[1]) {
         argv[1] = "power";
-        argv[2] = "on";
-        argc = 2;
+        argv[++argc] = "on";
+    } else if (!strcmp(argv[1], "insert") || !strcmp(argv[1], "move")) {
+        /* A cartridge filename can contain spaces. For move, only the
+           final word is the separate destination argument. */
+        char *name = shell_trim(save);
+        if (*name) {
+            argv[++argc] = name;
+            if (!strcmp(argv[1], "move")) {
+                char *destination = name + strlen(name);
+                while (destination > name && !isspace((unsigned char)destination[-1]))
+                    --destination;
+                if (destination > name) {
+                    destination[-1] = '\0';
+                    shell_trim(name);
+                    argv[++argc] = destination;
+                }
+            }
+        }
     } else {
-        argv[0] = (char *)device;
+        char *part;
+        while ((part = strtok_r(NULL, " \t", &save)) != NULL) {
+            if (argc >= 8) {
+                printf("[Game Boy Advance] Too many command arguments.\n");
+                free(copy);
+                return 1;
+            }
+            argv[++argc] = part;
+        }
     }
-    argv[argc + 1] = NULL;
 
     int is_power_off = argc == 2 && !strcmp(argv[1], "power") && !strcmp(argv[2], "off");
     ShellGameboyStatus before = {0}, after = {0};
     int have_before = shell_gameboy_read_status(&before);
 
+    struct timespec deadline;
+    if (r2_gameboy_command_deadline(&deadline) != 0) {
+        perror("[Game Boy Advance] clock_gettime");
+        free(copy);
+        return 1;
+    }
     pid_t child = fork();
     if (child < 0) {
         perror("[Game Boy Advance] fork");
@@ -2361,17 +2381,23 @@ static int shell_gameboy(const char *arg)
         return 1;
     }
     if (child == 0) {
+        if (setpgid(0, 0) != 0) _exit(126);
         execv(device, argv);
         perror("[Game Boy Advance] execv");
         _exit(127);
     }
+    (void)setpgid(child, child);
     int status = 0;
     int cancelled = 0;
+    int timed_out = 0;
     const struct timespec wait_pause = {.tv_nsec = 100000000L};
     for (;;) {
-        if (!cancelled && (atomic_load(&shell_shutdown) || r2_is_shutting_down())) {
-            cancelled = 1;
-            (void)kill(child, SIGKILL);
+        if (!cancelled) {
+            timed_out = r2_gameboy_command_expired(&deadline);
+            if (timed_out || atomic_load(&shell_shutdown) || r2_is_shutting_down()) {
+                cancelled = 1;
+                if (kill(-child, SIGKILL) != 0) (void)kill(child, SIGKILL);
+            }
         }
         pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) break;
@@ -2384,7 +2410,9 @@ static int shell_gameboy(const char *arg)
         (void)nanosleep(&wait_pause, NULL);
     }
     int command_ok = !cancelled && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!command_ok) {
+    if (timed_out) {
+        printf("[Game Boy Advance] Command timed out. Check console status before retrying.\n");
+    } else if (!command_ok) {
         printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
     } else {
         /* The event-outbox read may reconcile an exited emulator, so sync it

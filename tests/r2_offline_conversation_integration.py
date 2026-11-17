@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -942,6 +943,42 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
     print("PASS: exact Hands output survived a crash and rejected acknowledgement, then reached one linked turn.")
 
 
+def gameboy_shell_cartridge_name(binary: Path, workspace: Path, url: str) -> None:
+    root = workspace / "Game Boy Device"
+    cartridges = root / "Cartridges"
+    cartridges.mkdir(parents=True)
+    console = root / "GameBoyAdvance"
+    shutil.copyfile(REPO / "GameBoyAdvance.py", console)
+    console.chmod(0o700)
+    filename = "Metroid  Fusion (Europe).gba"
+    cartridge = cartridges / filename
+    cartridge.write_bytes(bytes(0x200))
+    env = runtime_environment(workspace, url, 4096)
+    env.update(R2_GAMEBOY_ROOT=str(root), R2_GAMEBOY_EXECUTABLE=str(console))
+    commands = (
+        f"gameboy move {filename} shelf\n"
+        f"gameboy move {filename} pockets\n"
+        f"gameboy insert {filename}\n"
+        "exit\n"
+    )
+    result = subprocess.run(
+        [str(binary)], cwd=workspace, env=env, input=commands,
+        text=True, capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Inserted cartridge: {cartridge.stem}" in result.stdout, result.stdout
+    with sqlite3.connect(root / "gameboy.db") as db:
+        assert db.execute("SELECT rom_path FROM cartridge_slot").fetchone() == (str(cartridge),)
+    with sqlite3.connect(root / "State" / "console_state.db") as db:
+        assert db.execute(
+            "SELECT details FROM console_events WHERE event_type='cartridge_moved' ORDER BY id"
+        ).fetchall() == [
+            (f"Filename={filename}; destination=shelf",),
+            (f"Filename={filename}; destination=pockets",),
+        ]
+    print("PASS: production shell preserved a Game Boy cartridge filename through move and insert.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -983,6 +1020,7 @@ def main() -> int:
             recover_reflection_during_service(binary, workspace, url)
             recover_learning_after_restart(binary, workspace, url)
             recover_completed_hands_result(binary, workspace, url)
+            gameboy_shell_cartridge_name(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()
