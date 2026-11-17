@@ -272,8 +272,16 @@ class TVDisplaySmoke(unittest.TestCase):
             def configure(self, **kwargs):
                 self.props.update(kwargs)
 
+        class Player:
+            def audio_set_mute(self, muted):
+                self.muted = muted
+
+            def set_pause(self, paused):
+                self.paused = paused
+
         display = object.__new__(TV.CRTDisplay)
-        display._player = None
+        display._player = Player()
+        display._last_transport = "play"
         display._renderer_published = False
         display.picture = Widget()
         display.status = Widget()
@@ -282,6 +290,9 @@ class TVDisplaySmoke(unittest.TestCase):
             ValueError("Saved VCR position is not finite"))
         display._publish_renderer = lambda path: None
         display.refresh(schedule=False)
+        self.assertTrue(display._player.muted)
+        self.assertEqual(display._player.paused, 1)
+        self.assertIsNone(display._last_transport)
         self.assertTrue(display.picture.raised)
         self.assertEqual(display.picture.props["text"], "TV STATE UNAVAILABLE")
         self.assertIn("Saved VCR position", display.status.props["text"])

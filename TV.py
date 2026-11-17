@@ -535,6 +535,15 @@ class CRTDisplay:
                      + "   |   Reality-linked controls"
             )
         except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError) as exc:
+            # With no authoritative TV state, hold the existing media silent.
+            # Reapply the authoritative transport when reads recover.
+            if self._player:
+                self._last_transport = None
+                try:
+                    self._player.audio_set_mute(True)
+                    self._player.set_pause(1)
+                except (OSError, RuntimeError):
+                    pass
             self._publish_renderer(None)
             self.picture.lift()
             self.picture.configure(text="TV STATE UNAVAILABLE", fg="#b8c0b2")
