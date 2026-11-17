@@ -813,6 +813,68 @@ static void check_structured_report_evidence(void)
     r2_altself_shutdown();
 }
 
+static void check_action_result_under_history_pressure(void)
+{
+    const char *filename = "turn-result-fixture.txt";
+    const char *path = R2_WORKSPACE "/turn-result-fixture.txt";
+    char *user = text(512, 'u', "Please read the result fixture. ");
+    char *file_text = text(650, 'r', "complete action result from the fixture ");
+    memcpy(file_text + 640, "EXACT-TAIL", 10);
+
+    FILE *file = fopen(path, "w");
+    assert(file && fputs(file_text, file) >= 0 && fclose(file) == 0);
+    assert(init_db() == 0 && r2_diary_init() == 0);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    message_free_all();
+    /* The tool pair can fit only by evicting the active turn. The complete
+       direct result still fits beside the user message, without that pair. */
+    char *fixed_history = text(MAX_LIVE_MESSAGE_BYTES - 1350U, 'p', "Old fixture answer.");
+    assert(message_add_pinned("assistant", fixed_history) == 0);
+    free(fixed_history);
+    set_response("I will read the saved document.\n[READ] turn-result-fixture.txt", "stop", 1);
+
+    core_initialized = 1;
+    char *reply = r2_talk(user);
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    char *expected = NULL;
+    assert(asprintf(&expected, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n",
+                    filename, file_text) >= 0);
+    assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
+                            strlen("I processed the action request. Here is the recorded result:\n")));
+    assert(strstr(reply, expected));
+    assert(messages.count == 3 && !strcmp(messages.items[1].role, "user") &&
+           !strcmp(messages.items[1].content, user) && !messages.items[1].pinned &&
+           !strcmp(messages.items[2].content, reply));
+    assert(!active_turn_history.user && !active_turn_history.action_request &&
+           !active_turn_history.action_result);
+
+    sqlite3_stmt *statement = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT user_text,assistant_text,tool_result FROM r2_log_pending_learning "
+        "WHERE user_text=?;", -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(statement, 1, user, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 0), user));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 1), reply));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 2), expected));
+    assert(sqlite3_step(statement) == SQLITE_DONE);
+    sqlite3_finalize(statement);
+
+    free(reply);
+    free(expected);
+    free(file_text);
+    free(user);
+    message_free_all();
+    r2_diary_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+    assert(unlink(path) == 0);
+    puts("Active user turn and exact action result survived live-history admission pressure.");
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -968,6 +1030,7 @@ int main(void)
     check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();
+    check_action_result_under_history_pressure();
     r2_log_shutdown();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);

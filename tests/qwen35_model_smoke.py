@@ -385,7 +385,7 @@ require(
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
     and "Append the internal assistant tool-call and its tool-result as one logical" in core
     and "Cannot fit complete assistant/tool history pair without evicting protected context." in core
-    and "i != preserve_index && !evict[i] && !messages.items[i].pinned" in core
+    and "i != preserve_index && !evict[i] && !message_is_protected(&messages.items[i])" in core
     and "raw [WORLD]/[RUN]/etc. commands into later model context" in core
     and "do not repeat it unless the user asks again" in core,
     "tool-result history stays atomic and trusted while executed control syntax is not replayed as dialogue",
@@ -396,8 +396,8 @@ tool_pair_end = core.find("reply = chat_with_relevant_memories(message);", tool_
 require(
     tool_pair_start >= 0 and tool_pair_end > tool_pair_start
     and "Here is the recorded result:\\n%s" in core[tool_pair_start:tool_pair_end]
-    and "reply = tools;" in core[tool_pair_start:tool_pair_end]
-    and core.find("free(tools);", tool_pair_start) > core.find("if (pair_rc != 0)", tool_pair_start),
+    and "tool_evidence = tools;" in core[tool_pair_start:tool_pair_end]
+    and "reply = tool_evidence;" in core[tool_pair_start:tool_pair_end],
     "if tool-history persistence fails, R2 retains and reports the actual tool result without rerunning the action",
 )
 

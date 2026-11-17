@@ -800,6 +800,24 @@ static pthread_cond_t task_queue_cond =
 
 static MessageList messages = {0};
 
+/* Guarded by messages_lock. Content allocations survive array compaction. */
+typedef struct {
+    const char *user;
+    const char *action_request;
+    const char *action_result;
+} ActiveTurnHistory;
+
+static ActiveTurnHistory active_turn_history;
+
+static int message_is_protected(const Message *message)
+{
+    const char *content = message->content;
+    return message->pinned ||
+        (content && (content == active_turn_history.user ||
+                     content == active_turn_history.action_request ||
+                     content == active_turn_history.action_result));
+}
+
 
 /* ============================================================
    BASIC HELPERS
@@ -991,7 +1009,7 @@ static int message_add_ex(
            kept_bytes > MAX_LIVE_MESSAGE_BYTES - new_bytes) {
         size_t remove_index = SIZE_MAX;
         for (size_t i = 0; i < messages.count; ++i) {
-            if (!evict[i] && !messages.items[i].pinned) {
+            if (!evict[i] && !message_is_protected(&messages.items[i])) {
                 remove_index = i;
                 break;
             }
@@ -999,7 +1017,7 @@ static int message_add_ex(
         if (remove_index == SIZE_MAX) {
             free(role_copy);
             free(content_copy);
-            fprintf(stderr, "[R2 memory] Pinned context prevents an atomic live-history append.\n");
+            fprintf(stderr, "[R2 memory] Protected context prevents an atomic live-history append.\n");
             return -1;
         }
         evict[remove_index] = 1;
@@ -1121,7 +1139,7 @@ static int message_add_pair_preserving_locked(const char *role_a, const char *co
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
         size_t remove_index = SIZE_MAX;
         for (size_t i = 0; i < messages.count; ++i) {
-            if (i != preserve_index && !evict[i] && !messages.items[i].pinned) {
+            if (i != preserve_index && !evict[i] && !message_is_protected(&messages.items[i])) {
                 remove_index = i;
                 break;
             }
@@ -1259,6 +1277,7 @@ static void message_free_all(void)
     messages.items = NULL;
     messages.count = 0;
     messages.capacity = 0;
+    active_turn_history = (ActiveTurnHistory){0};
 }
 
 
@@ -14710,6 +14729,7 @@ static char *r2_talk_impl(const char *message)
         return NULL;
     }
 
+    active_turn_history.user = messages.items[messages.count - 1].content;
     pthread_mutex_unlock(&messages_lock);
 
     int64_t hands_result_id = attach_pending_hands_result();
@@ -14858,8 +14878,12 @@ static char *r2_talk_impl(const char *message)
                     "repeat the action unless the user asks again.";
                 pair_rc = message_add_pair_locked(
                     "assistant", tool_request_context, "user", tagged_tool_result);
-                if (pair_rc == 0 && messages.count > 0)
-                    messages.items[messages.count - 1].internal_tool_result = 1;
+                if (pair_rc == 0) {
+                    Message *result = &messages.items[messages.count - 1];
+                    result->internal_tool_result = 1;
+                    active_turn_history.action_request = (result - 1)->content;
+                    active_turn_history.action_result = result->content;
+                }
             }
         }
         free(tagged_tool_result);
@@ -14869,19 +14893,14 @@ static char *r2_talk_impl(const char *message)
         reply = NULL;
 
         if (pair_rc != 0) {
+            tool_evidence = tools;
             if (asprintf(&reply,
                          "I processed the action request. Here is the recorded result:\n%s",
-                         tools) < 0) {
-                /* The complete result is already allocated. Return it directly. */
-                reply = tools;
-                tools = NULL;
+                         tool_evidence) < 0) {
+                /* Use the same bytes for the visible reply and the durable result. */
+                reply = tool_evidence;
             }
-            free(tools);
             tools = NULL;
-            if (!reply) {
-                    fprintf(stderr, "[R2] Could not allocate a visible reply after action-context persistence failed; preserving the user turn and not repeating the action.\n");
-                return NULL;
-            }
             fprintf(stderr,
                     "[R2] Action-context persistence failed; returning the result text without repeating the action.\n");
             goto finalize_reply;
@@ -15118,7 +15137,8 @@ finalize_reply:
 
     /* Deliver the generated answer immediately; model-assisted bookkeeping
        continues independently and yields if a new foreground turn arrives. */
-    schedule_post_turn_processing(message, reply, turn_event_id, tool_evidence);
+    schedule_post_turn_processing(message, reply, turn_event_id,
+                                  tool_evidence == reply ? strdup(reply) : tool_evidence);
 
     return reply;
 }
@@ -15147,6 +15167,9 @@ char *r2_talk(const char *message)
     r2_audio_turn_evidence = &speech_evidence;
     r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
+    pthread_mutex_lock(&messages_lock);
+    active_turn_history = (ActiveTurnHistory){0};
+    pthread_mutex_unlock(&messages_lock);
     remove_pending_hands_result();
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
