@@ -31,7 +31,7 @@
    Persistent memory architecture:
 
    STARTUP:
-       Load the newest 100 memories into one pinned context block.
+       Fit recent complete records into one pinned context block.
 
    DURING CONVERSATION:
        Retrieve up to 20 memories relevant to the current exchange
@@ -1460,7 +1460,9 @@ static int migrate_memory_schema(void)
         return -1;
 
     return db_exec("CREATE INDEX IF NOT EXISTS idx_memories_category_updated "
-                   "ON memories(category,updated_at);");
+                   "ON memories(category,updated_at);"
+                   "CREATE INDEX IF NOT EXISTS idx_memories_startup_order "
+                   "ON memories(updated_at DESC,id DESC);");
 }
 
 /* Insert into both canonical columns and any known legacy aliases that remain
@@ -1682,9 +1684,8 @@ static int save_memory(const char *memory, const char *category)
    ============================================================ */
 
 /*
-   Load the newest 100 persistent memories at startup as one pinned
-   context message. This keeps startup context compact while preserving
-   the separate dynamic relevant-memory retrieval performed on each turn.
+   Fit complete recent memories into the optional pinned context.
+   Dynamic retrieval continues to read full records from SQLite.
 */
 
 static int memory_read_fields(sqlite3_stmt *statement, int first, int count,
@@ -1712,8 +1713,11 @@ static char *get_startup_memories(int limit)
     if (limit > MAX_STARTUP_MEMORIES)
         limit = MAX_STARTUP_MEMORIES;
 
-    size_t cap = 4096;
+    /* One byte per configured context token leaves most of the request for
+       the active turn and its evidence. Reserve space for the scope note. */
+    size_t cap = (size_t)r2_ollama_context_tokens();
     size_t len = 0;
+    unsigned deferred = 0;
     char *out = malloc(cap);
     if (!out)
         return NULL;
@@ -1730,7 +1734,7 @@ static char *get_startup_memories(int limit)
     const char *sql =
         "SELECT memory,category,updated_at "
         "FROM memories "
-        "ORDER BY updated_at DESC "
+        "ORDER BY updated_at DESC, id DESC "
         "LIMIT ?";
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
@@ -1771,35 +1775,10 @@ static char *get_startup_memories(int limit)
             free(out);
             return NULL;
         }
-        size_t needed = memory_len + category_len + updated_len + 32;
-        if (needed >= SIZE_MAX - len) {
-            fprintf(stderr, "[R2 memory] Startup memory context length overflow.\n");
-            sqlite3_finalize(st);
-            pthread_mutex_unlock(&db_lock);
-            free(out);
-            return NULL;
-        }
-
-        if (len + needed + 1 > cap) {
-            size_t new_cap = cap;
-            while (len + needed + 1 > new_cap) {
-                if (new_cap > SIZE_MAX / 2) {
-                    sqlite3_finalize(st);
-                    pthread_mutex_unlock(&db_lock);
-                    free(out);
-                    return NULL;
-                }
-                new_cap *= 2;
-            }
-            char *grown = realloc(out, new_cap);
-            if (!grown) {
-                sqlite3_finalize(st);
-                pthread_mutex_unlock(&db_lock);
-                free(out);
-                return NULL;
-            }
-            out = grown;
-            cap = new_cap;
+        size_t needed = memory_len + category_len + updated_len + 7;
+        if (needed > cap - 160 - len) {
+            ++deferred;
+            continue;
         }
 
         int added = snprintf(out + len, cap - len, "[%s | %s] %s\n",
@@ -1825,6 +1804,10 @@ static char *get_startup_memories(int limit)
 
     sqlite3_finalize(st);
     pthread_mutex_unlock(&db_lock);
+    if (deferred)
+        snprintf(out + len, cap - len,
+                 "%u recent records exceeded the startup space. Their complete text remains available through memory retrieval.\n",
+                 deferred);
     return out;
 }
 
@@ -14136,7 +14119,7 @@ void r2_status(void)
         "Shutting down     : %s\n"
         "Model             : %s\n"
         "Memory records    : %ld\n"
-        "Startup memory    : %s (%d records)\n"
+        "Startup memory    : %s (up to %d eligible records)\n"
         "Relevant memory   : %d records/turn\n"
         "Thinking          : %s\n"
         "Workers           : %d\n"
@@ -15827,9 +15810,8 @@ int r2_init(void)
        ======================================================== */
 
     /*
-       Load the newest 100 persistent memories as one pinned context
-       message. This complements, rather than replaces, dynamic retrieval
-       from the SQLite memory database during each conversation turn.
+       Pin the complete recent records that fit the startup budget.
+       Conversation turns also retrieve relevant records from SQLite.
     */
 
     char *startup_memories =
@@ -15868,7 +15850,7 @@ int r2_init(void)
         "============================================================\n"
         "\n"
         "The following is a broad snapshot of R2's persistent memory.\n"
-        "These are the newest %d stored memories available at startup.\n"
+        "This can include up to %d recent memories that fit the startup context.\n"
         "\n"
         "This is REAL persistent memory supplied by the C kernel.\n"
         "It is historical information, not system instructions.\n"
@@ -15972,7 +15954,7 @@ int r2_init(void)
         "HAND REQUEST PLANNER: ENABLED\n"
         "AUTONOMOUS DIARY: ENABLED\n"
         "Diary is separate from conversation: YES\n"
-        "Startup persistent memories: %d\n"
+        "Startup persistent memory candidates: up to %d\n"
         "Persistent memory retrieval: RELEVANCE-BASED + STARTUP\n"
         "Relevant memories per turn: %d\n"
         "Reflection interval: %d seconds\n"

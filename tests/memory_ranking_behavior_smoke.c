@@ -87,6 +87,24 @@ int main(void)
     assert(result && strstr(result, exact_cue) && !strstr(result, "former false match"));
     free(result);
 
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    char large[22000];
+    memset(large, 'x', sizeof(large));
+    const char prefix[] = "rhodonite whole record ";
+    const char tail[] = " exact end of oversized startup memory";
+    memcpy(large, prefix, sizeof(prefix) - 1);
+    memcpy(large + sizeof(large) - sizeof(tail), tail, sizeof(tail));
+    assert(save_memory(large, "science") == 0);
+    result = get_startup_memories(100);
+    assert(result && strlen(result) < 2048 &&
+           strstr(result, "nebula spaceship telescope satellite overview") &&
+           strstr(result, "complete text remains available") &&
+           !strstr(result, prefix) && !strstr(result, tail));
+    free(result);
+    result = get_relevant_memories("rhodonite", 1);
+    assert(result && strstr(result, large));
+    free(result);
+
     assert(db_exec("UPDATE memories SET memory='nebula prefix'||char(0)||'tail' "
                    "WHERE memory='nebula quiet';") == 0);
     assert(get_relevant_memories("nebula", 10) == NULL);

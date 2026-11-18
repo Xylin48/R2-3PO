@@ -1100,6 +1100,28 @@ def oversized_imagination_request(binary: Path, workspace: Path, url: str) -> No
     print("PASS: an over-8-KiB request reached Imagination in full and survived restart in Choice Lab and Life Log.")
 
 
+def oversized_startup_memory(binary: Path, workspace: Path, url: str) -> None:
+    database = workspace / "R2" / "r2_memory.db"
+    exact = "LONG_STARTUP_MEMORY_4982 " + ("é" * (17 * 1024 * 1024)) + " end of record ☃"
+    digest = hashlib.sha256(exact.encode("utf-8")).digest()
+    with sqlite3.connect(database) as db:
+        row = db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?,'fixture','2035-01-01','2035-01-01')", (exact,),
+        ).lastrowid
+    del exact
+    for _ in range(2):
+        run = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            input="exit\n", capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert "R2-3PO ONLINE" in run.stdout and "[R2-3PO shut down.]" in run.stdout
+    with sqlite3.connect(database) as db:
+        (stored,) = db.execute("SELECT memory FROM memories WHERE id=?", (row,)).fetchone()
+        assert hashlib.sha256(stored.encode("utf-8")).digest() == digest
+    print("PASS: startup and restart retained an exact 34-MiB memory outside the pinned prompt.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -1144,6 +1166,7 @@ def main() -> int:
             recover_completed_hands_result(binary, workspace, url)
             gameboy_shell_cartridge_name(binary, workspace, url)
             oversized_imagination_request(binary, workspace, url)
+            oversized_startup_memory(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()
