@@ -62,6 +62,7 @@ run_as_r2() {
 BACKUP_EXEC=""
 INSTALL_SUCCEEDED=0
 NEW_EXEC_INSTALLED=0
+CORE_START_ATTEMPTED=0
 OLLAMA_STATE_CAPTURED=0
 OLLAMA_WAS_ACTIVE=0
 OLLAMA_WAS_ENABLED=0
@@ -74,15 +75,25 @@ cleanup_unit_staging() {
     fi
 }
 
+stop_failed_activation() {
+    [[ "$CORE_START_ATTEMPTED" == "1" ]] || return 0
+    if ! root_run systemctl disable --now r2-3po.service; then
+        log "ERROR: could not stop and disable R2; leaving the executable in place."
+        return 1
+    fi
+    CORE_START_ATTEMPTED=0
+}
+
 cleanup_on_exit() {
     local status=$?
     trap - EXIT
+    trap '' INT TERM
     cleanup_unit_staging
 
     # Cover failures after replacing R2 but before the explicit activation
     # rollback path (for example, chmod/date/systemd setup failures).
     if [[ "$status" -ne 0 && "$INSTALL_SUCCEEDED" != "1" &&
-          "$NEW_EXEC_INSTALLED" == "1" ]]; then
+          "$NEW_EXEC_INSTALLED" == "1" ]] && stop_failed_activation; then
         if [[ -n "$BACKUP_EXEC" && -f "$BACKUP_EXEC" ]]; then
             local restore_exec=""
             restore_exec="$(run_as_r2 mktemp "$R2_ROOT/r2.restore.XXXXXX" 2>/dev/null)" || true
@@ -114,7 +125,7 @@ cleanup_on_exit() {
     # store. If any pre-activation step fails, restore its original enabled and
     # active state instead of leaving a previously running service stranded.
     if [[ "$INSTALL_SUCCEEDED" != "1" &&
-          "$OLLAMA_STATE_CAPTURED" == "1" ]]; then
+          "$OLLAMA_STATE_CAPTURED" == "1" && "$CORE_START_ATTEMPTED" == "0" ]]; then
         if [[ "$OLLAMA_WAS_ENABLED" == "1" ]]; then
             root_run systemctl enable r2-ollama.service >/dev/null 2>&1 || true
         else
@@ -130,6 +141,8 @@ cleanup_on_exit() {
     exit "$status"
 }
 trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_core_ready() {
     # The service runner allows two 180-second model requests per policy,
@@ -161,11 +174,7 @@ wait_for_core_ready() {
 
 rollback_previous_executable() {
     # Stop any failed/new instance before inspecting or restoring the prior binary.
-    if ! root_run systemctl disable --now r2-3po.service; then
-        log "ERROR: could not stop and disable R2; leaving the executable in place."
-        NEW_EXEC_INSTALLED=0 # Prevent cleanup from replacing an executable that may still be in use.
-        return 1
-    fi
+    stop_failed_activation || return 1
     if [[ -z "$BACKUP_EXEC" || ! -f "$BACKUP_EXEC" ]]; then
         log "WARNING: no previous executable is available to roll back to; the failed service has been stopped."
         return 1
@@ -509,6 +518,7 @@ NEW_EXEC_INSTALLED=1
 run_as_r2 chmod 0755 "$R2_EXEC"
 
 log "Starting the reviewed R2 release..."
+CORE_START_ATTEMPTED=1
 if ! root_run systemctl start r2-3po.service; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true

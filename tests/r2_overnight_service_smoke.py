@@ -2,6 +2,7 @@
 """Static safety/regression checks for R2's unattended overnight service."""
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -290,6 +291,44 @@ root_run() {
                 )
                 self.assertEqual(result.stdout.splitlines()[-1], f"{status} {elapsed}")
 
+
+    def test_interrupted_activation_stops_core_before_restoring_executable(self):
+        source = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")
+        cleanup = source[source.index("cleanup_unit_staging() {"):
+                         source.index("wait_for_core_ready() {")]
+        for stop_status in (0, 1):
+            with self.subTest(stop_status=stop_status), tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                live = folder / "r2"
+                backup = folder / "previous"
+                live.write_text("candidate")
+                backup.write_text("previous")
+                script = """
+set -euo pipefail
+R2_ROOT="$1"
+R2_EXEC="$1/r2"
+BACKUP_EXEC="$1/previous"
+TEMP_EXEC="$1/pending"
+UNIT_STAGING_DIR=""
+INSTALL_SUCCEEDED=0
+NEW_EXEC_INSTALLED=1
+CORE_START_ATTEMPTED=1
+OLLAMA_STATE_CAPTURED=0
+STOP_STATUS="$2"
+log() { printf '%s\\n' "$*"; }
+root_run() {
+    [[ "$*" == "systemctl disable --now r2-3po.service" ]] || return 2
+    [[ "$(cat "$R2_EXEC")" == candidate ]] || return 2
+    printf 'stop attempted\\n'
+    return "$STOP_STATUS"
+}
+run_as_r2() { "$@"; }
+""" + cleanup + 'kill -TERM "$BASHPID"\n'
+                result = subprocess.run(["bash", "-c", script, "fixture", temp, str(stop_status)],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 143, result)
+                self.assertIn("stop attempted", result.stdout)
+                self.assertEqual(live.read_text(), "previous" if stop_status == 0 else "candidate")
 
     def test_installer_restores_private_ollama_state_after_early_failure(self):
         installer = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")
