@@ -20,24 +20,13 @@ Resolve every `[FAIL]`. Review each `[WARN]` and confirm whether the feature is 
 
 For the interactive desktop launcher, keep the isolated `r2-ollama.service` on `127.0.0.1:11435` stopped. Interactive R2 uses the desktop Ollama endpoint on `127.0.0.1:11434`; both servers share the GTX 1050 Ti's VRAM, so a runner loaded by the isolated service can make the interactive endpoint's `ollama ps` look empty while still consuming GPU memory. If preflight reports a `llama-server` process with no model listed, inspect `systemctl status ollama.service r2-ollama.service` and identify the owning process before stopping anything; do not kill a runner blindly.
 
-For a read-only database inventory and integrity report:
+Run database acceptance against disposable stores or an isolated copy. Identify the detached copy explicitly:
 
 ```sh
-python3 /home/x/R2_Home/R2/tools/audit_r2_databases.py \
-  --root /home/x/R2_Home/R2
+python3 tools/audit_r2_databases.py --root /path/to/isolated-r2-data
 ```
 
-For non-overwriting snapshots, choose a new destination directory for each run. For a cross-database-consistent set, first exit the interactive launcher cleanly if it is running. If R2 is running as the overnight service, stop that service before continuing. Do not proceed while either R2 core is active.
-
-```sh
-# Run this line only when the overnight systemd service is the active runtime:
-sudo systemctl stop r2-3po.service
-python3 /home/x/R2_Home/R2/tools/audit_r2_databases.py \
-  --root /home/x/R2_Home/R2 \
-  --snapshot-dir "/home/x/R2_Home/R2_Database_Snapshots/rollout-$(date +%Y%m%d-%H%M%S)"
-```
-
-Do not delete or replace legacy databases to make a check pass. Investigate integrity failures or unexpected schema/row reports first. The audit tool is read-only against source databases; snapshots are new files.
+Keep the originals stopped while preparing the quiescent backup for final deployment. The overnight installer creates and audits a private SQLite snapshot before launching the core. Keep a separate backup of the original conversation and diary files, which the SQLite snapshot does not copy. Investigate integrity failures or unexpected schema and row reports before going ahead.
 
 ## 3. Check model and devices independently before installing R2
 

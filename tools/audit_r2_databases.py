@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +43,31 @@ def _readonly_connection(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _snapshot_conflicts(path: Path) -> list[Path]:
+    candidates = [path, *(path.with_name(path.name + suffix)
+                          for suffix in ("-wal", "-shm", "-journal"))]
+    return [candidate for candidate in candidates
+            if candidate.exists() or candidate.is_symlink()]
+
+
 def snapshot_database(source: Path, destination: Path) -> None:
     """Create a private, consistent SQLite backup without changing the source."""
+    conflicts = _snapshot_conflicts(destination)
+    if conflicts:
+        raise FileExistsError(f"refusing existing snapshot path: {conflicts[0]}")
+    busy_since: float | None = None
+
+    def check_backup_progress(status: int, _remaining: int, _total: int) -> None:
+        nonlocal busy_since
+        if status not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            busy_since = None
+            return
+        now = time.monotonic()
+        if busy_since is None:
+            busy_since = now
+        elif now - busy_since >= 2.0:
+            raise sqlite3.OperationalError("database remained locked during snapshot")
+
     source_db: sqlite3.Connection | None = None
     target_db: sqlite3.Connection | None = None
     created = False
@@ -53,8 +77,8 @@ def snapshot_database(source: Path, destination: Path) -> None:
         fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         os.close(fd)
         created = True
-        target_db = sqlite3.connect(destination)
-        source_db.backup(target_db)
+        target_db = sqlite3.connect(destination, timeout=2.0)
+        source_db.backup(target_db, pages=256, progress=check_backup_progress, sleep=0.05)
         target_db.commit()
     except Exception:
         if target_db is not None:
@@ -95,8 +119,8 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
     _reject_snapshot_symlink_components(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     _reject_snapshot_symlink_components(snapshot_dir)
-    targets = [snapshot_dir / name for name in ALL_DATABASES]
-    conflicts = [path for path in targets if path.exists() or path.is_symlink()]
+    conflicts = [path for name in ALL_DATABASES
+                 for path in _snapshot_conflicts(snapshot_dir / name)]
     if conflicts:
         joined = ", ".join(str(path.relative_to(snapshot_dir)) for path in conflicts)
         raise FileExistsError(f"refusing to mix with existing snapshot file(s): {joined}")
@@ -253,12 +277,13 @@ def _relationship_check(
             ("r2_log_links", "to_event_id"),
         }
         select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
-        values = [row[0] for row in source_db.execute(select_sql)]
         qt = '"' + target_table.replace('"', '""') + '"'
         qtc = '"' + target_column.replace('"', '""') + '"'
         orphan_values: list[Any] = []
         orphan_count = 0
-        for value in values:
+        checked_rows = 0
+        for (value,) in source_db.execute(select_sql):
+            checked_rows += 1
             if value is None or target_db.execute(
                 f"SELECT 1 FROM {qt} WHERE {qtc}=? LIMIT 1", (value,)
             ).fetchone() is None:
@@ -266,7 +291,7 @@ def _relationship_check(
                 if len(orphan_values) < 50:
                     orphan_values.append(value)
         result["status"] = "checked"
-        result["checked_rows"] = len(values)
+        result["checked_rows"] = checked_rows
         result["orphan_count"] = orphan_count
         result["orphan_values"] = orphan_values
     except sqlite3.Error as exc:

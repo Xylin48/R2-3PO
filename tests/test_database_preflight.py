@@ -97,6 +97,66 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertEqual(snapshot.execute("SELECT value FROM safe").fetchone()[0], "source")
             snapshot.close()
 
+    def test_snapshot_refuses_leftover_sidecars_before_copying_any_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            source = root / "r2_reality.db"
+            sqlite3.connect(source).close()
+            destination = Path(directory) / "snapshots"
+            destination.mkdir()
+            for suffix in ("-wal", "-shm", "-journal"):
+                with self.subTest(suffix=suffix):
+                    stale = destination / ("r2_fridge.db" + suffix)
+                    stale.write_bytes(b"preserve this file")
+                    with self.assertRaisesRegex(FileExistsError, stale.name):
+                        audit.create_snapshot_set(root, destination)
+                    with self.assertRaisesRegex(FileExistsError, stale.name):
+                        audit.snapshot_database(source, destination / "r2_fridge.db")
+                    self.assertEqual(stale.read_bytes(), b"preserve this file")
+                    self.assertEqual(list(destination.iterdir()), [stale])
+                    stale.unlink()
+
+    def test_snapshot_copies_committed_wal_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.db"
+            destination = Path(directory) / "snapshot.db"
+            with contextlib.closing(sqlite3.connect(source)) as writer:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE memory(value TEXT)")
+                writer.execute("INSERT INTO memory VALUES ('committed')")
+                writer.commit()
+                wal = source.with_name(source.name + "-wal")
+                before = wal.read_bytes()
+
+                audit.snapshot_database(source, destination)
+
+                self.assertEqual(wal.read_bytes(), before)
+                with contextlib.closing(sqlite3.connect(destination)) as copy:
+                    self.assertEqual(copy.execute("SELECT value FROM memory").fetchall(),
+                                     [("committed",)])
+
+    def test_snapshot_stops_retrying_a_locked_source_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "r2_fridge.db"
+            destination = root / "snapshots"
+            sqlite3.connect(root / "r2_reality.db").close()
+            with contextlib.closing(sqlite3.connect(source)) as writer:
+                writer.execute("CREATE TABLE stock(value TEXT)")
+                writer.execute("BEGIN EXCLUSIVE")
+                with patch.object(audit.time, "monotonic", side_effect=[0.0, 3.0]):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "remained locked"):
+                        audit.create_snapshot_set(root, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+                writer.rollback()
+
+            created = audit.create_snapshot_set(root, destination)
+            self.assertEqual([path.name for path in created], ["r2_reality.db", "r2_fridge.db"])
+            for snapshot in created:
+                self.assertEqual(audit.audit_database(snapshot)["integrity"], ["ok"])
+
     def test_snapshot_directory_symlink_is_rejected_before_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
