@@ -10,6 +10,12 @@ PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 umask 077
 
+# Any invocation that can start the real core is a final deployment action.
+if [[ "$#" -ne 1 || "${1:-}" != "--activate-reviewed" ]]; then
+    echo "[R2 installer] No action taken. Final activation requires --activate-reviewed after release signoff." >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] || {
     echo "[R2 installer] ERROR: this trusted bootstrap must be invoked as root via sudo." >&2
     exit 1
@@ -59,7 +65,6 @@ NEW_EXEC_INSTALLED=0
 OLLAMA_STATE_CAPTURED=0
 OLLAMA_WAS_ACTIVE=0
 OLLAMA_WAS_ENABLED=0
-R2_ROLLBACK_RESTARTED=0
 UNIT_STAGING_DIR=""
 
 cleanup_unit_staging() {
@@ -108,11 +113,8 @@ cleanup_on_exit() {
     # The installer stops the private model server while repairing its model
     # store. If any pre-activation step fails, restore its original enabled and
     # active state instead of leaving a previously running service stranded.
-    # If rollback successfully restarted the previous R2 core, keep its model
-    # server running; that core depends on it.
     if [[ "$INSTALL_SUCCEEDED" != "1" &&
-          "$OLLAMA_STATE_CAPTURED" == "1" &&
-          "$R2_ROLLBACK_RESTARTED" != "1" ]]; then
+          "$OLLAMA_STATE_CAPTURED" == "1" ]]; then
         if [[ "$OLLAMA_WAS_ENABLED" == "1" ]]; then
             root_run systemctl enable r2-ollama.service >/dev/null 2>&1 || true
         else
@@ -159,7 +161,11 @@ wait_for_core_ready() {
 
 rollback_previous_executable() {
     # Stop any failed/new instance before inspecting or restoring the prior binary.
-    root_run systemctl stop r2-3po.service >/dev/null 2>&1 || true
+    if ! root_run systemctl disable --now r2-3po.service; then
+        log "ERROR: could not stop and disable R2; leaving the executable in place."
+        NEW_EXEC_INSTALLED=0 # Prevent cleanup from replacing an executable that may still be in use.
+        return 1
+    fi
     if [[ -z "$BACKUP_EXEC" || ! -f "$BACKUP_EXEC" ]]; then
         log "WARNING: no previous executable is available to roll back to; the failed service has been stopped."
         return 1
@@ -178,20 +184,7 @@ rollback_previous_executable() {
     fi
     NEW_EXEC_INSTALLED=0
     log "Restored previous executable from $BACKUP_EXEC"
-    root_run systemctl reset-failed r2-3po.service >/dev/null 2>&1 || true
-    if ! root_run systemctl start r2-3po.service; then
-        log "WARNING: previous executable is restored, but the service could not be started."
-        return 1
-    fi
-    if wait_for_core_ready; then
-        R2_ROLLBACK_RESTARTED=1
-        log "Previous executable restored and core readiness marker observed."
-    else
-        log "WARNING: previous executable is restored, but it did not reach core readiness."
-        root_run systemctl --no-pager --full status r2-3po.service || true
-        root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-        return 1
-    fi
+    log "R2 remains stopped for manual recovery; the previous executable will not be launched."
 }
 
 [[ -d "$R2_SOURCE" ]] || fail "expected source tree at $R2_SOURCE. Copy/clone this repository there first, then rerun."
@@ -515,11 +508,11 @@ run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"
 NEW_EXEC_INSTALLED=1
 run_as_r2 chmod 0755 "$R2_EXEC"
 
-log "Enabling R2 at boot and starting the overnight service..."
-if ! root_run systemctl enable --now r2-3po.service; then
+log "Starting the reviewed R2 release..."
+if ! root_run systemctl start r2-3po.service; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-    rollback_previous_executable || log "WARNING: automatic executable rollback/restart was incomplete."
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
     fail "systemd could not start R2. The previous executable was restored when available; fix the reported preflight/dependency issue before relying on overnight operation."
 fi
 
@@ -528,8 +521,13 @@ fi
 if ! wait_for_core_ready; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-    rollback_previous_executable || log "WARNING: automatic executable rollback/restart was incomplete."
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
     fail "R2 did not reach active state. The previous executable was restored when available; inspect the service logs before retrying deployment."
+fi
+
+if ! root_run systemctl enable r2-3po.service; then
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
+    fail "R2 reached readiness, but could not be enabled at boot. Inspect service state before retrying."
 fi
 
 INSTALL_SUCCEEDED=1

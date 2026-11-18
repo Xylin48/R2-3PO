@@ -182,14 +182,24 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("trap cleanup_on_exit EXIT", source)
         self.assertIn('run_as_r2 chmod 0755 "$R2_EXEC"', source)
         self.assertIn("refusing symlinked existing executable", source)
-        self.assertEqual(source.count("rollback_previous_executable || log"), 2)
+        self.assertEqual(source.count("rollback_previous_executable || log"), 3)
         self.assertLess(source.index('cp "$R2_EXEC" "$BACKUP_EXEC"'),
                         source.index('mv -f "$TEMP_EXEC" "$R2_EXEC"'))
         self.assertLess(
             source.index('python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60'),
             source.index('BACKUP_EXEC="$(run_as_r2 mktemp "$R2_ROOT/r2.previous.XXXXXX")"'),
         )
-        self.assertIn("systemctl enable --now r2-3po.service", source)
+        self.assertIn('if ! root_run systemctl start r2-3po.service; then', source)
+        self.assertLess(source.index('if ! wait_for_core_ready; then'),
+                        source.index('if ! root_run systemctl enable r2-3po.service; then'))
+        self.assertNotIn("systemctl enable --now r2-3po.service", source)
+        self.assertEqual(source.count("systemctl start r2-3po.service"), 1)
+        bootstrap = ROOT / "tools/r2_install_root_bootstrap.sh"
+        for args in ([], ["--help"], ["--activate-reviewed", "extra"]):
+            result = subprocess.run(["bash", str(bootstrap), *args], capture_output=True,
+                                    text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("No action taken", result.stderr)
         self.assertIn("copy_ollama_model.py", source)
         self.assertIn("R2_OLLAMA_UNIT_EOF", source)
         self.assertIn("R2_SERVICE_UNIT_EOF", source)
@@ -296,7 +306,7 @@ root_run() {
         self.assertIn("enabled|enabled-runtime|linked|linked-runtime) OLLAMA_WAS_ENABLED=1 ;;", installer)
         self.assertIn("OLLAMA_STATE_CAPTURED=1", installer)
         self.assertIn('if [[ "$INSTALL_SUCCEEDED" != "1"', installer)
-        self.assertIn('R2_ROLLBACK_RESTARTED=1', installer)
+        self.assertIn('systemctl disable --now r2-3po.service', installer)
         self.assertIn('INSTALL_SUCCEEDED=1', installer)
         self.assertIn('run_as_r2 rm -f -- "$R2_EXEC"', installer)
         self.assertIn('root_run systemctl disable r2-3po.service >/dev/null 2>&1 || true', installer)
