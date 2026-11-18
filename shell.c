@@ -191,7 +191,7 @@ static void *tv_control_server(void *unused)
             continue;
         }
 
-        int client = accept(server_fd, NULL, NULL);
+        int client = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
@@ -222,7 +222,8 @@ static void *tv_control_server(void *unused)
 
             ssize_t received = recv(client, command + used,
                                     sizeof(command) - 1 - used, 0);
-            if (received < 0 && errno == EINTR) continue;
+            if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
             if (received <= 0) break;
             used += (size_t)received;
             idle_polls = 0;
@@ -350,7 +351,7 @@ static int tv_control_start(void)
     struct stat st;
     if (lstat(tv_control_path, &st) == 0) {
         if (!S_ISSOCK(st.st_mode)) return -1;
-        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe < 0) return -1;
         struct sockaddr_un existing;
         memset(&existing, 0, sizeof(existing));
@@ -363,7 +364,7 @@ static int tv_control_start(void)
         if (unlink(tv_control_path) != 0) return -1; /* stale socket only */
     } else if (errno != ENOENT) return -1;
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
@@ -3036,11 +3037,15 @@ int r2_shell_run(void)
         sigdelset(&wait_mask, SIGTERM);
     }
 
+    if (signal(SIGINT, shell_signal_handler) == SIG_ERR ||
+        signal(SIGTERM, shell_signal_handler) == SIG_ERR) {
+        fprintf(stderr, "[R2 Shell] Could not install termination handlers.\n");
+        if (service_signals_blocked)
+            (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        return -1;
+    }
     shell_shutdown = 0;
     shell_running = 1;
-
-    signal(SIGINT, shell_signal_handler);
-    signal(SIGTERM, shell_signal_handler);
 
     if (tv_control_start() != 0)
         fprintf(stderr, "[TV] GUI control socket unavailable; shell TV commands remain available.\n");
@@ -3050,6 +3055,16 @@ int r2_shell_run(void)
     /* Source discovery is enabled by default; an unplugged mic or camera is
        not a startup error. No feed starts until a real input is found. */
     shell_watch_start();
+
+    /* Publish readiness only after installing service signal handling and
+       starting the shell interfaces. Keep the marker used by the installer. */
+    sigset_t pending;
+    if (service_mode && !shell_shutdown && !r2_is_shutting_down() &&
+        sigpending(&pending) == 0 &&
+        !sigismember(&pending, SIGINT) && !sigismember(&pending, SIGTERM)) {
+        printf("[R2 READY] Core initialized; entering shell.\n");
+        fflush(stdout);
+    }
 
     while (
         shell_running &&

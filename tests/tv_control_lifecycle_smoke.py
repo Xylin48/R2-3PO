@@ -32,7 +32,7 @@ require("int complete_line = 0;" in server
         and "complete_line = 1;" in server
         and "if (!complete_line || atomic_load(&tv_control_stop) || memchr(command," in server,
         "partial or oversized socket commands cannot trigger TV actions")
-require("int client = accept(server_fd, NULL, NULL);" in server
+require("accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC)" in server
         and "POLLIN" in server,
         "accept occurs only after listener readiness is polled")
 require("poll(&output, 1, 250)" in server
@@ -43,6 +43,9 @@ require("poll(&output, 1, 250)" in server
 
 stop_start = shell.find("static void tv_control_stop_server(void)")
 startup = shell[end:stop_start]
+require("int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);" in startup
+        and "int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);" in startup,
+        "startup cannot block on a competing listener and sockets close on exec")
 bind_failure = startup.find("if (bind(fd,")
 owned_socket = startup.find("if (chmod(tv_control_path", bind_failure)
 require(bind_failure >= 0 and owned_socket > bind_failure

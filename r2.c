@@ -16209,13 +16209,6 @@ int main(void)
         return 1;
     }
 
-    /* Installer readiness must prove the core initialized, not merely that the
-       shell runner passed dependency checks before exec'ing this process. */
-    if (service_mode && !strcmp(service_mode, "1")) {
-        printf("[R2 READY] Core initialized; entering shell.\n");
-        fflush(stdout);
-    }
-
     extern int r2_shell_run(void);
     resume_post_turn_learning();
     if (r2_shell_run() != 0) {
