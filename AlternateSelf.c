@@ -93,24 +93,34 @@ static int altself_restore_missing_log_links(void)
             return -1;
         }
         sqlite3_int64 branch_id = sqlite3_column_int64(st, 0);
-        const unsigned char *name_text = sqlite3_column_text(st, 1);
-        const unsigned char *scenario_text = sqlite3_column_text(st, 2);
-        const unsigned char *status_text = sqlite3_column_text(st, 3);
-        char name[256], scenario[512], status[64], summary[512], details[1200];
-        snprintf(name, sizeof(name), "%s", name_text ? (const char *)name_text : "");
-        snprintf(scenario, sizeof(scenario), "%s",
-                 scenario_text ? (const char *)scenario_text : "");
-        snprintf(status, sizeof(status), "%s",
-                 status_text ? (const char *)status_text : "active");
-        sqlite3_finalize(st);
+        const char *name = (const char *)sqlite3_column_text(st, 1);
+        const char *scenario = (const char *)sqlite3_column_text(st, 2);
+        const char *status = (const char *)sqlite3_column_text(st, 3);
+        const char *fields[] = {name, scenario, status};
+        for (int i = 0; i < 3; ++i) {
+            if (fields[i] ? strlen(fields[i]) == (size_t)sqlite3_column_bytes(st, i + 1)
+                          : sqlite3_column_type(st, i + 1) == SQLITE_NULL)
+                continue;
+            sqlite3_finalize(st);
+            return -1;
+        }
+        if (!name) name = "";
+        if (!scenario) scenario = "";
+        if (!status) status = "active";
 
+        /* Keep the existing lookup summary so a retry can reuse an event
+         * created by an older build. The restorable evidence is in details. */
+        char summary[512];
         snprintf(summary, sizeof(summary),
                  "Restored Life Log link for legacy Alternate-Self branch #%lld: %.180s",
                  (long long)branch_id, name);
-        snprintf(details, sizeof(details),
+        char *details = NULL;
+        int formatted = asprintf(&details,
                  "branch_id=%lld; name=%s; status=%s; scenario=%s; "
                  "migration=restored missing Life Log relationship without changing the hypothetical",
                  (long long)branch_id, name, status, scenario);
+        sqlite3_finalize(st);
+        if (formatted < 0) return -1;
 
         int64_t event_id = -1;
         rc = sqlite3_prepare_v2(as_db,
@@ -118,6 +128,7 @@ static int altself_restore_missing_log_links(void)
             "ORDER BY id DESC LIMIT 1;", -1, &st, NULL);
         if (rc != SQLITE_OK) {
             if (st) sqlite3_finalize(st);
+            free(details);
             return -1;
         }
         sqlite3_bind_text(st, 1, "alternate_self_legacy_link_restored",
@@ -128,6 +139,7 @@ static int altself_restore_missing_log_links(void)
             event_id = sqlite3_column_int64(st, 0);
         else if (rc != SQLITE_DONE) {
             sqlite3_finalize(st);
+            free(details);
             return -1;
         }
         sqlite3_finalize(st);
@@ -136,6 +148,7 @@ static int altself_restore_missing_log_links(void)
             event_id = r2_log_event(R2_LOG_THINKING,
                                     "alternate_self_legacy_link_restored",
                                     summary, details, "AlternateSelf");
+        free(details);
         if (event_id <= 0) {
             fprintf(stderr, "[R2 Alternate-Self Lab] Could not create Life Log link for legacy branch #%lld.\n",
                     (long long)branch_id);

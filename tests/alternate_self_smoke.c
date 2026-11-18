@@ -42,7 +42,8 @@ static int ensure_log_schema(void)
         "AND NOT EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=1);"
         "INSERT INTO r2_alternate_self_branches"
         "(id,name,scenario,status,log_event_id,created_utc,updated_utc) "
-        "SELECT 2,'Unlinked legacy branch','Legacy scenario without Life Log link','active',0,"
+        "SELECT 2,'Unlinked legacy branch','Legacy scenario without Life Log link: '"
+        "||replace(hex(zeroblob(900)),'00','é')||' exact legacy tail ☃','active',0,"
         "'2020-01-02T00:00:00Z','2020-01-02T00:00:00Z' "
         "WHERE NOT EXISTS(SELECT 1 FROM r2_alternate_self_branches WHERE id=2);"
         "INSERT INTO r2_alternate_self_branches"
@@ -188,6 +189,8 @@ int main(void)
         sqlite3_prepare_v2(link_check,
             "SELECT b.log_event_id>0 AND e.id IS NOT NULL "
             "AND e.event_type='alternate_self_legacy_link_restored' "
+            "AND instr(e.details,'scenario='||b.scenario||'; migration=')>0 "
+            "AND b.scenario LIKE '% exact legacy tail ☃' "
             "FROM r2_alternate_self_branches b "
             "LEFT JOIN r2_log_events e ON e.id=b.log_event_id WHERE b.id=2;",
             -1, &link_stmt, NULL) == SQLITE_OK &&
@@ -195,7 +198,7 @@ int main(void)
         restored_link = sqlite3_column_int(link_stmt, 0);
     if (link_stmt) sqlite3_finalize(link_stmt);
     if (link_check) sqlite3_close(link_check);
-    if (!check(restored_link, "backfill orphaned legacy branch into the shared Life Log")) goto done;
+    if (!check(restored_link, "backfill orphaned legacy branch with its complete original scenario")) goto done;
 
     view = r2_altself_show(1);
     if (!check(view && strstr(view, "Legacy branch") && strstr(view, "Legacy scenario"),
