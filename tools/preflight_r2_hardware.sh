@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only deployment readiness report. Never installs, rebuilds, edits DBs, or starts/stops R2.
+# Read-only deployment readiness report. Checks database path permissions without opening SQLite.
 set -uo pipefail
 R2_ROOT="${R2_ROOT:-/home/x/R2_Home}"
 R2_SOURCE="${R2_SOURCE:-$R2_ROOT/R2}"
@@ -177,9 +177,9 @@ for file in \
 done
 if [[ -x "$R2_EXEC" ]]; then pass "installed R2 executable exists"; else warn "installed executable missing; installer must build it before activation."; fi
 if have systemctl && systemctl is-active --quiet r2-3po.service 2>/dev/null; then
-  warn "overnight service is active; stop it before installation or database preflight."
+  warn "overnight service is active; stop it before final activation or taking deployment backups."
 elif have pgrep && pgrep -x r2 >/dev/null 2>&1; then
-  warn "interactive R2 is running; stop it before installation or database preflight."
+  warn "interactive R2 is running; stop it before final activation or taking deployment backups."
 else printf '[INFO] no active R2 core detected\n'; fi
 
 section "Dedicated user, workspace, and sound assets"
@@ -263,34 +263,6 @@ if have ollama; then
 else
   warn "ollama CLI not found on PATH."
 fi
-
-section "Read-only SQLite integrity"
-python3 - "$R2_SOURCE" <<'PY'
-import pathlib, sqlite3, sys
-from urllib.parse import quote
-root = pathlib.Path(sys.argv[1])
-names = ("r2_memory.db", "r2_reality.db", "r2_fridge.db", "r2_rewards.db", "r2_addictions.db")
-existing = bad = 0
-for name in names:
-    path = root / name
-    if path.is_symlink():
-        print(f"[FAIL] refusing symlinked database: {path}"); bad += 1; continue
-    if not path.exists():
-        print(f"[INFO] not created yet: {name}"); continue
-    existing += 1
-    try:
-        uri = "file:" + quote(str(path.resolve()), safe="/") + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=3) as db:
-            result = db.execute("PRAGMA integrity_check").fetchone()
-        if result and result[0] == "ok": print(f"[PASS] {name}: integrity_check=ok (read-only)")
-        else: print(f"[FAIL] {name}: integrity_check={result!r}"); bad += 1
-    except Exception as exc:
-        print(f"[FAIL] {name}: read-only check failed: {exc}"); bad += 1
-if not existing: print("[WARN] no existing database files; first-run DB initialization remains unverified")
-sys.exit(1 if bad else 0)
-PY
-db_rc=$?
-if [[ "$db_rc" -ne 0 ]]; then fail "existing database integrity check failed"; fi
 
 section "Audio, microphone, camera, TV, and emulator"
 if have mpg123 || have ffplay || have mpv; then pass "supported local MP3 playback process available"
@@ -383,6 +355,6 @@ if [[ "$FAILURES" -gt 0 ]]; then
 elif [[ "$WARNINGS" -gt 0 ]]; then
   printf 'CORE CHECKS PASSED WITH WARNINGS. Review optional device/audio/GUI warnings before relying on those features.\n'
 else
-  printf 'PREFLIGHT PASSED. Still test a real conversation and physical speaker/microphone/camera after activation.\n'
+  printf 'PREFLIGHT PASSED. Check local model inference and physical audio/camera independently before activation.\n'
 fi
 exit 0

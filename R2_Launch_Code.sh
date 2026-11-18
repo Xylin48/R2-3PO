@@ -243,7 +243,7 @@ fi
 echo
 echo "Preflight finished. Review any [WARN] items above."
 if [[ -t 0 ]]; then
-    read -r -p "Press Enter to continue launching R2, or Ctrl+C to cancel..."
+    read -r -p "Press Enter to continue launching R2, or Ctrl+C to cancel..." || exit 1
 fi
 echo
 
@@ -262,6 +262,39 @@ cd "$R2_ROOT" || {
     read -p "Press Enter to exit..."
     exit 1
 }
+
+# The standalone hardware report checks database permissions only. Open
+# SQLite here after final launch authorization and before workspace writes.
+echo "[preflight] Checking existing SQLite integrity for final activation..."
+if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    python3 - "$R2_SOURCE" <<'PY'
+import pathlib, sqlite3, sys
+from urllib.parse import quote
+root = pathlib.Path(sys.argv[1])
+names = ("r2_memory.db", "r2_reality.db", "r2_fridge.db", "r2_rewards.db", "r2_addictions.db")
+existing = bad = 0
+for name in names:
+    path = root / name
+    if path.is_symlink():
+        print(f"[FAIL] refusing symlinked database: {path}"); bad += 1; continue
+    if not path.exists():
+        print(f"[INFO] not created yet: {name}"); continue
+    existing += 1
+    try:
+        uri = "file:" + quote(str(path.resolve()), safe="/") + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=3) as db:
+            result = db.execute("PRAGMA integrity_check").fetchone()
+        if result and result[0] == "ok": print(f"[PASS] {name}: integrity_check=ok (read-only)")
+        else: print(f"[FAIL] {name}: integrity_check={result!r}"); bad += 1
+    except Exception as exc:
+        print(f"[FAIL] {name}: read-only check failed: {exc}"); bad += 1
+if not existing: print("[WARN] no existing database files; first-run DB initialization remains unverified")
+sys.exit(1 if bad else 0)
+PY
+then
+    echo "ERROR: Existing database integrity check failed. R2 was not launched."
+    exit 1
+fi
 
 # Create only the established workspace directories if they are missing.
 # Reality.c uses these same paths; never create parallel lowercase pockets/fridge trees.

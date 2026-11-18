@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Safety/coverage contract for the non-destructive hardware preflight."""
 from pathlib import Path
+import sqlite3
 import subprocess
+import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 script = (ROOT / "tools/preflight_r2_hardware.sh").read_text(encoding="utf-8")
@@ -13,15 +16,13 @@ required = (
     'R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"',
     'http://127.0.0.1:11434/api/tags',
     'qwen3.5:9b',
-    'PRAGMA integrity_check',
-    '?mode=ro',
     'r2_memory.db', 'r2_reality.db', 'r2_fridge.db',
     'r2_rewards.db', 'r2_addictions.db',
     'pactl', 'R2 runtime account can connect to its default PulseAudio/PipeWire server',
     '/dev/video*', 'R2 runtime account can read/write',
     '/dev/snd/*',
     "R2 service's configured audio supplementary group can access", 'mGBA Qt emulator',
-    'stop it before installation or database preflight',
+    'stop it before final activation or taking deployment backups',
     'run_as_r2 test -r "$R2_FX_DIR"',
     'r2 must have read/write/traverse access to $path for runtime directories, SQLite, and persistent memory',
     'existing runtime directory is not read/write/traverse accessible to r2',
@@ -72,7 +73,8 @@ if missing:
 if "SupplementaryGroups=audio" not in service:
     raise SystemExit("R2 service must receive service-scoped ALSA access through the audio group")
 for forbidden in ('chmod 777', 'systemctl enable', 'systemctl start',
-                  'systemctl stop', 'make clean all', 'rm -f'):
+                  'systemctl stop', 'make clean all', 'rm -f',
+                  'sqlite3', 'PRAGMA integrity_check', 'audit_r2_databases.py --root'):
     if forbidden in script:
         raise SystemExit(f"preflight must be read-only; found forbidden operation: {forbidden}")
 # Package-manager commands may appear only as human-readable guidance in warning
@@ -118,6 +120,13 @@ if launcher.index("pgrep -x r2") > network_at:
     raise SystemExit("duplicate process check must precede temporary network rules")
 if network_at > preflight_at:
     raise SystemExit("R2-only network isolation must precede runtime preflight")
+sqlite_at = launcher.index("PRAGMA integrity_check")
+if not (launcher.index("--activate-reviewed") < preflight_at <
+        launcher.index("Press Enter to continue launching R2") < sqlite_at <
+        launcher.index("Checking R2 workspace directories...")):
+    raise SystemExit("database integrity check must follow final launch authorization and precede workspace writes")
+if '?mode=ro' not in launcher:
+    raise SystemExit("the final interactive activation must open databases read-only during integrity checking")
 for marker in (
     'Checking R2 workspace directories...',
     'Checking the local Ollama API and required model',
@@ -142,5 +151,28 @@ loaded_ps = subprocess.run(
 )
 if empty_ps.returncode != 1 or loaded_ps.returncode != 0:
     raise SystemExit("ollama ps row detection must ignore the header and detect actual model rows")
+
+# Execute only the launcher's database check, using disposable files.
+probe_start = launcher.rindex("<<'PY'\n", 0, sqlite_at) + len("<<'PY'\n")
+probe_end = launcher.index("\nPY\n", sqlite_at)
+sqlite_probe = launcher[probe_start:probe_end]
+with tempfile.TemporaryDirectory() as temp:
+    data = Path(temp)
+    memory = data / "r2_memory.db"
+    with sqlite3.connect(memory) as database:
+        database.execute("CREATE TABLE memory(value TEXT)")
+        database.commit()
+    database.close()
+    original = memory.read_bytes()
+    probe_args = [sys.executable, "-", str(data)]
+    result = subprocess.run(probe_args, input=sqlite_probe, text=True, capture_output=True)
+    if result.returncode != 0 or "r2_memory.db: integrity_check=ok" not in result.stdout:
+        raise SystemExit(f"valid detached database failed activation check: {result}")
+    if memory.read_bytes() != original or set(data.iterdir()) != {memory}:
+        raise SystemExit("integrity check modified the detached database or created missing stores")
+    memory.write_bytes(b"a corrupt database fixture")
+    result = subprocess.run(probe_args, input=sqlite_probe, text=True, capture_output=True)
+    if result.returncode != 1 or "[FAIL]" not in result.stdout:
+        raise SystemExit(f"corrupt detached database passed activation check: {result}")
 
 print("R2 hardware preflight safety, coverage, and launcher-order smoke test passed")
