@@ -67,6 +67,11 @@ INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
 HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
 HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
+IMAGINE_TURN = "Imagine the long quartzlight scenario."
+IMAGINE_REQUEST = ("Imagine a quartzlight scene. " + "Keep the imagined snow visible ☃. " * 255
+                   + "The final constraint is a green door.")
+IMAGINE_NOTE = "Imagine quartzlight and snow with a green door."
+IMAGINE_RESULT = "In this hypothetical scene, quartzlight illuminates snow beside a green door."
 
 
 class LocalOllama(BaseHTTPRequestHandler):
@@ -120,9 +125,14 @@ class LocalOllama(BaseHTTPRequestHandler):
         if current_index >= 0 and user_messages[current_index] == LARGE_READ:
             reply = (REPLY if has_tool_result
                      else "I will open the exact fixture.\n[READ] large-fixture.txt")
+        if current_index >= 0 and user_messages[current_index] == IMAGINE_TURN and not has_tool_result:
+            reply = f"I can imagine that.\n[IMAGINE] {IMAGINE_REQUEST}\n[END IMAGINE]"
         system = "\n".join(item["content"] for item in payload.get("messages", [])
                            if item.get("role") == "system" and isinstance(item.get("content"), str))
         if ("internal associative-memory retrieval planner" in system and current_index >= 0
+                and user_messages[current_index] == IMAGINE_TURN):
+            reply = "quartzlight"
+        elif ("internal associative-memory retrieval planner" in system and current_index >= 0
                 and "rhodonite" in user_messages[current_index]):
             reply = "rhodonite\nmineral"
         elif "autonomous needs controller" in system:
@@ -133,7 +143,10 @@ class LocalOllama(BaseHTTPRequestHandler):
             else:
                 reply = "NONE"
         elif "Review supplied evidence for the current request" in system:
-            if any("Review the completed action result" in message for message in user_messages):
+            if any(message.startswith("EVIDENCE REVIEW\nRequest: Review the complete original imagination request.")
+                   for message in user_messages):
+                reply = IMAGINE_NOTE
+            elif any("Review the completed action result" in message for message in user_messages):
                 reply = "The requested action returned file data. The archived evidence is the original."
             elif any("Read the current user's message" in message for message in user_messages):
                 reply = (LONG_READ_REVIEW if any("Please read the combined fixture." in message
@@ -145,6 +158,9 @@ class LocalOllama(BaseHTTPRequestHandler):
                          else "No durable fixture memory is stated in this fragment.")
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "imagination subsystem" in system:
+            if any(IMAGINE_NOTE in message for message in user_messages):
+                reply = IMAGINE_RESULT
         elif "strict structured data extractor" in system:
             if any(SELF_REPORT_REPLY in m for m in user_messages):
                 reply = SELF_REPORT_EXTRACTION
@@ -1044,6 +1060,46 @@ def gameboy_shell_cartridge_name(binary: Path, workspace: Path, url: str) -> Non
     print("PASS: production shell preserved a Game Boy cartridge filename through move and insert.")
 
 
+def oversized_imagination_request(binary: Path, workspace: Path, url: str) -> None:
+    request_bytes = IMAGINE_REQUEST.encode("utf-8")
+    assert len(request_bytes) > 8192
+    start = len(LocalOllama.requests)
+    conversation(binary, workspace, url, (IMAGINE_TURN,), 2048)
+
+    fragments = []
+    final_requests = []
+    for payload in LocalOllama.requests[start:]:
+        for message in payload["messages"]:
+            content = message["content"]
+            if (message["role"] == "user"
+                    and content.startswith("EVIDENCE REVIEW\nRequest: Review the complete original imagination request.")
+                    and "\nRound 0," in content.split("BEGIN FRAGMENT", 1)[0]):
+                fragments.append(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
+            if message["role"] == "user" and content.startswith("USER'S IMAGINATION REQUEST (review notes"):
+                assert IMAGINE_NOTE in content
+                final_requests.append(content)
+    assert b"".join(fragments) == request_bytes
+    assert len(final_requests) == 1
+
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        rows = db.execute(
+            "SELECT b.id,b.scenario,b.conclusion,b.imagination_context,h.scenario,e.category "
+            "FROM r2_alternate_self_branches b JOIN r2_log_hypotheticals h ON h.event_id=b.log_event_id "
+            "JOIN r2_log_events e ON e.id=b.log_event_id WHERE b.scenario=?", (IMAGINE_REQUEST,),
+        ).fetchall()
+    assert len(rows) == 1
+    branch_id, scenario, result, evidence, logged_scenario, category = rows[0]
+    assert scenario == logged_scenario == IMAGINE_REQUEST and category == "hypothetical"
+    assert result == IMAGINE_RESULT and "IMAGINATION REQUEST REVIEW" in evidence
+    restarted = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+        input=f"alternate show {branch_id}\nexit\n", capture_output=True, text=True,
+        check=True, timeout=30,
+    )
+    assert IMAGINE_REQUEST in restarted.stdout and IMAGINE_RESULT in restarted.stdout
+    print("PASS: an over-8-KiB request reached Imagination in full and survived restart in Choice Lab and Life Log.")
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -1087,6 +1143,7 @@ def main() -> int:
             recover_learning_after_restart(binary, workspace, url)
             recover_completed_hands_result(binary, workspace, url)
             gameboy_shell_cartridge_name(binary, workspace, url)
+            oversized_imagination_request(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

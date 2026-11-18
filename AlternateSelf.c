@@ -291,7 +291,9 @@ static int write_branch(sqlite3 *db, int64_t event_id, void *context)
         "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind,imagination_context)"
         " VALUES(?,?,?,?,?,'active',?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?);", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, branch->name, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, branch->scenario, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text64(st, 2, branch->scenario, strlen(branch->scenario),
+                                 SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = branch->assumptions ? sqlite3_bind_text(st, 3, branch->assumptions, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
     if (rc == SQLITE_OK) rc = branch->predicted_outcome ? sqlite3_bind_text(st, 4, branch->predicted_outcome, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
     if (rc == SQLITE_OK) rc = branch->conclusion ? sqlite3_bind_text(st, 5, branch->conclusion, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 5);

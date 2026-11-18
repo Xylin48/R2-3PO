@@ -2869,7 +2869,10 @@ static int64_t log_hypothetical_record(const char *scenario, const char *assumpt
                                        const char *relationship, const char *evidence,
                                        int (*save_branch)(sqlite3 *, int64_t, void *), void *branch, int64_t ordinal)
 {
-    if (!valid_text(scenario) || strlen(scenario) > 8192 ||
+    /* Explicit Choice Lab branches keep the full scenario in the same
+     * transaction as their Life Log event. The extracted-record limit still
+     * applies to standalone hypotheses emitted by the model. */
+    if (!valid_text(scenario) || (!save_branch && strlen(scenario) > 8192) ||
         (assumptions && strlen(assumptions) > R2_LOG_MAX_TEXT) ||
         (predicted_outcome && strlen(predicted_outcome) > R2_LOG_MAX_TEXT) ||
         (conclusion && strlen(conclusion) > R2_LOG_MAX_TEXT) ||
@@ -2896,7 +2899,8 @@ static int64_t log_hypothetical_record(const char *scenario, const char *assumpt
         "VALUES(?,?,?,?,?,?);", -1, &st, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_bind_int64(st, 1, event_id);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, scenario, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_text64(st, 2, scenario, strlen(scenario), SQLITE_TRANSIENT, SQLITE_UTF8);
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 3, assumptions);
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, predicted_outcome);
         if (rc == SQLITE_OK) rc = bind_optional_text(st, 5, conclusion);
