@@ -8,7 +8,7 @@ R2 already has a headless shell mode, a supervised systemd unit, a local-model p
 - Local model copier: `tools/copy_ollama_model.py`
 - Trusted bootstrap source: `tools/r2_install_root_bootstrap.sh` (install once as `/usr/local/sbin/r2-3po-install`); `tools/install_r2_overnight.sh` is only a nonprivileged notice.
 
-The overnight core uses the same persistent R2 databases as the interactive launcher, but its inference server is separate: the installer copies the already-installed `qwen3.5:9b` model from the host Ollama service at `127.0.0.1:11434` into `/home/x/R2_Home/.ollama/models`, then runs an `r2`-owned Ollama server on `127.0.0.1:11435`. It does not download model weights or modify the host Ollama service. **Only one R2 core may run at a time.** Both launch paths keep `HOME` set to `/home/x/R2_Home`, while the process UID remains `r2`; `/home/r2` is not an alternate memory, diary, or workspace location. While the overnight core is active, its stricter UID-scoped firewall chain permits only `127.0.0.1:11435`; IPv6 and all other egress for UID `r2` are rejected. The private Ollama service has its own chain, which also permits local port 11434 so the interactive launcher can use the host Ollama after the overnight core is stopped. The core chain is inserted first while the service is active, so port 11434 is not available to `r2` during overnight operation. The separate chains are cleaned up independently so stopping one service does not remove the other's rules. The installer refuses to rebuild while an R2 process is already running, checks database paths and permissions, takes a private SQLite snapshot, requires a clean integrity audit, copies only an already-installed model, builds to a process-specific temporary executable, preserves the previous binary, and starts the private model server only after installation checks. If the private model preflight fails, R2 is not started; if R2 activation fails, it attempts to restore and restart the previous executable.
+The overnight core uses the same persistent R2 databases as the interactive launcher, but its inference server is separate: the installer copies the already-installed `qwen3.5:9b` model from the host Ollama service at `127.0.0.1:11434` into `/home/x/R2_Home/.ollama/models`, then runs an `r2`-owned Ollama server on `127.0.0.1:11435`. It does not download model weights or modify the host Ollama service. **Only one R2 core may run at a time.** Both launch paths keep `HOME` set to `/home/x/R2_Home`, while the process UID remains `r2`; `/home/r2` is not an alternate memory, diary, or workspace location. While the overnight core is active, its stricter UID-scoped firewall chain permits only `127.0.0.1:11435`; IPv6 and all other egress for UID `r2` are rejected. The private Ollama service has its own chain, which also permits local port 11434 so the interactive launcher can use the host Ollama after the overnight core is stopped. The core chain is inserted first while the service is active, so port 11434 is not available to `r2` during overnight operation. The separate chains are cleaned up independently so stopping one service does not remove the other's rules. The installer refuses to rebuild while an R2 process is already running, checks database paths and permissions, takes a private SQLite snapshot, requires a clean integrity audit, copies only an already-installed model, builds to a process-specific temporary executable, preserves the previous binary, and starts the private model server only after installation checks. A failed model preflight prevents R2 startup. If final activation fails, the bootstrap attempts to stop and disable R2 and restores the previous executable when available. That executable stays stopped for manual recovery.
 
 ## One-time host preparation
 
@@ -59,7 +59,7 @@ Foreground chat and its corrective retry allow up to six hours per request by de
 
 ```sh
 export R2_OLLAMA_TIMEOUT_SECONDS=14400
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 The launcher forwards this setting to the dedicated `r2` process. For the overnight systemd service, use a service override instead because systemd does not inherit an interactive shell's exported variables:
@@ -93,7 +93,7 @@ First stop the overnight service and any other R2 process, then run the interact
 ```sh
 sudo systemctl stop r2-3po.service
 export R2_OLLAMA_TRACE_PROMPTS=1
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 Send one test message that demonstrates the failure. The terminal prints the private trace filename, normally under `/home/x/R2_Home/R2_Log/`. After that one reproduction, exit R2 and disable tracing:
@@ -104,7 +104,9 @@ unset R2_OLLAMA_TRACE_PROMPTS
 
 Tracing is off by default. When enabled, each serialized request is saved to a new file with owner-only permissions (`0600`); existing files are never overwritten and symlinks are not followed. The trace contains private conversation history, retrieved memories, and your exact message. **Review and redact it before sharing**; do not post it publicly or leave tracing enabled during ordinary use. Once the trace is available, compare the actual current user message and preceding context against the generated reply to determine whether the distortion came from prompt assembly/context, the model itself, or response handling. Do not treat a successful build as proof that this semantic failure is resolved.
 
-## Build, audit, and activate
+## Final activation after release signoff
+
+Complete the [rollout-readiness checklist](rollout-readiness.md) before installing the bootstrap or starting either R2 launch path. The command below is the final launch on the live workspace.
 
 First exit any interactive R2 session. The service and interactive launcher share persistent SQLite databases.
 
@@ -115,8 +117,8 @@ Do **not** run a source-tree script with `sudo`. The checkout under `/home/x/R2_
 Do **not** copy the bootstrap directly from `/home/x/R2_Home/R2`: that tree is writable by `r2`, so checking it and then running `sudo install` from the same path leaves a time-of-check/time-of-use gap. Fetch the reviewed bootstrap from an immutable commit into the desktop user's home (outside the R2-writable tree), verify its Git blob ID, then install that exact file:
 
 ```sh
-BOOTSTRAP_COMMIT=6bc5217ae07d7b7cd3927fb045a71482d11affa5
-BOOTSTRAP_BLOB_SHA=10489001918f3155fbb28a00aec0f14534268c94
+BOOTSTRAP_COMMIT=8ac7e12fadab952486209123901f97b50d646ee3
+BOOTSTRAP_BLOB_SHA=7a1fa6ff2726f4ca4c409c3ef8d91539f3460d5f
 umask 077
 curl -fsSL \
   "https://raw.githubusercontent.com/Xylin48/R2-3PO/${BOOTSTRAP_COMMIT}/tools/r2_install_root_bootstrap.sh" \
@@ -148,7 +150,7 @@ The commit URL is immutable, and the Git blob hash must match exactly. Do not re
 From then on, use only the protected entrypoint:
 
 ```sh
-sudo /usr/local/sbin/r2-3po-install
+sudo /usr/local/sbin/r2-3po-install --activate-reviewed
 ```
 
 The trusted bootstrap compiles the current checkout and runs the model copier, database audit, and preflight as the unprivileged `r2` account. Its systemd unit definitions are embedded in the root-owned bootstrap; it does not install unit contents read from the runtime-writable checkout. The repository's `tools/install_r2_overnight.sh` is now only a nonprivileged notice and must not be invoked with `sudo`. If the trusted bootstrap itself is intentionally changed in a future release, review that change and reinstall the root-owned copy deliberately.
@@ -159,7 +161,7 @@ The bootstrap will:
 - check permissions and refuse symlinked database paths;
 - create a private snapshot of the memory, Reality, fridge, reward, and addiction databases and require the integrity audit to pass;
 - compile the full C runtime as `r2` and keep the previous executable until the private Ollama server passes a real generation preflight;
-- install the trusted embedded systemd units, reload systemd, and enable/start the overnight service.
+- install the trusted embedded systemd units, reload systemd, start the reviewed release, and enable it at boot after readiness.
 
 The bootstrap intentionally stops if the database audit or model preflight fails. Preserve the report and snapshot and investigate the issue rather than deleting or replacing the database files.
 
@@ -191,7 +193,7 @@ The runner attempts to acquire a system sleep inhibitor before doing startup che
 
 The service intentionally runs without an interactive `R2>` prompt. Stop the service before launching `R2_Launch_Code.sh`; the desktop launcher checks whether the service is active to help prevent concurrent database writers.
 
-After future source changes, stop R2 and rerun the installer so the executable is rebuilt, the database audit is repeated, and the service is restarted safely. The installer does not create or rename the local FX assets.
+For future releases, complete signoff and take a fresh snapshot before the next authorized activation. The installer does not create or rename the local FX assets.
 
 ## Verification boundary
 

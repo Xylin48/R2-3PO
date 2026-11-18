@@ -34,7 +34,7 @@ launching R2:
 ```sh
 export R2_WHISPER_MODEL=/home/x/R2_Home/models/ggml-base.en.bin
 export R2_WHISPER_CLI=/usr/local/bin/whisper-cli
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 Adjust the paths to match the actual installed model and executable. If
@@ -113,7 +113,7 @@ different node, set `R2_CAMERA_DEVICE` before launching R2, for example:
 
 ```sh
 export R2_CAMERA_DEVICE=/dev/video2
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 The selected V4L2 device must support the current capture mode (640×480 at

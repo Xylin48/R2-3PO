@@ -2,6 +2,8 @@
 
 R2-3PO is a C program with separate core, shell, diary, life-log, visual, eye, and hearing modules.
 
+**Treat first launch with R2’s live data as the final deployment step.** Use disposable fixtures, standalone model and device checks, and the [rollout-readiness checklist](docs/rollout-readiness.md) before installation. Both supported launchers require `--activate-reviewed`.
+
 For unattended overnight operation, boot-time activation, crash recovery, and sleep-inhibitor behavior, see [the overnight service guide](docs/overnight-service.md). For the staged preflight, database snapshot, real-device acceptance, and rollback gate, see the [rollout-readiness checklist](docs/rollout-readiness.md). The installer performs a database snapshot/integrity preflight before enabling the service. Do not run the systemd service and the interactive launcher at the same time.
 
 `R2_Launch_Code.sh` checks for an existing R2 process, applies a temporary UID-scoped firewall policy that allows Linux user `r2` to access only local Ollama at `127.0.0.1:11434`, then runs the read-only hardware preflight before compiling, opening the Observer, or launching R2. The firewall does not disable Wi-Fi or affect the desktop account, and is removed when the launcher exits. R2-side preflight, Ollama generation, compilation, workspace writes, Observer, and the core run as `r2`; their `HOME` is set to `/home/x/R2_Home` so `/home/r2` does not become a second project/data location. Review every `[FAIL]` and resolve it before continuing; `[WARN]` items identify optional or host-specific features that still need checking. You can also run `bash /home/x/R2_Home/R2/tools/preflight_r2_hardware.sh` manually before deployment. The launcher compiles with warnings treated as errors (`-Werror`), matching CI. See the guide for activation and live-device verification.
@@ -239,13 +241,13 @@ Before installing, make sure the local Ollama installation has the required mode
 ollama pull qwen3.5:9b
 ```
 
-Follow the [overnight service guide](docs/overnight-service.md) to verify and install the root-owned bootstrap, then run it from its installed location:
+Complete the [rollout-readiness checklist](docs/rollout-readiness.md) before installing R2 or launching him with his live data. For the final activation, verify and install the root-owned bootstrap using the [overnight service guide](docs/overnight-service.md), then run it from its installed location:
 
 ```sh
-sudo /usr/local/sbin/r2-3po-install
+sudo /usr/local/sbin/r2-3po-install --activate-reviewed
 ```
 
-The installer refuses to rebuild while an R2 process is already running, prepares missing data-only folders as the `r2` account, then creates a private, consistent snapshot of all five SQLite databases and requires their integrity audit to pass before activation. It also checks existing database-file permissions. Only then does it compile the current source to a process-specific temporary executable, preserve the previous binary, install `r2-3po.service`, and request immediate startup. If activation or core initialization fails, it attempts to restore and restart the previous executable; if no previous binary exists, it stops the failed service and reports that rollback is unavailable.
+The installer refuses to rebuild while an R2 process is already running, prepares missing data-only folders as the `r2` account, then creates a private, consistent snapshot of all five SQLite databases and requires their integrity audit to pass before activation. It also checks existing database-file permissions. Only then does it compile the current source to a process-specific temporary executable, preserve the previous binary, install `r2-3po.service`, and request immediate startup. If activation or core initialization fails, it attempts to stop and disable the service, and restores the previous executable when available. Recovery requires a separate decision to start R2.
 
 Useful operations:
 

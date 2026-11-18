@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [[ "$#" -ne 1 || "${1:-}" != "--activate-reviewed" ]]; then
+    echo "[R2 launcher] No action taken. Final activation requires --activate-reviewed after release signoff." >&2
+    exit 2
+fi
+
 R2_ROOT="/home/x/R2_Home"
 # Keep the Game Boy CLI and the shell's state reader on the same configured root.
 if [[ -z "${R2_GAMEBOY_ROOT:-}" ]]; then

@@ -195,11 +195,12 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertNotIn("systemctl enable --now r2-3po.service", source)
         self.assertEqual(source.count("systemctl start r2-3po.service"), 1)
         bootstrap = ROOT / "tools/r2_install_root_bootstrap.sh"
-        for args in ([], ["--help"], ["--activate-reviewed", "extra"]):
-            result = subprocess.run(["bash", str(bootstrap), *args], capture_output=True,
-                                    text=True, timeout=5)
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("No action taken", result.stderr)
+        for entrypoint in (bootstrap, ROOT / "R2_Launch_Code.sh"):
+            for args in ([], ["--help"], ["--activate-reviewed", "extra"]):
+                result = subprocess.run(["bash", str(entrypoint), *args], capture_output=True,
+                                        text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("No action taken", result.stderr)
         self.assertIn("copy_ollama_model.py", source)
         self.assertIn("R2_OLLAMA_UNIT_EOF", source)
         self.assertIn("R2_SERVICE_UNIT_EOF", source)
