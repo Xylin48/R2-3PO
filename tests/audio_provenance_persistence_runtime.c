@@ -144,20 +144,20 @@ static void test_file_reads(void)
     assert(fd >= 0 && write(fd, "complete-original", 17) == 17 && close(fd) == 0);
     for (read_fault = 1; read_fault <= 2; ++read_fault) {
         errno = 0;
-        assert(read_entire_file(path) == NULL && errno == EIO);
+        assert(read_entire_open_file(fopen(path, "rb")) == NULL && errno == EIO);
     }
     read_fault = 3;
     growing_file = path;
-    char *text = read_entire_file(path);
+    char *text = read_entire_open_file(fopen(path, "rb"));
     assert(text && !strcmp(text, "complete-original-GROWN-END"));
     free(text);
     read_fault = 0;
     FILE *stream = fopen(path, "wb");
     assert(stream && fwrite("abc\0hidden", 1, 10, stream) == 10 && fclose(stream) == 0);
-    assert(read_entire_file(path) == NULL);
+    assert(read_entire_open_file(fopen(path, "rb")) == NULL);
     stream = fopen(path, "wb");
     assert(stream && fclose(stream) == 0);
-    text = read_entire_file(path);
+    text = read_entire_open_file(fopen(path, "rb"));
     assert(text && !*text);
     free(text);
     assert(unlink(path) == 0);
@@ -214,7 +214,7 @@ static void test_workspace_replacement(void)
     sync_failure = 1;
     assert(workspace_write("write-fixture", "failed replacement", output) == -1);
     assert(sync_failure == 0);
-    char *text = read_entire_file(target);
+    char *text = workspace_read("write-fixture");
     assert(text && strcmp(text, "original") == 0);
     free(text);
 
@@ -222,7 +222,7 @@ static void test_workspace_replacement(void)
     assert(workspace_write("write-fixture", "new complete version", output) ==
            WORKSPACE_WRITE_SYNC_UNCONFIRMED);
     assert(sync_failure == 0);
-    text = read_entire_file(target);
+    text = workspace_read("write-fixture");
     assert(text && strcmp(text, "new complete version") == 0);
     free(text);
     struct stat state;

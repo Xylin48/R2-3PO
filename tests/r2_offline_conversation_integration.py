@@ -122,7 +122,10 @@ class LocalOllama(BaseHTTPRequestHandler):
                      else "I will open the exact fixture.\n[READ] large-fixture.txt")
         system = "\n".join(item["content"] for item in payload.get("messages", [])
                            if item.get("role") == "system" and isinstance(item.get("content"), str))
-        if "autonomous needs controller" in system:
+        if ("internal associative-memory retrieval planner" in system and current_index >= 0
+                and "rhodonite" in user_messages[current_index]):
+            reply = "rhodonite\nmineral"
+        elif "autonomous needs controller" in system:
             if any(f"Fridge food: {FRIDGE_FOOD}" in message for message in user_messages):
                 reply = f"[WORLD] fridge_eat|{FRIDGE_FOOD}"
             elif any("Sleepiness: 99." in message for message in user_messages):
@@ -541,17 +544,21 @@ def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
     with original.open("ab") as stream:
         stream.write(b"\x00")
     unavailable = "Can you remember the rhodonite fixture?"
-    output = conversation(binary, workspace, url, (unavailable,), 16384)
+    start = len(LocalOllama.requests)
+    output = conversation(binary, workspace, url, (unavailable,), 2048)
     assert "Could not search the complete original conversation archive" in output
-    assert any(
-        any(item.get("role") == "user" and item.get("content") == unavailable
-            for item in request["messages"])
-        and any(item.get("role") == "system"
-                and "ORIGINAL CONVERSATION ARCHIVE STATUS:" in item["content"]
-                and early not in item["content"] and tail not in item["content"]
-                for item in request["messages"])
-        for request in LocalOllama.requests
-    )
+    sources = []
+    for request in LocalOllama.requests[start:]:
+        if any(item.get("role") == "user" and item.get("content") == unavailable
+               for item in request["messages"]):
+            sources.extend(item["content"] for item in request["messages"] if item.get("role") == "system")
+        sources.extend(item["content"] for item in request["messages"]
+                       if item.get("role") == "user"
+                       and item["content"].startswith(f"EVIDENCE REVIEW\nRequest: {unavailable}\n")
+                       and "\nRound 0," in item["content"].split("BEGIN FRAGMENT", 1)[0])
+    assert any("ORIGINAL CONVERSATION ARCHIVE STATUS:" in item for item in sources)
+    assert all("ORIGINAL CONVERSATION ARCHIVE (historical text" not in item and tail not in item
+               for item in sources)
     original.unlink()
     print("PASS: the complete original archive survived restart and exact deep-tail recall beyond the live-history limit.")
 

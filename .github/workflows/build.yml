@@ -641,7 +641,7 @@ jobs:
       - name: Prevent private reasoning from leaking into user-facing replies
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/r2_reply_smoke.c R2Reply.c -o /tmp/r2-reply-smoke
-          /tmp/r2-reply-smoke
+          timeout 15s /tmp/r2-reply-smoke
 
       - name: Audit sound asset inventory without touching audio payloads
         run: |

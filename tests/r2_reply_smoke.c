@@ -5,6 +5,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void check_many_private_blocks(void)
+{
+    const char opening[] = "Example:\n```xml\n";
+    const char block[] = "<think><analysis>private</analysis>private</think>\n";
+    const char sanitized[] = "<think>[content omitted]</think>\n";
+    const char closing[] = "```\nPublic answer.";
+    const size_t repeats = 32768;
+    size_t capacity = sizeof(opening) - 1 + repeats * (sizeof(block) - 1) + sizeof(closing);
+    char *input = malloc(capacity);
+    assert(input);
+    char *next = input;
+    memcpy(next, opening, sizeof(opening) - 1);
+    next += sizeof(opening) - 1;
+    for (size_t i = 0; i < repeats; ++i) {
+        memcpy(next, block, sizeof(block) - 1);
+        next += sizeof(block) - 1;
+    }
+    memcpy(next, closing, sizeof(closing));
+    char *reply = r2_reply_sanitize(input);
+    assert(reply && !strncmp(reply, opening, sizeof(opening) - 1));
+    assert(strlen(reply) == sizeof(opening) - 1 + repeats * (sizeof(sanitized) - 1) + sizeof(closing) - 1);
+    const char *line = reply + sizeof(opening) - 1;
+    for (size_t i = 0; i < repeats; ++i) {
+        assert(!memcmp(line, sanitized, sizeof(sanitized) - 1));
+        line += sizeof(sanitized) - 1;
+    }
+    assert(!strcmp(line, closing));
+    free(reply);
+    free(input);
+}
+
 int main(void)
 {
     char *reply = r2_reply_sanitize("Hello there. <think>I should plan what to say.</think> How are you?");
@@ -142,6 +173,8 @@ int main(void)
     assert(reply[prefix_len + suffix_len - 1] == 'b');
     free(reply);
     free(large_input);
+
+    check_many_private_blocks();
 
     puts("R2 user-facing reply sanitizer smoke passed");
     return 0;
