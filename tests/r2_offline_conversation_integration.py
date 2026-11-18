@@ -7,6 +7,7 @@ download, desktop session, or installed model is required.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -496,6 +497,63 @@ def oversized_user_and_action(binary: Path, workspace: Path, url: str) -> None:
     ]
     assert reviewed[-1][1].endswith(exact)
     print("PASS: 2048-token follow-up preserved both an oversized typed request and its large file result.")
+
+
+def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
+    home = workspace / "R2"
+    original = home / "r2_original_conversation.txt"
+    early = "User: The rhodonite fixture had this complete record. " + "évidence 🐈. " * 730 + "  \n"
+    # A final record without a newline is still a complete source span.
+    tail = "R2: I remember that the rhodonite fixture ended here. Unchanged final spaces.  "
+    padding = b"Old unrelated notes from the original recording.\n" * 16384
+    with original.open("wb") as stream:
+        stream.write(early.encode("utf-8"))
+        for _ in range(44):
+            stream.write(padding)
+        tail_offset = stream.tell()
+        stream.write(tail.encode("utf-8"))
+    assert tail_offset > 32 * 1024 * 1024
+
+    with original.open("rb") as stream:
+        before = hashlib.file_digest(stream, "sha256").digest()
+    turns = ("Do you remember the rhodonite fixture?", "What did I tell you about rhodonite?")
+    for turn in turns:
+        output = conversation(binary, workspace, url, (turn,), 2048)
+        assert "Original conversation retained on disk" in output
+
+    with original.open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").digest() == before
+    with sqlite3.connect(home / "r2_memory.db") as db:
+        for turn in turns:
+            snapshots = db.execute(
+                "SELECT r.original_context FROM r2_log_context_reviews r "
+                "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
+                "WHERE c.user_text=?", (turn,),
+            ).fetchall()
+            assert len(snapshots) == 1, (turn, len(snapshots))
+            snapshot = snapshots[0][0]
+            heading = "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte "
+            assert heading + "0:\n" + early + "\n" in snapshot
+            assert heading + str(tail_offset) + ":\n" + tail + "\n" in snapshot
+            assert "Old unrelated notes from the original recording." not in snapshot
+
+    # A malformed tail must not publish a matching prefix as verified history.
+    with original.open("ab") as stream:
+        stream.write(b"\x00")
+    unavailable = "Can you remember the rhodonite fixture?"
+    output = conversation(binary, workspace, url, (unavailable,), 16384)
+    assert "Could not search the complete original conversation archive" in output
+    assert any(
+        any(item.get("role") == "user" and item.get("content") == unavailable
+            for item in request["messages"])
+        and any(item.get("role") == "system"
+                and "ORIGINAL CONVERSATION ARCHIVE STATUS:" in item["content"]
+                and early not in item["content"] and tail not in item["content"]
+                for item in request["messages"])
+        for request in LocalOllama.requests
+    )
+    original.unlink()
+    print("PASS: the complete original archive survived restart and exact deep-tail recall beyond the live-history limit.")
 
 
 def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
@@ -1013,6 +1071,7 @@ def main() -> int:
             oversized_action_result(binary, workspace, url)
             oversized_user_and_action(binary, workspace, url)
             compact_age_continuity(binary, workspace, url)
+            oversized_original_archive(binary, workspace, url)
             autonomous_cycle(binary, workspace, url)
             interrupt_partial_terminal_line(binary, workspace, url)
             interrupt_foreground_reply(binary, workspace, url)

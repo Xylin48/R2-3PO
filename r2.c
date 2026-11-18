@@ -22,6 +22,10 @@
 #define MAX_COMMAND 2000
 #define MAX_MESSAGES 2000
 #define MAX_LIVE_MESSAGE_BYTES (32U * 1024U * 1024U)
+/* Keep the optional legacy startup prompt from consuming live-turn headroom.
+ * Larger originals remain on disk and are searched as historical evidence. */
+#define MAX_PINNED_ORIGINAL_ARCHIVE_BYTES (256U * 1024U)
+#define MAX_ORIGINAL_ARCHIVE_MATCHES 4
 
 /*
    Persistent memory architecture:
@@ -380,6 +384,7 @@ static int core_storage_lock = -1;
 /* curl_global_cleanup is valid only after a successful global initialization. */
 static int curl_global_initialized = 0;
 static int startup_memory_loaded = 0;
+static int original_archive_on_disk = 0;
 static atomic_int watch_running = ATOMIC_VAR_INIT(0);
 static int diary_initialized = 0;
 /* These flags are consumed by the tool dispatcher before the capture implementation. */
@@ -888,9 +893,52 @@ static char *read_entire_open_file(FILE *f)
     return buf;
 }
 
-static char *read_entire_file(const char *path)
+static FILE *open_original_archive(struct stat *status)
 {
-    return read_entire_open_file(fopen(path, "rb"));
+    int fd = open(ORIGINAL_CONVERSATION, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    int rc = fstat(fd, status);
+    if (rc == 0 && S_ISREG(status->st_mode)) {
+        FILE *stream = fdopen(fd, "rb");
+        if (stream) return stream;
+    }
+    int saved = rc != 0 || S_ISREG(status->st_mode) ? errno : EINVAL;
+    close(fd);
+    errno = saved;
+    return NULL;
+}
+
+static int prepare_original_archive(char **original)
+{
+    original_archive_on_disk = 0;
+    *original = NULL;
+    struct stat status;
+    FILE *stream = open_original_archive(&status);
+    if (!stream) return errno == ENOENT ? 0 : -1;
+    if (status.st_size > MAX_PINNED_ORIGINAL_ARCHIVE_BYTES) {
+        original_archive_on_disk = 1;
+        return fclose(stream);
+    }
+
+    size_t length = (size_t)status.st_size;
+    char *data = malloc(length + 1);
+    if (!data) {
+        fclose(stream);
+        return -1;
+    }
+    size_t read_length = fread(data, 1, length, stream);
+    int extra = fgetc(stream);
+    int failed = ferror(stream) || read_length != length ||
+        memchr(data, '\0', read_length) != NULL;
+    if (fclose(stream) != 0) failed = 1;
+    if (failed || extra != EOF) {
+        free(data);
+        errno = EIO;
+        return -1;
+    }
+    data[length] = '\0';
+    *original = data;
+    return 0;
 }
 
 
@@ -6072,6 +6120,109 @@ static int r2_append_visual_associations(char **context,
     return rc;
 }
 
+static size_t r2_original_archive_match_score(const char *line,
+    const char *const keywords[], size_t keyword_count)
+{
+    size_t score = 0;
+    for (size_t i = 0; i < keyword_count; ++i) {
+        const char *word = keywords[i];
+        if (!strcmp(word, "remember") || !strcmp(word, "remembered") ||
+            !strcmp(word, "memory") || !strcmp(word, "recall") ||
+            !strcmp(word, "conversation") || !strcmp(word, "earlier")) continue;
+        size_t length = strlen(word);
+        const char *match = line;
+        while ((match = strcasestr(match, word)) != NULL) {
+            if ((match == line || !isalnum((unsigned char)match[-1])) &&
+                !isalnum((unsigned char)match[length])) {
+                ++score;
+                break;
+            }
+            ++match;
+        }
+    }
+    return score;
+}
+
+/* Search the entire on-disk text once, retaining complete matching lines.
+ * Each selected span is identified by its exact original byte offset. */
+static int r2_append_original_archive_matches(char **context,
+    const char *const keywords[], size_t keyword_count)
+{
+    if (!original_archive_on_disk || !keyword_count) return 0;
+    struct stat before, after;
+    FILE *stream = open_original_archive(&before);
+    if (!stream) goto unavailable;
+    struct {
+        char *line;
+        size_t score;
+        uintmax_t offset;
+    } best[MAX_ORIGINAL_ARCHIVE_MATCHES] = {0};
+    char *line = NULL;
+    size_t capacity = 0;
+    uintmax_t offset = 0;
+    ssize_t length;
+    int failed = 0;
+    while (!r2_is_shutting_down() && (length = getline(&line, &capacity, stream)) >= 0) {
+        if (memchr(line, '\0', (size_t)length) ||
+            (uintmax_t)length > (uintmax_t)before.st_size - offset) {
+            failed = 1;
+            break;
+        }
+        size_t score = r2_original_archive_match_score(line, keywords, keyword_count);
+        size_t weakest = 0;
+        for (size_t i = 1; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) {
+            if (best[i].score < best[weakest].score ||
+                (best[i].score == best[weakest].score && best[i].offset < best[weakest].offset))
+                weakest = i;
+        }
+        if (score && score >= best[weakest].score) {
+            char *copy = strdup(line);
+            if (!copy) {
+                failed = 1;
+                break;
+            }
+            free(best[weakest].line);
+            best[weakest].line = copy;
+            best[weakest].score = score;
+            best[weakest].offset = offset;
+        }
+        offset += (uintmax_t)length;
+    }
+    if (ferror(stream) || !feof(stream) || offset != (uintmax_t)before.st_size ||
+        fstat(fileno(stream), &after) != 0 ||
+        before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
+        failed = 1;
+    if (fclose(stream) != 0) failed = 1;
+    free(line);
+
+    int rc = 0;
+    /* Emit the chosen records in source order, regardless of their match rank. */
+    for (size_t n = 0; !failed && rc == 0 && n < MAX_ORIGINAL_ARCHIVE_MATCHES; ++n) {
+        size_t first = SIZE_MAX;
+        for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i)
+            if (best[i].score && (first == SIZE_MAX || best[i].offset < best[first].offset))
+                first = i;
+        if (first == SIZE_MAX) break;
+        char heading[160];
+        snprintf(heading, sizeof(heading),
+            "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte %ju:\n",
+            best[first].offset);
+        rc = r2_append_association_section(context, heading, best[first].line);
+        best[first].score = 0;
+    }
+    for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) free(best[i].line);
+    if (r2_is_shutting_down()) { errno = ECANCELED; return -1; }
+    if (!failed) return rc;
+
+unavailable:
+    fprintf(stderr, "[R2 Context] Could not search the complete original conversation archive.\n");
+    return r2_append_association_section(context, "ORIGINAL CONVERSATION ARCHIVE STATUS:\n",
+        "The source could not be read completely for this turn. Its contents are unverified.");
+}
+
 static pthread_mutex_t r2_associative_query_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static char *r2_associative_cached_input = NULL;
 static char *r2_associative_cached_plan = NULL;
@@ -6232,8 +6383,16 @@ static char *r2_build_associative_search_query(const char *query)
 
     size_t query_length = strlen(query);
     size_t concepts_length = strlen(clean);
-    const char heading[] = "\n\nORIGINAL USER MESSAGE (retrieval input only):\n";
-    size_t total = query_length + sizeof(heading) - 1 + concepts_length + 1;
+    /* The next consumers tokenize every word in this string. A descriptive
+     * label becomes a search cue even when the user never used those words. */
+    const char separator[] = "\n\n";
+    if (query_length > SIZE_MAX - sizeof(separator) ||
+        concepts_length > SIZE_MAX - sizeof(separator) - query_length) {
+        free(clean);
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    size_t total = concepts_length + sizeof(separator) + query_length;
     char *combined = malloc(total);
     if (!combined) {
         free(clean);
@@ -6243,7 +6402,7 @@ static char *r2_build_associative_search_query(const char *query)
         return fallback;
     }
 
-    snprintf(combined, total, "%s%s%s", clean, heading, query);
+    snprintf(combined, total, "%s%s%s", clean, separator, query);
     fprintf(stderr,
             "[R2 Association] Generated associative retrieval cues (%zu chars); original user text remains unchanged.\n",
             concepts_length);
@@ -6497,6 +6656,11 @@ static char *chat_with_relevant_memories(
         r2_history_release(&life_history); return NULL;
     }
     free(diary_matches);
+
+    if (r2_append_original_archive_matches(&memory_context, keywords, keyword_count) != 0) {
+        free(associative_query); free(memory_context);
+        r2_history_release(&life_history); return NULL;
+    }
 
     int visual_requested = query_requests_visual_context(query);
     if (r2_visual_is_initialized() &&
@@ -15607,14 +15771,12 @@ int r2_init(void)
        LOAD ARCHIVED CONVERSATION
        ======================================================== */
 
-    char *original =
-        read_entire_file(
-            ORIGINAL_CONVERSATION
-        );
-
-    if (!original && errno != ENOENT) {
+    char *original = NULL;
+    if (prepare_original_archive(&original) != 0) {
         R2_INIT_FAIL("could not read the complete archived conversation");
     }
+    if (original_archive_on_disk)
+        fprintf(stderr, "[R2 Context] Original conversation retained on disk for exact historical retrieval.\n");
 
     if (
         original &&
