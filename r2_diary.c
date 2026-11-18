@@ -1332,12 +1332,18 @@ static int mirror_append(int64_t id, const char *path, const char *record, size_
     if (fsync(fd) != 0 || mirror_prefix(fd, start, record, length, &present) != 0)
         goto done;
     if (present != length) { errno = ESTALE; goto done; }
-    struct stat open_file, named_file;
+    struct stat open_file, named_file, open_directory, named_directory;
     if (fstat(fd, &open_file) != 0 ||
-        fstatat(directory, filename, &named_file, AT_SYMLINK_NOFOLLOW) != 0)
+        fstatat(directory, filename, &named_file, AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstat(directory, &open_directory) != 0 ||
+        lstat(R2_DIARY_DIR, &named_directory) != 0)
         goto done;
-    if (!S_ISREG(named_file.st_mode) ||
-        open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino) {
+    /* The pinned directory may have been renamed during the append. Keep
+       the reservation until its bytes are reachable at the diary path. */
+    if (!S_ISREG(named_file.st_mode) || !S_ISDIR(named_directory.st_mode) ||
+        open_file.st_dev != named_file.st_dev || open_file.st_ino != named_file.st_ino ||
+        open_directory.st_dev != named_directory.st_dev ||
+        open_directory.st_ino != named_directory.st_ino) {
         errno = ESTALE;
         goto done;
     }

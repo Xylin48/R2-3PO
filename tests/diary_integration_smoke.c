@@ -23,6 +23,8 @@
  * when the diary filesystem tools begin their descriptor-based walk. */
 static int swap_diary_leaf = 0;
 static int swap_diary_parent = 0;
+static int replace_mirror_directory = 0;
+static char replaced_mirror_name[14];
 static int fail_diary_readdir = 0;
 static int fail_diary_fread = 0;
 static int fail_diary_fgets = 0;
@@ -44,6 +46,18 @@ static void maybe_swap_checked_workspace_open(const char *path, int flags)
     }
 }
 
+static void maybe_replace_mirror_directory(int fd, const char *path, int flags)
+{
+    const size_t length = strlen(path);
+    if (replace_mirror_directory && fd >= 0 && (flags & O_APPEND) &&
+        length == 13 && strcmp(path + 10, ".md") == 0) {
+        replace_mirror_directory = 0;
+        memcpy(replaced_mirror_name, path, length + 1);
+        assert(rename(R2_DIARY_DIR, R2_DIARY_DIR ".detached-fixture") == 0);
+        assert(mkdir(R2_DIARY_DIR, 0700) == 0);
+    }
+}
+
 /* Some libc/compiler combinations target openat64 or the fortified
  * __openat64_2 entry point instead of the unfortified openat symbol. */
 #define DEFINE_OPENAT_WRAPPER(symbol)                                             \
@@ -51,12 +65,14 @@ static void maybe_swap_checked_workspace_open(const char *path, int flags)
     int __wrap_##symbol(int fd, const char *path, int flags, ...)                 \
     {                                                                             \
         maybe_swap_checked_workspace_open(path, flags);                           \
-        if (flags & O_CREAT) {                                                     \
+        if (flags & O_CREAT) {                                                    \
             va_list args;                                                         \
             va_start(args, flags);                                                \
-            mode_t mode = va_arg(args, mode_t);                                    \
+            mode_t mode = va_arg(args, mode_t);                                   \
             va_end(args);                                                         \
-            return __real_##symbol(fd, path, flags, mode);                        \
+            int opened = __real_##symbol(fd, path, flags, mode);                  \
+            maybe_replace_mirror_directory(opened, path, flags);                  \
+            return opened;                                                        \
         }                                                                         \
         return __real_##symbol(fd, path, flags);                                  \
     }
@@ -675,6 +691,38 @@ static void verify_mirror_symlink_is_not_followed(void)
     assert(unlink(outside) == 0);
 }
 
+static void verify_detached_mirror_is_replayed(void)
+{
+    const char entry[] = "detached mirror directory fixture";
+    replace_mirror_directory = 1;
+    assert(r2_diary_write(entry) == 0);
+    assert(replace_mirror_directory == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM diary_entries "
+                      "WHERE entry='detached mirror directory fixture';") == 1);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 1);
+    assert(r2_diary_replay_mirrors() == -1);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 1);
+    char empty_path[sizeof(R2_DIARY_DIR) + sizeof(replaced_mirror_name)];
+    int n = snprintf(empty_path, sizeof(empty_path), "%s/%s", R2_DIARY_DIR, replaced_mirror_name);
+    assert(n > 0 && (size_t)n < sizeof(empty_path));
+    struct stat state;
+    assert(stat(empty_path, &state) == 0 && state.st_size == 0);
+    assert(unlink(empty_path) == 0);
+    assert(rmdir(R2_DIARY_DIR) == 0);
+    assert(rename(R2_DIARY_DIR ".detached-fixture", R2_DIARY_DIR) == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(r2_diary_replay_mirrors() == 0);
+    assert(scalar_int("SELECT COUNT(*) FROM r2_diary_pending_mirrors;") == 0);
+    char relative[64];
+    n = snprintf(relative, sizeof(relative), "R2_Diary/%s", replaced_mirror_name);
+    assert(n > 0 && (size_t)n < sizeof(relative));
+    char *matches = r2_workspace_search(relative, entry);
+    assert(matches);
+    const char *first = strstr(matches, entry);
+    assert(first && !strstr(first + sizeof(entry) - 1, entry));
+    free(matches);
+}
+
 int main(void)
 {
     char *context;
@@ -911,6 +959,7 @@ int main(void)
 
     verify_mirror_flush_failure();
     verify_mirror_symlink_is_not_followed();
+    verify_detached_mirror_is_replayed();
     verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
