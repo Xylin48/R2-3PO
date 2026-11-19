@@ -11,8 +11,10 @@
 #include <stdio.h>
 #include <time.h>
 
-static int fail_result_format, fail_result_growth, growth_armed;
-static uintptr_t read_path_address, read_data_address;
+/* Linker wrapping happens after optimization, so keep these observations
+ * visible across calls compiled as ordinary libc calls. */
+static volatile int fail_result_format, fail_result_growth, growth_armed;
+static volatile uintptr_t read_path_address, read_data_address;
 
 void __real_free(void *value);
 void __wrap_free(void *value)
@@ -34,10 +36,8 @@ void *__wrap_realloc(void *value, size_t size)
     return __real_realloc(value, size);
 }
 
-int __wrap_asprintf(char **answer, const char *format, ...)
+static int format_tool_fixture(char **answer, const char *format, va_list args)
 {
-    va_list args;
-    va_start(args, format);
     int read_result = (fail_result_format || fail_result_growth) &&
         !strcmp(format, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n");
     if (read_result) {
@@ -48,15 +48,33 @@ int __wrap_asprintf(char **answer, const char *format, ...)
         va_end(copy);
         if (fail_result_format) {
             fail_result_format = 0;
-            va_end(args);
             *answer = NULL;
             errno = ENOMEM;
             return -1;
         }
     }
     int formatted = vasprintf(answer, format, args);
-    va_end(args);
     growth_armed = read_result && fail_result_growth && formatted > 1024;
+    return formatted;
+}
+
+int __wrap_asprintf(char **answer, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int formatted = format_tool_fixture(answer, format, args);
+    va_end(args);
+    return formatted;
+}
+
+/* Fortified glibc calls this symbol at the same production call site. */
+int __wrap___asprintf_chk(char **answer, int flag, const char *format, ...)
+{
+    (void)flag;
+    va_list args;
+    va_start(args, format);
+    int formatted = format_tool_fixture(answer, format, args);
+    va_end(args);
     return formatted;
 }
 
