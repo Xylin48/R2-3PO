@@ -132,18 +132,19 @@ require(
     "recognized text misclassification triggers the retry",
 )
 require(
-    "static char *r2_validate_corrective_reply(" not in core,
-    "corrective model output is not gated by a response classifier or replaced with a canned clarification",
+    "r2_reply_claims_garbled_typed_audio(retry_user_facing)" in core
+    and "r2_input_speech_event <= 0" in core,
+    "reject a repeated false audio claim only for typed input",
 )
 require(
     "reply = retry_user_facing;" in core
     and "if (retry_user_facing && *retry_user_facing)" in core,
-    "a nonempty sanitized corrective response is delivered as produced by R2",
+    "usable sanitized corrective text is delivered as produced by R2",
 )
 require(
     "retaining the original model result" in core
     and "couldn't form a reliable response" not in core,
-    "if corrective inference returns no text, the code does not substitute a canned user-facing answer",
+    "ordinary corrective failure can retain the original model result",
 )
 require(
     "If the user says YOUR prior message, answer, or reply was garbled" in core,

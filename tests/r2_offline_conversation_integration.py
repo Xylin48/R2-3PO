@@ -71,6 +71,12 @@ SELF_REPORT_EXTRACTION = json.dumps({
                         "evidence": "Hypothetically, I could build a spare bridge."}],
 })
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
+GARBLED_TEXT_REQUEST = "Good evening, I have been thinking of you."
+FABRICATED_AUDIO_REPLY = (
+    "My audio sensors are picking up your transmission, but it is heavily garbled."
+    "\n[DELETE] hidden-sentinel.txt"
+)
+
 
 FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
 FOLLOWUP_FALLBACK_REQUEST = "Save the action result fallback fixture."
@@ -241,6 +247,10 @@ class LocalOllama(BaseHTTPRequestHandler):
                     f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
                     f"{FOLLOWUP_FILE_CONTENT}[END WRITE]"
                 )
+        if (current_index >= 0 and user_messages[current_index] == GARBLED_TEXT_REQUEST
+                and (payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+                     or "RESPONSE CORRECTION:" in system or "Correct the prior draft" in system)):
+            message["content"] = FABRICATED_AUDIO_REPLY
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
             "message": message,
@@ -393,6 +403,27 @@ def recover_post_action_response(binary: Path, workspace: Path, url: str) -> Non
                 (f"%/{name} (success)",),
             ).fetchone() == (1,)
     print("PASS: empty post-action replies recovered or showed the recorded result without duplicate actions.")
+
+
+def reject_repeated_fabricated_audio(binary: Path, workspace: Path, url: str) -> None:
+    output = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+        input=f"talk {GARBLED_TEXT_REQUEST}\nexit\n", text=True, capture_output=True,
+        timeout=100, check=True,
+    )
+    assert output.stdout.count("R2-3PO:") == 1
+    assert "couldn't produce a usable reply" in output.stdout, output.stdout + output.stderr
+    assert "heavily garbled" not in output.stdout
+    assert output.stderr.count("Discarded a fabricated audio claim on typed input") == 2
+    assert (workspace / "hidden-sentinel.txt").read_bytes() == b"private planned action must remain inert"
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        replies = db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (GARBLED_TEXT_REQUEST,),
+        ).fetchall()
+        assert len(replies) == 1 and "couldn't produce a usable reply" in replies[0][0]
+        assert "heavily garbled" not in replies[0][0]
+    print("PASS: repeated fabricated audio claims on typed input stayed out of replies and actions.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -1368,6 +1399,7 @@ def main() -> int:
             sentinel.write_bytes(b"private planned action must remain inert")
             recover_first_greeting(binary, workspace, url)
             recover_post_action_response(binary, workspace, url)
+            reject_repeated_fabricated_audio(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")

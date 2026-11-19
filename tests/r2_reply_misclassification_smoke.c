@@ -254,6 +254,10 @@ int main(void)
                 "fabricated garbled transmission on a greeting triggers recovery");
     ok &= check(!r2_reply_misclassifies_plain_text("Can you check the audio signal?", garbled_transmission),
                 "an actual audio question can discuss a garbled transmission");
+    r2_input_speech_event = 1;
+    ok &= check(!r2_reply_misclassifies_plain_text(mother_message, garbled_transmission),
+                "the typed-input rule leaves speech input with recorded provenance alone");
+    r2_input_speech_event = 0;
 
     ok &= check(!r2_reply_misclassifies_plain_text(mother_message,
                     "I missed you too, Mom. A room with a bed and pockets "

@@ -5605,6 +5605,14 @@ static int r2_reply_contains_known_failure_phrase(const char *reply)
     return 0;
 }
 
+static int r2_reply_claims_garbled_typed_audio(const char *reply)
+{
+    return r2_input_speech_event <= 0 && reply &&
+           strcasestr(reply, "audio sensors") &&
+           strcasestr(reply, "your transmission") &&
+           (strcasestr(reply, "heavily garbled") || strcasestr(reply, "coming through corrupted"));
+}
+
 static int r2_reply_misclassifies_plain_text(const char *query, const char *reply)
 {
     if (!query || !reply)
@@ -5690,9 +5698,7 @@ static int r2_reply_misclassifies_plain_text(const char *query, const char *repl
         }
     }
 
-    if (strcasestr(reply, "audio sensors") &&
-        strcasestr(reply, "your transmission") &&
-        (strcasestr(reply, "heavily garbled") || strcasestr(reply, "coming through corrupted")))
+    if (r2_reply_claims_garbled_typed_audio(reply))
         return 1;
 
     if (!reports_r2_output_problem && strlen(query) < 24)
@@ -7049,6 +7055,7 @@ static char *chat_with_relevant_memories(
     int reply_misclassified =
         r2_reply_misclassifies_plain_text(query, reply ? reply : "");
     if (retry_after_sanitize_failure || reply_misclassified) {
+        int original_fabricated_audio = reply_misclassified && r2_reply_claims_garbled_typed_audio(reply);
         char *retry = r2_retry_direct_answer(copy, base_count, query);
         char *retry_user_facing = NULL;
         if (retry) {
@@ -7058,19 +7065,27 @@ static char *chat_with_relevant_memories(
             fprintf(stderr, "[R2 Conversation] Direct-answer retry could not be completed.\n");
         }
 
-        /*
-         * A corrective retry is an opportunity for R2 to rethink the answer,
-         * not a classifier-controlled replacement of his words. Deliver the
-         * sanitized retry as produced. If inference itself fails, retain the
-         * original result and let normal error reporting expose the failure.
-         */
+        /* The broad relevance heuristic requests a retry only. Reject the
+           specific false sensory claim on typed input before it can be shown,
+           learned, or routed as an action. */
+        if (r2_reply_claims_garbled_typed_audio(retry_user_facing) &&
+            r2_reply_misclassifies_plain_text(query, retry_user_facing)) {
+            free(retry_user_facing);
+            retry_user_facing = NULL;
+        }
         if (retry_user_facing && *retry_user_facing) {
             free(reply);
             reply = retry_user_facing;
         } else {
             free(retry_user_facing);
-            fprintf(stderr,
-                    "[R2 Conversation] Corrective inference returned no usable text; retaining the original model result.\n");
+            if (original_fabricated_audio) {
+                free(reply);
+                reply = NULL;
+                fprintf(stderr, "[R2 Conversation] Discarded a fabricated audio claim on typed input after correction failed.\n");
+            } else {
+                fprintf(stderr,
+                        "[R2 Conversation] Corrective inference returned no usable text; retaining the original model result.\n");
+            }
         }
     }
 

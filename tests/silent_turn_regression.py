@@ -44,8 +44,9 @@ require(
     "failed inference produces a visible allocated fallback instead of returning NULL",
 )
 require(
-    "The recorded tool result is still in the conversation." in implementation
-    and "does not rerun the completed action" in implementation,
+    'r2_log_event(R2_LOG_SYSTEM, "conversation_tool_followup_retry",' in implementation
+    and "reply = recorded_action_reply(tool_evidence);" in implementation
+    and implementation.count("process_tools(stripped_reply)") == 1,
     "failed post-action generation preserves the completed action result without replaying the action",
 )
 require(
