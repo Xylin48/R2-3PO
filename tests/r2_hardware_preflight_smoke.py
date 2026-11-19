@@ -190,7 +190,7 @@ run_as_r2() { "$@"; }
 probe_start = launcher.index('R2_DATABASE_AUDIT=')
 probe_end = launcher.index("# Create only the established workspace", sqlite_at)
 sqlite_probe = (
-    'R2_ROOT="$1"\nR2_SOURCE="$1/source"\n'
+    'R2_ROOT="$1"\nR2_SOURCE="$1/source"\nR2_GAMEBOY_ROOT="$1/Devices/GameBoyAdvance"\n'
     'sudo() { shift 4; "$@"; }\n'
     + launcher[probe_start:probe_end].replace(
         '"$R2_SOURCE/tools/audit_r2_databases.py"', '"$R2_AUDIT_FIXTURE"'
@@ -226,6 +226,13 @@ with tempfile.TemporaryDirectory() as temp:
     result = run_probe()
     if result.returncode != 0 or "5/5 required database files found" not in result.stdout:
         raise SystemExit(f"valid detached database set failed activation check: {result}")
+    device = Path(temp) / "Devices" / "GameBoyAdvance"
+    device.mkdir(parents=True)
+    (device / "gameboy.db").write_bytes(b"a corrupt cartridge database fixture")
+    result = run_probe()
+    if result.returncode != 1 or "ERROR  Devices/GameBoyAdvance/gameboy.db" not in result.stdout:
+        raise SystemExit(f"corrupt sibling cartridge database passed activation check: {result}")
+    (device / "gameboy.db").unlink()
     memory.write_bytes(b"a corrupt database fixture")
     result = run_probe()
     if result.returncode != 1 or "ERROR  r2_memory.db" not in result.stdout:

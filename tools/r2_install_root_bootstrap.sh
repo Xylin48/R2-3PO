@@ -277,7 +277,8 @@ AUDIT_SCRIPT="$R2_SOURCE/tools/audit_r2_databases.py"
 [[ -f "$AUDIT_SCRIPT" ]] || fail "database audit tool is missing: $AUDIT_SCRIPT"
 SNAPSHOT_DIR="$R2_ROOT/audit-snapshot-$(date '+%Y%m%d-%H%M%S')"
 log "Creating a private SQLite snapshot and checking database integrity..."
-AUDIT_ARGS=(--root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR")
+AUDIT_ARGS=(--root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR"
+    --gameboy-root "$R2_ROOT/Devices/GameBoyAdvance")
 if [[ "${2:-}" == "--legacy-memory-only" ]]; then
     AUDIT_ARGS+=(--legacy-memory-only)
 fi

@@ -4,18 +4,17 @@ from pathlib import Path
 import re
 
 source = Path("r2.c").read_text(encoding="utf-8")
-matches = list(re.finditer(r"char\s*\*id\s*=\s*start_background_task\s*\(", source))
-assert len(matches) == 3, f"expected 3 background enqueue call sites, found {len(matches)}"
+calls = list(re.finditer(r"start_background_task\s*\([^;{}]*\)\s*;", source))
+assert len(calls) == 3, f"expected 3 background enqueue call sites, found {len(calls)}"
 
-for match in matches:
-    tail = source[match.end():match.end() + 1400]
-    cleanup = re.search(r"free\(id\);", tail)
-    assert cleanup, "could not find task enqueue result cleanup"
-    block = tail[:cleanup.end()]
-    assert re.search(r"if\s*\(\s*id\s*\)", block), (
-        "task enqueue result is not checked before reporting success"
-    )
-    assert "The command passed validation, but the task could not be queued." in block, (
+for call in calls:
+    branches = re.match(r"\s*if\s*\(id\)\s*\{([^{}]*)\}\s*else\s*\{([^{}]*)\}",
+                        source[call.end():])
+    assert branches, "task enqueue result is not checked before reporting success"
+    success, failure = branches.groups()
+    assert "Background task was queued." in success
+    assert "Background task was queued." not in failure
+    assert "The command passed validation, but the task could not be queued." in failure, (
         "enqueue failure must be reported as a failure, not a successful task start"
     )
 

@@ -110,13 +110,16 @@ def snapshot_database(source: Path, destination: Path) -> None:
             target_db.close()
 
 
-def _path_has_symlink_component(root: Path, relative: str) -> bool:
-    current = root
-    for part in Path(relative).parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
+def _database_paths(root: Path, gameboy_root: Path | None) -> dict[str, Path]:
+    paths = {name: root / name for name in ALL_DATABASES}
+    if gameboy_root is not None:
+        for name in OPTIONAL_DATABASES:
+            paths[name] = gameboy_root / Path(name).relative_to("Devices/GameBoyAdvance")
+    return paths
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    return any(component.is_symlink() for component in (*reversed(path.parents), path))
 
 
 def _reject_snapshot_symlink_components(path: Path) -> None:
@@ -127,7 +130,8 @@ def _reject_snapshot_symlink_components(path: Path) -> None:
             raise OSError(f"refusing symlinked snapshot destination: {component}")
 
 
-def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
+def create_snapshot_set(root: Path, snapshot_dir: Path, *,
+                        gameboy_root: Path | None = None) -> list[Path]:
     """Create snapshots for required and present optional DBs, never overwriting."""
     _reject_snapshot_symlink_components(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -139,16 +143,16 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
         raise FileExistsError(f"refusing to mix with existing snapshot file(s): {joined}")
 
     # Refuse a database or parent-directory symlink before reading/copying it.
-    linked_sources = [name for name in ALL_DATABASES
-                      if _path_has_symlink_component(root, name)]
+    paths = _database_paths(root, gameboy_root)
+    linked_sources = [name for name, path in paths.items() if _path_has_symlink_component(path)]
     if linked_sources:
         joined = ", ".join(linked_sources)
         raise OSError(f"refusing symlink database path(s): {joined}")
 
     sources = []
-    for name in ALL_DATABASES:
-        existing = _existing_sqlite_paths(root / name)
-        error = _invalid_database_path(root / name, existing)
+    for name, path in paths.items():
+        existing = _existing_sqlite_paths(path)
+        error = _invalid_database_path(path, existing)
         if error is not None:
             raise OSError(f"{name}: {error}")
         if existing:
@@ -157,12 +161,11 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
     created: list[Path] = []
     try:
         for name in sources:
-            source = root / name
             destination = snapshot_dir / name
             _reject_snapshot_symlink_components(destination.parent)
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _reject_snapshot_symlink_components(destination.parent)
-            snapshot_database(source, destination)
+            snapshot_database(paths[name], destination)
             created.append(destination)
     except Exception:
         for path in created:
@@ -399,14 +402,13 @@ def audit_relationships(
     return output
 
 
-def audit_root(root: Path) -> dict[str, Any]:
+def audit_root(root: Path, *, gameboy_root: Path | None = None) -> dict[str, Any]:
     reports: dict[str, dict[str, Any]] = {}
-    for name in ALL_DATABASES:
-        path = root / name
-        if _path_has_symlink_component(root, name):
+    for name, path in _database_paths(root, gameboy_root).items():
+        if _path_has_symlink_component(path):
             reports[name] = {
                 "path": str(path),
-                "exists": path.exists() or path.is_symlink(),
+                "exists": True,
                 "integrity": None,
                 "tables": {},
                 "legacy_phantom_food_records": [],
@@ -571,6 +573,8 @@ def main() -> int:
                         help="R2 data directory containing SQLite database files")
     parser.add_argument("--snapshot-dir", type=Path,
                         help="optional destination for non-overwriting SQLite snapshots")
+    parser.add_argument("--gameboy-root", type=Path,
+                        help="installed Game Boy directory when it is outside --root")
     parser.add_argument("--legacy-memory-only", action="store_true",
                         help="allow a snapshotted memory-only installation with structured legacy state")
     parser.add_argument("--visual-library", type=Path,
@@ -591,7 +595,7 @@ def main() -> int:
     snapshot_created = False
     if args.snapshot_dir is not None:
         try:
-            created = create_snapshot_set(args.root, args.snapshot_dir)
+            created = create_snapshot_set(args.root, args.snapshot_dir, gameboy_root=args.gameboy_root)
             if created:
                 audit_root_path = args.snapshot_dir
                 snapshot_created = True
@@ -601,7 +605,7 @@ def main() -> int:
             # accidentally treating an old/partial snapshot as current data.
             audit_root_path = args.root
 
-    report = audit_root(audit_root_path)
+    report = audit_root(audit_root_path, gameboy_root=None if snapshot_created else args.gameboy_root)
     summary = report["summary"]
     memory_tables = report["databases"]["r2_memory.db"]["tables"]
     legacy_missing = set(DATABASES) - {"r2_memory.db"}

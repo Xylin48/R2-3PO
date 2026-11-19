@@ -348,6 +348,7 @@ run_as_r2() { "$@"; }
         self.assertIn('if [[ "$INSTALL_SUCCEEDED" != "1"', installer)
         self.assertIn('systemctl disable --now r2-3po.service', installer)
         self.assertIn('INSTALL_SUCCEEDED=1', installer)
+        self.assertIn('--gameboy-root "$R2_ROOT/Devices/GameBoyAdvance"', installer)
         self.assertIn('run_as_r2 rm -f -- "$R2_EXEC"', installer)
         self.assertIn('root_run systemctl disable r2-3po.service >/dev/null 2>&1 || true', installer)
         self.assertIn('NEW_EXEC_INSTALLED=0', installer)

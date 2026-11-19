@@ -213,11 +213,7 @@ R2 does not force Ollama to use CPU-only inference. Ollama normally detects supp
 
 On this R2 host, the interactive launcher detects the GeForce GTX 1050 Ti and defaults to `R2_OLLAMA_NUM_GPU=20`, requesting partial layer offload to fit the card's 4 GiB VRAM more conservatively than forcing every layer onto it. The overnight service uses the same 20-layer request. Set `R2_OLLAMA_NUM_GPU=0` to return to Ollama's automatic placement, `-1` to request all layers, or another positive number to request a different layer count. A request is not proof of acceleration: the startup preflight now sends the same layer policy, keeps the model warm, queries Ollama's `/api/ps` VRAM allocation, and reports the visible NVIDIA device. If the report shows no VRAM use, inspect the Ollama service logs and `nvidia-smi`; the request option cannot compensate for an unsupported or undiscovered backend.
 
-Check the actual result after R2 starts generating:
-
-```sh
-ollama ps
-```
+Before final activation, use the standalone model preflight in the [rollout-readiness checklist](docs/rollout-readiness.md). For the desktop Ollama endpoint, `ollama ps` reports the processor split after the probe loads the model.
 
 For NVIDIA, check `nvidia-smi` and the Ollama service log; for AMD, check the installed ROCm/Vulkan backend and device permissions. See the [Ollama GPU guide](https://docs.ollama.com/gpu) and [troubleshooting guide](https://docs.ollama.com/troubleshooting). A successful configuration should show a CPU/GPU split in `ollama ps` rather than `100% CPU`.
 
@@ -259,9 +255,9 @@ sudo systemctl start r2-3po.service
 sudo systemctl disable r2-3po.service
 ```
 
-The supervisor restarts unexpected exits. The service runner checks the local Ollama API and completes real text and image probes with `qwen3.5:9b` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for a readiness marker emitted after core initialization—not merely the runner's dependency-check log—and applies the same readiness check when rolling back. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
+The supervisor restarts unexpected exits during normal service. The service runner checks the local Ollama API and completes real text and image probes with `qwen3.5:9b` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for the core readiness marker before enabling the service at boot. If activation fails, it stops and disables the service before restoring an available previous executable, which stays stopped. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
 
-Sound assets remain host-local at `/home/x/R2_Home/R2_sounds/FX`. Service startup checks core prerequisites but does not prove speaker playback, camera permissions, microphone capture, or GUI/VLC integration. Verify those against the actual desktop/audio session after startup. Use `R2_Launch_Code.sh` for the existing interactive desktop shell and Observer window.
+Sound assets remain host-local at `/home/x/R2_Home/R2_sounds/FX`. Check the speaker, camera, microphone, and VLC dependencies with standalone tools in the desktop session before final activation. Use `R2_Launch_Code.sh` for the interactive desktop shell and Observer window after signoff.
 
 **Activation boundary:** installing this service on GitHub does not activate it on the physical Linux host. Run the installer on that host, then check `systemctl status` and `journalctl` before relying on an overnight run.
 

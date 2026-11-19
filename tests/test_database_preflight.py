@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import sqlite3
 import stat
@@ -278,6 +279,46 @@ class DatabasePreflightTests(unittest.TestCase):
             snapshot_report = audit.audit_root(snapshots)
             self.assertEqual(snapshot_report["summary"]["optional_found"], 2)
             self.assertEqual(snapshot_report["summary"]["integrity_failures"], [])
+
+    def test_cli_audits_installed_gameboy_stores_beside_core_and_reopens_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "R2"
+            root.mkdir()
+            for name in audit.DATABASES:
+                sqlite3.connect(root / name).close()
+            device = home / "Devices" / "GameBoyAdvance"
+            (device / "State").mkdir(parents=True)
+            originals = {}
+            for relative in ("gameboy.db", "State/console_state.db"):
+                path = device / relative
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    db.execute("CREATE TABLE history(record TEXT)")
+                    db.execute("INSERT INTO history VALUES(?)", (relative,))
+                    db.commit()
+                originals[relative] = path.read_bytes()
+
+            snapshots = home / "snapshots"
+            args = [str(SCRIPT), "--root", str(root), "--gameboy-root", str(device), "--json"]
+            output = io.StringIO()
+            with patch("sys.argv", [*args, "--snapshot-dir", str(snapshots)]), contextlib.redirect_stdout(output):
+                self.assertEqual(audit.main(), 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["summary"]["optional_found"], 2)
+            for relative, original in originals.items():
+                name = f"Devices/GameBoyAdvance/{relative}"
+                snapshot = snapshots / name
+                self.assertEqual(report["databases"][name]["path"], str(snapshot))
+                self.assertEqual((device / relative).read_bytes(), original)
+                with contextlib.closing(sqlite3.connect(snapshot)) as copy:
+                    self.assertEqual(copy.execute("SELECT record FROM history").fetchall(), [(relative,)])
+
+            (device / "State" / "console_state.db").write_bytes(b"corrupt fixture")
+            output = io.StringIO()
+            with patch("sys.argv", args), contextlib.redirect_stdout(output):
+                self.assertEqual(audit.main(), 2)
+            self.assertIn("Devices/GameBoyAdvance/State/console_state.db",
+                          json.loads(output.getvalue())["summary"]["integrity_failures"])
 
     def test_explicit_memory_only_snapshot_keeps_modern_missing_database_checks(self):
         with tempfile.TemporaryDirectory() as directory:

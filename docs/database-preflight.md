@@ -19,13 +19,15 @@ Those device databases are optional for installations without the Game Boy subsy
 
 ## Audit a stopped R2 instance
 
-Pass the directory that contains the database files (normally `/home/x/R2_Home/R2`):
+Pass the directory that contains the core databases and the installed Game Boy directory:
 
 ```sh
-python3 tools/audit_r2_databases.py --root /home/x/R2_Home/R2
+python3 tools/audit_r2_databases.py \
+  --root /home/x/R2_Home/R2 \
+  --gameboy-root /home/x/R2_Home/Devices/GameBoyAdvance
 ```
 
-Add `--json` for machine-readable output.
+Add `--json` for machine-readable output. Omit `--gameboy-root` when auditing a detached snapshot. The snapshot already stores the optional databases under `Devices/GameBoyAdvance` relative to its root.
 
 ## Snapshot and audit
 
@@ -34,6 +36,7 @@ The script can use SQLite's backup API to create a per-database snapshot and aud
 ```sh
 python3 tools/audit_r2_databases.py \
   --root /home/x/R2_Home/R2 \
+  --gameboy-root /home/x/R2_Home/Devices/GameBoyAdvance \
   --snapshot-dir /home/x/R2_Home/database-preflight-snapshot
 ```
 

@@ -268,7 +268,7 @@ cd "$R2_ROOT" || {
 # The separate hardware report does not open SQLite.
 echo "[preflight] Checking the SQLite stores for final activation..."
 R2_DATABASE_AUDIT="$R2_SOURCE/tools/audit_r2_databases.py"
-AUDIT_ARGS=(--root "$R2_SOURCE")
+AUDIT_ARGS=(--root "$R2_SOURCE" --gameboy-root "$R2_GAMEBOY_ROOT")
 if [[ "${2:-}" == "--legacy-memory-only" ]]; then
     if ! SNAPSHOT_DIR="$(sudo -n -u r2 -- mktemp -d "$R2_ROOT/audit-snapshot-desktop.XXXXXX")"; then
         echo "ERROR: Could not create the database snapshot directory. R2 was not launched."
