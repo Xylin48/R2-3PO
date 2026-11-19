@@ -15492,6 +15492,42 @@ static int r2_startup_thread_create(pthread_t *thread,
     return -1; \
 } while (0)
 
+static const char initialized_database_set[] = ".r2-database-set-initialized";
+
+static int verify_initialized_database_set(void)
+{
+    struct stat entry;
+    if (fstatat(core_storage_lock, initialized_database_set, &entry,
+                AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(entry.st_mode)) return -1;
+
+    static const char *const databases[] = {
+        "r2_memory.db", "r2_reality.db", "r2_fridge.db",
+        "r2_rewards.db", "r2_addictions.db",
+    };
+    for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); ++i) {
+        if (fstatat(core_storage_lock, databases[i], &entry,
+                    AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(entry.st_mode) ||
+            entry.st_size == 0) {
+            fprintf(stderr, "[R2] Required initialized database is missing or invalid: %s\n",
+                    databases[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int mark_initialized_database_set(void)
+{
+    int fd = openat(core_storage_lock, initialized_database_set,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return errno == EEXIST ? 0 : -1;
+    int synced = fsync(fd);
+    int closed = close(fd);
+    return synced == 0 && closed == 0 && fsync(core_storage_lock) == 0 ? 0 : -1;
+}
+
 int r2_init(void)
 {
     if (init_attempt_active || core_initialized) {
@@ -15533,6 +15569,8 @@ int r2_init(void)
             R2_INIT_FAIL("another R2 core is using %s", R2_HOME);
         R2_INIT_FAIL("could not lock persistent data directory: %s", strerror(lock_error));
     }
+    if (verify_initialized_database_set() != 0)
+        R2_INIT_FAIL("could not verify the established database set");
     if (mkdir_p(DIARY_DIR) != 0)
         R2_INIT_FAIL("could not create the diary directory");
 
@@ -15627,6 +15665,10 @@ int r2_init(void)
         db = NULL;
         R2_INIT_FAIL("could not initialize R2 reality engine");
     }
+    /* All five stores now have committed schemas. Record that subsequent
+       starts must never initialize replacements for a missing store. */
+    if (mark_initialized_database_set() != 0)
+        R2_INIT_FAIL("could not record the initialized database set");
 
     if (r2_eyes_init(&eyes) != 0) {
         r2_imagination_shutdown();

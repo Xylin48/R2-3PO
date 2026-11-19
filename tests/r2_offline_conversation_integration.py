@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1165,7 +1166,7 @@ def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
                 input=commands, text=True, capture_output=True, timeout=30, check=True,
             )
             assert "R2-3PO ONLINE" in run.stdout and "[R2-3PO shut down.]" in run.stdout
-        with sqlite3.connect(memory) as db:
+        with closing(sqlite3.connect(memory)) as db:
             assert db.execute("SELECT qty FROM r2_fridge_items").fetchall() == [(2,)]
             assert db.execute("SELECT memory FROM memories WHERE id=1").fetchone() == (
                 "I remember hearing about a fictional mango.",)
@@ -1173,7 +1174,7 @@ def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
                 "SELECT count(*) FROM r2_log_events WHERE event_type='fridge_food_consumed' "
                 "AND instr(details,'legacy plum')>0"
             ).fetchone() == (1,)
-            with sqlite3.connect(home / "r2_rewards.db") as rewards:
+            with closing(sqlite3.connect(home / "r2_rewards.db")) as rewards:
                 reward = rewards.execute(
                     "SELECT points,log_event_id FROM reward_events WHERE target='legacy plum' "
                     "AND source='food_consumed'"
@@ -1181,19 +1182,45 @@ def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
             assert len(reward) == 1 and reward[0][0] == 2 and reward[0][1] is not None
             assert db.execute("SELECT id FROM r2_log_events WHERE id=?", (reward[0][1],)).fetchone() == (
                 reward[0][1],)
-        with sqlite3.connect(home / "r2_reality.db") as db:
+        with closing(sqlite3.connect(home / "r2_reality.db")) as db:
             assert db.execute("SELECT ingredients,taste FROM r2_food_experiences "
                               "WHERE food_name='legacy plum'").fetchall() == [("plum", "tart")]
-        with sqlite3.connect(home / "r2_fridge.db") as db:
+        with closing(sqlite3.connect(home / "r2_fridge.db")) as db:
             assert db.execute("SELECT name,quantity FROM r2_fridge_items").fetchall() == [
                 ("legacy plum", 1)]
-        with sqlite3.connect(home / "r2_addictions.db") as db:
+        with closing(sqlite3.connect(home / "r2_addictions.db")) as db:
             assert db.execute("SELECT event_kind,source FROM addiction_events "
                               "WHERE target='legacy plum'").fetchall() == [("choice", "eating")]
-        for name in ("memory", "reality", "fridge", "rewards", "addictions"):
-            with sqlite3.connect(home / f"r2_{name}.db") as db:
-                assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)], name
+        stores = [
+            home / f"r2_{name}.db"
+            for name in ("memory", "reality", "fridge", "rewards", "addictions")
+        ]
+        for path in stores:
+            with closing(sqlite3.connect(path)) as db:
+                assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)], path.name
         print("PASS: memory-only startup migrated stock and connected all five stores through a meal and restart.")
+
+        original = {path: path.read_bytes() for path in stores}
+        for path in stores:
+            saved_store = path.with_suffix(".fixture-backup")
+            path.rename(saved_store)
+            try:
+                run = subprocess.run(
+                    [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                    input="exit\n", text=True, capture_output=True, timeout=30,
+                )
+                assert run.returncode != 0 and "R2-3PO ONLINE" not in run.stdout, run
+                assert f"Required initialized database is missing or invalid: {path.name}" in run.stderr, run
+                assert not path.exists(), path
+                assert all(other.read_bytes() == original[other] for other in stores if other != path)
+            finally:
+                saved_store.replace(path)
+        recovered = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            input="exit\n", text=True, capture_output=True, timeout=30, check=True,
+        )
+        assert "R2-3PO ONLINE" in recovered.stdout and "[R2-3PO shut down.]" in recovered.stdout
+        print("PASS: an initialized workspace refused all five missing-store cases and reopened after restoration.")
     finally:
         workspace.rename(workspace.with_name("legacy-workspace"))
         saved_workspace.rename(workspace)

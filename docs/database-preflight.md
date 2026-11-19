@@ -84,3 +84,8 @@ the legacy database. An existing dedicated Fridge table keeps authority,
 including when it is empty after a meal. Food mentioned in memories alone
 does not create inventory. Reality, Fridge, Reward, Addiction and Memory
 retain their own records and exchange evidence through their normal operations.
+
+After initializing all five stores, the core records that the database set
+exists in `R2/.r2-database-set-initialized`. Later starts check that all
+five database files are present before opening any of them. Keep the record
+with the data directory during backup and restoration.
