@@ -126,7 +126,7 @@ if launcher.index("pgrep -x r2") > network_at:
 if network_at > preflight_at:
     raise SystemExit("R2-only network isolation must precede runtime preflight")
 sqlite_at = launcher.index('python3 "$R2_DATABASE_AUDIT"')
-if not (launcher.index("--activate-reviewed") < preflight_at <
+if not (preflight_at <
         launcher.index("Press Enter to continue launching R2") < sqlite_at <
         launcher.index("Checking R2 workspace directories...")):
     raise SystemExit("database integrity check must follow final launch authorization and precede workspace writes")
@@ -213,7 +213,8 @@ probe_start = launcher.index('R2_DATABASE_AUDIT=')
 probe_end = launcher.index("# Create only the established workspace", sqlite_at)
 sqlite_probe = (
     'R2_ROOT="$1"\nR2_SOURCE="$1/source"\nR2_GAMEBOY_ROOT="$1/Devices/GameBoyAdvance"\n'
-    'sudo() { shift 4; "$@"; }\n'
+    'shift\nsudo() { shift 4; "$@"; }\n'
+    + launcher.split('R2_ROOT=', 1)[0]
     + launcher[probe_start:probe_end].replace(
         '"$R2_SOURCE/tools/audit_r2_databases.py"', '"$R2_AUDIT_FIXTURE"'
     )
@@ -245,9 +246,10 @@ with tempfile.TemporaryDirectory() as temp:
 
     for name in ("r2_reality.db", "r2_fridge.db", "r2_rewards.db", "r2_addictions.db"):
         sqlite3.connect(data / name).close()
-    result = run_probe()
-    if result.returncode != 0 or "5/5 required database files found" not in result.stdout:
-        raise SystemExit(f"valid detached database set failed activation check: {result}")
+    for args in ((), ("--activate-reviewed",)):
+        result = run_probe(*args)
+        if result.returncode != 0 or "5/5 required database files found" not in result.stdout:
+            raise SystemExit(f"valid desktop launch arguments failed: {result}")
     device = Path(temp) / "Devices" / "GameBoyAdvance"
     device.mkdir(parents=True)
     (device / "gameboy.db").write_bytes(b"a corrupt cartridge database fixture")

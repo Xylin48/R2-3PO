@@ -70,7 +70,7 @@ Foreground chat and its corrective retry allow up to six hours per request by de
 
 ```sh
 export R2_OLLAMA_TIMEOUT_SECONDS=14400
-/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
+/home/x/R2_Home/R2_Launch_Code.sh
 ```
 
 The launcher forwards this setting to the dedicated `r2` process. For the overnight systemd service, use a service override instead because systemd does not inherit an interactive shell's exported variables:
@@ -104,7 +104,7 @@ First stop the overnight service and any other R2 process, then run the interact
 ```sh
 sudo systemctl stop r2-3po.service
 export R2_OLLAMA_TRACE_PROMPTS=1
-/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
+/home/x/R2_Home/R2_Launch_Code.sh
 ```
 
 Send one test message that demonstrates the failure. The terminal prints the private trace filename, normally under `/home/x/R2_Home/R2_Log/`. After that one reproduction, exit R2 and disable tracing:

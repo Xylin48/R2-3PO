@@ -2,7 +2,7 @@
 
 R2-3PO is a C program with separate core, shell, diary, life-log, visual, eye, and hearing modules.
 
-**Treat first launch with R2’s live data as the final deployment step.** Use disposable fixtures, standalone model and device checks, and the [rollout-readiness checklist](docs/rollout-readiness.md) before installation. Both supported launchers require `--activate-reviewed`.
+**Treat first launch with R2’s live data as the final deployment step.** Use disposable fixtures, standalone model and device checks, and the [rollout-readiness checklist](docs/rollout-readiness.md) before installation. The desktop launcher starts with no arguments. The protected overnight installer requires `--activate-reviewed`.
 
 For unattended overnight operation, boot-time activation, crash recovery, and sleep-inhibitor behavior, see [the overnight service guide](docs/overnight-service.md). For the staged preflight, database snapshot, real-device acceptance, and rollback gate, see the [rollout-readiness checklist](docs/rollout-readiness.md). The installer performs a database snapshot/integrity preflight before enabling the service. Do not run the systemd service and the interactive launcher at the same time.
 

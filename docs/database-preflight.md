@@ -75,8 +75,9 @@ For a known older installation whose only core store is `r2_memory.db`,
 add `--legacy-memory-only` to the snapshot command. The audit requires a
 successful snapshot and a recognized structured Reality or Fridge layout.
 It continues to reject partially missing multi-database sets and integrity
-or relationship errors. The overnight bootstrap and the desktop launcher
-accept the same flag after `--activate-reviewed` for that specific layout.
+or relationship errors. For that layout, pass `--legacy-memory-only` to the
+desktop launcher, or append it after `--activate-reviewed` when invoking the
+overnight bootstrap.
 For a regular update, the desktop launcher audits the existing five stores
 before building or starting the core.
 

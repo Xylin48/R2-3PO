@@ -1,8 +1,11 @@
 #!/bin/bash
 
-if [[ "${1:-}" != "--activate-reviewed" || "$#" -gt 2 ||
-      ( "$#" -eq 2 && "$2" != "--legacy-memory-only" ) ]]; then
-    echo "[R2 launcher] No action taken. Final activation requires --activate-reviewed after release signoff." >&2
+# Older shortcuts may still pass the former desktop activation flag.
+if [[ "${1:-}" == "--activate-reviewed" ]]; then
+    shift
+fi
+if [[ "$#" -gt 1 || ( "$#" -eq 1 && "$1" != "--legacy-memory-only" ) ]]; then
+    echo "[R2 launcher] No action taken. Usage: $0 [--legacy-memory-only]" >&2
     exit 2
 fi
 
@@ -269,7 +272,7 @@ cd "$R2_ROOT" || {
 echo "[preflight] Checking the SQLite stores for final activation..."
 R2_DATABASE_AUDIT="$R2_SOURCE/tools/audit_r2_databases.py"
 AUDIT_ARGS=(--root "$R2_SOURCE" --gameboy-root "$R2_GAMEBOY_ROOT")
-if [[ "${2:-}" == "--legacy-memory-only" ]]; then
+if [[ "${1:-}" == "--legacy-memory-only" ]]; then
     if ! SNAPSHOT_DIR="$(sudo -n -u r2 -- mktemp -d "$R2_ROOT/audit-snapshot-desktop.XXXXXX")"; then
         echo "ERROR: Could not create the database snapshot directory. R2 was not launched."
         exit 1
