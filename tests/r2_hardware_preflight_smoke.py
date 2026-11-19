@@ -62,6 +62,7 @@ required = (
     '$1 != "NAME"',
     'llama-server process exists but ollama ps cannot confirm a loaded model',
     'Hardware preflight identity: %s (uid=%s, groups=%s)',
+    'for DEVICE_GROUP in audio video; do',
     'DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)',
     'sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2',
     'sudo -n setpriv --reuid="$uid" --regid="$gid" --groups="$groups" -- "$@"',
@@ -156,6 +157,27 @@ loaded_ps = subprocess.run(
 )
 if empty_ps.returncode != 1 or loaded_ps.returncode != 0:
     raise SystemExit("ollama ps row detection must ignore the header and detect actual model rows")
+
+# Check the supplementary group list used before the report drops privilege.
+group_start = script.index('  R2_RUNTIME_GROUPS="$(id -G r2')
+group_end = script.index('  if [[ ! "$R2_UID"', group_start)
+group_fixture = """
+set -uo pipefail
+id() { printf '311 29\\n'; }
+getent() {
+    case "$2" in
+        audio) printf 'audio:x:29:\\n' ;;
+        video) [[ "$1" == group && "$ADD_VIDEO" == yes ]] || return 2
+               printf 'video:x:44:\\n' ;;
+    esac
+}
+ADD_VIDEO="$1"
+""" + script[group_start:group_end] + 'printf "%s\\n" "$R2_RUNTIME_GROUPS"'
+for video, groups in (("yes", "311,29,44"), ("no", "311,29")):
+    result = subprocess.run(["bash", "-c", group_fixture, "fixture", video],
+                            text=True, capture_output=True, check=True)
+    if result.stdout.strip() != groups:
+        raise SystemExit(f"expected {groups} in hardware report group handoff: {result}")
 
 # Exercise the same model parser the hardware report runs against /api/tags.
 tags_parser = script.split("printf '%s' \"$TAGS\" | python3 -c '", 1)[1].split("\n'", 1)[0]

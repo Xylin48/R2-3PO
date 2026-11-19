@@ -8,8 +8,8 @@ R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"
 OLLAMA_URL="${R2_OLLAMA_URL:-http://127.0.0.1:11434/api/tags}"
 
 # Run the complete report as the dedicated runtime account, with the same
-# supplementary audio group the interactive launcher grants R2. No persistent
-# ownership, ACL, or group-membership changes are made.
+# supplementary audio and video groups the interactive launcher grants R2.
+# No persistent ownership, ACL, or group-membership changes are made.
 if [[ "$(id -un)" != "r2" ]]; then
   if ! id r2 >/dev/null 2>&1; then
     printf '[FAIL] Linux account r2 is missing; cannot run runtime preflight.\n' >&2
@@ -19,13 +19,15 @@ if [[ "$(id -un)" != "r2" ]]; then
   R2_GID="$(id -g r2)"
   R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
   R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
-  AUDIO_GID="$(getent group audio 2>/dev/null | cut -d: -f3 || true)"
-  if [[ "$AUDIO_GID" =~ ^[0-9]+$ ]]; then
-    case ",$R2_RUNTIME_GROUPS," in
-      *,"$AUDIO_GID",*) ;;
-      *) R2_RUNTIME_GROUPS+=",${AUDIO_GID}" ;;
-    esac
-  fi
+  for DEVICE_GROUP in audio video; do
+    if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
+       [[ "$DEVICE_GID" =~ ^[0-9]+$ ]]; then
+      case ",$R2_RUNTIME_GROUPS," in
+        *,"$DEVICE_GID",*) ;;
+        *) R2_RUNTIME_GROUPS+=",${DEVICE_GID}" ;;
+      esac
+    fi
+  done
   if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
     printf '[FAIL] Could not resolve the r2 runtime identity.\n' >&2
     exit 1
