@@ -529,6 +529,8 @@ def main() -> int:
                         help="R2 data directory containing SQLite database files")
     parser.add_argument("--snapshot-dir", type=Path,
                         help="optional destination for non-overwriting SQLite snapshots")
+    parser.add_argument("--legacy-memory-only", action="store_true",
+                        help="allow a snapshotted memory-only installation with structured legacy state")
     parser.add_argument("--visual-library", type=Path,
                         help="compare a Visual JPEG directory with its SQLite index")
     parser.add_argument("--visual-db", type=Path,
@@ -538,6 +540,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.visual_db is not None and args.visual_library is None:
         parser.error("--visual-db requires --visual-library")
+
+    if args.legacy_memory_only and args.snapshot_dir is None:
+        parser.error("--legacy-memory-only requires --snapshot-dir")
 
     audit_root_path = args.root
     snapshot_errors: list[str] = []
@@ -555,6 +560,23 @@ def main() -> int:
             audit_root_path = args.root
 
     report = audit_root(audit_root_path)
+    summary = report["summary"]
+    memory_tables = report["databases"]["r2_memory.db"]["tables"]
+    legacy_missing = set(DATABASES) - {"r2_memory.db"}
+    recognized_legacy = (
+        args.legacy_memory_only and snapshot_created
+        and set(summary["missing"]) == legacy_missing
+        and (
+            {"name", "container", "quantity"} <= set(
+                memory_tables.get("r2_reality_objects", {}).get("columns", []))
+            or (
+                "name" in memory_tables.get("r2_fridge_items", {}).get("columns", [])
+                and bool({"quantity", "qty", "amount"} & set(
+                    memory_tables.get("r2_fridge_items", {}).get("columns", [])))
+            )
+        )
+    )
+    summary["legacy_memory_only"] = recognized_legacy
     report["source_root"] = str(args.root.resolve())
     report["snapshot_errors"] = snapshot_errors
     report["snapshot_created"] = snapshot_created
@@ -599,6 +621,8 @@ def main() -> int:
                   f"orphan_values={relationship.get('orphan_values', [])}")
         if summary["missing"]:
             print("Note: missing files are reported, not created.")
+        if recognized_legacy:
+            print("Structured memory-only layout verified. R2 will initialize dedicated stores on startup.")
         if summary["legacy_phantom_food_records"]:
             print("Note: suspicious legacy rows are reported only; no rows are changed.")
         if snapshot_created:
@@ -614,11 +638,10 @@ def main() -> int:
                         print(f"  {label}: {json.dumps(items)}")
                 print("Unindexed files are candidates. Stop R2 before interpreting archive differences.")
 
-    # Missing expected databases are a failed preflight, not a clean pass.
-    # The report remains read-only and still lists every missing path.
+    # Only an explicitly selected and snapshotted legacy layout may omit the dedicated stores.
     return 2 if (report["summary"]["integrity_failures"] or
                   report["summary"]["relationship_failures"] or
-                  report["summary"]["missing"] or snapshot_errors or
+                  (summary["missing"] and not recognized_legacy) or snapshot_errors or
                   report.get("visual_archive", {}).get("error")) else 0
 
 

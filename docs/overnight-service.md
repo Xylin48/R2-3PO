@@ -164,6 +164,11 @@ From then on, use only the protected entrypoint:
 sudo /usr/local/sbin/r2-3po-install --activate-reviewed
 ```
 
+For a verified older installation with only `r2_memory.db` and structured
+legacy state, append `--legacy-memory-only`. See the
+[database preflight](database-preflight.md#migrating-a-memory-only-installation)
+for the snapshot and migration behavior.
+
 The trusted bootstrap compiles the current checkout and runs the model copier, database audit, and preflight as the unprivileged `r2` account. Its systemd unit definitions are embedded in the root-owned bootstrap; it does not install unit contents read from the runtime-writable checkout. The repository's `tools/install_r2_overnight.sh` is now only a nonprivileged notice and must not be invoked with `sudo`. If the trusted bootstrap itself is intentionally changed in a future release, review that change and reinstall the root-owned copy deliberately.
 
 The bootstrap will:

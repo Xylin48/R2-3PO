@@ -1143,6 +1143,62 @@ def oversized_startup_memory(binary: Path, workspace: Path, url: str) -> None:
     print("PASS: startup and restart retained an exact 34-MiB memory outside the pinned prompt.")
 
 
+def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
+    saved_workspace = workspace.with_name("earlier-workspace")
+    workspace.rename(saved_workspace)
+    try:
+        home = workspace / "R2"
+        home.mkdir(parents=True)
+        memory = home / "r2_memory.db"
+        with sqlite3.connect(memory) as db:
+            db.executescript(
+                "CREATE TABLE r2_fridge_items(name TEXT PRIMARY KEY, qty INTEGER, "
+                "description TEXT, fullness REAL, energy REAL, ingredients TEXT, taste TEXT);"
+                "INSERT INTO r2_fridge_items VALUES('legacy plum',2,'migrated stock',25,4,'plum','tart');"
+                "CREATE TABLE memories(id INTEGER PRIMARY KEY,memory TEXT,category TEXT);"
+                "INSERT INTO memories VALUES(1,'I remember hearing about a fictional mango.','experience');"
+            )
+        assert list(home.iterdir()) == [memory]
+        for commands in ("fridge eat legacy plum\nexit\n", "exit\n"):
+            run = subprocess.run(
+                [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                input=commands, text=True, capture_output=True, timeout=30, check=True,
+            )
+            assert "R2-3PO ONLINE" in run.stdout and "[R2-3PO shut down.]" in run.stdout
+        with sqlite3.connect(memory) as db:
+            assert db.execute("SELECT qty FROM r2_fridge_items").fetchall() == [(2,)]
+            assert db.execute("SELECT memory FROM memories WHERE id=1").fetchone() == (
+                "I remember hearing about a fictional mango.",)
+            assert db.execute(
+                "SELECT count(*) FROM r2_log_events WHERE event_type='fridge_food_consumed' "
+                "AND instr(details,'legacy plum')>0"
+            ).fetchone() == (1,)
+            with sqlite3.connect(home / "r2_rewards.db") as rewards:
+                reward = rewards.execute(
+                    "SELECT points,log_event_id FROM reward_events WHERE target='legacy plum' "
+                    "AND source='food_consumed'"
+                ).fetchall()
+            assert len(reward) == 1 and reward[0][0] == 2 and reward[0][1] is not None
+            assert db.execute("SELECT id FROM r2_log_events WHERE id=?", (reward[0][1],)).fetchone() == (
+                reward[0][1],)
+        with sqlite3.connect(home / "r2_reality.db") as db:
+            assert db.execute("SELECT ingredients,taste FROM r2_food_experiences "
+                              "WHERE food_name='legacy plum'").fetchall() == [("plum", "tart")]
+        with sqlite3.connect(home / "r2_fridge.db") as db:
+            assert db.execute("SELECT name,quantity FROM r2_fridge_items").fetchall() == [
+                ("legacy plum", 1)]
+        with sqlite3.connect(home / "r2_addictions.db") as db:
+            assert db.execute("SELECT event_kind,source FROM addiction_events "
+                              "WHERE target='legacy plum'").fetchall() == [("choice", "eating")]
+        for name in ("memory", "reality", "fridge", "rewards", "addictions"):
+            with sqlite3.connect(home / f"r2_{name}.db") as db:
+                assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)], name
+        print("PASS: memory-only startup migrated stock and connected all five stores through a meal and restart.")
+    finally:
+        workspace.rename(workspace.with_name("legacy-workspace"))
+        saved_workspace.rename(workspace)
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -1188,6 +1244,7 @@ def main() -> int:
             gameboy_shell_cartridge_name(binary, workspace, url)
             oversized_imagination_request(binary, workspace, url)
             oversized_startup_memory(binary, workspace, url)
+            legacy_memory_only_startup(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()

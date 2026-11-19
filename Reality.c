@@ -1599,11 +1599,95 @@ static int fridge_migrate_columns(void)
     return SQLITE_OK;
 }
 
-static int fridge_migrate_schema(void)
+/* A legacy memory-only installation can contain structured fridge stock.
+ * Read the source through a separate read-only connection. Free-form memories
+ * about food have no inventory authority. */
+static int fridge_import_legacy_stock(const char *path)
+{
+    sqlite3 *source = NULL;
+    sqlite3_stmt *rows = NULL, *insert = NULL;
+    int rc = sqlite3_open_v2(path, &source, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) goto done;
+    rc = sqlite3_busy_timeout(source, 5000);
+    if (rc != SQLITE_OK) goto done;
+    rc = sqlite3_prepare_v2(source,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='r2_fridge_items' COLLATE NOCASE",
+        -1, &rows, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(rows);
+    sqlite3_finalize(rows);
+    rows = NULL;
+    if (rc == SQLITE_DONE) { rc = SQLITE_OK; goto done; }
+    if (rc != SQLITE_ROW) goto done;
+
+    /* Pick fixed legacy aliases using their actual column names. */
+    const char *columns[] = {"name", "description", "quantity", "fullness", "energy",
+                             "ingredients", "taste", "updated_at"};
+    const char *expressions[] = {NULL, "NULL", NULL, "0", "0", "NULL", "NULL", "NULL"};
+    for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); ++i) {
+        if (sqlite3_table_column_metadata(source, "main", "r2_fridge_items",
+                columns[i], NULL, NULL, NULL, NULL, NULL) == SQLITE_OK)
+            expressions[i] = columns[i];
+    }
+    if (!expressions[2]) {
+        if (sqlite3_table_column_metadata(source, "main", "r2_fridge_items",
+                "qty", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK)
+            expressions[2] = "qty";
+        else if (sqlite3_table_column_metadata(source, "main", "r2_fridge_items",
+                "amount", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK)
+            expressions[2] = "amount";
+    }
+    if (!expressions[0] || !expressions[2]) { rc = SQLITE_SCHEMA; goto done; }
+
+    char *sql = sqlite3_mprintf("SELECT %s,%s,%s,%s,%s,%s,%s,%s FROM r2_fridge_items",
+        expressions[0], expressions[1], expressions[2], expressions[3],
+        expressions[4], expressions[5], expressions[6], expressions[7]);
+    if (!sql) { rc = SQLITE_NOMEM; goto done; }
+    rc = sqlite3_prepare_v2(source, sql, -1, &rows, NULL);
+    sqlite3_free(sql);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(fridge_db,
+            "INSERT INTO r2_fridge_items(name,description,quantity,fullness,energy,ingredients,taste,updated_at) "
+            "VALUES(?1,?2,?3,COALESCE(?4,0),COALESCE(?5,0),?6,?7,"
+            "COALESCE(NULLIF(?8,''),CURRENT_TIMESTAMP))", -1, &insert, NULL);
+    while (rc == SQLITE_OK && (rc = sqlite3_step(rows)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(rows, 0);
+        sqlite3_int64 quantity = sqlite3_column_int64(rows, 2);
+        if (!name || !*name || strlen(name) != (size_t)sqlite3_column_bytes(rows, 0) ||
+            sqlite3_column_type(rows, 2) != SQLITE_INTEGER || quantity < 1 || quantity > INT_MAX) {
+            rc = SQLITE_CORRUPT;
+            break;
+        }
+        rc = SQLITE_OK;
+        for (int i = 0; rc == SQLITE_OK && i < 8; ++i)
+            rc = sqlite3_bind_value(insert, i + 1, sqlite3_column_value(rows, i));
+        if (rc == SQLITE_OK) rc = sqlite3_step(insert);
+        if (rc == SQLITE_DONE && sqlite3_changes(fridge_db) != 1) rc = SQLITE_CONSTRAINT;
+        if (rc == SQLITE_DONE) rc = sqlite3_reset(insert);
+    }
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
+done:
+    sqlite3_finalize(insert);
+    sqlite3_finalize(rows);
+    sqlite3_close(source);
+    return rc;
+}
+
+static int fridge_migrate_schema(const char *legacy_path)
 {
     int rc = sqlite3_exec(fridge_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc != SQLITE_OK) return rc;
-    rc = fridge_migrate_columns();
+    int already_owned = sqlite3_table_column_metadata(fridge_db, "main",
+        "r2_fridge_items", NULL, NULL, NULL, NULL, NULL, NULL) == SQLITE_OK;
+    rc = sqlite3_exec(fridge_db,
+        "CREATE TABLE IF NOT EXISTS r2_fridge_items(name TEXT PRIMARY KEY COLLATE NOCASE,description TEXT,quantity INTEGER NOT NULL CHECK(quantity>0),fullness REAL NOT NULL DEFAULT 0,energy REAL NOT NULL DEFAULT 0,ingredients TEXT,taste TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
+        "CREATE TABLE IF NOT EXISTS r2_fridge_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
+        "INSERT OR IGNORE INTO r2_fridge_meta(key,value) VALUES('schema_version','1');",
+        NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = fridge_migrate_columns();
+    /* An existing dedicated table, even if empty, owns stock. Retrying a
+       migration after consuming stock cannot resurrect the old quantities. */
+    if (rc == SQLITE_OK && !already_owned && legacy_path)
+        rc = fridge_import_legacy_stock(legacy_path);
     if (rc == SQLITE_OK)
         rc = sqlite3_exec(fridge_db, "COMMIT", NULL, NULL, NULL);
     if (rc != SQLITE_OK)
@@ -1624,15 +1708,14 @@ static int fridge_init(void)
         pthread_mutex_unlock(&fridge_lock);
         return -1;
     }
-    sqlite3_busy_timeout(fridge_db, 5000);
-    sqlite3_exec(fridge_db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;", NULL, NULL, NULL);
-    rc = sqlite3_exec(fridge_db,
-        "CREATE TABLE IF NOT EXISTS r2_fridge_items(name TEXT PRIMARY KEY COLLATE NOCASE,description TEXT,quantity INTEGER NOT NULL CHECK(quantity>0),fullness REAL NOT NULL DEFAULT 0,energy REAL NOT NULL DEFAULT 0,ingredients TEXT,taste TEXT,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
-        "CREATE TABLE IF NOT EXISTS r2_fridge_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
-        "INSERT OR IGNORE INTO r2_fridge_meta(key,value) VALUES('schema_version','1');",
-        NULL, NULL, NULL);
-    /* Migrate older inventory layouts without deleting user-entered stock. */
-    if (rc == SQLITE_OK && fridge_migrate_schema() != SQLITE_OK) rc = SQLITE_ERROR;
+    rc = sqlite3_busy_timeout(fridge_db, 5000);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(fridge_db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;",
+                          NULL, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        const char *legacy = access(R2_DIARY_DATABASE, F_OK) == 0 ? R2_DIARY_DATABASE : NULL;
+        rc = fridge_migrate_schema(legacy);
+    }
     /* Remove only stock created by the former automatic-refill behavior.
        Real user-entered inventory and all unrelated food are preserved. */
     if (rc == SQLITE_OK && sqlite3_exec(fridge_db,

@@ -278,6 +278,29 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertEqual(snapshot_report["summary"]["optional_found"], 2)
             self.assertEqual(snapshot_report["summary"]["integrity_failures"], [])
 
+    def test_explicit_memory_only_snapshot_keeps_modern_missing_database_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            memory = root / "r2_memory.db"
+            with sqlite3.connect(memory) as db:
+                db.executescript(
+                    "CREATE TABLE r2_fridge_items(name TEXT PRIMARY KEY, qty INTEGER);"
+                    "INSERT INTO r2_fridge_items VALUES('legacy pear',2);"
+                )
+            first = Path(directory) / "legacy-snapshot"
+            with patch("sys.argv", ["audit_r2_databases.py", "--root", str(root),
+                            "--snapshot-dir", str(first), "--legacy-memory-only"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(), 0)
+            self.assertEqual(sorted(p.name for p in first.iterdir()), ["r2_memory.db"])
+            self.assertFalse((root / "r2_fridge.db").exists())
+
+            sqlite3.connect(root / "r2_fridge.db").close()
+            second = Path(directory) / "partial-snapshot"
+            with patch("sys.argv", ["audit_r2_databases.py", "--root", str(root),
+                            "--snapshot-dir", str(second), "--legacy-memory-only"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(), 2)
+
     def test_cli_fails_preflight_when_expected_databases_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

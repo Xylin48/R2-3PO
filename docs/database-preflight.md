@@ -65,3 +65,20 @@ storage failure; startup publishes only when the complete owned file verifies.
 Missing or partial files remain pending. Withdrawn records are cancelled saves
 whose cleanup did not finish. Startup excludes them even if a matching JPEG is
 restored later. The read-only report does not delete either kind of record.
+
+### Migrating a memory-only installation
+
+For a known older installation whose only core store is `r2_memory.db`,
+add `--legacy-memory-only` to the snapshot command. The audit requires a
+successful snapshot and a recognized structured Reality or Fridge layout.
+It continues to reject partially missing multi-database sets and integrity
+or relationship errors. The overnight bootstrap accepts the same flag
+after `--activate-reviewed` for that specific layout.
+
+The core initializes the dedicated stores on startup. It imports structured
+stock from `r2_fridge_items` when creating its first dedicated Fridge table,
+understanding the old `qty` and `amount` names. The original stock remains in
+the legacy database. An existing dedicated Fridge table keeps authority,
+including when it is empty after a meal. Food mentioned in memories alone
+does not create inventory. Reality, Fridge, Reward, Addiction and Memory
+retain their own records and exchange evidence through their normal operations.

@@ -11,7 +11,8 @@ export PATH
 umask 077
 
 # Any invocation that can start the real core is a final deployment action.
-if [[ "$#" -ne 1 || "${1:-}" != "--activate-reviewed" ]]; then
+if [[ "${1:-}" != "--activate-reviewed" || "$#" -gt 2 ||
+      ( "$#" -eq 2 && "${2:-}" != "--legacy-memory-only" ) ]]; then
     echo "[R2 installer] No action taken. Final activation requires --activate-reviewed after release signoff." >&2
     exit 2
 fi
@@ -270,13 +271,17 @@ for database in "$R2_SOURCE/r2_memory.db" "$R2_SOURCE/r2_reality.db" "$R2_SOURCE
     fi
 done
 
-# No R2 process is running, so take a consistent, private snapshot of all five
-# persistent databases and require a clean integrity audit before installing/starting code.
+# With R2 stopped, snapshot each existing store before activating the core.
+# The normal path expects all five; the explicit legacy path verifies its source.
 AUDIT_SCRIPT="$R2_SOURCE/tools/audit_r2_databases.py"
 [[ -f "$AUDIT_SCRIPT" ]] || fail "database audit tool is missing: $AUDIT_SCRIPT"
 SNAPSHOT_DIR="$R2_ROOT/audit-snapshot-$(date '+%Y%m%d-%H%M%S')"
 log "Creating a private SQLite snapshot and checking database integrity..."
-run_as_r2 python3 "$AUDIT_SCRIPT" --root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR" ||
+AUDIT_ARGS=(--root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR")
+if [[ "${2:-}" == "--legacy-memory-only" ]]; then
+    AUDIT_ARGS+=(--legacy-memory-only)
+fi
+run_as_r2 python3 "$AUDIT_SCRIPT" "${AUDIT_ARGS[@]}" ||
     fail "database snapshot/integrity audit failed. R2 was not activated; inspect the report and preserve the snapshot/source databases."
 log "Database snapshot and integrity audit passed: $SNAPSHOT_DIR"
 
