@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 import sqlite3
 import stat
 import tempfile
@@ -313,6 +314,35 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertIn("MISSING  r2_memory.db", output.getvalue())
             self.assertIn("MISSING  r2_rewards.db", output.getvalue())
             self.assertIn("MISSING  r2_addictions.db", output.getvalue())
+
+    def test_memory_only_snapshot_refuses_nonregular_paths_and_orphaned_sidecars(self):
+        for obstruction in ("directory", "fifo", "orphaned wal"):
+            with self.subTest(obstruction=obstruction), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with sqlite3.connect(root / "r2_memory.db") as db:
+                    db.execute("CREATE TABLE r2_fridge_items (name TEXT, quantity INTEGER)")
+                fridge = root / "r2_fridge.db"
+                if obstruction == "directory":
+                    fridge.mkdir()
+                elif obstruction == "fifo":
+                    os.mkfifo(fridge)
+                else:
+                    fridge = root / "r2_fridge.db-wal"
+                    fridge.write_bytes(b"preserve recovery evidence")
+
+                snapshot = root / "snapshot"
+                args = [str(SCRIPT), "--root", str(root), "--snapshot-dir",
+                        str(snapshot), "--legacy-memory-only", "--json"]
+                output = io.StringIO()
+                with patch("sys.argv", args), contextlib.redirect_stdout(output):
+                    self.assertEqual(audit.main(), 2)
+                report = audit.audit_root(root)
+                self.assertIn("r2_fridge.db", report["summary"]["integrity_failures"])
+                self.assertNotIn("r2_fridge.db", report["summary"]["missing"])
+                self.assertEqual(list(snapshot.iterdir()), [])
+                self.assertTrue(fridge.exists())
+                if obstruction == "orphaned wal":
+                    self.assertEqual(fridge.read_bytes(), b"preserve recovery evidence")
 
 
 if __name__ == "__main__":

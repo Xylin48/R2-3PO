@@ -2,6 +2,7 @@
 """Safety/coverage contract for the non-destructive hardware preflight."""
 from pathlib import Path
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -123,12 +124,13 @@ if launcher.index("pgrep -x r2") > network_at:
     raise SystemExit("duplicate process check must precede temporary network rules")
 if network_at > preflight_at:
     raise SystemExit("R2-only network isolation must precede runtime preflight")
-sqlite_at = launcher.index("PRAGMA integrity_check")
+sqlite_at = launcher.index('python3 "$R2_DATABASE_AUDIT"')
 if not (launcher.index("--activate-reviewed") < preflight_at <
         launcher.index("Press Enter to continue launching R2") < sqlite_at <
         launcher.index("Checking R2 workspace directories...")):
     raise SystemExit("database integrity check must follow final launch authorization and precede workspace writes")
-if '?mode=ro' not in launcher:
+audit_path = ROOT / "tools" / "audit_r2_databases.py"
+if '?mode=ro' not in audit_path.read_text(encoding="utf-8"):
     raise SystemExit("the final interactive activation must open databases read-only during integrity checking")
 for marker in (
     'Checking R2 workspace directories...',
@@ -184,27 +186,49 @@ run_as_r2() { "$@"; }
     if "refusing symlinked runtime database" not in result.stdout:
         raise SystemExit("hardware report missed a dangling database symlink")
 
-# Execute only the launcher's database check, using disposable files.
-probe_start = launcher.rindex("<<'PY'\n", 0, sqlite_at) + len("<<'PY'\n")
-probe_end = launcher.index("\nPY\n", sqlite_at)
-sqlite_probe = launcher[probe_start:probe_end]
+# Execute the launcher's actual audit block with a disposable data root.
+probe_start = launcher.index('R2_DATABASE_AUDIT=')
+probe_end = launcher.index("# Create only the established workspace", sqlite_at)
+sqlite_probe = (
+    'R2_ROOT="$1"\nR2_SOURCE="$1/source"\n'
+    'sudo() { shift 4; "$@"; }\n'
+    + launcher[probe_start:probe_end].replace(
+        '"$R2_SOURCE/tools/audit_r2_databases.py"', '"$R2_AUDIT_FIXTURE"'
+    )
+)
 with tempfile.TemporaryDirectory() as temp:
-    data = Path(temp)
+    data = Path(temp) / "source"
+    data.mkdir()
     memory = data / "r2_memory.db"
     with sqlite3.connect(memory) as database:
-        database.execute("CREATE TABLE memory(value TEXT)")
-        database.commit()
+        database.execute("CREATE TABLE r2_fridge_items(name TEXT, quantity INTEGER)")
     database.close()
     original = memory.read_bytes()
-    probe_args = [sys.executable, "-", str(data)]
-    result = subprocess.run(probe_args, input=sqlite_probe, text=True, capture_output=True)
-    if result.returncode != 0 or "r2_memory.db: integrity_check=ok" not in result.stdout:
-        raise SystemExit(f"valid detached database failed activation check: {result}")
+    probe_args = ["bash", "-c", sqlite_probe, "launcher-fixture", temp]
+    probe_env = {**os.environ, "R2_AUDIT_FIXTURE": str(audit_path)}
+    def run_probe(*args):
+        return subprocess.run([*probe_args, *args], env=probe_env, text=True, capture_output=True)
+
+    result = run_probe()
+    if result.returncode != 1 or "Database audit failed" not in result.stdout:
+        raise SystemExit(f"partial modern database set passed activation check: {result}")
+    result = run_probe("--legacy-memory-only")
+    if result.returncode != 0 or "Structured memory-only layout verified" not in result.stdout:
+        raise SystemExit(f"legacy database failed explicit activation check: {result}")
+    snapshots = list(Path(temp).glob("audit-snapshot-desktop.*/r2_memory.db"))
+    if len(snapshots) != 1:
+        raise SystemExit(f"legacy activation did not snapshot its source: {snapshots}")
     if memory.read_bytes() != original or set(data.iterdir()) != {memory}:
         raise SystemExit("integrity check modified the detached database or created missing stores")
+
+    for name in ("r2_reality.db", "r2_fridge.db", "r2_rewards.db", "r2_addictions.db"):
+        sqlite3.connect(data / name).close()
+    result = run_probe()
+    if result.returncode != 0 or "5/5 required database files found" not in result.stdout:
+        raise SystemExit(f"valid detached database set failed activation check: {result}")
     memory.write_bytes(b"a corrupt database fixture")
-    result = subprocess.run(probe_args, input=sqlite_probe, text=True, capture_output=True)
-    if result.returncode != 1 or "[FAIL]" not in result.stdout:
+    result = run_probe()
+    if result.returncode != 1 or "ERROR  r2_memory.db" not in result.stdout:
         raise SystemExit(f"corrupt detached database passed activation check: {result}")
 
 print("R2 hardware preflight safety, coverage, and launcher-order smoke test passed")

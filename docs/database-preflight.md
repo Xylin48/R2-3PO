@@ -37,7 +37,7 @@ python3 tools/audit_r2_databases.py \
   --snapshot-dir /home/x/R2_Home/database-preflight-snapshot
 ```
 
-Existing snapshot files are never overwritten. Choose a new or empty destination directory. If any expected snapshot database or SQLite sidecar (`-wal`, `-shm`, or `-journal`) already exists, the script refuses the whole snapshot set before copying anything. A source that stays locked causes the snapshot to fail and the incomplete copies from that attempt are removed. New snapshot files are created with owner-only permissions (0600). Source database files are opened read-only; suspicious rows are reported, not altered.
+Existing snapshot files are never overwritten. Choose a new or empty destination directory. If any expected snapshot database or SQLite sidecar (`-wal`, `-shm`, or `-journal`) already exists, the script refuses the whole snapshot set before copying anything. Nonregular database files and sidecars without their parent database also block the audit and snapshot. A source that stays locked causes the snapshot to fail and the incomplete copies from that attempt are removed. New snapshot files are created with owner-only permissions (0600). Source database files are opened read-only; suspicious rows are reported, not altered.
 
 Snapshots are consistent individually, but the separate databases are not captured at one atomic instant. Stop R2 before running the audit when cross-database consistency matters. Keep the snapshot directory private because these databases may contain personal memories and activity records. Do not upload the database files to public issues or logs.
 
@@ -72,8 +72,10 @@ For a known older installation whose only core store is `r2_memory.db`,
 add `--legacy-memory-only` to the snapshot command. The audit requires a
 successful snapshot and a recognized structured Reality or Fridge layout.
 It continues to reject partially missing multi-database sets and integrity
-or relationship errors. The overnight bootstrap accepts the same flag
-after `--activate-reviewed` for that specific layout.
+or relationship errors. The overnight bootstrap and the desktop launcher
+accept the same flag after `--activate-reviewed` for that specific layout.
+For a regular update, the desktop launcher audits the existing five stores
+before building or starting the core.
 
 The core initializes the dedicated stores on startup. It imports structured
 stock from `r2_fridge_items` when creating its first dedicated Fridge table,

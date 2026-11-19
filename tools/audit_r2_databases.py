@@ -43,16 +43,29 @@ def _readonly_connection(path: Path) -> sqlite3.Connection:
     return db
 
 
-def _snapshot_conflicts(path: Path) -> list[Path]:
+def _existing_sqlite_paths(path: Path) -> list[Path]:
     candidates = [path, *(path.with_name(path.name + suffix)
                           for suffix in ("-wal", "-shm", "-journal"))]
     return [candidate for candidate in candidates
             if candidate.exists() or candidate.is_symlink()]
 
 
+def _invalid_database_path(path: Path, existing: list[Path]) -> str | None:
+    for candidate in existing:
+        if candidate.is_symlink():
+            return f"SQLite path is a symlink; refusing to follow it: {candidate.name}"
+        if not candidate.is_file():
+            return f"SQLite path is not a regular file: {candidate.name}"
+    if existing and path not in existing:
+        return "database file is missing but SQLite sidecars exist: " + ", ".join(
+            candidate.name for candidate in existing
+        )
+    return None
+
+
 def snapshot_database(source: Path, destination: Path) -> None:
     """Create a private, consistent SQLite backup without changing the source."""
-    conflicts = _snapshot_conflicts(destination)
+    conflicts = _existing_sqlite_paths(destination)
     if conflicts:
         raise FileExistsError(f"refusing existing snapshot path: {conflicts[0]}")
     busy_since: float | None = None
@@ -120,7 +133,7 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
     snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     _reject_snapshot_symlink_components(snapshot_dir)
     conflicts = [path for name in ALL_DATABASES
-                 for path in _snapshot_conflicts(snapshot_dir / name)]
+                 for path in _existing_sqlite_paths(snapshot_dir / name)]
     if conflicts:
         joined = ", ".join(str(path.relative_to(snapshot_dir)) for path in conflicts)
         raise FileExistsError(f"refusing to mix with existing snapshot file(s): {joined}")
@@ -132,12 +145,19 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
         joined = ", ".join(linked_sources)
         raise OSError(f"refusing symlink database path(s): {joined}")
 
+    sources = []
+    for name in ALL_DATABASES:
+        existing = _existing_sqlite_paths(root / name)
+        error = _invalid_database_path(root / name, existing)
+        if error is not None:
+            raise OSError(f"{name}: {error}")
+        if existing:
+            sources.append(name)
+
     created: list[Path] = []
     try:
-        for name in ALL_DATABASES:
+        for name in sources:
             source = root / name
-            if not source.is_file():
-                continue
             destination = snapshot_dir / name
             _reject_snapshot_symlink_components(destination.parent)
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -155,17 +175,20 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
 
 
 def audit_database(path: Path) -> dict[str, Any]:
+    existing = _existing_sqlite_paths(path)
     report: dict[str, Any] = {
         "path": str(path),
-        "exists": path.is_file() or path.is_symlink(),
+        # An incomplete store with orphaned sidecars needs review as well.
+        "exists": bool(existing),
         "integrity": None,
         "tables": {},
         "legacy_phantom_food_records": [],
         "foreign_key_violations": [],
         "error": None,
     }
-    if path.is_symlink():
-        report["error"] = "database path is a symlink; refusing to follow it"
+    error = _invalid_database_path(path, existing)
+    if error is not None:
+        report["error"] = error
         return report
     if not report["exists"]:
         report["error"] = "database file not found"
@@ -249,8 +272,9 @@ def _relationship_check(
         if source_table not in source_tables or target_table not in target_tables:
             result["reason"] = "legacy schema is missing a source or target table"
             return result
-        if source_column not in _table_columns(source_db, source_table) or \
-           target_column not in _table_columns(target_db, target_table):
+        source_columns = _table_columns(source_db, source_table)
+        target_columns = _table_columns(target_db, target_table)
+        if source_column not in source_columns or target_column not in target_columns:
             result["reason"] = "legacy schema is missing a source or target column"
             return result
         qs = '"' + source_table.replace('"', '""') + '"'
@@ -276,7 +300,16 @@ def _relationship_check(
             ("r2_log_links", "from_event_id"),
             ("r2_log_links", "to_event_id"),
         }
-        select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
+        select_columns = qc
+        match_conditions = ""
+        if (source_table == "reward_once_keys"
+                and {"target", "source"} <= source_columns & target_columns):
+            # Reward retries resolve a receipt by ID and its owning key.
+            select_columns += ", target, source"
+            match_conditions = " AND target=? AND source=?"
+        select_sql = f"SELECT {select_columns} FROM {qs}" + (
+            "" if required else f" WHERE {qc} IS NOT NULL"
+        )
         # These older reward records use zero for a relationship that has
         # not been established yet. Check every populated ID.
         if (source_table, source_column) in {
@@ -289,10 +322,11 @@ def _relationship_check(
         orphan_values: list[Any] = []
         orphan_count = 0
         checked_rows = 0
-        for (value,) in source_db.execute(select_sql):
+        for row in source_db.execute(select_sql):
+            value = row[0]
             checked_rows += 1
             if value is None or target_db.execute(
-                f"SELECT 1 FROM {qt} WHERE {qtc}=? LIMIT 1", (value,)
+                f"SELECT 1 FROM {qt} WHERE {qtc}=?{match_conditions} LIMIT 1", tuple(row)
             ).fetchone() is None:
                 orphan_count += 1
                 if len(orphan_values) < 50:
@@ -314,7 +348,7 @@ def audit_relationships(
     connections: dict[str, sqlite3.Connection | None] = {}
     for name in ("r2_memory.db", "r2_rewards.db"):
         path = root / name
-        if not path.is_file() or path.is_symlink():
+        if reports[name]["error"] is not None or not reports[name]["exists"]:
             connections[name] = None
             continue
         try:

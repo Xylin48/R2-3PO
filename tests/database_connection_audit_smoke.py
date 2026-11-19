@@ -88,6 +88,24 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert any(item["source_table"] == "reward_once_keys"
                and item["orphan_values"] == [998] for item in relationships)
 
+    # A populated receipt must own the event it points to, even when its ID exists.
+    with sqlite3.connect(rewards) as db:
+        db.executescript("""
+            ALTER TABLE reward_events ADD COLUMN target TEXT;
+            ALTER TABLE reward_events ADD COLUMN source TEXT;
+            ALTER TABLE reward_once_keys ADD COLUMN source TEXT;
+            UPDATE reward_events SET target='linked', source='meal' WHERE id=1;
+            UPDATE reward_once_keys SET source='meal' WHERE target='linked';
+            INSERT INTO reward_once_keys VALUES('another-target',1,'meal');
+            INSERT INTO reward_once_keys VALUES('linked',1,'another-source');
+        """)
+    ownership_failures = [
+        item for item in audit.audit_root(root)["summary"]["relationship_failures"]
+        if item["source_table"] == "reward_once_keys"
+    ]
+    assert len(ownership_failures) == 1, ownership_failures
+    assert sorted(ownership_failures[0]["orphan_values"]) == [1, 1, 998], ownership_failures
+
     # Legacy copies may lack declared foreign keys on exact reflection links.
     with sqlite3.connect(memory) as db:
         db.executescript("""
