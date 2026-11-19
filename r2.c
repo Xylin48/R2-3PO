@@ -8768,6 +8768,17 @@ static char *r2_process_ears_listen_request(const char *request)
     return result;
 }
 
+static void release_tool_result_text(char **text)
+{
+    free(*text);
+    *text = NULL;
+}
+
+static void release_tool_result_json(struct json_object **value)
+{
+    if (*value) json_object_put(*value);
+}
+
 static char *process_tools_with_status(
     const char *reply,
     int *world_action_succeeded)
@@ -8785,6 +8796,9 @@ static char *process_tools_with_status(
 
     results[0] = '\0';
 
+    /* APPEND can return immediately after an action. Its block-scoped
+       inputs must still be released on that early return. */
+#define TOOL_OWNED_TEXT __attribute__((cleanup(release_tool_result_text)))
 #define APPEND(...)                                                       \
     do {                                                                    \
         char *_part = NULL;                                                 \
@@ -8838,7 +8852,7 @@ static char *process_tools_with_status(
      */
     size_t alt_create_pos = 0;
     while (1) {
-        char *entry = extract_marker(reply, "[ALTERNATE_CREATE]",
+        char *entry TOOL_OWNED_TEXT = extract_marker(reply, "[ALTERNATE_CREATE]",
                                      "[END ALTERNATE_CREATE]", &alt_create_pos);
         if (!entry) break;
 
@@ -8883,15 +8897,13 @@ static char *process_tools_with_status(
         } else {
             APPEND("ALTERNATE-SELF LAB ERROR: expected name|scenario|assumptions|predicted outcome|conclusion|optional evidence event ID.\n");
         }
-        free(entry);
     }
 
     /* Alternate-Self Lab queries read, create, or compare hypothetical branches only. */
     if (find_control_marker_line(reply, "[ALTERNATE_LIST]", 0)) {
-        char *branches = r2_altself_list(20);
+        char *branches TOOL_OWNED_TEXT = r2_altself_list(20);
         if (branches) {
             APPEND("ALTERNATE-SELF LAB RESULT (all entries are hypothetical):\n%s\n", branches);
-            free(branches);
         } else {
             APPEND("ALTERNATE-SELF LAB ERROR: branch storage is unavailable.\n");
         }
@@ -8902,10 +8914,9 @@ static char *process_tools_with_status(
         long long branch_id = 0;
         if (r2_parse_control_positive_id(
                 alt_marker + strlen("[ALTERNATE_SHOW]"), &branch_id) == 0) {
-            char *branch = r2_altself_show((int64_t)branch_id);
+            char *branch TOOL_OWNED_TEXT = r2_altself_show((int64_t)branch_id);
             if (branch) {
                 APPEND("ALTERNATE-SELF BRANCH (hypothetical only):\n%s\n", branch);
-                free(branch);
             } else APPEND("ALTERNATE-SELF LAB ERROR: branch could not be read.\n");
         } else APPEND("ALTERNATE-SELF LAB ERROR: expected a positive branch ID.\n");
     }
@@ -8916,10 +8927,9 @@ static char *process_tools_with_status(
         if (r2_parse_control_positive_id_pair(
                 alt_marker + strlen("[ALTERNATE_COMPARE]"),
                 &first_id, &second_id) == 0) {
-            char *branches = r2_altself_compare((int64_t)first_id, (int64_t)second_id);
+            char *branches TOOL_OWNED_TEXT = r2_altself_compare((int64_t)first_id, (int64_t)second_id);
             if (branches) {
                 APPEND("ALTERNATE-SELF COMPARISON INPUT (hypothetical branches; not factual events):\n%s\n", branches);
-                free(branches);
             } else APPEND("ALTERNATE-SELF LAB ERROR: branches could not be compared.\n");
         } else APPEND("ALTERNATE-SELF LAB ERROR: expected two positive branch IDs.\n");
     }
@@ -8948,7 +8958,7 @@ static char *process_tools_with_status(
 
     if (find_control_marker_line(reply, "[READ_DIARY]", 0)) {
 
-        char *diary_context =
+        char *diary_context TOOL_OWNED_TEXT =
             r2_diary_build_reflection_context(50);
 
         if (diary_context) {
@@ -8959,7 +8969,6 @@ static char *process_tools_with_status(
                 diary_context
             );
 
-            free(diary_context);
 
         } else {
 
@@ -8975,7 +8984,7 @@ static char *process_tools_with_status(
 
     while (1) {
 
-        char *entry =
+        char *entry TOOL_OWNED_TEXT =
             extract_marker(
                 reply,
                 "[DIARY]",
@@ -9005,17 +9014,16 @@ static char *process_tools_with_status(
             );
         }
 
-        free(entry);
     }
 
     size_t read_pos = 0;
-    char *read_path = extract_marker(reply, "[READ]", "\n", &read_pos);
+    char *read_path TOOL_OWNED_TEXT = extract_marker(reply, "[READ]", "\n", &read_pos);
 
     if (read_path) {
 
         const char *path = read_path;
 
-        char *c =
+        char *c TOOL_OWNED_TEXT =
             workspace_read(path);
 
         if (c) {
@@ -9028,7 +9036,6 @@ static char *process_tools_with_status(
                 c
             );
 
-            free(c);
 
         } else {
 
@@ -9038,11 +9045,11 @@ static char *process_tools_with_status(
                 path
             );
         }
-        free(read_path);
+        release_tool_result_text(&read_path);
     }
 
     size_t list_pos = 0;
-    char *list_path = extract_marker(reply, "[LIST]", "\n", &list_pos);
+    char *list_path TOOL_OWNED_TEXT = extract_marker(reply, "[LIST]", "\n", &list_pos);
 
     if (list_path) {
 
@@ -9050,7 +9057,7 @@ static char *process_tools_with_status(
 
         if (!*path) path = ".";
 
-        char *l =
+        char *l TOOL_OWNED_TEXT =
             workspace_list(path);
 
         if (l) {
@@ -9063,7 +9070,6 @@ static char *process_tools_with_status(
                 l
             );
 
-            free(l);
 
         } else {
 
@@ -9073,11 +9079,11 @@ static char *process_tools_with_status(
                 path
             );
         }
-        free(list_path);
+        release_tool_result_text(&list_path);
     }
 
     size_t delete_pos = 0;
-    char *delete_path = extract_marker(reply, "[DELETE]", "\n", &delete_pos);
+    char *delete_path TOOL_OWNED_TEXT = extract_marker(reply, "[DELETE]", "\n", &delete_pos);
 
     if (delete_path) {
 
@@ -9105,7 +9111,7 @@ static char *process_tools_with_status(
                 path
             );
         }
-        free(delete_path);
+        release_tool_result_text(&delete_path);
     }
 
     const char *m = find_control_marker_line(reply, "[WRITE]", 0);
@@ -9164,7 +9170,7 @@ static char *process_tools_with_status(
 
                 size_t cn = (size_t)(control_delimiter_line(e, content) - content);
 
-                char *data =
+                char *data TOOL_OWNED_TEXT =
                     malloc(cn + 1);
 
                 if (!data) {
@@ -9225,7 +9231,6 @@ static char *process_tools_with_status(
                         );
                     }
 
-                    free(data);
                 }
 
             } else {
@@ -9258,7 +9263,7 @@ static char *process_tools_with_status(
 
     while (1) {
 
-        char *request =
+        char *request TOOL_OWNED_TEXT =
             extract_marker(
                 reply,
                 "[HAND_REQUEST]",
@@ -9269,9 +9274,9 @@ static char *process_tools_with_status(
         if (!request)
             break;
 
-        char *err = NULL;
+        char *err TOOL_OWNED_TEXT = NULL;
 
-        char *cmd =
+        char *cmd TOOL_OWNED_TEXT =
             plan_hand_request(
                 request,
                 &err
@@ -9289,7 +9294,7 @@ static char *process_tools_with_status(
                 )
             ) {
 
-                char *id =
+                char *id TOOL_OWNED_TEXT =
                     start_background_task(
                         cmd
                     );
@@ -9312,7 +9317,6 @@ static char *process_tools_with_status(
                     );
                 }
 
-                free(id);
 
             } else {
 
@@ -9323,7 +9327,6 @@ static char *process_tools_with_status(
                 );
             }
 
-            free(cmd);
 
         } else {
 
@@ -9334,8 +9337,6 @@ static char *process_tools_with_status(
             );
         }
 
-        free(err);
-        free(request);
     }
 
     m =
@@ -9355,7 +9356,7 @@ static char *process_tools_with_status(
             size_t n =
                 (size_t)(e - p);
 
-            char *cmd =
+            char *cmd TOOL_OWNED_TEXT =
                 malloc(n + 1);
 
             if (cmd) {
@@ -9381,7 +9382,7 @@ static char *process_tools_with_status(
                     )
                 ) {
 
-                    char *id =
+                    char *id TOOL_OWNED_TEXT =
                         start_background_task(t);
 
                     if (id) {
@@ -9402,7 +9403,6 @@ static char *process_tools_with_status(
                         );
                     }
 
-                    free(id);
 
                 } else {
 
@@ -9413,7 +9413,6 @@ static char *process_tools_with_status(
                     );
                 }
 
-                free(cmd);
 
             } else {
 
@@ -9435,21 +9434,19 @@ static char *process_tools_with_status(
     /* Hypothetical exploration is separate from factual memory and Reality. */
     size_t imagine_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[IMAGINE]", "[END IMAGINE]", &imagine_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[IMAGINE]", "[END IMAGINE]", &imagine_pos);
         if (!request) break;
-        char *scenario = r2_imagination_create(trim(request));
+        char *scenario TOOL_OWNED_TEXT = r2_imagination_create(trim(request));
         if (scenario) {
             APPEND("IMAGINATION RESULT:\n%s\n", scenario);
-            free(scenario);
         } else {
             APPEND("IMAGINATION ERROR: scenario could not be generated or persisted; no factual memory or real-world state was changed.\n");
         }
-        free(request);
     }
 
     size_t imagine_feedback_pos = 0;
     while (1) {
-        char *entry = extract_marker(reply, "[IMAGINE_FEEDBACK]", "[END IMAGINE_FEEDBACK]",
+        char *entry TOOL_OWNED_TEXT = extract_marker(reply, "[IMAGINE_FEEDBACK]", "[END IMAGINE_FEEDBACK]",
                                      &imagine_feedback_pos);
         if (!entry) break;
         char *first = strchr(entry, '|');
@@ -9481,12 +9478,11 @@ static char *process_tools_with_status(
         default: feedback_status = "ERROR: could not save feedback for the requested imagination branch"; break;
         }
         APPEND("IMAGINATION FEEDBACK %s.\n", feedback_status);
-        free(entry);
     }
 
     size_t sensory_journal_pos = 0;
     while (1) {
-        char *entry = extract_marker(reply, "[SENSORY_JOURNAL]", "\n", &sensory_journal_pos);
+        char *entry TOOL_OWNED_TEXT = extract_marker(reply, "[SENSORY_JOURNAL]", "\n", &sensory_journal_pos);
         if (!entry) break;
         char *first = strchr(entry, '|');
         char *second = first ? strchr(first + 1, '|') : NULL;
@@ -9497,7 +9493,7 @@ static char *process_tools_with_status(
             *second = '\0';
             arg1 = trim(first + 1);
         }
-        char *result = NULL;
+        char *result TOOL_OWNED_TEXT = NULL;
         if (!strcasecmp(action, "recent") && first) {
             char *end = NULL;
             errno = 0;
@@ -9522,82 +9518,73 @@ static char *process_tools_with_status(
         }
         if (result) {
             APPEND("SENSORY JOURNAL RESULT:\n%s\n", result);
-            free(result);
         } else {
             APPEND("SENSORY JOURNAL ERROR: use recent|1..100, search|query|1..100, or note|text|details.\n");
         }
-        free(entry);
     }
 
     /* Decisions to open/close sensors override Watch discovery. */
     size_t sense_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[SENSE]", "\n", &sense_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[SENSE]", "\n", &sense_pos);
         if (!request) break;
-        char *result = r2_process_sense_request(trim(request));
-        if (result) { APPEND("%s\n", result); free(result); }
-        free(request);
+        char *result TOOL_OWNED_TEXT = r2_process_sense_request(trim(request));
+        if (result) APPEND("%s\n", result);
     }
 
     /* R2 may choose to watch for subsequent model turns. Watch discovery
        never sets the media-attention decision. */
     size_t media_focus_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[MEDIA_FOCUS]", "\n", &media_focus_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[MEDIA_FOCUS]", "\n", &media_focus_pos);
         if (!request) break;
-        char *result = r2_process_media_focus_request(trim(request));
-        if (result) { APPEND("%s\n", result); free(result); }
-        free(request);
+        char *result TOOL_OWNED_TEXT = r2_process_media_focus_request(trim(request));
+        if (result) APPEND("%s\n", result);
     }
 
     /* Media pixels only enter semantic reasoning when the brain requests
        that display. Primary camera frames remain a distinct image source. */
     size_t media_see_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[MEDIA_SEE]", "\n", &media_see_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[MEDIA_SEE]", "\n", &media_see_pos);
         if (!request) break;
-        char *result = r2_process_media_see_request(trim(request));
-        if (result) { APPEND("%s\n", result); free(result); }
-        free(request);
+        char *result TOOL_OWNED_TEXT = r2_process_media_see_request(trim(request));
+        if (result) APPEND("%s\n", result);
     }
 
     /* Source discovery is itself a deliberate read-only action and does
        not choose a particular movie, microphone or playback output. */
     size_t ears_sources_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[EARS_SOURCES]", "\n", &ears_sources_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[EARS_SOURCES]", "\n", &ears_sources_pos);
         if (!request) break;
-        char *list = r2_ears_desktop_available_sources();
+        char *list TOOL_OWNED_TEXT = r2_ears_desktop_available_sources();
         if (list) {
             APPEND("EARS SOURCE DISCOVERY RESULT (available, not necessarily attended):\n%s\n", list);
-            free(list);
         } else {
             APPEND("EARS SOURCE DISCOVERY ERROR: could not allocate complete source list.\n");
         }
-        free(request);
     }
 
     /* Deliberate hearing is an action chosen by the brain, not a side effect
        of raw audio capture. Only this marker invokes speech recognition. */
     size_t ears_listen_pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[EARS_LISTEN]", "\n", &ears_listen_pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[EARS_LISTEN]", "\n", &ears_listen_pos);
         if (!request) break;
-        char *result = r2_process_ears_listen_request(request);
+        char *result TOOL_OWNED_TEXT = r2_process_ears_listen_request(request);
         if (result) {
             APPEND("%s\n", result);
-            free(result);
         } else {
             APPEND("EARS LISTEN ERROR: the result could not be allocated; verify the current audio/Whisper state before retrying.\n");
         }
-        free(request);
     }
 
     /* Persistent room, object, inventory and self-continuity actions.
        Format: [WORLD] action|field1|field2|field3|field4 */
     pos = 0;
     while (1) {
-        char *request = extract_marker(reply, "[WORLD]", "\n", &pos);
+        char *request TOOL_OWNED_TEXT = extract_marker(reply, "[WORLD]", "\n", &pos);
         if (!request) break;
         char *fields[5] = {0};
         char *part = request;
@@ -9606,7 +9593,6 @@ static char *process_tools_with_status(
             fields[nf++] = trim(strsep(&part, "|"));
         }
         if (part) {
-            free(request);
             APPEND("WORLD ERROR: too many fields; no action was taken.\n");
             continue;
         }
@@ -9663,7 +9649,8 @@ static char *process_tools_with_status(
             int command_rc = command
                 ? run_gameboy_console(console_path, command, arg1, arg2, &console_output)
                 : -1;
-            struct json_object *console_json = gameboy_parse_response(console_output);
+            struct json_object *console_json
+                __attribute__((cleanup(release_tool_result_json))) = gameboy_parse_response(console_output);
             free(console_output);
             int response_is_list = command && !strcmp(command, "list") &&
                 console_json && json_object_is_type(console_json, json_type_array);
@@ -9752,7 +9739,6 @@ static char *process_tools_with_status(
                 r2_log_event(R2_LOG_WORLD, "gameboy_device_action",
                              summary, NULL, "GameBoyAdvance");
             }
-            if (console_json) json_object_put(console_json);
         } else if (nf > 0 && !strcasecmp(fields[0], "location")) {
             int home = nf == 3 && !strcasecmp(fields[2], "home");
             int away = nf == 3 && (!strcasecmp(fields[2], "outside") ||
@@ -9769,9 +9755,8 @@ static char *process_tools_with_status(
                     APPEND("LOCATION ERROR: the requested move could not be committed.\n");
             }
         } else if (nf == 1 && !strcasecmp(fields[0], "look")) {
-            char *view = r2_reality_room_look();
+            char *view TOOL_OWNED_TEXT = r2_reality_room_look();
             APPEND("REAL WORLD RESULT:\n%s\n", view ? view : "Could not read room state.");
-            free(view);
         } else if (nf >= 4 && !strcasecmp(fields[0], "add")) {
             int qty = 1, valid_qty = 1;
             if (nf >= 5) {
@@ -9808,9 +9793,8 @@ static char *process_tools_with_status(
         } else if (nf == 5 && !strcasecmp(fields[0], "buy")) {
             double price=0.0;int valid=parse_finite_double(fields[2],&price);int rc=valid?r2_reality_buy_item(fields[1],fields[3],price,fields[4]):-1;APPEND("PURCHASE %s: %s for $%.2f %s.\n",rc==0?"RESULT":"ERROR",fields[1],price,rc==0?"paid and added":"failed; check funds and destination");
         } else if (nf <= 2 && !strcasecmp(fields[0], "fridge")) {
-            char *view = r2_fridge_context();
+            char *view TOOL_OWNED_TEXT = r2_fridge_context();
             APPEND("FRIDGE RESULT:\n%s\n", view ? view : "Fridge database unavailable.");
-            free(view);
         } else if (nf == 2 && !strcasecmp(fields[0], "fridge_take")) {
             int rc = r2_fridge_take(fields[1]);
             APPEND("FRIDGE %s: '%s' %s.\n", rc == 0 ? "RESULT" : "ERROR", fields[1],
@@ -9822,9 +9806,8 @@ static char *process_tools_with_status(
             APPEND("FRIDGE %s: eating '%s' %s.\n", rc == 0 ? "RESULT" : "ERROR", fields[1],
                    rc == 0 ? "reduced hunger and consumed fridge stock" : "failed; item may not be in the fridge");
         } else if (nf == 1 && !strcasecmp(fields[0], "tv_status")) {
-            char *tv = r2_reality_tv_status();
+            char *tv TOOL_OWNED_TEXT = r2_reality_tv_status();
             APPEND("TV STATUS:\n%s", tv ? tv : "TV state unavailable.\n");
-            free(tv);
         } else if (nf == 2 && !strcasecmp(fields[0], "tv_power")) {
             int on = !strcasecmp(fields[1], "on") ? 1 : !strcasecmp(fields[1], "off") ? 0 : -1;
             int rc = on >= 0 ? r2_reality_tv_power(on) : -1;
@@ -9841,11 +9824,10 @@ static char *process_tools_with_status(
             char *end = NULL; long channel = strtol(fields[1], &end, 10);
             int rc = (end != fields[1] && !*end && channel >= 2 && channel <= 13)
                 ? r2_reality_tv_tune_rf((int)channel) : -1;
-            char *tv = r2_reality_tv_status();
+            char *tv TOOL_OWNED_TEXT = r2_reality_tv_status();
             APPEND("TV %s: %s RF channel %s. Current state:\n%s",
                    rc == 0 ? "RESULT" : "ERROR",
                    rc == 0 ? "selected" : "could not select", fields[1], tv ? tv : "unavailable\n");
-            free(tv);
         } else if (nf == 4 && !strcasecmp(fields[0], "tv_connect")) {
             char *end = NULL;
             errno = 0;
@@ -9910,7 +9892,6 @@ static char *process_tools_with_status(
         } else {
             APPEND("REAL WORLD ERROR: malformed or unsupported [WORLD] action.\n");
         }
-        free(request);
     }
 
     m =
@@ -9966,7 +9947,7 @@ static char *process_tools_with_status(
             )
         ) {
 
-            char *id =
+            char *id TOOL_OWNED_TEXT =
                 start_background_task(
                     cmd
                 );
@@ -9989,7 +9970,6 @@ static char *process_tools_with_status(
                 );
             }
 
-            free(id);
 
         } else {
 
@@ -10002,6 +9982,7 @@ static char *process_tools_with_status(
     }
 
 #undef APPEND
+#undef TOOL_OWNED_TEXT
 
     return results;
 }

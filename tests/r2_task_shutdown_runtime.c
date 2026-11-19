@@ -7,8 +7,77 @@
 #undef main
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
+
+static int fail_result_format, fail_result_growth, growth_armed;
+static uintptr_t read_path_address, read_data_address;
+
+void __real_free(void *value);
+void __wrap_free(void *value)
+{
+    if ((uintptr_t)value == read_path_address) read_path_address = 0;
+    if ((uintptr_t)value == read_data_address) read_data_address = 0;
+    __real_free(value);
+}
+
+void *__real_realloc(void *value, size_t size);
+void *__wrap_realloc(void *value, size_t size)
+{
+    if (growth_armed) {
+        growth_armed = 0;
+        fail_result_growth = 0;
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_realloc(value, size);
+}
+
+int __wrap_asprintf(char **answer, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int read_result = (fail_result_format || fail_result_growth) &&
+        !strcmp(format, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n");
+    if (read_result) {
+        va_list copy;
+        va_copy(copy, args);
+        read_path_address = (uintptr_t)va_arg(copy, const char *);
+        read_data_address = (uintptr_t)va_arg(copy, const char *);
+        va_end(copy);
+        if (fail_result_format) {
+            fail_result_format = 0;
+            va_end(args);
+            *answer = NULL;
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    int formatted = vasprintf(answer, format, args);
+    va_end(args);
+    growth_armed = read_result && fail_result_growth && formatted > 1024;
+    return formatted;
+}
+
+static void check_action_output_allocation_failure(void)
+{
+    static const char path[] = R2_WORKSPACE "/large read fixture.txt";
+    FILE *fp = fopen(path, "w");
+    assert(fp);
+    for (unsigned i = 0; i < 2200; ++i) assert(fputc('x', fp) == 'x');
+    assert(fclose(fp) == 0);
+    for (int grow = 0; grow <= 1; ++grow) {
+        fail_result_format = !grow;
+        fail_result_growth = grow;
+        char *answer = process_tools("[READ] large read fixture.txt");
+        assert(!fail_result_format && !fail_result_growth);
+        assert(answer && strstr(answer, "I ran out of memory while recording an action result."));
+        assert(!read_path_address && !read_data_address);
+        free(answer);
+    }
+    assert(unlink(path) == 0);
+}
 
 static void *request_shutdown_after_delay(void *unused)
 {
@@ -205,6 +274,7 @@ int main(void)
 
     check_complete_output_archive();
     atomic_store(&shutting_down, 0);
+    check_action_output_allocation_failure();
     check_workspace_path_with_spaces();
     check_console_shutdown("exec sleep 30");
     check_console_shutdown("exec >/dev/null; exec sleep 30");
