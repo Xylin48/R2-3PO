@@ -44,7 +44,9 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     with sqlite3.connect(rewards) as db:
         db.executescript("""
             CREATE TABLE reward_events(id INTEGER PRIMARY KEY, log_event_id INTEGER);
-            INSERT INTO reward_events VALUES(1,1);
+            INSERT INTO reward_events VALUES(1,1),(3,0),(4,NULL);
+            CREATE TABLE reward_once_keys(target TEXT, reward_event_id INTEGER);
+            INSERT INTO reward_once_keys VALUES('linked',1),('pending-zero',0),('pending-null',NULL);
         """)
 
     reports = audit.audit_root(root)
@@ -55,6 +57,11 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert checked_relationships
     assert all(item["status"] in ("checked", "not_checked") for item in relationships), relationships
     assert all(item["orphan_count"] == 0 for item in checked_relationships), checked_relationships
+    reward_checks = [item for item in checked_relationships
+                     if item["source_database"] == "r2_rewards.db"]
+    assert {item["source_table"]: item["checked_rows"] for item in reward_checks} == {
+        "reward_events": 1, "reward_once_keys": 1,
+    }, reward_checks
 
     with sqlite3.connect(memory) as db:
         db.execute("INSERT INTO r2_alternate_self_branches VALUES(2,NULL,NULL)")
@@ -75,6 +82,11 @@ with tempfile.TemporaryDirectory(prefix="r2-db-links-") as tmp:
     assert len(broken) == 1, broken
     assert broken[0]["source_table"] == "reward_events"
     assert broken[0]["orphan_values"] == [999]
+    with sqlite3.connect(rewards) as db:
+        db.execute("INSERT INTO reward_once_keys VALUES('broken',998)")
+    relationships = audit.audit_relationships(root, reports["databases"])
+    assert any(item["source_table"] == "reward_once_keys"
+               and item["orphan_values"] == [998] for item in relationships)
 
     # Legacy copies may lack declared foreign keys on exact reflection links.
     with sqlite3.connect(memory) as db:

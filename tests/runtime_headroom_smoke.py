@@ -65,7 +65,9 @@ if talk.count("process_tools(") != 1:
     raise SystemExit("A failed post-action reply retry must not execute already-completed tools a second time.")
 
 for label, source, needle in (
-    ("fridge schema migration", reality, "static int fridge_migrate_schema(void)"),
+    ("fridge schema migration", reality, "static int fridge_migrate_schema(const char *legacy_path)"),
+    ("legacy stock import at first fridge creation", reality,
+     "rc = fridge_import_legacy_stock(legacy_path);"),
     ("Reality need-state migration", reality, "static int migrate_reality_self_schema(void)"),
     ("visual experience schema migration", visual, "static int visual_migrate_schema(void)"),
     ("diary link schema migration", diary, "diary_ensure_column(\"r2_diary_entry_links\", \"memory_indexed\""),

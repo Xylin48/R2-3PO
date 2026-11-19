@@ -277,6 +277,13 @@ def _relationship_check(
             ("r2_log_links", "to_event_id"),
         }
         select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
+        # These older reward records use zero for a relationship that has
+        # not been established yet. Check every populated ID.
+        if (source_table, source_column) in {
+            ("reward_events", "log_event_id"),
+            ("reward_once_keys", "reward_event_id"),
+        }:
+            select_sql += f" AND {qc} <> 0"
         qt = '"' + target_table.replace('"', '""') + '"'
         qtc = '"' + target_column.replace('"', '""') + '"'
         orphan_values: list[Any] = []
@@ -342,6 +349,7 @@ def audit_relationships(
         ("r2_memory.db", "r2_sensory_journal_reflection_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_reflection_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
         ("r2_rewards.db", "reward_events", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_rewards.db", "reward_once_keys", "reward_event_id", "r2_rewards.db", "reward_events", "id"),
     ]
     output = []
     try:
