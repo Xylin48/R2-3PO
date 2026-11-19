@@ -24,6 +24,8 @@ static char *reviewed_bytes;
 static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
+static int invalid_body_at;
+static char *isolated_retry_payload;
 static int foreground_after_response;
 static int completed_turn_after_response;
 static int defer_post_turn_request;
@@ -117,6 +119,16 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
             assert(!json_object_get_boolean(think));
             body = reasoning_retry_response;
         }
+    }
+    if (perform_count == invalid_body_at) {
+        static char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
+        body = truncated_body;
+        isolated_retry_payload = strdup(posted);
+        assert(isolated_retry_payload);
+    } else if (isolated_retry_payload) {
+        assert(!strcmp(posted, isolated_retry_payload));
+        free(isolated_retry_payload);
+        isolated_retry_payload = NULL;
     }
     size_t n = strlen(body), split = n / 3;
     assert(write_response(body, 1, split, write_data) == split);
@@ -905,9 +917,10 @@ static void check_reasoning_recovery(void)
     const char *old_query = ollama_authoritative_user_query;
     ollama_authoritative_user_query = greeting;
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         ollama_audit_stage = i == 1 ? "conversation-retry" : "conversation-answer";
-        set_response(i == 0 ? "[RUN] rejected first attempt" : "", i == 0 ? "length" : "stop", 1);
+        const char *initial = i == 0 ? "[RUN] rejected first attempt" : i == 3 ? " \n\t" : "";
+        set_response(initial, i == 0 ? "length" : "stop", 1);
         reasoning_retry_response = i == 2 ? incomplete : recovered;
         int before = perform_count;
         char *reply = ollama_chat_with_limit(turn, 2, "Complete policy.", 768, 60);
@@ -1003,6 +1016,18 @@ static void check_compact_ranked_memory(void)
            strstr(full, third));
     free(full);
     free(answer);
+
+    ollama_audit_stage = "conversation-retry";
+    char *correction = r2_build_retry_system_prompt();
+    assert(correction);
+    before = perform_count;
+    answer = r2_foreground_chat(turn, 4, correction, query, 1024, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(r2_compact_conversation_policy) &&
+           captured_contains(compact_retry_system_prompt) &&
+           captured_contains(identity) && captured_contains(query));
+    free(correction);
+    free(answer);
     free(history);
     free(world);
     free(large);
@@ -1014,6 +1039,54 @@ static void check_compact_ranked_memory(void)
     ollama_audit_stage = old_stage;
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;
+}
+
+static void check_isolated_response_replay(void)
+{
+    const char *policy = "Read the complete evidence.";
+    const char *fragment = "Evidence fragment stays exact across the replay.";
+    const char *note = "The complete fragment was reviewed.";
+    int old_mode = ollama_foreground_turn_mode;
+    ollama_foreground_turn_mode = 1;
+    set_response(note, "stop", 1);
+    int before = perform_count;
+    invalid_body_at = before + 1;
+    char *reply = r2_model_generate(policy, fragment, 512);
+    assert(reply && !strcmp(reply, note) && perform_count == before + 2);
+    assert(!isolated_retry_payload);
+    free(reply);
+    invalid_body_at = 0;
+
+    before = perform_count;
+    free(response_body);
+    response_body = strdup("{\"done\":");
+    assert(response_body);
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 2);
+
+    fixture_http_status = 503;
+    before = perform_count;
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
+    fixture_http_status = 200;
+
+    ollama_foreground_turn_mode = 0;
+    set_response(note, "stop", 1);
+    before = perform_count;
+    invalid_body_at = before + 1;
+    foreground_after_response = 1;
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
+    assert(isolated_retry_payload);
+    free(isolated_retry_payload);
+    isolated_retry_payload = NULL;
+    invalid_body_at = 0;
+    atomic_store(&foreground_conversation_waiting, 0);
+    ollama_foreground_turn_mode = old_mode;
+
+    const char *problem = NULL;
+    size_t offset = 0;
+    static const char embedded_nul[] = "{}\0{}";
+    assert(!r2_parse_complete_json_object(embedded_nul, sizeof(embedded_nul) - 1,
+                                          &problem, &offset));
+    assert(problem && !strcmp(problem, "embedded NUL byte") && offset == 2);
 }
 
 int main(void)
@@ -1103,6 +1176,7 @@ int main(void)
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     check_reasoning_recovery();
     assert(cleanup_count == perform_count + 2);
+    check_isolated_response_replay();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
     assert(asprintf(&malformed, "%s trailing non-JSON", response_body) >= 0);
