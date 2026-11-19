@@ -53,6 +53,17 @@ It checks the source/deployment files, the local Ollama API and `qwen3.5:9b`, SQ
 
    If a check fails, correct the existing owner/group/ACL deliberately before continuing. The core stores its five SQLite databases under `R2/` (`r2_memory.db`, `r2_reality.db`, `r2_fridge.db`, `r2_rewards.db`, and `r2_addictions.db`), so account `r2` needs read/write access to that directory and its existing database files.
 
+## Update the interactive launcher
+
+The desktop launcher lives beside the `R2/` checkout. After updating that
+checkout to the reviewed revision, refresh the desktop copy from the same revision.
+This keeps a numbered backup if a launcher is already installed.
+
+```sh
+install --backup=numbered -m 0755 \
+  /home/x/R2_Home/R2/R2_Launch_Code.sh /home/x/R2_Home/R2_Launch_Code.sh
+```
+
 ## Local inference timeout
 
 Foreground chat and its corrective retry allow up to six hours per request by default to accommodate slow mixed CPU/GPU inference and Qwen's reasoning channel. Override the setting before starting the interactive launcher if needed:

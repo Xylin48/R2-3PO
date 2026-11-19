@@ -696,6 +696,7 @@ jobs:
 
       - name: Validate deployment scripts and private model copier
         run: |
+          test -x R2_Launch_Code.sh
           bash -n R2_Launch_Code.sh
           bash -n tools/r2_service_runner.sh
           bash -n tools/r2_ollama_runner.sh
