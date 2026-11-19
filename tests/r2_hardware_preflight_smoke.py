@@ -92,11 +92,11 @@ if 'sudo -n -u r2 -g r2 -G audio' in script:
     raise SystemExit("preflight must not use unsupported sudo-rs -G syntax")
 if 'sudo -n -u r2 test -r' in script or 'sudo -n -u r2 pactl info' in script:
     raise SystemExit("runtime checks must execute directly as r2 after the preflight privilege drop")
-if 'sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --' not in launcher:
+if 'R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --' not in launcher:
     raise SystemExit("launcher must use setpriv for supplementary groups under sudo-rs")
 if 'sudo -u r2 -g r2 -G "$R2_RUNTIME_GROUPS"' in launcher:
     raise SystemExit("launcher must not use unsupported sudo-rs -G syntax")
-if 'sudo -n -u r2 mkdir -p "$DIR"' not in launcher:
+if 'run_as_r2 mkdir -p "$DIR"' not in launcher:
     raise SystemExit("launcher must create runtime directories as r2, not as the desktop login user")
 if 'Could not create workspace directory as r2' not in launcher:
     raise SystemExit("launcher must stop if runtime-owned directory creation fails")
@@ -213,7 +213,7 @@ probe_start = launcher.index('R2_DATABASE_AUDIT=')
 probe_end = launcher.index("# Create only the established workspace", sqlite_at)
 sqlite_probe = (
     'R2_ROOT="$1"\nR2_SOURCE="$1/source"\nR2_GAMEBOY_ROOT="$1/Devices/GameBoyAdvance"\n'
-    'shift\nsudo() { shift 4; "$@"; }\n'
+    'shift\nrun_as_r2() { "$@"; }\n'
     + launcher.split('R2_ROOT=', 1)[0]
     + launcher[probe_start:probe_end].replace(
         '"$R2_SOURCE/tools/audit_r2_databases.py"', '"$R2_AUDIT_FIXTURE"'

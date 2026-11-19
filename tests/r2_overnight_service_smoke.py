@@ -154,7 +154,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertNotIn("FAKETIME_OFFSET=$((R2_EPOCH - REAL_EPOCH))", launcher)
         self.assertIn("no relaunch reset", launcher)
         self.assertIn('R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}"', launcher)
-        self.assertIn('sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2', launcher)
+        self.assertIn('run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2', launcher)
         self.assertIn('if [[ -z "${R2_OLLAMA_NUM_GPU+x}" ]]; then', launcher)
         self.assertIn("GTX 1050 Ti", launcher)
         self.assertIn("export R2_OLLAMA_NUM_GPU=20", launcher)
@@ -162,7 +162,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("R2_RUNTIME_GROUPS=", launcher)
         self.assertIn('R2_RUNTIME_GROUPS+=",${DEVICE_GID}"', launcher)
         self.assertIn("for DEVICE_GROUP in audio video; do", launcher)
-        self.assertIn('sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --', launcher)
+        self.assertIn('R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --', launcher)
         self.assertNotIn('sudo -u r2 -g r2 -G "$R2_RUNTIME_GROUPS"', launcher)
         self.assertNotIn("usermod -aG audio", launcher)
 

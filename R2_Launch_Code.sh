@@ -44,6 +44,27 @@ if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]
     exit 1
 fi
 
+# Give R2 runtime commands the device groups they need without permanently
+# changing account membership. Preserve r2's existing groups, then add the
+# host audio/video GIDs for speaker/microphone and camera access when present.
+R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
+for DEVICE_GROUP in audio video; do
+    if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
+       [[ "$DEVICE_GID" =~ ^[0-9]+$ ]]; then
+        case ",$R2_RUNTIME_GROUPS," in
+            *,"$DEVICE_GID",*) ;;
+            *) R2_RUNTIME_GROUPS+=",${DEVICE_GID}" ;;
+        esac
+    fi
+done
+
+# Drop privileges before executing any project or runtime command.
+R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --
+    env HOME="$R2_ROOT" USER=r2 LOGNAME=r2)
+run_as_r2() {
+    "${R2_HANDOFF[@]}" "$@"
+}
+
 R2_NETWORK_LOCK_ACTIVE=0
 OBSERVER_XHOST_GRANTED=0
 OBSERVER_PID=""
@@ -236,7 +257,7 @@ if [[ ! -r "$R2_PREFLIGHT" ]]; then
     if [[ -t 0 ]]; then read -r -p "Press Enter to exit..."; fi
     exit 1
 fi
-if ! R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" R2_EXEC="$R2_EXEC" \
+if ! run_as_r2 env R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" R2_EXEC="$R2_EXEC" \
      R2_FX_DIR="$R2_FX_DIR" bash "$R2_PREFLIGHT"; then
     echo
     echo "R2 launch cancelled: preflight reported one or more failures."
@@ -273,15 +294,14 @@ echo "[preflight] Checking the SQLite stores for final activation..."
 R2_DATABASE_AUDIT="$R2_SOURCE/tools/audit_r2_databases.py"
 AUDIT_ARGS=(--root "$R2_SOURCE" --gameboy-root "$R2_GAMEBOY_ROOT")
 if [[ "${1:-}" == "--legacy-memory-only" ]]; then
-    if ! SNAPSHOT_DIR="$(sudo -n -u r2 -- mktemp -d "$R2_ROOT/audit-snapshot-desktop.XXXXXX")"; then
+    if ! SNAPSHOT_DIR="$(run_as_r2 mktemp -d "$R2_ROOT/audit-snapshot-desktop.XXXXXX")"; then
         echo "ERROR: Could not create the database snapshot directory. R2 was not launched."
         exit 1
     fi
     echo "[preflight] Legacy database snapshot directory: $SNAPSHOT_DIR"
     AUDIT_ARGS+=(--snapshot-dir "$SNAPSHOT_DIR" --legacy-memory-only)
 fi
-if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
-    python3 "$R2_DATABASE_AUDIT" "${AUDIT_ARGS[@]}"; then
+if ! run_as_r2 python3 "$R2_DATABASE_AUDIT" "${AUDIT_ARGS[@]}"; then
     echo "ERROR: Database audit failed. R2 was not launched."
     exit 1
 fi
@@ -305,7 +325,7 @@ for DIR in "${R2_DIRS[@]}"; do
     # Runtime-owned directories must be created as r2. Creating a missing
     # directory as the desktop login user would leave it mode 0755 and
     # unwritable by R2, causing SQLite/diary/world-state writes to fail later.
-    if ! sudo -n -u r2 mkdir -p "$DIR"; then
+    if ! run_as_r2 mkdir -p "$DIR"; then
         echo "ERROR: Could not create workspace directory as r2: $DIR"
         echo "Check that r2 can traverse and write the workspace root."
         read -p "Press Enter to exit..."
@@ -324,7 +344,7 @@ if [[ ! -r "$R2_SOURCE/tools/preflight_ollama_model.py" ]]; then
     read -p "Press Enter to exit..."
     exit 1
 fi
-if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+if ! run_as_r2 env \
     R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
     R2_OLLAMA_NUM_CTX="${R2_OLLAMA_NUM_CTX:-}" \
     R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
@@ -354,7 +374,7 @@ if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
                 for CONTEXT_TOKENS in "${CONTEXT_CANDIDATES[@]}"; do
                     export R2_OLLAMA_NUM_CTX="$CONTEXT_TOKENS"
                     echo "[GPU] Retrying foreground preflight with ${GPU_LAYERS} GPU layers and ${CONTEXT_TOKENS} context tokens."
-                    if sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+                    if run_as_r2 env \
                         R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
                         R2_OLLAMA_NUM_CTX="$R2_OLLAMA_NUM_CTX" \
                         R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
@@ -366,7 +386,7 @@ if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
                 done
             else
                 echo "[GPU] Retrying foreground preflight with ${GPU_LAYERS} GPU layers and explicitly configured context ${R2_OLLAMA_NUM_CTX}."
-                if sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+                if run_as_r2 env \
                     R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
                     R2_OLLAMA_NUM_CTX="$R2_OLLAMA_NUM_CTX" \
                     R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
@@ -400,7 +420,7 @@ echo
 if [[ -z "${R2_WHISPER_MODEL:-}" ]]; then
     echo "[speech] Local Whisper is not configured; typed chat and vision can still run."
     echo "[speech] To enable voice-to-chat, see: $R2_SOURCE/docs/local-speech-input.md"
-elif ! sudo -n -u r2 -- test -r "$R2_WHISPER_MODEL"; then
+elif ! run_as_r2 test -r "$R2_WHISPER_MODEL"; then
     echo "[speech] WARNING: R2 cannot read R2_WHISPER_MODEL=$R2_WHISPER_MODEL"
     echo "[speech] Voice-to-chat will be unavailable until the model path and permissions are corrected."
 else
@@ -418,7 +438,7 @@ if [[ -f "$TV_SOURCE" && -f "$TV_INSTALLER" ]]; then
     if [[ ! -x "$TV_DIR/run_tv.sh" || ! -f "$TV_DIR/TV.desktop" ||
           ! -f "$TV_DIR/TV.py" ]] || ! cmp -s "$TV_SOURCE" "$TV_DIR/TV.py"; then
         echo "Installing/updating R2's TV device..."
-        if ! sudo -n -u r2 -- env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+        if ! run_as_r2 env \
             R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
             bash "$TV_INSTALLER"; then
             echo "WARNING: TV installer failed. R2 will continue startup; TV needs attention."
@@ -509,12 +529,12 @@ echo
 R2_FX_DIR="${R2_FX_DIR:-/home/x/R2_Home/R2_sounds/FX}"
 SOUND_AUDIT="$R2_SOURCE/tools/audit_r2_sound_assets.py"
 if [ -f "$SOUND_AUDIT" ]; then
-    if ! sudo -n -u r2 env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    if ! run_as_r2 \
             python3 "$SOUND_AUDIT" --root "$R2_FX_DIR"; then
         echo "WARNING: r2 could not complete the sound asset inventory."
         echo "R2 will still start; beep/whistle markers may have no matching audio."
     fi
-elif sudo -n -u r2 env HOME="$R2_ROOT" bash -c 'test -d "$1" && test -r "$1" && find "$1" -maxdepth 1 -type f -iname "*.mp3" -print -quit | grep -q .' _ "$R2_FX_DIR"; then
+elif run_as_r2 bash -c 'test -d "$1" && test -r "$1" && find "$1" -maxdepth 1 -type f -iname "*.mp3" -print -quit | grep -q .' _ "$R2_FX_DIR"; then
     echo "State-aware sound assets are readable by r2: $R2_FX_DIR"
 else
     echo "WARNING: r2 cannot find readable MP3 effects in: $R2_FX_DIR"
@@ -682,7 +702,7 @@ if [ -e "$TEMP_EXEC" ] || [ -L "$TEMP_EXEC" ]; then
     exit 1
 fi
 
-sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2 \
+run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2 \
     "$R2_SOURCE/r2.c" \
     "$R2_SOURCE/shell.c" \
     "$R2_SOURCE/r2_diary.c" \
@@ -713,7 +733,7 @@ sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2 \
 status=$?
 
 if [ $status -ne 0 ]; then
-    sudo -n -u r2 -- rm -f "$TEMP_EXEC"
+    run_as_r2 rm -f "$TEMP_EXEC"
     echo
     echo "========================================"
     echo "ERROR: R2 compilation failed."
@@ -724,8 +744,8 @@ if [ $status -ne 0 ]; then
     exit $status
 fi
 
-if ! sudo -n -u r2 -- chmod 0755 "$TEMP_EXEC" || ! sudo -n -u r2 -- mv -f "$TEMP_EXEC" "$R2_EXEC"; then
-    sudo -n -u r2 -- rm -f "$TEMP_EXEC"
+if ! run_as_r2 chmod 0755 "$TEMP_EXEC" || ! run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"; then
+    run_as_r2 rm -f "$TEMP_EXEC"
     echo "ERROR: Could not atomically install the newly compiled R2 executable."
     echo "The previous executable was preserved if replacement had not completed; R2 was NOT launched."
     exit 1
@@ -773,7 +793,7 @@ echo
 if [ -n "${DISPLAY:-}" ] && command -v xhost >/dev/null 2>&1 && xhost +SI:localuser:r2 >/dev/null 2>&1; then
     OBSERVER_XHOST_GRANTED=1
     # Don't pass the desktop user's cookie or R2's virtual-clock environment.
-    sudo -n -u r2 env -u XAUTHORITY HOME="$R2_ROOT" USER=r2 LOGNAME=r2 DISPLAY="${DISPLAY}" \
+    "${R2_HANDOFF[@]}" env -u XAUTHORITY DISPLAY="${DISPLAY}" \
         python3 "$R2_SOURCE/Observer.py" &
     OBSERVER_PID=$!
 else
@@ -782,42 +802,11 @@ else
 fi
 
 echo "Launching R2..."
+printf 'R2 diagnostics are saved in %s.\n' "$R2_ROOT/R2_Log/Debug.txt"
 echo
 
-# Give this R2 process the device groups it needs without permanently
-# changing account membership. Preserve r2's existing groups, then add the
-# host audio/video GIDs for speaker/microphone and camera access when present.
-R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
-for DEVICE_GROUP in audio video; do
-    if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
-       [[ "$DEVICE_GID" =~ ^[0-9]+$ ]]; then
-        case ",$R2_RUNTIME_GROUPS," in
-            *,"$DEVICE_GID",*) ;;
-            *) R2_RUNTIME_GROUPS+=",${DEVICE_GID}" ;;
-        esac
-    fi
-done
-
-# ------------------------------------------------------------
-# START R2 WITH ITS PRIVATE CLOCK
-# ------------------------------------------------------------
-
-R2_UID="$(id -u r2)"
-R2_GID="$(id -g r2)"
-R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
-if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
-    echo "ERROR: Could not resolve the dedicated r2 account identity."
-    exit 1
-fi
-
-# Ubuntu sudo-rs does not support sudo's traditional -G option. Run setpriv
-# with elevated privilege only long enough to set supplementary groups, then
-# drop UID/GID before starting R2. No permanent account/group changes occur.
-sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" -- \
-    env \
-    HOME="$R2_ROOT" \
-    USER="r2" \
-    LOGNAME="r2" \
+# Apply the private clock only to the core and its children.
+run_as_r2 env \
     DISPLAY="${DISPLAY:-}" \
     R2_SOURCE="$R2_SOURCE" \
     XAUTHORITY="${XAUTHORITY:-}" \
@@ -838,7 +827,13 @@ sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS
     R2_CAMERA_DEVICE="${R2_CAMERA_DEVICE:-/dev/video0}" \
     R2_VISION_MODEL="qwen3.5:9b" \
     R2_FX_DIR="$R2_FX_DIR" \
-    sh -c 'exec "$1" 2>>"$2"' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt"
+    bash -c '
+        if [[ "$3" == 1 ]]; then
+            : >>"$2" || exit 1
+            exec "$1" 2> >(tee -a -- "$2" >&2)
+        fi
+        exec "$1" 2>>"$2"
+    ' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"
 
 status=$?
 

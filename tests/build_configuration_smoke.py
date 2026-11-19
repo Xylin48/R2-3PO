@@ -91,7 +91,7 @@ require(
     "default Makefile build treats compiler warnings as errors",
 )
 require(
-    'sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2 \\' in launcher,
+    'run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2 \\' in launcher,
     "interactive launcher uses the same strict compiler policy",
 )
 require(

@@ -66,6 +66,12 @@ install --backup=numbered -m 0755 \
 
 ## Local inference timeout
 
+The desktop launcher runs its audits, model probes, compiler, device setup,
+Observer, and core through the dedicated `r2` account. For an interactive
+diagnostic run, set `R2_LIVE_DIAGNOSTICS=1` before starting the launcher.
+Core diagnostics then appear in the terminal and continue to be appended to
+`/home/x/R2_Home/R2_Log/Debug.txt` by `r2`.
+
 Foreground chat and its corrective retry allow up to six hours per request by default to accommodate slow mixed CPU/GPU inference and Qwen's reasoning channel. Override the setting before starting the interactive launcher if needed:
 
 ```sh
