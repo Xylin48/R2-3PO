@@ -72,6 +72,23 @@ diagnostic run, set `R2_LIVE_DIAGNOSTICS=1` before starting the launcher.
 Core diagnostics then appear in the terminal and continue to be appended to
 `/home/x/R2_Home/R2_Log/Debug.txt` by `r2`.
 
+From your desktop account, read the existing log under R2's identity, even
+with R2 and its model stopped.
+
+```sh
+sudo -u r2 -- tail -n 100 /home/x/R2_Home/R2_Log/Debug.txt
+```
+
+When Ollama completes a foreground chat with only private reasoning or stops
+at the generation limit, R2 can replay that request once with thinking off.
+The replay keeps the same current turn, context, images and generation budget.
+The diagnostics identify the reason, context size and output budget. Only a
+complete assistant response can proceed to the normal reply and action checks.
+
+The desktop launcher sends these requests as `r2` to the existing localhost
+Ollama service on port 11434. The overnight installation has its own
+`r2`-owned Ollama service on port 11435.
+
 Foreground chat and its corrective retry allow up to six hours per request by default to accommodate slow mixed CPU/GPU inference and Qwen's reasoning channel. Override the setting before starting the interactive launcher if needed:
 
 ```sh

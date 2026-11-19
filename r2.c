@@ -3760,6 +3760,10 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     return 0;
 }
 
+static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predict,
+                                int allow_reasoning, long timeout_seconds,
+                                const char **retry_without_thinking);
+
 static char *ollama_chat_with_limit(
     Message *msgs,
     size_t count,
@@ -4472,18 +4476,49 @@ static char *ollama_chat_with_limit(
             audit_startup_memory, audit_retrieved_context, audit_reality_context,
             audit_capability_context, audit_learning_context, audit_system_chars);
 
+    const char *retry_without_thinking = NULL;
+    char *result = ollama_submit_chat(payload, num_ctx, num_predict, allow_reasoning,
+                                     timeout_seconds, &retry_without_thinking);
+    /* Replay the exact serialized context once, with Qwen's non-thinking sampler.
+       Do not reuse incomplete output, re-collect sensory input, or interpret a
+       transport error as a reasoning problem. */
+    if (!result && retry_without_thinking && allow_reasoning &&
+        !ollama_background_mode && !shutting_down) {
+        fprintf(stderr,
+                "[R2 Ollama] Retrying the same request with thinking disabled "
+                "(stage=%s, reason=%s, context=%d, num_predict=%d).\n",
+                ollama_audit_stage, retry_without_thinking, num_ctx, num_predict);
+        if (json_object_object_get_ex(root, "options", &options) &&
+            ollama_json_object_add_checked(root, "think", json_object_new_boolean(0)) == 0 &&
+            ollama_json_object_add_checked(options, "temperature", json_object_new_double(0.7)) == 0 &&
+            ollama_json_object_add_checked(options, "top_p", json_object_new_double(0.8)) == 0) {
+            payload = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+            if (payload)
+                result = ollama_submit_chat(payload, num_ctx, num_predict, 0,
+                                            timeout_seconds, &retry_without_thinking);
+        } else {
+            fprintf(stderr, "[R2 Ollama] Could not construct the non-thinking retry.\n");
+        }
+    }
+    json_object_put(root);
+    return result;
+}
+
+static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predict,
+                                int allow_reasoning, long timeout_seconds,
+                                const char **retry_without_thinking)
+{
+    *retry_without_thinking = NULL;
     /* Capture exactly what will be sent to Ollama only when the owner opts in. */
     ollama_trace_prompt_if_enabled(payload);
 
     char ollama_url[128];
     if (r2_ollama_chat_url(ollama_url, sizeof(ollama_url)) != 0) {
-        json_object_put(root);
         return NULL;
     }
 
     CURL *curl = curl_easy_init();
     if (!curl) {
-        json_object_put(root);
         return NULL;
     }
 
@@ -4492,7 +4527,6 @@ static char *ollama_chat_with_limit(
     headers = curl_slist_append(headers, "Content-Type: application/json");
     if (!headers) {
         curl_easy_cleanup(curl);
-        json_object_put(root);
         return NULL;
     }
     char curl_error[CURL_ERROR_SIZE] = {0};
@@ -4506,7 +4540,7 @@ static char *ollama_chat_with_limit(
             fprintf(stderr, "[R2 Ollama] Request option %d failed: %s.\n", \
                     (int)(option), curl_easy_strerror(setup_rc)); \
             curl_slist_free_all(headers); curl_easy_cleanup(curl); \
-            json_object_put(root); free(b.data); return NULL; \
+            free(b.data); return NULL; \
         } \
     } while (0)
     R2_OLLAMA_SETOPT(CURLOPT_URL, ollama_url);
@@ -4536,7 +4570,6 @@ static char *ollama_chat_with_limit(
                 *post_turn_deferred = 1;
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
-            json_object_put(root);
             free(b.data);
             return NULL;
         }
@@ -4570,7 +4603,6 @@ static char *ollama_chat_with_limit(
              (atomic_load(&foreground_conversation_waiting) > 0 &&
               !ollama_foreground_turn_mode))) {
             free(b.data);
-            json_object_put(root);
             return NULL;
         }
         const char *why = curl_error[0] ? curl_error : curl_easy_strerror(cc);
@@ -4588,7 +4620,6 @@ static char *ollama_chat_with_limit(
                          "R2's text-model request failed at the transport layer.",
                          details, MODEL);
         free(b.data);
-        json_object_put(root);
         return NULL;
     }
 
@@ -4600,7 +4631,6 @@ static char *ollama_chat_with_limit(
                          "R2's text-model endpoint returned a non-success HTTP status.",
                          b.data ? b.data : "Empty HTTP response.", MODEL);
         free(b.data);
-        json_object_put(root);
         return NULL;
     }
 
@@ -4611,7 +4641,6 @@ static char *ollama_chat_with_limit(
                          "R2's text-model endpoint returned an empty response body.",
                          NULL, MODEL);
         free(b.data);
-        json_object_put(root);
         return NULL;
     }
 
@@ -4623,11 +4652,9 @@ static char *ollama_chat_with_limit(
                          "R2's text-model endpoint returned invalid JSON.",
                          "Invalid response rejected before reading any model channel.", MODEL);
         free(b.data);
-        json_object_put(root);
         return NULL;
     }
     free(b.data);
-    json_object_put(root);
 
     struct json_object *msg = NULL;
     struct json_object *content = NULL;
@@ -4708,11 +4735,12 @@ static char *ollama_chat_with_limit(
     fprintf(stderr,
             "[R2 Ollama] inference=%s model=%s prompt_tokens=%lld prompt_s=%.3f "
             "generated_tokens=%lld generation_s=%.3f tok_s=%.2f total_s=%.3f "
-            "context=%d gpu_layer_policy=%s available_ram_gib=%.2f\n",
+            "context=%d num_predict=%d think=%d gpu_layer_policy=%s available_ram_gib=%.2f\n",
             ollama_background_mode ? "background" : "foreground", MODEL,
             prompt_tokens, prompt_ns > 0 ? (double)prompt_ns / 1e9 : 0.0,
             generated_tokens, generation_seconds, tokens_per_second,
-            total_ns > 0 ? (double)total_ns / 1e9 : 0.0, num_ctx,
+            total_ns > 0 ? (double)total_ns / 1e9 : 0.0,
+            num_ctx, num_predict, allow_reasoning,
             (gpu_policy && *gpu_policy) ? gpu_policy : "ollama-auto",
             available_bytes ? (double)available_bytes / (1024.0 * 1024.0 * 1024.0) : 0.0);
 
@@ -4751,10 +4779,13 @@ static char *ollama_chat_with_limit(
                 "Incomplete model output reached its generation limit; not a completed reply or executed action.",
                 result ? result : "No final-channel text was returned; private reasoning was not archived.", MODEL) <= 0)
             fprintf(stderr, "[R2 Ollama] Could not archive the incomplete final-channel output.\n");
+        *retry_without_thinking = "generation-limit";
         free(result); json_object_put(resp); return NULL;
     }
 
     if (!result) {
+        if (content_chars == 0 && thinking_chars > 0)
+            *retry_without_thinking = "reasoning-only";
         /*
          * Do not print the model's private thinking text. Its presence/length,
          * final-channel length, and Ollama completion metadata distinguish an
@@ -6918,7 +6949,7 @@ static char *chat_with_relevant_memories(
         } else {
             free(retry_user_facing);
             fprintf(stderr,
-                    "[R2 Conversation] Corrective inference returned no usable text; retaining the original model result.\\n");
+                    "[R2 Conversation] Corrective inference returned no usable text; retaining the original model result.\n");
         }
     }
 

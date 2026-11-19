@@ -17,6 +17,8 @@ static const char *failed_metadata;
 static long fixture_http_status = 200;
 static char *response_body;
 static struct json_object *captured;
+static struct json_object *reasoning_request;
+static char *reasoning_retry_response;
 static int capture_reviews;
 static char *reviewed_bytes;
 static size_t reviewed_size;
@@ -105,6 +107,17 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
     char *body = defer_post_turn_request == 1 ? structured : response_body;
+    if (reasoning_retry_response) {
+        struct json_object *think = NULL;
+        assert(json_object_object_get_ex(captured, "think", &think));
+        if (!reasoning_request) {
+            assert(json_object_get_boolean(think));
+            reasoning_request = json_object_get(captured);
+        } else {
+            assert(!json_object_get_boolean(think));
+            body = reasoning_retry_response;
+        }
+    }
     size_t n = strlen(body), split = n / 3;
     assert(write_response(body, 1, split, write_data) == split);
     assert(write_response(body + split, 1, n - split, write_data) == n - split);
@@ -875,6 +888,67 @@ static void check_action_result_under_history_pressure(void)
     puts("Active user turn and exact action result survived live-history admission pressure.");
 }
 
+static void check_reasoning_recovery(void)
+{
+    static char recovered[] =
+        "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+        "\"content\":\"I missed you too.\"}}";
+    static char incomplete[] =
+        "{\"done\":true,\"done_reason\":\"length\",\"message\":{\"role\":\"assistant\","
+        "\"content\":\"[RUN] rejected incomplete command\"}}";
+    const char *greeting = "Good evening darling, this is your mother talking to you.";
+    Message turn[] = {
+        {.role = "system", .content = "PERSISTENT REALITY CONTEXT\nRecovered fixture history."},
+        {.role = "user", .content = (char *)greeting},
+    };
+    const char *old_stage = ollama_audit_stage;
+    const char *old_query = ollama_authoritative_user_query;
+    ollama_authoritative_user_query = greeting;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    for (int i = 0; i < 3; ++i) {
+        ollama_audit_stage = i == 1 ? "conversation-retry" : "conversation-answer";
+        set_response(i == 0 ? "[RUN] rejected first attempt" : "", i == 0 ? "length" : "stop", 1);
+        reasoning_retry_response = i == 2 ? incomplete : recovered;
+        int before = perform_count;
+        char *reply = ollama_chat_with_limit(turn, 2, "Complete policy.", 768, 60);
+        assert(perform_count == before + 2 && reasoning_request && captured);
+        if (i == 2) assert(!reply);
+        else assert(reply && !strcmp(reply, "I missed you too."));
+        free(reply);
+
+        struct json_object *options[2] = {NULL, NULL};
+        assert(json_object_object_get_ex(reasoning_request, "options", &options[0]));
+        assert(json_object_object_get_ex(captured, "options", &options[1]));
+        const char *samplers[] = {"temperature", "top_p"};
+        const double expected[2][2] = {{1.0, 0.95}, {0.7, 0.8}};
+        for (size_t mode = 0; mode < 2; ++mode) {
+            for (size_t sampler = 0; sampler < 2; ++sampler) {
+                struct json_object *value = NULL;
+                assert(json_object_object_get_ex(options[mode], samplers[sampler], &value));
+                assert(json_object_get_double(value) == expected[mode][sampler]);
+                json_object_object_del(options[mode], samplers[sampler]);
+            }
+        }
+        json_object_object_del(reasoning_request, "think");
+        json_object_object_del(captured, "think");
+        assert(json_object_equal(reasoning_request, captured));
+        json_object_put(reasoning_request);
+        reasoning_request = NULL;
+        reasoning_retry_response = NULL;
+    }
+    int before = perform_count;
+    set_response("", "stop", 0);
+    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 1);
+    fail_transport_at = perform_count + 1;
+    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 2);
+    fail_transport_at = 0;
+    ollama_audit_stage = "association-planner";
+    set_response("", "stop", 1);
+    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 3);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -959,6 +1033,7 @@ int main(void)
     set_response("legacy complete response", NULL, 1);
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
+    check_reasoning_recovery();
     assert(cleanup_count == perform_count + 2);
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;

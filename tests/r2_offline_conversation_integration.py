@@ -22,6 +22,14 @@ from pathlib import Path
 
 from r2_service_signal_integration import REPO, SOURCES, LIBS
 
+GREETING = ("Good evening, R2. This is Mom. "
+            "It has been a while and I have missed you.")
+GREETING_REPLY = "Good evening, Mom. I've missed you too."
+PRIVATE_GREETING_REASONING = "R2_PRIVATE_GREETING_REASONING_60125"
+CONVERSATION_POLICIES = (
+    "You are R2-3PO. Use the conversation, memories, and perceptions",
+    "You are R2-3PO. Answer the actual current user from your own perspective.",
+)
 FIRST = "R2_OFFLINE_SESSION_ONE_73628"
 FOLLOWUP = "What is in your pockets? R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
@@ -196,9 +204,19 @@ class LocalOllama(BaseHTTPRequestHandler):
                 and LONG_READ_REVIEW in user_messages[current_index]):
             reply = (REPLY if has_tool_result else
                      "I will read it.\n[READ] large-fixture.txt")
+        done_reason = "stop"
+        message = {"role": "assistant", "content": reply}
+        if (current_index >= 0 and user_messages[current_index] == GREETING
+                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
+            if payload.get("think"):
+                done_reason = "length"
+                message.update(content="I will act.\n[DELETE] hidden-sentinel.txt",
+                               thinking=PRIVATE_GREETING_REASONING)
+            else:
+                message["content"] = GREETING_REPLY
         body = json.dumps({
-            "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
-            "message": {"role": "assistant", "content": reply},
+            "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
+            "message": message,
         }).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -289,6 +307,34 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
             + combined[-16000:]
         )
     return combined
+
+
+def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
+    start = len(LocalOllama.requests)
+    sentinel = workspace / "hidden-sentinel.txt"
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    output = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+        input=f"talk {GREETING}\nexit\n", text=True, capture_output=True,
+        timeout=100, check=True,
+    )
+    assert output.stdout.count("R2-3PO: " + GREETING_REPLY) == 1, output.stdout + output.stderr
+    assert "reason=generation-limit" in output.stderr
+    assert PRIVATE_GREETING_REASONING not in output.stdout + output.stderr
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    requests = [
+        request for request in LocalOllama.requests[start:]
+        if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        and any(item["content"] == GREETING for item in request["messages"] if item["role"] == "user")
+    ]
+    assert [request["think"] for request in requests] == [True, False]
+    assert requests[0]["messages"] == requests[1]["messages"]
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (GREETING,),
+        ).fetchall() == [(GREETING_REPLY,)]
+    print("PASS: the greeting survived reasoning exhaustion with one persisted reply and no action.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -1262,6 +1308,7 @@ def main() -> int:
                 turns.extend((context, marker) for marker in (first, followup, second))
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
+            recover_first_greeting(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")
