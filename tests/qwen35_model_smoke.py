@@ -360,7 +360,7 @@ require(
 )
 
 require(
-    "Follow-up generation failed after one refreshed retry; returning a visible reply and preserving the action result." in core
+    "reply = recorded_action_reply(tool_evidence);" in core
     and "Tool processing failed; returning a visible reply and preserving the user turn." in core
     and "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in core
     and "goto finalize_reply;" in core,
@@ -392,12 +392,12 @@ require(
 )
 
 tool_pair_start = core.find('const char tool_result_prefix[] = "[R2_INTERNAL_TOOL_RESULT]\\n"')
-tool_pair_end = core.find("reply = chat_with_relevant_memories(message);", tool_pair_start)
+tool_pair_end = core.find("chat_with_relevant_memories(message);", tool_pair_start)
 require(
     tool_pair_start >= 0 and tool_pair_end > tool_pair_start
-    and "Here is the recorded result:\\n%s" in core[tool_pair_start:tool_pair_end]
+    and "Here is the recorded result:\\n%s" in core
     and "tool_evidence = tools;" in core[tool_pair_start:tool_pair_end]
-    and "reply = tool_evidence;" in core[tool_pair_start:tool_pair_end],
+    and "reply = recorded_action_reply(tool_evidence);" in core[tool_pair_start:tool_pair_end],
     "if tool-history persistence fails, R2 retains and reports the actual tool result without rerunning the action",
 )
 

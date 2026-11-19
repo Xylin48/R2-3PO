@@ -72,6 +72,16 @@ SELF_REPORT_EXTRACTION = json.dumps({
 })
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
+FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
+FOLLOWUP_FALLBACK_REQUEST = "Save the action result fallback fixture."
+FOLLOWUP_RECOVERY_ANSWER = "The recovery fixture was saved."
+FOLLOWUP_FILES = {
+    FOLLOWUP_RECOVERY_REQUEST: "recovery-result.txt",
+    FOLLOWUP_FALLBACK_REQUEST: "fallback-result.txt",
+}
+FOLLOWUP_FILE_CONTENT = "The verified contents of the action fixture.\n"
+
+
 
 HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
 HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
@@ -86,6 +96,7 @@ IMAGINE_RESULT = "In this hypothetical scene, quartzlight illuminates snow besid
 
 class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
+    post_action_attempts: dict[str, int] = {}
     lock = threading.Lock()
     slow_started = threading.Event()
     slow_release = threading.Event()
@@ -214,6 +225,22 @@ class LocalOllama(BaseHTTPRequestHandler):
                                thinking=PRIVATE_GREETING_REASONING)
             else:
                 message["content"] = GREETING_REPLY
+        if (current_index >= 0 and user_messages[current_index] in FOLLOWUP_FILES
+                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
+            request = user_messages[current_index]
+            if has_tool_result:
+                with self.lock:
+                    attempts = self.post_action_attempts.get(request, 0) + 1
+                    self.post_action_attempts[request] = attempts
+                message["content"] = (
+                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST and attempts == 2
+                    else "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
+                )
+            else:
+                message["content"] = (
+                    f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
+                    f"{FOLLOWUP_FILE_CONTENT}[END WRITE]"
+                )
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
             "message": message,
@@ -335,6 +362,37 @@ def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
             (GREETING,),
         ).fetchall() == [(GREETING_REPLY,)]
     print("PASS: the greeting survived reasoning exhaustion with one persisted reply and no action.")
+
+
+def recover_post_action_response(binary: Path, workspace: Path, url: str) -> None:
+    sentinel = workspace / "hidden-sentinel.txt"
+    output = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+        input="".join(f"talk {request}\n" for request in FOLLOWUP_FILES) + "exit\n",
+        text=True, capture_output=True, timeout=100, check=True,
+    )
+    assert output.stdout.count("R2-3PO: " + FOLLOWUP_RECOVERY_ANSWER) == 1, output.stdout + output.stderr
+    assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
+    assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    assert all(LocalOllama.post_action_attempts.get(request) == 2 for request in FOLLOWUP_FILES)
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        for request, name in FOLLOWUP_FILES.items():
+            assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
+            rows = db.execute("SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+                              (request,)).fetchall()
+            assert len(rows) == 1
+            reply = rows[0][0]
+            if request == FOLLOWUP_RECOVERY_REQUEST:
+                assert reply.strip() == FOLLOWUP_RECOVERY_ANSWER
+            else:
+                assert "REAL WRITE RESULT:" in reply and name in reply
+                assert f"Bytes: {len(FOLLOWUP_FILE_CONTENT)}" in reply
+            assert db.execute(
+                "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
+                (f"%/{name} (success)",),
+            ).fetchone() == (1,)
+    print("PASS: empty post-action replies recovered or showed the recorded result without duplicate actions.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -1309,6 +1367,7 @@ def main() -> int:
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
             recover_first_greeting(binary, workspace, url)
+            recover_post_action_response(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")

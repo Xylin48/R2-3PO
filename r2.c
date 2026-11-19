@@ -15016,6 +15016,17 @@ static char *clean_final_reply(const char *reply)
     return result;
 }
 
+/* Transfer the evidence buffer itself if there is no memory for a wrapper.
+ * The finalizer handles the case where the reply and evidence share ownership. */
+static char *recorded_action_reply(char *evidence)
+{
+    char *reply = NULL;
+    if (asprintf(&reply, "I processed the action request. Here is the recorded result:\n%s",
+                 evidence) < 0)
+        return evidence;
+    return reply;
+}
+
 static char *r2_talk_impl(const char *message)
 {
     if (!core_initialized || shutting_down || !message)
@@ -15206,12 +15217,7 @@ static char *r2_talk_impl(const char *message)
 
         if (pair_rc != 0) {
             tool_evidence = tools;
-            if (asprintf(&reply,
-                         "I processed the action request. Here is the recorded result:\n%s",
-                         tool_evidence) < 0) {
-                /* Use the same bytes for the visible reply and the durable result. */
-                reply = tool_evidence;
-            }
+            reply = recorded_action_reply(tool_evidence);
             tools = NULL;
             fprintf(stderr,
                     "[R2] Action-context persistence failed; returning the result text without repeating the action.\n");
@@ -15220,45 +15226,26 @@ static char *r2_talk_impl(const char *message)
         tool_evidence = tools;
         tools = NULL;
 
-        reply = chat_with_relevant_memories(message);
-        if (!reply && !shutting_down) {
+        reply = shutting_down ? NULL : chat_with_relevant_memories(message);
+        char *sound_clean_reply = reply && !shutting_down ? clean_final_reply(reply) : NULL;
+        free(reply);
+        if (!reply_has_visible_text(sound_clean_reply) && !shutting_down) {
+            free(sound_clean_reply);
             r2_log_event(R2_LOG_SYSTEM, "conversation_tool_followup_retry",
-                         "R2's first post-action response attempt failed; refreshing current context and retrying once.",
-                         "The already completed tool result remains in live context. The retry regenerates only the user-facing follow-up and does not rerun the completed action.",
+                         "R2's first post-action response attempt had no usable reply. Refreshing context and retrying once.",
+                         "The completed tool result remains in context. This retry generates the outward follow-up only.",
                          "r2_talk");
             (void)refresh_reality_context_message();
-            reply = chat_with_relevant_memories(message);
-        }
-        if (!reply) {
-            reply = xstrdup(
-                "I couldn't generate a follow-up answer. "
-                "The recorded tool result is still in the conversation.");
-            if (!reply) {
-                    fprintf(stderr,
-                        "[R2] Follow-up generation failed after one refreshed retry and fallback allocation failed; preserving the action and user turn.\n");
-                free(tool_evidence);
-                return NULL;
-            }
-            fprintf(stderr,
-                    "[R2] Follow-up generation failed after one refreshed retry; returning a visible reply and preserving the action result.\n");
+            reply = shutting_down ? NULL : chat_with_relevant_memories(message);
+            sound_clean_reply = reply && !shutting_down ? clean_final_reply(reply) : NULL;
+            free(reply);
         }
 
-        char *sound_clean_reply = clean_final_reply(reply);
         if (!reply_has_visible_text(sound_clean_reply)) {
-            free(reply);
             free(sound_clean_reply);
-            reply = xstrdup(
-                "I couldn't prepare a usable follow-up. "
-                "The recorded tool result remains in the conversation.");
-            if (!reply) {
-                    fprintf(stderr, "[R2] Could not allocate a visible reply after tool follow-up cleanup failed; preserving the action and user turn.\n");
-                free(tool_evidence);
-                return NULL;
-            }
-            fprintf(stderr,
-                    "[R2] Tool follow-up cleanup produced no visible text; returning a visible reply and preserving the action result.\n");
+            fprintf(stderr, "[R2] Post-action response unavailable. Returning the recorded tool result.\n");
+            reply = recorded_action_reply(tool_evidence);
         } else {
-            free(reply);
             reply = sound_clean_reply;
         }
     } else {

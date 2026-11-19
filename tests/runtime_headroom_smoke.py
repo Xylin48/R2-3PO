@@ -57,10 +57,10 @@ retry_marker = talk.find('"conversation_tool_followup_retry"')
 if retry_marker < 0:
     raise SystemExit("A failed post-action reply must trigger one logged recovery attempt.")
 retry_refresh = talk.find("(void)refresh_reality_context_message();", retry_marker)
-retry_generation = talk.find("reply = chat_with_relevant_memories(message);", retry_refresh)
-final_failure = talk.find("Follow-up generation failed after one refreshed retry", retry_generation)
+retry_generation = talk.find("chat_with_relevant_memories(message);", retry_refresh)
+final_failure = talk.find("reply = recorded_action_reply(tool_evidence);", retry_generation)
 if min(retry_refresh, retry_generation, final_failure) < 0 or not (retry_marker < retry_refresh < retry_generation < final_failure):
-    raise SystemExit("Post-action recovery must refresh context, retry generation, then roll back only if retry fails.")
+    raise SystemExit("Post-action recovery must refresh context, retry generation, and display the recorded result if the retry fails.")
 if talk.count("process_tools(") != 1:
     raise SystemExit("A failed post-action reply retry must not execute already-completed tools a second time.")
 
