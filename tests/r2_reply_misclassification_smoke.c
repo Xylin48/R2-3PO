@@ -248,6 +248,13 @@ int main(void)
                     "I think you're trying to say you want a bed. Is that correct?"),
                 "explicit paraphrase requests may receive a confirming interpretation");
 
+    const char *garbled_transmission =
+        "My audio sensors are picking up your transmission, but it is coming through corrupted or heavily garbled.";
+    ok &= check(r2_reply_misclassifies_plain_text(mother_message, garbled_transmission),
+                "fabricated garbled transmission on a greeting triggers recovery");
+    ok &= check(!r2_reply_misclassifies_plain_text("Can you check the audio signal?", garbled_transmission),
+                "an actual audio question can discuss a garbled transmission");
+
     ok &= check(!r2_reply_misclassifies_plain_text(mother_message,
                     "I missed you too, Mom. A room with a bed and pockets "
                     "sounds exciting. What are you planning to put in the room?"),

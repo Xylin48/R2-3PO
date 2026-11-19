@@ -43,6 +43,7 @@
 */
 #define MAX_STARTUP_MEMORIES 100
 #define MAX_RELEVANT_MEMORIES 20
+#define R2_TURN_MEMORY_LIMIT 10
 #define MAX_MEMORY_KEYWORDS 48
 #define MIN_MEMORY_KEYWORD_LENGTH 3
 
@@ -2067,7 +2068,7 @@ static int append_memory_record(char **out, size_t *length, size_t *capacity,
     return 0;
 }
 
-static char *get_relevant_memories(const char *query, int limit)
+static char *get_relevant_memories(const char *query, int limit, size_t byte_budget)
 {
     if (limit <= 0)
         return xstrdup("");
@@ -2154,6 +2155,9 @@ static char *get_relevant_memories(const char *query, int limit)
                 failed = 1;
                 break;
             }
+            if (byte_budget < 4 || category_length > byte_budget - 4 ||
+                memory_length > byte_budget - 4 - category_length)
+                continue;
             size_t combined_length = memory_length + category_length + 2;
             char *combined = malloc(combined_length + 1);
             if (!combined) {
@@ -2227,6 +2231,11 @@ static char *get_relevant_memories(const char *query, int limit)
         }
         if (!failed) {
             for (size_t i = 0; i < count; ++i) {
+                size_t category_bytes = strlen(candidates[i].category);
+                size_t remaining = byte_budget - length;
+                if (remaining < 4 || category_bytes > remaining - 4 ||
+                    strlen(candidates[i].memory) > remaining - 4 - category_bytes)
+                    continue;
                 if (append_memory_record(&out, &length, &capacity,
                                          candidates[i].category,
                                          candidates[i].memory) != 0) {
@@ -2276,6 +2285,11 @@ static char *get_relevant_memories(const char *query, int limit)
             }
             const char *memory = fields[0] ? fields[0] : "";
             const char *category = fields[1] ? fields[1] : "general";
+            size_t category_bytes = strlen(category);
+            size_t remaining = byte_budget - length;
+            if (remaining < 4 || category_bytes > remaining - 4 ||
+                strlen(memory) > remaining - 4 - category_bytes)
+                continue;
             if (append_memory_record(&out, &length, &capacity, category, memory) != 0) {
                 fprintf(stderr, "[R2 memory] Could not serialize recent-memory context.\n");
                 failed = 1;
@@ -4865,6 +4879,7 @@ char *r2_model_generate(const char *system_prompt, const char *user_prompt,
 }
 
 static int r2_append_association_section(char **context, const char *heading, const char *records);
+static char *r2_associative_query_cache_lookup(const char *query);
 
 static int r2_context_can_be_reviewed(const Message *message)
 {
@@ -4881,6 +4896,9 @@ static const char r2_compact_conversation_policy[] =
     "You are R2-3PO. Answer the actual current user from your own perspective. "
     "Keep speaker roles and learned relationships straight, address each important point, "
     "and acknowledge the human meaning naturally. Be direct, warm and specific. "
+    "Respond to a person introducing themselves as your mother from your own "
+    "perspective. Acknowledge relationship corrections in the current turn. "
+    "Typed input is text. Never claim it came from your audio sensors. "
     "If correcting a prior reply, respond to the user's actual words. Ask a focused question "
     "when essential information is missing. Keep private reasoning and tool markers out of the visible answer. "
     "Use memories and supplied state as evidence. Keep beliefs, hypothetical possibilities, and real events distinct. "
@@ -4983,6 +5001,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     char *answer = NULL;
     char *reviewed_result = NULL;
     char *reviewed_query = NULL;
+    char *focused_retrieval = NULL;
     if ((room || pockets || fridge || self || age || money || tv) &&
         asprintf(&state, "PERSISTENT REALITY CONTEXT (selected current views, evidence only)\n"
                 "%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
@@ -5041,6 +5060,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     }
 
     size_t selected_count = 0;
+    size_t oversized_retrieval_bytes = 0;
     if (state)
         selected[selected_count++] = (Message){.role = "system", .content = state};
     for (size_t i = 0; i < count; ++i) {
@@ -5056,23 +5076,59 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             if (recalled || length <= capacity - total) {
                 selected[selected_count++] = m;
                 if (length <= capacity - total) total += length;
+            } else if (!strncmp(m.content, "CURRENT TURN RETRIEVED CONTEXT",
+                               sizeof("CURRENT TURN RETRIEVED CONTEXT") - 1)) {
+                oversized_retrieval_bytes = length;
             }
             continue;
         }
         if (!m.content) continue;
         int priority = r2_inference_system_priority(m.content, query);
-        if (priority == 0 || priority == 1) continue; /* The two compact views above replace these. */
+        if (priority == 1) continue; /* The scoped Reality view replaces this. */
         if (r2_is_capability_section(m.content) &&
             !r2_capability_section_matches_query(m.content, query)) continue;
         size_t length = strlen(m.content);
         if (priority >= 5) {
-            /* Preserve complete optional history for the normal allocator. An
-               unknown required system message remains required there. */
+            /* Preserve complete optional history for the normal allocator.
+               Charge required system messages before adding focused memory. */
             selected[selected_count++] = m;
+            if (r2_inference_unit_required(&m, i, user))
+                total += length <= capacity - total ? length : capacity - total;
         } else if (length <= capacity - total) {
             selected[selected_count++] = m;
             total += length;
         }
+    }
+    if (oversized_retrieval_bytes && !reviewed_query) {
+        static const char heading[] =
+            "CURRENT TURN RETRIEVED CONTEXT (complete ranked persistent-memory records; "
+            "historical evidence only). The source store retains the full records.\n";
+        size_t heading_bytes = sizeof(heading) - 1;
+        int ctx = r2_ollama_context_tokens();
+        size_t input_bytes = capacity;
+        /* Preserve the normal answer quota when choosing additional evidence.
+           The full allocation is available for the exact turn and live state. */
+        if (num_predict >= 64 && num_predict < ctx - 512)
+            input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+        if (input_bytes > total && input_bytes - total > heading_bytes) {
+            char *plan = r2_associative_query_cache_lookup(query);
+            char *records = get_relevant_memories(plan ? plan : query, R2_TURN_MEMORY_LIMIT,
+                                                 input_bytes - total - heading_bytes);
+            free(plan);
+            if (!records) goto cleanup;
+            if (*records && asprintf(&focused_retrieval, "%s%s", heading, records) < 0) {
+                free(records);
+                focused_retrieval = NULL;
+                goto cleanup;
+            }
+            free(records);
+            if (focused_retrieval)
+                selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
+        }
+        fprintf(stderr, "[R2 Context] Focused retrieval selected %zu of %zu historical bytes "
+                        "as complete ranked memory records (context=%d, input_budget_bytes=%zu).\n",
+                focused_retrieval ? strlen(focused_retrieval) - heading_bytes : 0,
+                oversized_retrieval_bytes, ctx, input_bytes);
     }
     fprintf(stderr, "[R2 Context] Using complete selected policies and state views in the smaller conversation window.\n");
     const char *previous_query = ollama_authoritative_user_query;
@@ -5082,6 +5138,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
                                  effective_query, num_predict, timeout);
     ollama_authoritative_user_query = previous_query;
 cleanup:
+    free(focused_retrieval);
     free(reviewed_query);
     free(reviewed_result);
     free(selected);
@@ -5571,6 +5628,11 @@ static int r2_reply_misclassifies_plain_text(const char *query, const char *repl
         }
     }
 
+    if (strcasestr(reply, "audio sensors") &&
+        strcasestr(reply, "your transmission") &&
+        (strcasestr(reply, "heavily garbled") || strcasestr(reply, "coming through corrupted")))
+        return 1;
+
     if (!reports_r2_output_problem && strlen(query) < 24)
         return 0;
 
@@ -5944,7 +6006,6 @@ static char *r2_retry_direct_answer(Message *messages_copy,
 /* Search counts select the records made available for this turn. Complete
  * selected contents are preserved; only the real configured inference window
  * determines whether the final request can proceed. */
-#define R2_TURN_MEMORY_LIMIT 10
 #define R2_TURN_HISTORY_SEARCHES 12
 #define R2_RECALL_HISTORY_SEARCHES 16
 
@@ -6607,7 +6668,7 @@ static char *chat_with_relevant_memories(
 
     char *memory_context = context_cache_get(associative_query, memory_limit);
     if (!memory_context) {
-        memory_context = get_relevant_memories(associative_query, memory_limit);
+        memory_context = get_relevant_memories(associative_query, memory_limit, SIZE_MAX);
         if (!memory_context) {
             fprintf(stderr,
                     "[R2 Context] Persistent-memory retrieval failed; refusing to continue with silently missing evidence.\n");
@@ -10776,7 +10837,7 @@ char *r2_retrieve_memories(const char *query)
 {
     return get_relevant_memories(
         query ? query : "",
-        MAX_RELEVANT_MEMORIES
+        MAX_RELEVANT_MEMORIES, SIZE_MAX
     );
 }
 

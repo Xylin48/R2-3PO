@@ -949,6 +949,73 @@ static void check_reasoning_recovery(void)
     ollama_audit_stage = old_stage;
 }
 
+static void check_compact_ranked_memory(void)
+{
+    assert(!db && sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY, memory TEXT, category TEXT, updated_at TEXT);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    char *large = text(35000, 'x', "orchard orchard orchard oversized ");
+    char *first = text(8700, 'a', "orchard first complete memory ");
+    char *second = text(6900, 'b', "orchard second complete memory ");
+    char *third = text(3000, 'c', "orchard third complete memory ");
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO memories VALUES (1,%Q,'self','2026-11-19'),"
+        "(2,%Q,'self','2026-11-18'),(3,%Q,'self','2026-11-17'),(4,%Q,'self','2026-11-16');",
+        large, first, second, third);
+    assert(sql && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(sql);
+
+    char *history = text(62000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    char *world = text(30000, 'w', "PERSISTENT REALITY CONTEXT\n");
+    const char *identity = "============================================================\n"
+                           "IDENTITY AND PERSISTENT MEMORY\n"
+                           "Complete identity contract for R2-3PO.";
+    const char *query = "Good evening, darling. This is your mother speaking to you.";
+    Message turn[] = {
+        {.role = "system", .content = (char *)identity},
+        {.role = "system", .content = world},
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_stage = ollama_audit_stage;
+    const char *old_query = ollama_authoritative_user_query;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    r2_associative_query_cache_store(query, "orchard");
+    set_response("Good evening, Mom.", "stop", 1);
+    int before = perform_count;
+    char *answer = r2_foreground_chat(turn, 4, r2_conversation_system_prompt, query, 1024, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(identity) && captured_contains(query) &&
+           captured_contains(first) && captured_contains(second) && captured_contains(third));
+    assert(!captured_contains("orchard orchard orchard oversized") &&
+           !captured_contains(history) && !captured_contains(world));
+    struct json_object *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_ctx", &value) &&
+           json_object_get_int(value) == 8192);
+    assert(json_object_object_get_ex(options, "num_predict", &value) &&
+           json_object_get_int(value) == 1024);
+    char *full = get_relevant_memories("orchard", 10, SIZE_MAX);
+    assert(full && strstr(full, large) && strstr(full, first) && strstr(full, second) &&
+           strstr(full, third));
+    free(full);
+    free(answer);
+    free(history);
+    free(world);
+    free(large);
+    free(first);
+    free(second);
+    free(third);
+    r2_associative_query_cache_clear();
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -959,6 +1026,7 @@ int main(void)
     check_reflection_stop_and_long_visual_query();
     check_retry_and_isolated_inputs();
     check_foreground_context_review();
+    check_compact_ranked_memory();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
