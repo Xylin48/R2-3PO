@@ -75,8 +75,32 @@ int main(void)
     require_query(db, "SELECT count(*) FROM r2_log_conversations WHERE event_id=?1",
                   event_id, NULL, NULL, 0);
 
-    /* A subsequent, healthy initialization must replay the exact accepted
-       bytes without minting a replacement event or losing earlier history. */
+    if (r2_log_replay_conversation_archives() != -1) {
+        fputs("FAIL: live replay reported success while archive writes remained blocked.\n", stderr);
+        return 1;
+    }
+    sql(db, "DROP TRIGGER block_archive;");
+    if (r2_log_replay_conversation_archives() != 0 ||
+        r2_log_replay_conversation_archives() != 0) {
+        fputs("FAIL: live replay did not repair the archive exactly once.\n", stderr);
+        return 1;
+    }
+    require_query(db, "SELECT count(*) FROM r2_log_conversations "
+                     "WHERE event_id=?1 AND user_text=?2 AND assistant_text=?3",
+                  event_id, user, reply, 1);
+    require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
+                  event_id, NULL, NULL, 0);
+
+    /* Exercise startup recovery separately with another accepted turn. */
+    sql(db, "CREATE TRIGGER block_archive BEFORE INSERT ON r2_log_conversations "
+            "BEGIN SELECT RAISE(ABORT, 'injected archive write failure'); END;");
+    int64_t pending_after_reopen = r2_log_conversation_turn(user, reply);
+    if (pending_after_reopen <= event_id) {
+        fputs("FAIL: second accepted turn did not receive a new event ID.\n", stderr);
+        return 1;
+    }
+    require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
+                  pending_after_reopen, NULL, NULL, 1);
     sql(db, "DROP TRIGGER block_archive;");
     sqlite3_close(db);
     r2_log_shutdown();
@@ -95,8 +119,13 @@ int main(void)
                   event_id, NULL, NULL, 0);
     require_query(db, "SELECT count(*) FROM r2_log_events WHERE id=?1 "
                      "AND event_type='conversation_turn'", event_id, NULL, NULL, 1);
+    require_query(db, "SELECT count(*) FROM r2_log_conversations "
+                     "WHERE event_id=?1 AND user_text=?2 AND assistant_text=?3",
+                  pending_after_reopen, user, reply, 1);
+    require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
+                  pending_after_reopen, NULL, NULL, 0);
     sqlite3_close(db);
     r2_log_shutdown();
-    puts("PASS: accepted conversation persisted through failed archive write and replayed exactly once.");
+    puts("PASS: accepted conversations survived failed archive writes and replayed exactly once during service and after restart.");
     return 0;
 }

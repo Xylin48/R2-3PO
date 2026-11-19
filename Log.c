@@ -63,7 +63,6 @@ static int log_initialized = 0;
 static int64_t current_session_id = 0;
 static struct timespec process_start_time;
 static int process_clock_ready = 0;
-static void log_replay_conversation_archives(void);
 static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
                            const char *relationship, const char *notes);
 static int log_link_context_review_locked(int64_t archive_id, int64_t conversation_id);
@@ -899,7 +898,7 @@ int r2_log_init(void)
         r2_log_shutdown();
         return -1;
     }
-    log_replay_conversation_archives();
+    (void)r2_log_replay_conversation_archives();
 
     if (r2_log_session_start() != 0) {
         fprintf(stderr,
@@ -1391,11 +1390,16 @@ static int log_stage_turn_links_locked(int64_t event_id, int kind,
     return rc == SQLITE_OK ? 0 : -1;
 }
 
-static void log_replay_conversation_archives(void)
+int r2_log_replay_conversation_archives(void)
 {
     int64_t after = 0;
-    pthread_mutex_lock(&log_lock);
-    while (log_initialized && log_db) {
+    int failed = 0;
+    for (;;) {
+        pthread_mutex_lock(&log_lock);
+        if (!log_initialized || !log_db) {
+            pthread_mutex_unlock(&log_lock);
+            return -1;
+        }
         sqlite3_stmt *statement = NULL;
         int rc = sqlite3_prepare_v2(log_db,
             "WITH next_event(id) AS (SELECT MIN(id) FROM ("
@@ -1417,14 +1421,19 @@ static void log_replay_conversation_archives(void)
             if (rc != SQLITE_DONE)
                 fprintf(stderr, "[R2 Life Log] Could not read pending conversation archives: %s\n",
                         sqlite3_errmsg(log_db));
-            break;
+            pthread_mutex_unlock(&log_lock);
+            return rc == SQLITE_DONE && !failed ? 0 : -1;
         }
-        if (archive && log_publish_conversation_archive_locked(after) != 0)
+        if (archive && log_publish_conversation_archive_locked(after) != 0) {
+            failed = 1;
             fprintf(stderr, "[R2 Life Log] Conversation archive remains pending for event #%" PRId64 ".\n", after);
-        if (links && log_publish_turn_links_locked(after) != 0)
+        }
+        if (links && log_publish_turn_links_locked(after) != 0) {
+            failed = 1;
             fprintf(stderr, "[R2 Life Log] Conversation evidence remains pending for event #%" PRId64 ".\n", after);
+        }
+        pthread_mutex_unlock(&log_lock);
     }
-    pthread_mutex_unlock(&log_lock);
 }
 
 /*

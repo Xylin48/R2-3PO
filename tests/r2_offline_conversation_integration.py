@@ -858,6 +858,8 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
             "WHEN OLD.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
             "CREATE TRIGGER ignore_self_report_branch BEFORE INSERT ON r2_alternate_self_branches "
             "WHEN NEW.scenario='Build a spare copper bridge.' BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER ignore_live_archive BEFORE INSERT ON r2_log_conversations "
+            "WHEN NEW.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
         )
         def extracted_requests():
             with LocalOllama.lock:
@@ -903,6 +905,25 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                         assert len(pending) == 1 and pending[0][1] == SELF_REPORT_REPLY, pending
                         source = pending[0][0]
                         assert stored == (0,), stored
+                        assert db.execute(
+                            "SELECT user_text,assistant_text FROM r2_log_pending_conversations WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (LEARNING_RESTART_REQUEST, SELF_REPORT_REPLY)
+                        db.execute("DROP TRIGGER ignore_live_archive")
+                        archive = None
+                        deadline = time.monotonic() + 15
+                        while process.poll() is None and time.monotonic() < deadline:
+                            archive = db.execute(
+                                "SELECT user_text,assistant_text FROM r2_log_conversations WHERE event_id=?",
+                                (source,),
+                            ).fetchone()
+                            if archive is not None:
+                                break
+                            time.sleep(0.1)
+                        assert archive == (LEARNING_RESTART_REQUEST, SELF_REPORT_REPLY)
+                        assert db.execute(
+                            "SELECT 1 FROM r2_log_pending_conversations WHERE event_id=?", (source,),
+                        ).fetchone() is None
                         assert db.execute(
                             "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
                             (source,),

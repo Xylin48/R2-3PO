@@ -169,6 +169,8 @@ for file in \
   deploy/r2-ollama.service \
   tools/r2_ollama_runner.sh \
   tools/copy_ollama_model.py \
+  tools/preflight_ollama_model.py \
+  tools/r2_install_root_bootstrap.sh \
   tools/install_r2_overnight.sh \
   tools/audit_r2_databases.py \
   tools/audit_r2_sound_assets.py \
@@ -205,9 +207,10 @@ if [[ -d "$R2_ROOT" && -d "$R2_SOURCE" ]]; then
       fi
     done
     for database in "$R2_SOURCE/r2_memory.db" "$R2_SOURCE/r2_reality.db" "$R2_SOURCE/r2_fridge.db" "$R2_SOURCE/r2_rewards.db" "$R2_SOURCE/r2_addictions.db"; do
-      [[ -e "$database" ]] || continue
       if [[ -L "$database" ]]; then
         fail "refusing symlinked runtime database: $database"
+      elif [[ ! -e "$database" ]]; then
+        continue
       elif run_as_r2 test -f "$database" && run_as_r2 test -r "$database" && run_as_r2 test -w "$database"; then
         pass "r2 can read/write database $database"
       else
@@ -241,7 +244,18 @@ fi
 
 section "Ollama and unified Qwen 3.5 model"
 if TAGS="$(curl --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
-  if printf '%s' "$TAGS" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(m.get("name") == "qwen3.5:9b" or m.get("name","").startswith("qwen3.5:9b-") for m in d.get("models",[])) else 1)' >/dev/null 2>&1; then
+  if printf '%s' "$TAGS" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+models = data.get("models") if isinstance(data, dict) else None
+found = isinstance(models, list) and any(
+    isinstance(model, dict) and model.get("name") == "qwen3.5:9b"
+    for model in models
+)
+sys.exit(0 if found else 1)
+' >/dev/null 2>&1; then
     pass "local Ollama API responds and qwen3.5:9b is installed"
   else fail "Ollama responds but qwen3.5:9b is not installed"; fi
 else fail "Ollama API unreachable at $OLLAMA_URL"; fi
@@ -257,8 +271,9 @@ if have ollama; then
   # model is an inconsistent state (often another endpoint or a stale runner).
   # Do not kill it blindly; stop the owning service after identifying it.
   if have pgrep && pgrep -af '[l]lama-server' >/dev/null 2>&1 &&
-     ! printf '%s\n' "$OLLAMA_PS_OUTPUT" | awk 'NR > 1 && NF && $1 != "NAME" { found=1 } END { exit found ? 0 : 1 }'; then
-    fail "llama-server process exists but ollama ps reports no loaded model on the interactive endpoint; a separate or stale runner may be consuming GPU memory. Inspect: systemctl status ollama.service r2-ollama.service"
+     { [[ "$OLLAMA_PS_RC" -ne 0 ]] ||
+       ! printf '%s\n' "$OLLAMA_PS_OUTPUT" | awk 'NR > 1 && NF && $1 != "NAME" { found=1 } END { exit found ? 0 : 1 }'; }; then
+    fail "llama-server process exists but ollama ps cannot confirm a loaded model on the interactive endpoint; a separate or stale runner may be consuming GPU memory. Inspect: systemctl status ollama.service r2-ollama.service"
   fi
 else
   warn "ollama CLI not found on PATH."

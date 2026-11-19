@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Safety/coverage contract for the non-destructive hardware preflight."""
 from pathlib import Path
+import json
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +47,8 @@ required = (
     'deploy/r2-ollama.service',
     'tools/r2_ollama_runner.sh',
     'tools/copy_ollama_model.py',
+    'tools/preflight_ollama_model.py',
+    'tools/r2_install_root_bootstrap.sh',
     'tools/audit_r2_sound_assets.py',
     'tools/preflight_r2_hardware.sh',
     'for tool in bash make gcc curl python3 sudo setpriv pgrep date find grep cmp iptables ip6tables',
@@ -56,7 +59,7 @@ required = (
     'a separate Ollama API is responding on 127.0.0.1:11435',
     "pgrep -af '[l]lama-server'",
     '$1 != "NAME"',
-    'llama-server process exists but ollama ps reports no loaded model',
+    'llama-server process exists but ollama ps cannot confirm a loaded model',
     'Hardware preflight identity: %s (uid=%s, groups=%s)',
     'DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)',
     'sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2',
@@ -151,6 +154,35 @@ loaded_ps = subprocess.run(
 )
 if empty_ps.returncode != 1 or loaded_ps.returncode != 0:
     raise SystemExit("ollama ps row detection must ignore the header and detect actual model rows")
+
+# Exercise the same model parser the hardware report runs against /api/tags.
+tags_parser = script.split("printf '%s' \"$TAGS\" | python3 -c '", 1)[1].split("\n'", 1)[0]
+for response, expected in (
+    ({"models": [None, {"name": "qwen3.5:9b"}]}, 0),
+    ({"models": [{"name": "qwen3.5:9b-other"}]}, 1),
+    ({"models": "qwen3.5:9b"}, 1),
+    (["qwen3.5:9b"], 1),
+):
+    probe = subprocess.run([sys.executable, "-c", tags_parser],
+                           input=json.dumps(response), text=True, capture_output=True)
+    if probe.returncode != expected:
+        raise SystemExit(f"wrong hardware model verdict for {response!r}: {probe}")
+
+# Run the filesystem part of the report without privileges or live paths.
+database_block = script.split('    for database in ', 1)[1].split('  fi\nelse fail "workspace', 1)[0]
+with tempfile.TemporaryDirectory() as temp:
+    data = Path(temp)
+    (data / "r2_memory.db").symlink_to(data / "missing.db")
+    shell_fixture = """
+R2_SOURCE="$1"
+fail() { printf '%s\\n' "$*"; }
+pass() { :; }
+run_as_r2() { "$@"; }
+""" + "    for database in " + database_block
+    result = subprocess.run(["bash", "-c", shell_fixture, "fixture", temp],
+                            text=True, capture_output=True, check=True)
+    if "refusing symlinked runtime database" not in result.stdout:
+        raise SystemExit("hardware report missed a dangling database symlink")
 
 # Execute only the launcher's database check, using disposable files.
 probe_start = launcher.rindex("<<'PY'\n", 0, sqlite_at) + len("<<'PY'\n")

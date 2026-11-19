@@ -10154,6 +10154,10 @@ static void *autonomous_thinking(void *arg)
             last_periodic_check_ms = now_ms;
             retry_learning = 1;
             /* Retry durable work even if new reflections are deferred. */
+            if (r2_log_replay_conversation_archives() != 0)
+                fprintf(stderr, "[R2 Life Log] Some conversation archives or evidence links remain pending.\n");
+            if (shutting_down || !atomic_load(&diary_running))
+                break;
             if (r2_log_replay_reflections() != 0)
                 fprintf(stderr, "[R2 diary] Some reflection completions remain pending.\n");
             if (!shutting_down && atomic_load(&diary_running) && r2_diary_replay_mirrors() != 0)

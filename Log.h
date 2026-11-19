@@ -301,6 +301,8 @@ int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_t
 int64_t r2_log_complete_reflection(int64_t diary_id);
 /* Retry every pending reflection once. Returns -1 if any remain blocked. */
 int r2_log_replay_reflections(void);
+/* Retry accepted conversation archives and evidence links in event order. */
+int r2_log_replay_conversation_archives(void);
 
 /* Link two events by a named relationship. */
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,
