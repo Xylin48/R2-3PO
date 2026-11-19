@@ -7316,7 +7316,8 @@ static void execute_task(
 
     int pipefd[2];
 
-    if (pipe(pipefd) != 0) {
+    /* A simultaneous media or speech exec must not retain either end. */
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
         int error = errno;
         fclose(archive);
         unlink(c->archive_path);
@@ -14955,6 +14956,7 @@ static char *r2_talk_impl(const char *message)
     if (!reply_has_visible_text(stripped_reply)) {
         /* Marker-only/whitespace output is not a valid conversational answer.
            Retry once before executing any tool action. */
+        hands_result_used = 0;
         free(reply);
         free(stripped_reply);
         reply = NULL;
@@ -14979,6 +14981,8 @@ static char *r2_talk_impl(const char *message)
             }
             fprintf(stderr,
                     "[R2] Retry still produced no visible reply; returning a fallback and preserving the user turn.\n");
+        } else {
+            hands_result_used = 1;
         }
     }
 

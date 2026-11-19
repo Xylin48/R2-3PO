@@ -67,6 +67,7 @@ INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
 
 HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
 HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
+HANDS_REJECTED_REPLY_REQUEST = "Read the pending handoff with an unusable reply fixture."
 HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
 IMAGINE_TURN = "Imagine the long quartzlight scenario."
 IMAGINE_REQUEST = ("Imagine a quartzlight scene. " + "Keep the imagined snow visible ☃. " * 255
@@ -114,6 +115,8 @@ class LocalOllama(BaseHTTPRequestHandler):
                  if asks_for_pockets and not has_tool_result else REPLY)
         if current_index >= 0 and user_messages[current_index] == HANDS_QUEUE_REQUEST:
             reply = REPLY if has_tool_result else f"I will queue the test command.\n[HAND] printf {HANDS_RESULT}"
+        if current_index >= 0 and user_messages[current_index] == HANDS_REJECTED_REPLY_REQUEST:
+            reply = "[WORLD] look"
         if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
             reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -1011,6 +1014,16 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
                     proc.kill()
                     proc.wait()
                 proc.stdin.close()
+
+        rejected = subprocess.run(
+            [str(binary)], cwd=workspace, env=env,
+            input=f"talk {HANDS_REJECTED_REPLY_REQUEST}\nexit\n",
+            text=True, capture_output=True, timeout=30, check=True,
+        )
+        assert "Retry still produced no visible reply" in rejected.stderr, rejected
+        assert db.execute(
+            "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+        ).fetchone() == (None,)
 
         db.executescript(
             "CREATE TRIGGER block_hands_delivery BEFORE UPDATE OF delivered_to ON r2_log_hands_results "

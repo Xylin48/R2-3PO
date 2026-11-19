@@ -144,11 +144,13 @@ def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
                       if name in source_columns and name != "id"]
             if all(name in source_columns and name in target_columns
                    for name in ("timestamp", "context", "event_type", "summary")):
+                has_id = "id" in source_columns
+                order = "id" if has_id else "timestamp"
                 source_rows = db.execute(
-                    'SELECT * FROM cartridge."console_events" ORDER BY id'
-                ).fetchall()
+                    f'SELECT * FROM cartridge."console_events" ORDER BY {order}'
+                )
                 for row in source_rows:
-                    source_id = row["id"] if "id" in source_columns else None
+                    source_id = row["id"] if has_id else None
                     if source_id is not None:
                         existing = db.execute(
                             "SELECT * FROM main.console_events WHERE id=?", (source_id,)
