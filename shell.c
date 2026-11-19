@@ -648,7 +648,7 @@ static void shell_help(void)
         "      Search the chronological Life Log.\n"
         "\n"
         "  give <item> <quantity> [| description | container]\n"
-        "      Creator command: create item stacks from nothing; give money <dollars> adds cash.\n"
+        "      Create tracked items. give money <quantity> creates separate items with unspecified value.\n"
         "\n"
         "  tv [status|on|off|input 1..4|tune <channel>|connect <name> | input/RF | <port>|disconnect <name>|vcr ...]\n"
         "      Operate the persistent CRT television and built-in VCR.\n"
@@ -2476,7 +2476,7 @@ static int shell_money(const char *arg)
         free(copy);
         return 1;
     }
-    printf("Usage: money [status|deposit <amount>|withdraw <amount>|buy <item> | <price> | <description> | <container>]\n");return 1;
+    printf("Usage: money [status|receive <amount>|deposit <amount>|withdraw <amount>|buy <item> | <price> | <description> | <container>]\n");return 1;
 }
 
 static long long shell_parse_id(const char *text)
