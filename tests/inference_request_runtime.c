@@ -24,7 +24,10 @@ static char *reviewed_bytes;
 static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
+static const char burst_user[] = "Queued during active post-turn processing.";
+static int burst_learning_requests;
 static int invalid_body_at;
+static CURLcode invalid_body_result = CURLE_OK;
 static char *isolated_retry_payload;
 static int foreground_after_response;
 static int completed_turn_after_response;
@@ -67,6 +70,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     if (perform_count == fail_transport_at) return CURLE_COULDNT_CONNECT;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
+    if (strstr(posted, burst_user)) ++burst_learning_requests;
     if (captured) json_object_put(captured);
     captured = json_tokener_parse(posted); assert(captured);
     struct json_object *flag = NULL;
@@ -141,7 +145,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         completed_turn_after_response = 0;
         atomic_fetch_add(&last_conversation_activity_ms, 1);
     }
-    return CURLE_OK;
+    return perform_count == invalid_body_at ? invalid_body_result : CURLE_OK;
 }
 CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
 {
@@ -561,6 +565,32 @@ static void check_post_turn_retry(void)
     assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
     assert(memory_fixture_count(failures) == initial_failures);
+    before = perform_count;
+    const char *burst_reply = "The exact reply is already durable.";
+    begin_post_turn_work();
+    for (int i = 0; i < 3; ++i) {
+        int64_t event = r2_log_conversation_turn_for_learning(
+            burst_user, burst_reply, NULL, 0, NULL, 0, "Recorded result.");
+        assert(event > source && r2_log_ack_self_report(event) == 0);
+        schedule_post_turn_processing(burst_user, burst_reply, event, strdup("Recorded result."));
+    }
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
+    assert(perform_count == before);
+    resume_post_turn_learning();
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Queued during active post-turn processing.' "
+                                "AND tool_result='Recorded result.'") == 3);
+    finish_post_turn_worker();
+    set_response("NONE", "stop", 1);
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(!atomic_load(&post_turn_replay_requested) && burst_learning_requests == 3);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Queued during active post-turn processing.'") == 0);
+
     int64_t late = r2_log_conversation_turn_for_learning(
         "Earlier log", "I still need to finish.", NULL, 0, NULL, 0, NULL);
     int64_t newer = r2_log_conversation_turn_for_learning(
@@ -1056,6 +1086,19 @@ static void check_isolated_response_replay(void)
     assert(!isolated_retry_payload);
     free(reply);
     invalid_body_at = 0;
+
+    const CURLcode receive_failures[] = {CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
+    for (size_t i = 0; i < sizeof(receive_failures) / sizeof(receive_failures[0]); ++i) {
+        before = perform_count;
+        invalid_body_result = receive_failures[i];
+        invalid_body_at = before + 1;
+        reply = r2_model_generate(policy, fragment, 512);
+        assert(reply && !strcmp(reply, note) && perform_count == before + 2);
+        assert(!isolated_retry_payload);
+        free(reply);
+        invalid_body_at = 0;
+    }
+    invalid_body_result = CURLE_OK;
 
     before = perform_count;
     free(response_body);

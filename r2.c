@@ -189,6 +189,7 @@ static _Thread_local const char *ollama_audit_stage = "unspecified";
 static pthread_mutex_t post_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t post_turn_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int post_turn_active = 0;
+static atomic_bool post_turn_replay_requested = ATOMIC_VAR_INIT(0);
 /* A conversation turn must be atomic so failed-turn rollback cannot erase another turn. */
 static pthread_mutex_t conversation_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t vision_watch_thread;
@@ -3799,7 +3800,7 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
 
 typedef enum {
     OLLAMA_RETRY_NONE,
-    OLLAMA_RETRY_INVALID_BODY,
+    OLLAMA_RETRY_INCOMPLETE_RESPONSE,
     OLLAMA_RETRY_GENERATION_LIMIT,
     OLLAMA_RETRY_REASONING_ONLY
 } OllamaRetryReason;
@@ -4545,11 +4546,11 @@ static char *ollama_chat_with_limit(
         } else {
             fprintf(stderr, "[R2 Ollama] Could not construct the non-thinking retry.\n");
         }
-    } else if (!result && retry == OLLAMA_RETRY_INVALID_BODY &&
+    } else if (!result && retry == OLLAMA_RETRY_INCOMPLETE_RESPONSE &&
                ollama_isolated_request && !shutting_down) {
         /* A failed evidence fragment otherwise restarts the entire review.
            Replay only the current request. The normal request gate can defer it. */
-        fprintf(stderr, "[R2 Ollama] Replaying one isolated request after an invalid response body.\n");
+        fprintf(stderr, "[R2 Ollama] Replaying one isolated request after an incomplete or invalid response.\n");
         result = ollama_submit_chat(payload, num_ctx, num_predict, allow_reasoning,
                                     timeout_seconds, &retry);
     }
@@ -4658,6 +4659,8 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
             free(b.data);
             return NULL;
         }
+        if (cc == CURLE_PARTIAL_FILE || (cc == CURLE_RECV_ERROR && b.size > 0))
+            *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         const char *why = curl_error[0] ? curl_error : curl_easy_strerror(cc);
         char details[768];
         snprintf(details, sizeof(details),
@@ -4688,7 +4691,7 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
     }
 
     if (!b.data || b.size == 0) {
-        *retry = OLLAMA_RETRY_INVALID_BODY;
+        *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         fprintf(stderr, "[R2 Ollama] empty response body (HTTP %ld).\n", http_status);
         if (r2_log_is_initialized())
             r2_log_event(R2_LOG_ERROR, "ollama_empty_response",
@@ -4710,7 +4713,7 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
         if (r2_log_is_initialized())
             r2_log_event(R2_LOG_ERROR, "ollama_invalid_json",
                          "R2's text-model endpoint returned invalid JSON.", details, MODEL);
-        *retry = OLLAMA_RETRY_INVALID_BODY;
+        *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         free(b.data);
         return NULL;
     }
@@ -10275,7 +10278,7 @@ static void *autonomous_thinking(void *arg)
 
         /* Let the previous tick finish its own reflection and needs requests
            before handing leftover work to a background replay worker. */
-        if (retry_learning) {
+        if (retry_learning || atomic_load(&post_turn_replay_requested)) {
             retry_learning = 0;
             resume_post_turn_learning();
         }
@@ -14826,6 +14829,8 @@ static void resume_post_turn_learning(void)
     int64_t through = rc == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&db_lock);
+    if (rc == SQLITE_ROW)
+        atomic_store(&post_turn_replay_requested, 0);
     if (through > 0) post_turn_active++;
     pthread_mutex_unlock(&post_turn_lock);
     pthread_mutex_unlock(&conversation_turn_lock);
@@ -14851,9 +14856,25 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
         free(tool_result);
         return;
     }
+    /* The exchange is staged in SQLite before this call. Keep one live
+       learning worker and leave additional exchanges in that durable queue. */
+    pthread_mutex_lock(&post_turn_lock);
+    if (post_turn_active || atomic_load(&post_turn_replay_requested)) {
+        if (event_id > 0)
+            atomic_store(&post_turn_replay_requested, 1);
+        pthread_mutex_unlock(&post_turn_lock);
+        free(tool_result);
+        if (event_id <= 0)
+            log_post_turn_start_failure("unstaged turn while learning is busy", event_id);
+        return;
+    }
+    post_turn_active++;
+    pthread_mutex_unlock(&post_turn_lock);
+
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     if (!job) {
         free(tool_result);
+        finish_post_turn_worker();
         log_post_turn_start_failure("job allocation", event_id);
         return;
     }
@@ -14865,11 +14886,11 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->tool_result = tool_result;
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
+        finish_post_turn_worker();
         log_post_turn_start_failure("turn copy allocation", event_id);
         return;
     }
 
-    begin_post_turn_work();
     if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         log_post_turn_start_failure("thread creation", event_id);
@@ -16264,6 +16285,7 @@ void r2_shutdown(void)
     pthread_mutex_lock(&post_turn_lock);
     while (post_turn_active > 0)
         pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    atomic_store(&post_turn_replay_requested, 0);
     pthread_mutex_unlock(&post_turn_lock);
 
     /* Reap any short sound player before closing the Life Log. */
