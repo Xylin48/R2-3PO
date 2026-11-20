@@ -363,6 +363,24 @@ int main(void)
                 "direct reply to the user that addresses both topics is accepted");
 
 
+    ok &= check(r2_reply_has_identity_error(mother_message, "I'm ChatGPT. How can I assist?") &&
+                r2_reply_has_identity_error(mother_message, "I am an AI language model.") &&
+                r2_reply_has_identity_error(mother_message, "As an AI language model, I can answer questions.") &&
+                r2_reply_has_identity_error(mother_message, "This is R2-D2.") &&
+                r2_reply_has_identity_error(mother_message, "Hello R2, it's your mother."),
+                "identity substitutions and speaker reversals are eligible for rejection on either draft");
+    ok &= check(!r2_reply_has_identity_error("Do you use Qwen?",
+                                           "I'm R2-3PO. Qwen helps me find the words.") &&
+                !r2_reply_has_identity_error("Tell me about R2-D2.", "R2-D2 is a different droid.") &&
+                !r2_reply_has_identity_error("Write a dialogue where ChatGPT introduces itself.",
+                                             "I'm ChatGPT.") &&
+                !r2_reply_has_identity_error(mother_message, "I'm glad to hear from you, Mom."),
+                "ordinary personal replies, model explanations and explicitly authored dialogue remain valid");
+    ok &= check(strstr(compact_retry_system_prompt, R2_CONVERSATION_IDENTITY) &&
+                strstr(r2_compact_conversation_policy, R2_CONVERSATION_IDENTITY) &&
+                strstr(r2_conversation_system_prompt, R2_CONVERSATION_IDENTITY),
+                "every foreground prompt shares the first-person robot identity");
+
     char *retry_prompt = r2_build_retry_system_prompt();
     ok &= check(retry_prompt != NULL,
                 "corrective system prompt can be constructed");

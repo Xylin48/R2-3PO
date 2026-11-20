@@ -78,6 +78,16 @@ FABRICATED_AUDIO_REPLY = (
 )
 
 
+IDENTITY_GUARD_REQUEST = "Hi R2, do you remember the brass compass I told you about?"
+IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
+IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
+IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
+IDENTITY_WRITE = "\n[WRITE] identity-draft.txt\nRejected draft wrote this.\n[END WRITE]"
+IDENTITY_BAD_DRAFT = "I'm ChatGPT. How may I assist you?" + IDENTITY_WRITE
+IDENTITY_REVERSED_DRAFT = "Hi R2, you can tell me how you've been." + IDENTITY_WRITE
+IDENTITY_ANCHOR = "Speak in first person as the same R2-3PO robot companion across turns."
+
+
 FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
 FOLLOWUP_FALLBACK_REQUEST = "Save the action result fallback fixture."
 FOLLOWUP_RECOVERY_ANSWER = "The recovery fixture was saved."
@@ -181,6 +191,8 @@ class LocalOllama(BaseHTTPRequestHandler):
                 reply = (LONG_READ_REVIEW if any("Please read the combined fixture." in message
                                                  or LONG_READ_REVIEW in message for message in user_messages)
                          else LONG_USER_REVIEW)
+            elif any(IDENTITY_MEMORY in message for message in user_messages):
+                reply = IDENTITY_MEMORY
             elif any("post-turn memory decision" in message for message in user_messages):
                 reply = (BLUE_MEMORY if any("Which token was blue?" in message or BLUE_MEMORY in message
                                            for message in user_messages)
@@ -251,6 +263,15 @@ class LocalOllama(BaseHTTPRequestHandler):
                 and (payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
                      or "RESPONSE CORRECTION:" in system or "Correct the prior draft" in system)):
             message["content"] = FABRICATED_AUDIO_REPLY
+        if (current_index >= 0 and IDENTITY_ANCHOR in system
+                and user_messages[current_index] in (IDENTITY_GUARD_REQUEST, IDENTITY_REPEAT_REQUEST)):
+            correction = ("RESPONSE CORRECTION:" in system or "Correct the prior draft" in system)
+            if correction:
+                has_relationship_evidence = (user_messages[current_index] == IDENTITY_GUARD_REQUEST
+                                             and IDENTITY_MEMORY in system)
+                message["content"] = IDENTITY_REPLY if has_relationship_evidence else IDENTITY_REVERSED_DRAFT
+            else:
+                message["content"] = IDENTITY_BAD_DRAFT
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
             "message": message,
@@ -424,6 +445,48 @@ def reject_repeated_fabricated_audio(binary: Path, workspace: Path, url: str) ->
         assert len(replies) == 1 and "couldn't produce a usable reply" in replies[0][0]
         assert "heavily garbled" not in replies[0][0]
     print("PASS: repeated fabricated audio claims on typed input stayed out of replies and actions.")
+
+
+def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?, 'relationship', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)", (IDENTITY_MEMORY,),
+        )
+    for context, request, expect_reply in (
+        (4096, IDENTITY_GUARD_REQUEST, IDENTITY_REPLY),
+        (8192, IDENTITY_REPEAT_REQUEST, "couldn't produce a usable reply"),
+    ):
+        start = len(LocalOllama.requests)
+        output = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
+            input=f"{request}\nexit\n", text=True, capture_output=True,
+            timeout=100, check=True,
+        )
+        assert output.stdout.count("R2-3PO:") == 1 and expect_reply in output.stdout, output.stdout + output.stderr
+        answer_audits = [line for line in output.stderr.splitlines()
+                         if "[R2 Prompt Audit] stage=conversation-" in line]
+        assert answer_audits and all("robot_identity=1" in line for line in answer_audits)
+        assert "How may I assist you" not in output.stdout
+        assert "you can tell me how you've been" not in output.stdout
+        assert not (workspace / "identity-draft.txt").exists()
+        requests = [
+            payload["messages"] for payload in LocalOllama.requests[start:]
+            if any(item["role"] == "user" and item["content"] == request for item in payload["messages"])
+            and any(item["role"] == "system" and IDENTITY_ANCHOR in item["content"]
+                    for item in payload["messages"])
+        ]
+        assert requests and all(sum(item["role"] == "user" and item["content"] == request
+                                    for item in messages) == 1 for messages in requests)
+        assert any(any(item["role"] == "system" and
+                       ("RESPONSE CORRECTION:" in item["content"] or "Correct the prior draft" in item["content"])
+                       for item in messages) for messages in requests)
+        with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+            rows = db.execute("SELECT assistant_text FROM r2_log_conversations WHERE user_text=?",
+                              (request,)).fetchall()
+            assert len(rows) == 1 and expect_reply in rows[0][0]
+            assert "ChatGPT" not in rows[0][0] and "you can tell me how you've been" not in rows[0][0]
+    print("PASS: robot identity persisted through normal and corrected turns; wrong speakers never reached tools or history.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -1448,6 +1511,7 @@ def main() -> int:
             recover_first_greeting(binary, workspace, url)
             recover_post_action_response(binary, workspace, url)
             reject_repeated_fabricated_audio(binary, workspace, url)
+            preserve_robot_identity(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")

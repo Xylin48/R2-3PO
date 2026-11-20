@@ -14,19 +14,23 @@ def require(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 
-start = core.find("static int r2_reply_reverses_speaker_roles(")
+start = core.find("static int r2_user_requests_written_dialogue(")
 end = core.find("static int r2_reply_misclassifies_plain_text(", start)
-require(start >= 0 and end > start, "speaker-role reversal guard exists")
+require(start >= 0 and end > start, "speaker-role and identity guards exist")
 role_guard = core[start:end]
 for phrase, message in (
     ('"hello r2"', "guard recognizes a greeting directed to R2"),
     ('"hi r2"', "guard recognizes short greetings directed to R2"),
     ('"hey r2"', "guard recognizes casual greetings directed to R2"),
     ('"write a dialogue"', "guard avoids triggering on explicit dialogue-writing requests"),
-    ("r2_reply_reverses_speaker_roles(query, reply)", "primary nonresponsive-reply guard invokes speaker-role validation"),
+    ("r2_reply_reverses_speaker_roles(query, reply)", "identity guard includes speaker-role validation"),
 ):
-    source = role_guard if phrase != "r2_reply_reverses_speaker_roles(query, reply)" else core[end:end+500]
-    require(phrase in source, message)
+    require(phrase in role_guard, message)
+require(
+    "r2_reply_has_identity_error(query, reply)" in core[end:end + 500]
+    and "r2_reply_has_identity_error(query, retry_user_facing)" in core,
+    "primary and corrective drafts both undergo identity validation",
+)
 
 require(
     "A greeting from the user is not a request to rewrite that greeting" in core
