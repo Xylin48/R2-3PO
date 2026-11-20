@@ -5225,6 +5225,37 @@ cleanup:
     return answer;
 }
 
+/* Answer the current turn when optional historical review failed. Keep
+   required evidence and complete historical blocks that still fit. */
+static char *r2_answer_after_failed_history_review(Message *messages, size_t count,
+                                                   const char *system, size_t remaining,
+                                                   int num_predict, long timeout)
+{
+    static const char notice[] =
+        "Earlier evidence review was unavailable for this request. "
+        "The complete source is retained separately. Answer from the exact current message "
+        "and the evidence supplied here. Acknowledge any resulting uncertainty.";
+    if (remaining < sizeof(notice) - 1 || count >= SIZE_MAX / sizeof(Message))
+        return NULL;
+    Message *selected = calloc(count + 1, sizeof(*selected));
+    if (!selected) return NULL;
+    size_t used = 0;
+    selected[used++] = (Message){.role = "system", .content = (char *)notice};
+    remaining -= sizeof(notice) - 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (r2_context_can_be_reviewed(&messages[i])) {
+            size_t length = strlen(messages[i].content);
+            if (length > remaining) continue;
+            remaining -= length;
+        }
+        selected[used++] = messages[i];
+    }
+    fprintf(stderr, "[R2 Context] Historical review unavailable; answering from the current turn and available evidence.\n");
+    char *answer = ollama_chat_with_limit(selected, used, system, num_predict, timeout);
+    free(selected);
+    return answer;
+}
+
 static char *r2_foreground_chat(Message *messages, size_t count,
                                  const char *system, const char *query,
                                  int num_predict, long timeout)
@@ -5290,7 +5321,21 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     char *trace = NULL;
     char *notes = r2_review_context(query, snapshot,
         capacity - immutable - (size_t)heading_size, &trace);
-    if (!notes) { free(snapshot); return NULL; }
+    if (!notes) {
+        free(trace);
+        char *answer = NULL;
+        if (!shutting_down &&
+            (conversation_policy || system == r2_compact_conversation_policy) &&
+            !r2_query_explicitly_requests_recall(query)) {
+            int64_t archive = r2_log_archive_context_review(query, snapshot,
+                "Historical review failed. The original evidence is retained here verbatim.");
+            if (archive > 0 && r2_context_turn_record(archive) == 0)
+                answer = r2_answer_after_failed_history_review(messages, count, system,
+                                                               capacity - immutable, num_predict, timeout);
+        }
+        free(snapshot);
+        return answer;
+    }
 
     int64_t archive_id = r2_log_archive_context_review(query, snapshot, trace ? trace : notes);
     if (archive_id > 0) {
@@ -10743,7 +10788,15 @@ static char *memory_decision(
     int budget = 384;
     char *res;
     if (r2_fit_complete_input(strlen(sys) + strlen(u), r2_ollama_context_tokens(), &budget) == 0) {
+        /* The saved exchange owns this decision. Retry a damaged response
+           without adding live sensor data or changing the original evidence. */
+        int previous_isolated = ollama_isolated_request;
+        const char *previous_stage = ollama_audit_stage;
+        ollama_isolated_request = 1;
+        ollama_audit_stage = "post-turn-memory";
         res = ollama_chat_with_limit(&m, 1, sys, budget, 90L);
+        ollama_audit_stage = previous_stage;
+        ollama_isolated_request = previous_isolated;
     } else {
         char task[320];
         snprintf(task, sizeof(task),
