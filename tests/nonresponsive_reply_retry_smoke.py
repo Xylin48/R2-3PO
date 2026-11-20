@@ -137,7 +137,7 @@ require(
 )
 require(
     "r2_reply_claims_garbled_typed_audio(retry_user_facing)" in core
-    and "r2_input_speech_event <= 0" in core,
+    and "r2_input_speech_event == 0" in core,
     "reject a repeated false audio claim only for typed input",
 )
 require(
@@ -151,11 +151,11 @@ require(
     "ordinary corrective failure can retain the original model result",
 )
 require(
-    "If the user says YOUR prior message, answer, or reply was garbled" in core,
+    "When the user gives feedback about your previous reply" in core,
     "the main conversation prompt distinguishes feedback about R2's prior output from an unintelligible current user message",
 )
 require(
-    "Do not reinterpret typed text as an audio stream, random sounds, or machine data" in core,
+    "Use the current input source to distinguish typed text from transcribed speech." in core,
     "primary conversation prompt discourages typed-text misclassification",
 )
 require(

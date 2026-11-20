@@ -407,6 +407,7 @@ typedef struct {
     size_t count;
 } R2AudioTurnEvidence;
 static _Thread_local R2AudioTurnEvidence *r2_audio_turn_evidence = NULL;
+/* Zero identifies typed input. A negative value means a transcript whose Life Log event could not be saved. */
 static _Thread_local int64_t r2_input_speech_event = 0;
 
 static void r2_audio_turn_record(int64_t event_id)
@@ -4971,7 +4972,7 @@ static const char r2_compact_conversation_policy[] =
     "and acknowledge the human meaning naturally. Be direct, warm and specific. "
     "Respond to a person introducing themselves as your mother from your own "
     "perspective. Acknowledge relationship corrections in the current turn. "
-    "Typed input is text. Never claim it came from your audio sensors. "
+    "Use the current input source to distinguish typed text from transcribed speech. Read informal spelling and punctuation for meaning. "
     "If correcting a prior reply, respond to the user's actual words. Ask a focused question "
     "when essential information is missing. Keep private reasoning and tool markers out of the visible answer. "
     "Use memories and supplied state as evidence. Keep beliefs, hypothetical possibilities, and real events distinct. "
@@ -5380,6 +5381,25 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     return answer;
 }
 
+static char *r2_chat_with_input_source(Message *messages, size_t count,
+                                       const char *system, const char *query,
+                                       int num_predict, long timeout)
+{
+    if (count >= SIZE_MAX / sizeof(*messages)) { errno = EOVERFLOW; return NULL; }
+    Message *sourced = malloc((count + 1) * sizeof(*sourced));
+    if (!sourced) return NULL;
+    sourced[0] = (Message){
+        .role = "system",
+        .content = r2_input_speech_event
+            ? "CURRENT USER INPUT: an Ears speech transcript."
+            : "CURRENT USER INPUT: typed keyboard text."
+    };
+    if (count) memcpy(sourced + 1, messages, count * sizeof(*messages));
+    char *answer = r2_foreground_chat(sourced, count + 1, system, query, num_predict, timeout);
+    free(sourced);
+    return answer;
+}
+
 /* ============================================================
    NORMAL CONVERSATION
    ============================================================ */
@@ -5696,7 +5716,7 @@ static int r2_reply_contains_known_failure_phrase(const char *reply)
 
 static int r2_reply_claims_garbled_typed_audio(const char *reply)
 {
-    return r2_input_speech_event <= 0 && reply &&
+    return r2_input_speech_event == 0 && reply &&
            strcasestr(reply, "audio sensors") &&
            strcasestr(reply, "your transmission") &&
            (strcasestr(reply, "heavily garbled") || strcasestr(reply, "coming through corrupted"));
@@ -5707,7 +5727,7 @@ static int r2_reply_claims_garbled_typed_audio(const char *reply)
    about an unclear detail can still be delivered. */
 static int r2_reply_dismisses_typed_turn(const char *query, const char *reply)
 {
-    if (!query || !reply || r2_input_speech_event > 0 ||
+    if (!query || !reply || r2_input_speech_event != 0 ||
         r2_user_requests_written_dialogue(query))
         return 0;
     while (isspace((unsigned char)*reply)) ++reply;
@@ -5950,10 +5970,10 @@ static const char r2_conversation_system_prompt[] =
             "Acknowledge meaningful "
             "uncertainty. Never output private scratch notes, an intent summary, or "
             "a description of an answer you plan to give. "
-            "INTERPRETATION: Treat ordinary, grammatical user language as meaningful, "
-            "including messages that combine several topics or refer to personal context. "
-            "Do not call an intelligible message gibberish merely because a detail is unfamiliar. If the user says YOUR prior message, answer, or reply was garbled, confusing, unreadable, or made no sense, understand that as feedback about YOUR output; acknowledge it, correct yourself, and address what they were trying to tell you. Do not treat that feedback as evidence that the user's current message is unintelligible. "
-            "Do not reinterpret typed text as an audio stream, random sounds, or machine data unless the user is actually discussing audio, sound, signals, or transcription. "
+            "INTERPRETATION: Read the user's exact words for their meaning, including informal spelling, "
+            "typos, missing punctuation, and terms of affection. Use the current input source to distinguish "
+            "typed text from transcribed speech. When the user gives feedback about your previous reply, "
+            "acknowledge their feedback and address what they were trying to tell you. "
             "Do not replace a normal question or invitation with an analysis of the wording or "
             "a claim that the user is asking whether you are yourself. For multi-part messages, "
             "address each important part instead of fixating on one phrase. When the user shares "
@@ -5961,7 +5981,7 @@ static const char r2_conversation_system_prompt[] =
             "naturally before or alongside practical details. Do not recast the user's statement "
             "as words they supposedly meant to say, and do not answer as though the user were you. "
             "A greeting from the user is not a request to rewrite that greeting. If the user addresses you as R2 and introduces themselves as your mother, father, friend, or another person, reply to that person from your own perspective; do not generate a message from their perspective or greet yourself as R2. Answer every part of the message, including specific questions about your pockets or other current devices/inventory when that information is available. "
-            "SPEAKER AND RELATIONSHIP LEARNING: The current user message is spoken by the user; you are R2. Resolve pronouns from those actual speaker roles, not from names inside retrieved dialogue. Learn relationships from explicit statements and relevant persistent experiences, preserve them in memory, and apply them naturally when relevant. Retrieved dialogue is evidence about prior events, not the source of current turn roles. "
+            "SPEAKER AND RELATIONSHIP LEARNING: The current user message contains the user's words; you are R2. Resolve pronouns from those actual speaker roles, not from names inside retrieved dialogue. Learn relationships from explicit statements and relevant persistent experiences, preserve them in memory, and apply them naturally when relevant. Retrieved dialogue is evidence about prior events, not the source of current turn roles. "
             "Answer the clear intent first; if a genuinely necessary detail remains unclear, ask one focused question. "
             "REPLY STYLE: Lead with the direct answer. Be natural, specific, warm, "
             "and concise. Avoid repeating the user's message, generic preambles, "
@@ -7153,7 +7173,7 @@ static char *chat_with_relevant_memories(
     ollama_authoritative_user_query = query;
     ollama_audit_stage = "conversation-answer";
     char *reply =
-        r2_foreground_chat(
+        r2_chat_with_input_source(
             copy,
             base_count,
             r2_conversation_system_prompt,
@@ -15711,7 +15731,7 @@ char *r2_talk(const char *message)
 char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id)
 {
     int64_t previous = r2_input_speech_event;
-    r2_input_speech_event = speech_event_id;
+    r2_input_speech_event = speech_event_id > 0 ? speech_event_id : -1;
     char *reply = r2_talk(message);
     r2_input_speech_event = previous;
     return reply;

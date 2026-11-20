@@ -1215,6 +1215,27 @@ static void check_isolated_response_replay(void)
     assert(problem && !strcmp(problem, "embedded NUL byte") && offset == 2);
 }
 
+static void check_foreground_input_provenance(void)
+{
+    const char *query = "Hi, I missed you.";
+    Message turn = {.role = "user", .content = (char *)query};
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("I missed you too.", "stop", 1);
+    for (int i = 0; i < 2; ++i) {
+        /* Transcribed input remains speech even if logging its event failed. */
+        r2_input_speech_event = i ? -1 : 0;
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60);
+        assert(reply && captured_contains(query));
+        assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
+                                     "CURRENT USER INPUT: typed keyboard text."));
+        free(reply);
+    }
+    r2_input_speech_event = 0;
+    ollama_audit_stage = NULL;
+    ollama_authoritative_user_query = NULL;
+}
+
 static void check_memory_response_replay(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
@@ -1373,6 +1394,7 @@ int main(void)
     assert(cleanup_count == perform_count + 2);
     check_isolated_response_replay();
     check_memory_response_replay();
+    check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
     assert(asprintf(&malformed, "%s trailing non-JSON", response_body) >= 0);

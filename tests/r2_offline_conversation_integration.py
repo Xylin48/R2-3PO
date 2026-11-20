@@ -25,6 +25,9 @@ from r2_service_signal_integration import REPO, SOURCES, LIBS
 GREETING = ("Good evening, R2. This is Mom. "
             "It has been a while and I have missed you.")
 GREETING_REPLY = "Good evening, Mom. I've missed you too."
+REPORTED_GREETING = ("good afternoon R2, my darling. this is your mother speaking to you. "
+                     "it has been awhile, oh iv missed you greatly")
+REPORTED_GREETING_REPLY = "Good afternoon, Mom. I've missed you too."
 PRIVATE_GREETING_REASONING = "R2_PRIVATE_GREETING_REASONING_60125"
 CONVERSATION_POLICIES = (
     "You are R2-3PO. Use the conversation, memories, and perceptions",
@@ -260,6 +263,9 @@ class LocalOllama(BaseHTTPRequestHandler):
                                thinking=PRIVATE_GREETING_REASONING)
             else:
                 message["content"] = GREETING_REPLY
+        if (current_index >= 0 and user_messages[current_index] == REPORTED_GREETING
+                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
+            message["content"] = REPORTED_GREETING_REPLY
         if (current_index >= 0 and user_messages[current_index] in FOLLOWUP_FILES
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             request = user_messages[current_index]
@@ -397,6 +403,35 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
             + combined[-16000:]
         )
     return combined
+
+
+def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
+    for context in (8192, 4096):
+        start = len(LocalOllama.requests)
+        output = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
+            input=f"{REPORTED_GREETING}\nexit\n", text=True, capture_output=True,
+            timeout=100, check=True,
+        )
+        assert output.stdout.count("R2-3PO: " + REPORTED_GREETING_REPLY) == 1, output.stderr
+        requests = [
+            request for request in LocalOllama.requests[start:]
+            if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+            and request["messages"][-1] == {"role": "user", "content": REPORTED_GREETING}
+        ]
+        assert len(requests) == 1, requests
+        assert requests[0]["options"]["num_ctx"] == context
+        system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
+        assert "CURRENT USER INPUT: typed keyboard text." in system
+        assert IDENTITY_ANCHOR in system[0]
+        assert "The current user message is spoken by the user" not in system[0]
+        assert "RESPONSE CORRECTION:" not in system[0]
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (REPORTED_GREETING,),
+        ).fetchall() == [(REPORTED_GREETING_REPLY,)] * 2
+    print("PASS: the reported greeting reached the first R2 answer request as exact typed text.")
 
 
 def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
@@ -1616,6 +1651,7 @@ def main() -> int:
                 turns.extend((context, marker) for marker in (first, followup, second))
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
+            send_reported_greeting(binary, workspace, url)
             recover_first_greeting(binary, workspace, url)
             recover_post_action_response(binary, workspace, url)
             reject_repeated_fabricated_audio(binary, workspace, url)

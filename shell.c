@@ -825,7 +825,7 @@ static void shell_talk_inner(const char *message, int64_t speech_event_id)
         return;
     }
 
-    char *reply = speech_event_id > 0
+    char *reply = speech_event_id != 0
         ? r2_talk_with_speech_event(message, speech_event_id) : r2_talk(message);
 
     if (!reply || !*reply) {
@@ -857,13 +857,15 @@ static pthread_mutex_t shell_conversation_lock = PTHREAD_MUTEX_INITIALIZER;
 static void shell_talk_with_speech_event(const char *message, int64_t speech_event_id)
 {
     pthread_mutex_lock(&shell_conversation_lock);
-    shell_talk_inner(message, speech_event_id);
+    shell_talk_inner(message, speech_event_id > 0 ? speech_event_id : -1);
     pthread_mutex_unlock(&shell_conversation_lock);
 }
 
 static void shell_talk(const char *message)
 {
-    shell_talk_with_speech_event(message, 0);
+    pthread_mutex_lock(&shell_conversation_lock);
+    shell_talk_inner(message, 0);
+    pthread_mutex_unlock(&shell_conversation_lock);
 }
 
 /* ============================================================
