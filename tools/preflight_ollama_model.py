@@ -137,12 +137,12 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 def _is_complete_assistant_turn(reply: dict[str, Any]) -> bool:
     """Match the core's non-streaming Ollama completion contract."""
     message = reply.get("message")
-    reason = reply.get("done_reason", "")
+    reason = reply.get("done_reason", "missing")
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and reply.get("done") is True
-        and isinstance(reason, str) and "\x00" not in reason and reason != "length"
+        and isinstance(reason, str) and bool(reason) and "\x00" not in reason and reason != "length"
     )
 
 
@@ -242,24 +242,39 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
             os.environ["R2_OLLAMA_NUM_GPU"].strip() and gpu_layers != 0):
         options["num_gpu"] = gpu_layers
 
+    # Keep the expected answer in an earlier turn so the probe checks
+    # conversational role and context handling on the real model.
+    text_payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "You are R2-3PO. Follow the user's request and preserve literal codes."},
+            {"role": "user", "content": "The local readiness code is R2_READY."},
+            {"role": "assistant", "content": "I have the readiness code."},
+            {"role": "user", "content": "What code did I give you? Return exactly the code and nothing else."},
+        ],
+        "stream": False,
+        "truncate": False,
+        "shift": False,
+        "think": True,
+        "keep_alive": "10m",
+        "options": options,
+    }
     try:
-        reply = _read_json(
-            f"{api_base}/api/chat",
-            timeout=timeout,
-            payload={
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": "Reply with exactly this token and no other text: R2_READY",
-                }],
-                "stream": False,
-                "truncate": False,
-                "shift": False,
-                "think": True,
-                "keep_alive": "10m",
-                "options": options,
-            },
-        )
+        reply = _read_json(f"{api_base}/api/chat", timeout=timeout, payload=text_payload)
+        message = reply.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant" and reply.get("done") is True:
+            content = message.get("content")
+            thinking = message.get("thinking")
+            reasoning_only = (
+                _is_complete_assistant_turn(reply)
+                and (content is None or isinstance(content, str) and not content.strip())
+                and isinstance(thinking, str) and bool(thinking.strip())
+            )
+            if reply.get("done_reason") == "length" or reasoning_only:
+                print("Ollama text probe is retrying once with thinking disabled, using the same conversation and limits.")
+                retry_options = dict(options, temperature=0.7, top_p=0.8)
+                reply = _read_json(f"{api_base}/api/chat", timeout=timeout,
+                                   payload=dict(text_payload, think=False, options=retry_options))
     except urllib.error.HTTPError as exc:
         print(
             f"ERROR: Ollama listed {MODEL} but real chat generation failed: {_http_error_detail(exc)}",
@@ -275,7 +290,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     if not isinstance(content, str) or not content.strip():
         thinking = message.get("thinking") if isinstance(message, dict) else None
         if isinstance(thinking, str) and thinking.strip():
-            detail = "Ollama returned thinking output but no final answer text, despite the reasoning-enabled foreground probe."
+            detail = "Ollama returned thinking output but no final answer text."
         else:
             detail = "Ollama returned an empty final answer field."
         print(f"ERROR: Ollama listed {MODEL} but chat generation produced no usable final answer. {detail}", file=sys.stderr)

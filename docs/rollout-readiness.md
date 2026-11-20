@@ -2,11 +2,10 @@
 
 First launch on the real workspace is the final deployment step. Complete code review, isolated runtime tests, and hardware checks before installation. Keep the live databases, diary, and original conversation archive out of test runs.
 
-## 1. Confirm the candidate and CI
+## 1. Verify the candidate behavior
 
-- Use [draft PR #188](https://github.com/Xylin48/R2-3PO/pull/188) on `integrate/r2-full-source-audit-2026-11-17`. Record the exact source commit you plan to build and compare it with the workflow head.
-- Require the full `R2 build` GitHub Actions workflow on the production candidate. A later ledger-only commit can reference that run if its code and tests match.
-- Complete the line-by-line review and verify state transitions and recovery using disposable test stores, fixtures, or isolated working copies. Keep the candidate on the release branch pending signoff.
+- Record the exact source commit planned for deployment. Trace the affected code paths and exercise the compiled core against disposable stores. Check the visible replies, verified action results, persistent records, and recovery across a restart.
+- Use the GitHub workflow as an additional regression signal. Keep the candidate on the release branch pending signoff.
 
 ## 2. Preflight the target host before activation
 
@@ -32,7 +31,7 @@ Keep the originals stopped while preparing the quiescent backup for final deploy
 
 Use the standalone Ollama preflight for text, synthetic image inference, and GPU placement. Use host tools to check the microphone, camera, speaker, and TV/VCR or Game Boy dependencies directly. Keep the R2 executable stopped throughout these checks.
 
-The model-copy step validates the Ollama model reference and manifest structure before writing, rejects symlinked source manifests/blob files and source/destination parent components, checks every blob digest and source blob hash, verifies copied content, and uses exclusively-created temporary files for atomic replacement. The model preflight then runs both a real text completion and a camera-sized 640x480 synthetic-image completion in JSON mode that must identify a known blue square, using the same context-dependent output cap as Visual.c; image-bearing inference failure/OOM blocks startup and triggers the same conservative default-only fallback as text failure.
+The model-copy step validates the Ollama model reference and manifest structure before writing, rejects symlinked source manifests/blob files and source/destination parent components, checks every blob digest and source blob hash, verifies copied content, and uses exclusively-created temporary files for atomic replacement. The model preflight then requires the model to retrieve an exact code from an earlier synthetic conversation turn. It retries that same conversation once without thinking after a generation limit or a thinking-only response. It also runs a camera-sized 640x480 synthetic-image completion in JSON mode that must identify a known blue square, using the same context-dependent output cap as Visual.c; image-bearing inference failure/OOM blocks startup and triggers the same conservative default-only fallback as text failure.
 
 On the 4 GiB GTX 1050 Ti, the interactive launcher and overnight runner first probe the default 20 GPU layers and 8192 context tokens. With both settings selected automatically, they retry 4096 and 2048 context at the initial layer count, then try 12, 8, and 4 layers with 8192, 4096, and 2048 context at each count. If the operator sets context explicitly, retries keep that context. An explicit GPU-layer setting disables these automatic layer retries. The separate privileged installer's initial private-server probe uses a single 12-layer / 4096-context fallback before starting the service. A successful GTX 1050 Ti preflight must confirm both real generation and mixed CPU/GPU placement.
 
