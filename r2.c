@@ -15654,27 +15654,117 @@ static int r2_startup_thread_create(pthread_t *thread,
 
 static const char initialized_database_set[] = ".r2-database-set-initialized";
 
+/* Check the complete set before opening any store with write access. */
+static int check_existing_store(const char *path, const char *expected_table)
+{
+    sqlite3 *store = NULL;
+    sqlite3_stmt *query = NULL;
+    int rc = sqlite3_open_v2(path, &store, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_busy_timeout(store, 2000);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(store, "PRAGMA quick_check(1);", -1, &query, NULL);
+    const unsigned char *result = rc == SQLITE_OK && sqlite3_step(query) == SQLITE_ROW
+        ? sqlite3_column_text(query, 0) : NULL;
+    int healthy = result && !strcmp((const char *)result, "ok") &&
+                  sqlite3_step(query) == SQLITE_DONE;
+    sqlite3_finalize(query);
+
+    if (healthy && expected_table) {
+        query = NULL;
+        rc = sqlite3_prepare_v2(store, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
+                              -1, &query, NULL);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_bind_text(query, 1, expected_table, -1, SQLITE_STATIC);
+        healthy = rc == SQLITE_OK && sqlite3_step(query) == SQLITE_ROW;
+        if (!healthy)
+            fprintf(stderr, "[R2] Could not verify expected table %s in %s.\n", expected_table, path);
+        sqlite3_finalize(query);
+    }
+    if (!healthy)
+        fprintf(stderr, "[R2] Database failed read-only startup verification: %s (%s).\n",
+                path, store ? sqlite3_errmsg(store) : "SQLite handle unavailable");
+    if (store) sqlite3_close(store);
+    return healthy ? 0 : -1;
+}
+
 static int verify_initialized_database_set(void)
 {
     struct stat entry;
-    if (fstatat(core_storage_lock, initialized_database_set, &entry,
-                AT_SYMLINK_NOFOLLOW) != 0)
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISREG(entry.st_mode)) return -1;
+    int established = fstatat(core_storage_lock, initialized_database_set, &entry,
+                             AT_SYMLINK_NOFOLLOW) == 0;
+    if (established ? !S_ISREG(entry.st_mode) : errno != ENOENT)
+        return -1;
 
-    static const char *const databases[] = {
-        "r2_memory.db", "r2_reality.db", "r2_fridge.db",
-        "r2_rewards.db", "r2_addictions.db",
+    static const struct {
+        const char *name;
+        const char *path;
+        const char *table;
+    } stores[] = {
+        {"r2_memory.db", DB_PATH, "memories"},
+        {"r2_reality.db", R2_HOME "/r2_reality.db", "r2_reality_self"},
+        {"r2_fridge.db", R2_HOME "/r2_fridge.db", "r2_fridge_items"},
+        {"r2_rewards.db", R2_HOME "/r2_rewards.db", "reward_events"},
+        {"r2_addictions.db", R2_HOME "/r2_addictions.db", "addiction_events"},
     };
-    for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); ++i) {
-        if (fstatat(core_storage_lock, databases[i], &entry,
-                    AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(entry.st_mode) ||
-            entry.st_size == 0) {
+    static const char *const suffixes[] = {"-wal", "-shm", "-journal"};
+    enum { STORE_COUNT = sizeof(stores) / sizeof(stores[0]) };
+    int present[STORE_COUNT] = {0};
+    struct stat identities[STORE_COUNT];
+    size_t store_count = 0;
+    if (faccessat(core_storage_lock, ".", W_OK | X_OK, AT_EACCESS) != 0) {
+        fprintf(stderr, "[R2] Persistent database directory is not writable.\n");
+        return -1;
+    }
+    for (size_t i = 0; i < STORE_COUNT; ++i) {
+        present[i] = fstatat(core_storage_lock, stores[i].name, &entry, AT_SYMLINK_NOFOLLOW) == 0;
+        if (present[i] ? (!S_ISREG(entry.st_mode) || entry.st_size == 0)
+                       : (established || errno != ENOENT)) {
             fprintf(stderr, "[R2] Required initialized database is missing or invalid: %s\n",
-                    databases[i]);
+                    stores[i].name);
+            return -1;
+        }
+        store_count += present[i];
+        if (present[i]) {
+            if (faccessat(core_storage_lock, stores[i].name, R_OK | W_OK, AT_EACCESS) != 0) {
+                fprintf(stderr, "[R2] Database is not readable and writable: %s\n", stores[i].name);
+                return -1;
+            }
+            for (size_t earlier = 0; earlier < i; ++earlier) {
+                if (present[earlier] && identities[earlier].st_dev == entry.st_dev &&
+                    identities[earlier].st_ino == entry.st_ino) {
+                    fprintf(stderr, "[R2] Database paths share the same file: %s and %s\n",
+                            stores[earlier].name, stores[i].name);
+                    return -1;
+                }
+            }
+            identities[i] = entry;
+        }
+        for (size_t j = 0; j < sizeof(suffixes) / sizeof(suffixes[0]); ++j) {
+            char name[64];
+            snprintf(name, sizeof(name), "%s%s", stores[i].name, suffixes[j]);
+            if (fstatat(core_storage_lock, name, &entry, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (present[i] && S_ISREG(entry.st_mode) &&
+                    faccessat(core_storage_lock, name, R_OK | W_OK, AT_EACCESS) == 0)
+                    continue;
+            } else if (errno == ENOENT) {
+                continue;
+            }
+            fprintf(stderr, "[R2] Invalid SQLite sidecar at startup: %s\n", name);
             return -1;
         }
     }
+
+    /* Fresh workspaces and historical memory-only installations are valid.
+       A partial multi-store set is ambiguous even if its marker was lost. */
+    if (store_count && store_count != STORE_COUNT && !(store_count == 1 && present[0])) {
+        fprintf(stderr, "[R2] Incomplete database set at startup (%zu of %d stores present).\n",
+                store_count, STORE_COUNT);
+        return -1;
+    }
+    for (size_t i = 0; i < STORE_COUNT; ++i)
+        if (present[i] && check_existing_store(stores[i].path, established ? stores[i].table : NULL) != 0)
+            return -1;
     return 0;
 }
 
@@ -15714,7 +15804,7 @@ int r2_init(void)
 
     /* Lock the directory inode for the whole core lifetime. No lock file
        can be replaced independently of the databases it protects. */
-    core_storage_lock = open(R2_HOME, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    core_storage_lock = open(R2_HOME, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (core_storage_lock < 0)
         R2_INIT_FAIL("could not open persistent data directory: %s", strerror(errno));
     int lock_rc;

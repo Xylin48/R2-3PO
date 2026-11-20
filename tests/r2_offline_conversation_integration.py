@@ -1363,11 +1363,59 @@ def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
                 assert all(other.read_bytes() == original[other] for other in stores if other != path)
             finally:
                 saved_store.replace(path)
+        last_store = stores[-1]
+        saved_store = last_store.with_suffix(".fixture-backup")
+        marker = home / ".r2-database-set-initialized"
+
+        def check_refused(reason: str) -> None:
+            before = {path: path.read_bytes() for path in stores if path.exists()}
+            stopped = subprocess.run(
+                [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                input="exit\n", text=True, capture_output=True, timeout=30,
+            )
+            assert stopped.returncode != 0 and "R2-3PO ONLINE" not in stopped.stdout
+            assert reason in stopped.stderr, stopped.stderr
+            assert all(path.read_bytes() == data for path, data in before.items())
+            assert all(not path.exists() for path in stores if path not in before)
+
+        last_store.rename(saved_store)
+        try:
+            last_store.write_bytes(b"This fixture is a corrupt SQLite store.")
+            check_refused("Database failed read-only startup verification")
+            last_store.unlink()
+            with closing(sqlite3.connect(last_store)) as decoy:
+                decoy.execute("CREATE TABLE unrelated(note TEXT)")
+            check_refused("Could not verify expected table addiction_events")
+            last_store.unlink()
+            last_store.hardlink_to(memory)
+            check_refused("Database paths share the same file")
+            last_store.unlink()
+            marker.unlink()
+            check_refused("Incomplete database set at startup")
+            assert not marker.exists()
+        finally:
+            saved_store.replace(last_store)
+
+        sidecar = last_store.with_name(last_store.name + "-wal")
+        sidecar.symlink_to(memory)
+        try:
+            check_refused("Invalid SQLite sidecar at startup")
+        finally:
+            sidecar.unlink()
+        if os.geteuid() != 0:
+            mode = last_store.stat().st_mode & 0o777
+            last_store.chmod(0o400)
+            try:
+                check_refused("Database is not readable and writable")
+            finally:
+                last_store.chmod(mode)
+        print("PASS: unsafe database layouts failed before modifying any fixture store.")
         recovered = subprocess.run(
             [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
             input="exit\n", text=True, capture_output=True, timeout=30, check=True,
         )
         assert "R2-3PO ONLINE" in recovered.stdout and "[R2-3PO shut down.]" in recovered.stdout
+        assert marker.is_file()
         print("PASS: an initialized workspace refused all five missing-store cases and reopened after restoration.")
     finally:
         workspace.rename(workspace.with_name("legacy-workspace"))

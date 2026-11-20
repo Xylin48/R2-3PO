@@ -90,6 +90,11 @@ does not create inventory. Reality, Fridge, Reward, Addiction and Memory
 retain their own records and exchange evidence through their normal operations.
 
 After initializing all five stores, the core records that the database set
-exists in `R2/.r2-database-set-initialized`. Later starts check that all
-five database files are present before opening any of them. Keep the record
+exists in `R2/.r2-database-set-initialized`. Before writable opens, the
+core checks file access, distinct store identities, and SQLite sidecar paths,
+then opens existing
+stores read-only for a SQLite quick check. Established sets must also contain
+each store's expected table. A partially missing multi-store layout is
+refused even if the marker is absent. Fresh workspaces and historical
+memory-only layouts follow the existing provisioning path. Keep the marker
 with the data directory during backup and restoration.
