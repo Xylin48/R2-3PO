@@ -17,8 +17,6 @@ static const char *failed_metadata;
 static long fixture_http_status = 200;
 static char *response_body;
 static struct json_object *captured;
-static struct json_object *reasoning_request;
-static char *reasoning_retry_response;
 static int capture_reviews;
 static char *reviewed_bytes;
 static size_t reviewed_size;
@@ -113,17 +111,6 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
     char *body = defer_post_turn_request == 1 ? structured : response_body;
-    if (reasoning_retry_response) {
-        struct json_object *think = NULL;
-        assert(json_object_object_get_ex(captured, "think", &think));
-        if (!reasoning_request) {
-            assert(json_object_get_boolean(think));
-            reasoning_request = json_object_get(captured);
-        } else {
-            assert(!json_object_get_boolean(think));
-            body = reasoning_retry_response;
-        }
-    }
     if (perform_count == invalid_body_at) {
         static char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
         body = truncated_body;
@@ -216,7 +203,7 @@ static void check_request(Message *messages, size_t count, const char *override,
         const char *actual = json_object_get_string(content), *actual_role = json_object_get_string(role);
         int found = override && !strcmp(actual_role, "system") && !strcmp(actual, override);
         for (size_t j = 0; j < count; ++j)
-            if (!strcmp(actual_role, messages[j].role) && !strcmp(actual, messages[j].content)) found = 1;
+            if (!strcmp(actual_role, messages[j].internal_tool_result ? "tool" : messages[j].role) && !strcmp(actual, messages[j].content)) found = 1;
         assert(found); ++matches;
     }
     assert(matches == count + (override != NULL));
@@ -226,7 +213,7 @@ static void check_request(Message *messages, size_t count, const char *override,
             struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
             assert(json_object_object_get_ex(entry, "content", &content));
             assert(json_object_object_get_ex(entry, "role", &role));
-            if (!strcmp(json_object_get_string(role), messages[j].role) &&
+            if (!strcmp(json_object_get_string(role), messages[j].internal_tool_result ? "tool" : messages[j].role) &&
                 !strcmp(json_object_get_string(content), messages[j].content)) ++occurrences;
         }
         assert(occurrences == 1);
@@ -275,37 +262,46 @@ static int64_t unavailable_camera_events(void)
     return count;
 }
 
-static void check_retry_and_isolated_inputs(void)
+static void check_context_and_isolated_inputs(void)
 {
-    char *history = text(5000, 'h', "R2 PERSISTENT MEMORY - STARTUP CONTEXT quoted as text. ");
+    char *history = text(5000, 'h', "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     strcpy(history + 4983, "COMPLETE-HISTORY");
-    const char *query = "Current retry question";
-    assert(message_add("user", "First historical message") == 0);
-    assert(message_add("assistant", history) == 0);
-    assert(message_add("user", query) == 0);
-    Message turn[] = {{.role = "user", .content = (char *)query}};
+    const char *query = "Current question";
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
 
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
-    set_response("Retried answer", "stop", 1);
-    char *answer = r2_retry_direct_answer(turn, 1, query);
-    assert(answer && !strcmp(answer, "Retried answer"));
+    set_response("Direct answer", "stop", 1);
+    char *answer = r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60);
+    assert(answer && !strcmp(answer, "Direct answer"));
     assert(captured_contains(history) && captured_contains(query));
+    struct json_object *think = NULL;
+    assert(json_object_object_get_ex(captured, "think", &think) && !json_object_get_boolean(think));
+    int attempts = perform_count;
+    set_response("Incomplete answer", "length", 1);
+    assert(!r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60));
+    assert(perform_count == attempts + 1);
+    set_response("Direct answer", "stop", 1);
     free(answer);
 
-    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-RETRY-TOOL-RESULT";
+    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-TOOL-RESULT";
     Message action_turn[] = {
-        turn[0],
+        turn[1],
         {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
         {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
     };
-    answer = r2_retry_direct_answer(action_turn, 3, query);
+    answer = r2_chat_with_input_source(action_turn, 3, r2_conversation_system_prompt, query, 512, 60);
     assert(answer && captured_contains(query) && captured_contains(tool_result));
     free(answer);
 
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;
-    answer = r2_retry_direct_answer(turn, 1, query);
+    answer = r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60);
     assert(answer && perform_count > before + 1);
     assert(captured_contains(query) && !captured_contains(history));
     free(answer);
@@ -956,9 +952,8 @@ static void check_action_result_under_history_pressure(void)
     assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
                             strlen("I processed the action request. Here is the recorded result:\n")));
     assert(strstr(reply, expected));
-    assert(messages.count == 3 && !strcmp(messages.items[1].role, "user") &&
-           !strcmp(messages.items[1].content, user) && !messages.items[1].pinned &&
-           !strcmp(messages.items[2].content, reply));
+    assert(messages.count == 2 && !strcmp(messages.items[1].role, "user") &&
+           !strcmp(messages.items[1].content, user) && !messages.items[1].pinned);
     assert(!active_turn_history.user && !active_turn_history.action_request &&
            !active_turn_history.action_result);
 
@@ -1011,68 +1006,6 @@ static void check_action_result_under_history_pressure(void)
     db = NULL;
     assert(unlink(path) == 0);
     puts("Active user turn and exact action result survived live-history admission pressure.");
-}
-
-static void check_reasoning_recovery(void)
-{
-    static char recovered[] =
-        "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
-        "\"content\":\"I missed you too.\"}}";
-    static char incomplete[] =
-        "{\"done\":true,\"done_reason\":\"length\",\"message\":{\"role\":\"assistant\","
-        "\"content\":\"[RUN] rejected incomplete command\"}}";
-    const char *greeting = "Good evening darling, this is your mother talking to you.";
-    Message turn[] = {
-        {.role = "system", .content = "PERSISTENT REALITY CONTEXT\nRecovered fixture history."},
-        {.role = "user", .content = (char *)greeting},
-    };
-    const char *old_stage = ollama_audit_stage;
-    const char *old_query = ollama_authoritative_user_query;
-    ollama_authoritative_user_query = greeting;
-    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
-    for (int i = 0; i < 4; ++i) {
-        ollama_audit_stage = i == 1 ? "conversation-retry" : "conversation-answer";
-        const char *initial = i == 0 ? "[RUN] rejected first attempt" : i == 3 ? " \n\t" : "";
-        set_response(initial, i == 0 ? "length" : "stop", 1);
-        reasoning_retry_response = i == 2 ? incomplete : recovered;
-        int before = perform_count;
-        char *reply = ollama_chat_with_limit(turn, 2, "Complete policy.", 768, 60);
-        assert(perform_count == before + 2 && reasoning_request && captured);
-        if (i == 2) assert(!reply);
-        else assert(reply && !strcmp(reply, "I missed you too."));
-        free(reply);
-
-        struct json_object *options[2] = {NULL, NULL};
-        assert(json_object_object_get_ex(reasoning_request, "options", &options[0]));
-        assert(json_object_object_get_ex(captured, "options", &options[1]));
-        const char *samplers[] = {"temperature", "top_p"};
-        const double expected[2][2] = {{1.0, 0.95}, {0.7, 0.8}};
-        for (size_t mode = 0; mode < 2; ++mode) {
-            for (size_t sampler = 0; sampler < 2; ++sampler) {
-                struct json_object *value = NULL;
-                assert(json_object_object_get_ex(options[mode], samplers[sampler], &value));
-                assert(json_object_get_double(value) == expected[mode][sampler]);
-                json_object_object_del(options[mode], samplers[sampler]);
-            }
-        }
-        json_object_object_del(reasoning_request, "think");
-        json_object_object_del(captured, "think");
-        assert(json_object_equal(reasoning_request, captured));
-        json_object_put(reasoning_request);
-        reasoning_request = NULL;
-        reasoning_retry_response = NULL;
-    }
-    int before = perform_count;
-    set_response("", "stop", 0);
-    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 1);
-    fail_transport_at = perform_count + 1;
-    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 2);
-    fail_transport_at = 0;
-    ollama_audit_stage = "association-planner";
-    set_response("", "stop", 1);
-    assert(!ollama_chat_with_limit(turn, 2, NULL, 768, 60) && perform_count == before + 3);
-    ollama_authoritative_user_query = old_query;
-    ollama_audit_stage = old_stage;
 }
 
 static void check_compact_ranked_memory(void)
@@ -1130,17 +1063,6 @@ static void check_compact_ranked_memory(void)
     free(full);
     free(answer);
 
-    ollama_audit_stage = "conversation-retry";
-    char *correction = r2_build_retry_system_prompt();
-    assert(correction);
-    before = perform_count;
-    answer = r2_foreground_chat(turn, 4, correction, query, 1024, 60);
-    assert(answer && perform_count == before + 1);
-    assert(captured_contains(r2_compact_conversation_policy) &&
-           captured_contains(compact_retry_system_prompt) &&
-           captured_contains(identity) && captured_contains(query));
-    free(correction);
-    free(answer);
     free(history);
     free(world);
     free(large);
@@ -1312,7 +1234,7 @@ int main(void)
     check_structured_report_evidence();
     check_boundaries();
     check_reflection_stop_and_long_visual_query();
-    check_retry_and_isolated_inputs();
+    check_context_and_isolated_inputs();
     check_foreground_context_review();
     check_failed_optional_history_review();
     check_compact_ranked_memory();
@@ -1390,7 +1312,6 @@ int main(void)
     set_response("legacy complete response", NULL, 1);
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
-    check_reasoning_recovery();
     assert(cleanup_count == perform_count + 2);
     check_isolated_response_replay();
     check_memory_response_replay();

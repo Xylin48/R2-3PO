@@ -44,7 +44,7 @@ require(
     "failed inference produces a visible allocated fallback instead of returning NULL",
 )
 require(
-    'r2_log_event(R2_LOG_SYSTEM, "conversation_tool_followup_retry",' in implementation
+    implementation.count("chat_with_relevant_memories(message)") == 2
     and "reply = recorded_action_reply(tool_evidence);" in implementation
     and implementation.count("process_tools(stripped_reply)") == 1,
     "failed post-action generation preserves the completed action result without replaying the action",

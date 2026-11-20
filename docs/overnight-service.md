@@ -89,7 +89,7 @@ The desktop launcher sends these requests as `r2` to the existing localhost
 Ollama service on port 11434. The overnight installation has its own
 `r2`-owned Ollama service on port 11435.
 
-Foreground chat and its corrective retry allow up to six hours per request by default to accommodate slow mixed CPU/GPU inference and Qwen's reasoning channel. Override the setting before starting the interactive launcher if needed:
+Foreground chat allows up to six hours per request by default to accommodate slow mixed CPU/GPU inference. Override the setting before starting the interactive launcher if needed:
 
 ```sh
 export R2_OLLAMA_TIMEOUT_SECONDS=14400

@@ -405,8 +405,6 @@ jobs:
       - name: Refuse silently truncated active user turns
         run: python3 tests/no_truncated_current_turn_smoke.py
 
-      - name: Retry obvious nonresponsive text misclassification once
-        run: python3 tests/nonresponsive_reply_retry_smoke.py
       - name: Guard task pipe and child waits against interrupted system calls
         run: |
           python3 -m py_compile tests/r2_task_wait_smoke.py
@@ -420,14 +418,14 @@ jobs:
           cc $FLAGS tests/r2_task_shutdown_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-task-shutdown-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=asprintf -Wl,--wrap=__asprintf_chk -Wl,--wrap=realloc -Wl,--wrap=free
           /tmp/r2-task-shutdown-smoke-test
 
-      - name: Exercise the production reply-misclassification guard
+      - name: Exercise conversation context and completed-task evidence
         run: |
-          ROOT=/tmp/r2-reply-misclassification-smoke
+          ROOT=/tmp/r2-conversation-context-runtime
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
-          /tmp/r2-reply-misclassification-smoke-test
+          cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_conversation_context_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-conversation-context-runtime-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-conversation-context-runtime-test
 
       - name: Reject workspace read and directory-list symlink swaps after path validation
         run: |

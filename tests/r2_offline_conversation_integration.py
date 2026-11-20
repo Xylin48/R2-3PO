@@ -74,27 +74,12 @@ SELF_REPORT_EXTRACTION = json.dumps({
                         "evidence": "Hypothetically, I could build a spare bridge."}],
 })
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
-GARBLED_TEXT_REQUEST = "Good evening, I have been thinking of you."
-FABRICATED_AUDIO_REPLY = (
-    "My audio sensors are picking up your transmission, but it is heavily garbled."
-    "\n[DELETE] hidden-sentinel.txt"
-)
-
-
-DISMISSAL_GREETING = "Hi R2, it's good to see you today."
-DISMISSAL_LEARNING_REQUEST = "Remember that I keep the spare blue key in the kitchen tin."
-DISMISSAL_LEARNED = "The user said they keep the spare blue key in the kitchen tin."
-DISMISSAL_RECOVERED_REPLY = "It's good to see you too."
-TYPED_DISMISSAL = ("I'm sorry, but I couldn't understand your message. Can you clarify?"
-                   "\n[WRITE] rejected-dismissal.txt\nThis should never be written.\n[END WRITE]")
-
-IDENTITY_GUARD_REQUEST = "Hi R2, do you remember the brass compass I told you about?"
+UNANSWERED_LEARNING_REQUEST = "Remember that I keep the spare blue key in the kitchen tin."
+UNANSWERED_LEARNED = "The user said they keep the spare blue key in the kitchen tin."
+IDENTITY_RECALL_REQUEST = "Hi R2, do you remember the brass compass I told you about?"
 IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
 IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
 IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
-IDENTITY_WRITE = "\n[WRITE] identity-draft.txt\nRejected draft wrote this.\n[END WRITE]"
-IDENTITY_BAD_DRAFT = "I'm ChatGPT. How may I assist you?" + IDENTITY_WRITE
-IDENTITY_REVERSED_DRAFT = "Hi R2, you can tell me how you've been." + IDENTITY_WRITE
 IDENTITY_ANCHOR = "Speak in first person as the same R2-3PO robot companion across turns."
 
 
@@ -147,16 +132,19 @@ class LocalOllama(BaseHTTPRequestHandler):
         user_messages = [item["content"] for item in payload.get("messages", [])
                          if item.get("role") == "user" and isinstance(item.get("content"), str)]
         result_prefix = "[R2_INTERNAL_TOOL_RESULT]\n"
-        current_index = next((i for i in range(len(user_messages) - 1, -1, -1)
-                              if not user_messages[i].startswith(result_prefix)), -1)
+        current_index = len(user_messages) - 1
         asks_for_pockets = current_index >= 0 and user_messages[current_index].startswith(FOLLOWUP + " CTX_")
-        has_tool_result = any(message.startswith(result_prefix)
-                              for message in user_messages[current_index + 1:])
-        if current_index >= 0 and user_messages[current_index] == STOPPED_REQUEST and payload.get("think"):
+        current_user_index = max((i for i, item in enumerate(payload["messages"])
+                                  if item["role"] == "user"), default=-1)
+        action_results = [item["content"] for item in payload["messages"][current_user_index + 1:]
+                          if item["role"] == "tool"]
+        has_tool_result = bool(action_results)
+        foreground = payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        if current_index >= 0 and user_messages[current_index] == STOPPED_REQUEST and foreground:
             self.slow_started.set()
             self.slow_release.wait(timeout=25)
             return
-        if current_index >= 0 and user_messages[current_index] == LONG_FOREGROUND_REQUEST and payload.get("think"):
+        if current_index >= 0 and user_messages[current_index] == LONG_FOREGROUND_REQUEST and foreground:
             time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
@@ -167,7 +155,7 @@ class LocalOllama(BaseHTTPRequestHandler):
         if current_index >= 0 and user_messages[current_index] == HANDS_ACTION_FALLBACK_REQUEST:
             result_recorded = any(
                 message.startswith(result_prefix) and HANDS_ACTION_FALLBACK_FILE in message
-                for message in user_messages[current_index + 1:]
+                for message in action_results
             )
             reply = ("[WORLD] look" if result_recorded else
                      f"I'll save the test note.\n[WRITE] {HANDS_ACTION_FALLBACK_FILE}\n"
@@ -255,14 +243,8 @@ class LocalOllama(BaseHTTPRequestHandler):
                      "I will read it.\n[READ] large-fixture.txt")
         done_reason = "stop"
         message = {"role": "assistant", "content": reply}
-        if (current_index >= 0 and user_messages[current_index] == GREETING
-                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
-            if payload.get("think"):
-                done_reason = "length"
-                message.update(content="I will act.\n[DELETE] hidden-sentinel.txt",
-                               thinking=PRIVATE_GREETING_REASONING)
-            else:
-                message["content"] = GREETING_REPLY
+        if current_index >= 0 and user_messages[current_index] == GREETING and foreground:
+            message.update(content=GREETING_REPLY, thinking=PRIVATE_GREETING_REASONING)
         if (current_index >= 0 and user_messages[current_index] == REPORTED_GREETING
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             message["content"] = REPORTED_GREETING_REPLY
@@ -274,7 +256,7 @@ class LocalOllama(BaseHTTPRequestHandler):
                     attempts = self.post_action_attempts.get(request, 0) + 1
                     self.post_action_attempts[request] = attempts
                 message["content"] = (
-                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST and attempts == 2
+                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST
                     else "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
                 )
             else:
@@ -282,31 +264,19 @@ class LocalOllama(BaseHTTPRequestHandler):
                     f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
                     f"{FOLLOWUP_FILE_CONTENT}[END WRITE]"
                 )
-        if (current_index >= 0 and user_messages[current_index] == GARBLED_TEXT_REQUEST
-                and (payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
-                     or "RESPONSE CORRECTION:" in system or "Correct the prior draft" in system)):
-            message["content"] = FABRICATED_AUDIO_REPLY
-        if (current_index >= 0 and IDENTITY_ANCHOR in system
-                and user_messages[current_index] in (IDENTITY_GUARD_REQUEST, IDENTITY_REPEAT_REQUEST)):
-            correction = ("RESPONSE CORRECTION:" in system or "Correct the prior draft" in system)
-            if correction:
-                has_relationship_evidence = (user_messages[current_index] == IDENTITY_GUARD_REQUEST
-                                             and IDENTITY_MEMORY in system)
-                message["content"] = IDENTITY_REPLY if has_relationship_evidence else IDENTITY_REVERSED_DRAFT
-            else:
-                message["content"] = IDENTITY_BAD_DRAFT
-        if (current_index >= 0 and IDENTITY_ANCHOR in system
-                and user_messages[current_index] in (DISMISSAL_GREETING, DISMISSAL_LEARNING_REQUEST)):
-            correction = "RESPONSE CORRECTION:" in system or "Correct the prior draft" in system
-            message["content"] = (DISMISSAL_RECOVERED_REPLY
-                                  if correction and user_messages[current_index] == DISMISSAL_GREETING
-                                  else TYPED_DISMISSAL)
+        if current_index >= 0 and foreground:
+            if user_messages[current_index] == IDENTITY_RECALL_REQUEST:
+                message["content"] = IDENTITY_REPLY if IDENTITY_MEMORY in system else ""
+            elif user_messages[current_index] == IDENTITY_REPEAT_REQUEST:
+                message["content"] = "Good afternoon. I'm glad you stopped by."
+            elif user_messages[current_index] == UNANSWERED_LEARNING_REQUEST:
+                message["content"] = ""
         if "memory-evaluation system" in system and any(
-            DISMISSAL_LEARNING_REQUEST in text and "NO GENERATED R2 RESPONSE" in text
+            UNANSWERED_LEARNING_REQUEST in text and "NO GENERATED R2 RESPONSE" in text
             for text in user_messages
         ):
             if payload["options"]["num_predict"] >= 384:
-                message["content"] = "knowledge | " + DISMISSAL_LEARNED
+                message["content"] = "knowledge | " + UNANSWERED_LEARNED
             else:
                 done_reason = "length"
                 message["content"] = "knowledge | The user said they keep"
@@ -434,7 +404,7 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
     print("PASS: the reported greeting reached the first R2 answer request as exact typed text.")
 
 
-def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
+def generate_first_greeting(binary: Path, workspace: Path, url: str) -> None:
     start = len(LocalOllama.requests)
     sentinel = workspace / "hidden-sentinel.txt"
     assert sentinel.read_bytes() == b"private planned action must remain inert"
@@ -444,7 +414,6 @@ def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
         timeout=100, check=True,
     )
     assert output.stdout.count("R2-3PO: " + GREETING_REPLY) == 1, output.stdout + output.stderr
-    assert "reason=generation-limit" in output.stderr
     assert PRIVATE_GREETING_REASONING not in output.stdout + output.stderr
     assert sentinel.read_bytes() == b"private planned action must remain inert"
     requests = [
@@ -452,17 +421,16 @@ def recover_first_greeting(binary: Path, workspace: Path, url: str) -> None:
         if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
         and any(item["content"] == GREETING for item in request["messages"] if item["role"] == "user")
     ]
-    assert [request["think"] for request in requests] == [True, False]
-    assert requests[0]["messages"] == requests[1]["messages"]
+    assert [request["think"] for request in requests] == [False]
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         assert db.execute(
             "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
             (GREETING,),
         ).fetchall() == [(GREETING_REPLY,)]
-    print("PASS: the greeting survived reasoning exhaustion with one persisted reply and no action.")
+    print("PASS: the greeting used one first-answer request and kept private reasoning out of its reply.")
 
 
-def recover_post_action_response(binary: Path, workspace: Path, url: str) -> None:
+def complete_post_action_response(binary: Path, workspace: Path, url: str) -> None:
     sentinel = workspace / "hidden-sentinel.txt"
     output = subprocess.run(
         [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
@@ -473,7 +441,17 @@ def recover_post_action_response(binary: Path, workspace: Path, url: str) -> Non
     assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
     assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
     assert sentinel.read_bytes() == b"private planned action must remain inert"
-    assert all(LocalOllama.post_action_attempts.get(request) == 2 for request in FOLLOWUP_FILES)
+    assert all(LocalOllama.post_action_attempts.get(request) == 1 for request in FOLLOWUP_FILES)
+    for request in FOLLOWUP_FILES:
+        followups = [
+            payload for payload in LocalOllama.requests
+            if any(item["role"] == "user" and item["content"] == request
+                   for item in payload["messages"])
+            and any(item["role"] == "system" and item["content"].startswith("CURRENT TURN PHASE:")
+                    for item in payload["messages"])
+        ]
+        assert len(followups) == 1
+        assert followups[0]["messages"][-1]["role"] == "tool"
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         for request, name in FOLLOWUP_FILES.items():
             assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
@@ -490,32 +468,11 @@ def recover_post_action_response(binary: Path, workspace: Path, url: str) -> Non
                 "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
                 (f"%/{name} (success)",),
             ).fetchone() == (1,)
-    print("PASS: empty post-action replies recovered or showed the recorded result without duplicate actions.")
+    print("PASS: each completed action produced one follow-up call with a tool-role result.")
 
 
-def reject_repeated_fabricated_audio(binary: Path, workspace: Path, url: str) -> None:
-    output = subprocess.run(
-        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
-        input=f"talk {GARBLED_TEXT_REQUEST}\nexit\n", text=True, capture_output=True,
-        timeout=100, check=True,
-    )
-    assert output.stdout.count("R2-3PO:") == 1
-    assert "couldn't produce a usable reply" in output.stdout, output.stdout + output.stderr
-    assert "heavily garbled" not in output.stdout
-    assert output.stderr.count("Discarded a fabricated audio claim on typed input") == 2
-    assert (workspace / "hidden-sentinel.txt").read_bytes() == b"private planned action must remain inert"
-    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
-        replies = db.execute(
-            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
-            (GARBLED_TEXT_REQUEST,),
-        ).fetchall()
-        assert len(replies) == 1 and "couldn't produce a usable reply" in replies[0][0]
-        assert "heavily garbled" not in replies[0][0]
-    print("PASS: repeated fabricated audio claims on typed input stayed out of replies and actions.")
-
-
-def recover_typed_dismissal_and_learn(binary: Path, workspace: Path, url: str) -> None:
-    log_path = workspace.parent / "typed-dismissal.log"
+def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) -> None:
+    log_path = workspace.parent / "missing-answer.log"
     database = workspace / "R2" / "r2_memory.db"
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.Popen(
@@ -524,7 +481,7 @@ def recover_typed_dismissal_and_learn(binary: Path, workspace: Path, url: str) -
         )
         assert proc.stdin is not None
         try:
-            proc.stdin.write(f"{DISMISSAL_GREETING}\n{DISMISSAL_LEARNING_REQUEST}\n")
+            proc.stdin.write(f"{UNANSWERED_LEARNING_REQUEST}\n")
             proc.stdin.flush()
             learned = None
             deadline = time.monotonic() + 35
@@ -535,12 +492,12 @@ def recover_typed_dismissal_and_learn(binary: Path, workspace: Path, url: str) -
                         "JOIN r2_log_events m ON m.id=l.from_event_id "
                         "JOIN r2_log_conversations c ON c.event_id=l.to_event_id "
                         "WHERE l.relationship='memory_learned_from' AND m.details=?",
-                        (DISMISSAL_LEARNED,),
+                        (UNANSWERED_LEARNED,),
                     ).fetchone()
                 if learned:
                     break
                 time.sleep(0.1)
-            assert learned and learned[0] == DISMISSAL_LEARNING_REQUEST, log_path.read_text()[-13000:]
+            assert learned and learned[0] == UNANSWERED_LEARNING_REQUEST, log_path.read_text()[-13000:]
             assert "couldn't produce a usable reply" in learned[1], learned
             proc.stdin.write("exit\n")
             proc.stdin.flush()
@@ -550,11 +507,14 @@ def recover_typed_dismissal_and_learn(binary: Path, workspace: Path, url: str) -
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
-    assert not (workspace / "rejected-dismissal.txt").exists()
-    output = log_path.read_text()
-    assert output.count("R2-3PO: " + DISMISSAL_RECOVERED_REPLY) == 1, output
-    assert "R2-3PO: I'm sorry, but I couldn't understand your message." not in output
-    print("PASS: typed dismissal repaired when possible; repeated failure still learned the user's reported fact.")
+    requests = [
+        payload for payload in LocalOllama.requests
+        if payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        and payload["messages"][-1] == {"role": "user", "content": UNANSWERED_LEARNING_REQUEST}
+    ]
+    assert len(requests) == 1
+    print("PASS: an empty model answer sent no second request and the exact user report remained available for learning.")
+
 
 def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
     with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
@@ -563,8 +523,8 @@ def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
             "VALUES(?, 'relationship', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)", (IDENTITY_MEMORY,),
         )
     for context, request, expect_reply in (
-        (4096, IDENTITY_GUARD_REQUEST, IDENTITY_REPLY),
-        (8192, IDENTITY_REPEAT_REQUEST, "couldn't produce a usable reply"),
+        (4096, IDENTITY_RECALL_REQUEST, IDENTITY_REPLY),
+        (8192, IDENTITY_REPEAT_REQUEST, "Good afternoon. I'm glad you stopped by."),
     ):
         start = len(LocalOllama.requests)
         output = subprocess.run(
@@ -576,26 +536,19 @@ def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
         answer_audits = [line for line in output.stderr.splitlines()
                          if "[R2 Prompt Audit] stage=conversation-" in line]
         assert answer_audits and all("robot_identity=1" in line for line in answer_audits)
-        assert "How may I assist you" not in output.stdout
-        assert "you can tell me how you've been" not in output.stdout
-        assert not (workspace / "identity-draft.txt").exists()
         requests = [
             payload["messages"] for payload in LocalOllama.requests[start:]
             if any(item["role"] == "user" and item["content"] == request for item in payload["messages"])
             and any(item["role"] == "system" and IDENTITY_ANCHOR in item["content"]
                     for item in payload["messages"])
         ]
-        assert requests and all(sum(item["role"] == "user" and item["content"] == request
+        assert len(requests) == 1 and all(sum(item["role"] == "user" and item["content"] == request
                                     for item in messages) == 1 for messages in requests)
-        assert any(any(item["role"] == "system" and
-                       ("RESPONSE CORRECTION:" in item["content"] or "Correct the prior draft" in item["content"])
-                       for item in messages) for messages in requests)
         with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
             rows = db.execute("SELECT assistant_text FROM r2_log_conversations WHERE user_text=?",
                               (request,)).fetchall()
             assert len(rows) == 1 and expect_reply in rows[0][0]
-            assert "ChatGPT" not in rows[0][0] and "you can tell me how you've been" not in rows[0][0]
-    print("PASS: robot identity persisted through normal and corrected turns; wrong speakers never reached tools or history.")
+    print("PASS: robot identity and learned relationship evidence reached the first answer.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -802,8 +755,9 @@ def oversized_action_result(binary: Path, workspace: Path, url: str) -> None:
             if item.startswith("EVIDENCE REVIEW\nRequest: Review the completed action result") and "\nRound 0," in item.split("BEGIN FRAGMENT", 1)[0]:
                 first_pass.extend(item.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
         if LARGE_READ in items and any(
-            item.startswith("[R2_INTERNAL_TOOL_RESULT]\nModel review of the completed action, archive #")
-            for item in items
+            item["role"] == "tool"
+            and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\nModel review of the completed action, archive #")
+            for item in request["messages"]
         ):
             result_requests += 1
     assert first_pass == original.encode("utf-8"), "The review lost actual completed action bytes"
@@ -1327,7 +1281,8 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
             input=f"talk {HANDS_REJECTED_REPLY_REQUEST}\nexit\n",
             text=True, capture_output=True, timeout=30, check=True,
         )
-        assert "Retry still produced no visible reply" in rejected.stderr, rejected
+        assert "I couldn't produce a reply to this turn." in rejected.stdout, rejected
+        assert rejected.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, rejected
         assert db.execute(
             "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
         ).fetchone() == (None,)
@@ -1652,11 +1607,10 @@ def main() -> int:
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
             send_reported_greeting(binary, workspace, url)
-            recover_first_greeting(binary, workspace, url)
-            recover_post_action_response(binary, workspace, url)
-            reject_repeated_fabricated_audio(binary, workspace, url)
+            generate_first_greeting(binary, workspace, url)
+            complete_post_action_response(binary, workspace, url)
             preserve_robot_identity(binary, workspace, url)
-            recover_typed_dismissal_and_learn(binary, workspace, url)
+            learn_when_model_returns_no_answer(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")
@@ -1701,7 +1655,7 @@ def main() -> int:
             ):
                 raise AssertionError(f"Pocket inventory view was missing in the answer request at {context}")
             if marker.startswith(FOLLOWUP) and not any(
-                item.get("role") == "user" and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\n")
+                item.get("role") == "tool" and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\n")
                 and "REAL WORLD RESULT" in item["content"]
                 for request in requests for item in request.get("messages", [])
                 if isinstance(item, dict) and isinstance(item.get("content"), str)

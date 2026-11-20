@@ -54,16 +54,16 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertTrue(read.call_args_list[1].args[0].endswith("/api/chat"))
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
-        self.assertIs(payload["think"], True)
+        self.assertIs(payload["think"], False)
         self.assertEqual([message["role"] for message in payload["messages"]],
                          ["system", "user", "assistant", "user"])
         self.assertIn("R2_READY", payload["messages"][1]["content"])
         self.assertNotIn("R2_READY", payload["messages"][-1]["content"])
         self.assertIs(payload["truncate"], False)
         self.assertIs(payload["shift"], False)
-        self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
-        self.assertEqual(payload["options"]["temperature"], 1.0)
-        self.assertEqual(payload["options"]["top_p"], 0.95)
+        self.assertEqual(payload["options"]["num_predict"], 512 if payload["options"]["num_ctx"] < 4096 else 1024)
+        self.assertEqual(payload["options"]["temperature"], 0.7)
+        self.assertEqual(payload["options"]["top_p"], 0.8)
         self.assertEqual(payload["options"]["top_k"], 20)
         self.assertEqual(payload["options"]["min_p"], 0.0)
         self.assertEqual(payload["options"]["presence_penalty"], 1.5)
@@ -259,26 +259,15 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 self.assertFalse(probe.preflight(timeout=1))
         self.assertIn("chat generation produced no usable final answer", errors.getvalue())
 
-    def test_text_probe_replays_recoverable_failures_with_the_same_context(self) -> None:
-        candidates = [
-            {"done": True, "done_reason": "length", "message": {"role": "assistant", "content": "R2_READY"}},
-            {"done": True, "message": {"role": "assistant", "content": "", "thinking": "internal reasoning only"}},
-        ]
-        for initial in candidates:
-            with self.subTest(initial=initial), patch.object(probe, "_read_json", side_effect=[
-                {"models": [{"name": "qwen3.5:9b"}]}, initial,
-                {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
-                {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}},
-                {"models": [{"name": "qwen3.5:9b", "size_vram": 0}]},
-            ]) as read, patch.object(probe.subprocess, "run", return_value=SimpleNamespace(
-                returncode=1, stdout="", stderr=""
-            )):
-                self.assertTrue(probe.preflight(timeout=1))
-                first, retry = (call.kwargs["payload"] for call in read.call_args_list[1:3])
-                self.assertIs(first["think"], True)
-                self.assertIs(retry["think"], False)
-                self.assertEqual(retry, dict(first, think=False,
-                                             options=dict(first["options"], temperature=0.7, top_p=0.8)))
+    def test_text_probe_does_not_replay_incomplete_answers(self) -> None:
+        for content, reason in (("R2_READY", "length"), ("", "stop")):
+            with self.subTest(reason=reason), patch.object(probe, "_read_json", side_effect=[
+                {"models": [{"name": "qwen3.5:9b"}]},
+                {"done": True, "done_reason": reason,
+                 "message": {"role": "assistant", "content": content, "thinking": "internal"}},
+            ]) as read, contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(probe.preflight(timeout=1))
+                self.assertEqual(read.call_count, 2)
 
     def test_nonmatching_foreground_reply_does_not_pass_preflight(self) -> None:
         errors = io.StringIO()
@@ -317,11 +306,13 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
                 image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
                 (image if vision else text)["done_reason"] = "length"
-                replies = [{"models": [{"name": "qwen3.5:9b"}]}, text, image if vision else text]
+                replies = [{"models": [{"name": "qwen3.5:9b"}]}, text]
+                if vision:
+                    replies.append(image)
                 with patch.object(probe, "_read_json", side_effect=replies) as read, \
                      contextlib.redirect_stderr(io.StringIO()):
                     self.assertFalse(probe.preflight(timeout=1))
-                self.assertEqual(read.call_count, 3)
+                self.assertEqual(read.call_count, 3 if vision else 2)
 
     def test_negated_blue_does_not_pass_the_vision_probe(self) -> None:
         with patch.object(probe, "_read_json", side_effect=[

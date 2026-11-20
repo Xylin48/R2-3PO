@@ -56,22 +56,15 @@ require(
     "affect and nonverbal expression are learned from context rather than fixed state-to-reaction rules",
 )
 
-retry_builder = function_slice(
-    "static char *r2_build_retry_system_prompt(void)",
-    "static int r2_is_retry_context_message(",
-)
 require(
-    "SYSTEM_PROMPT" in retry_builder
-    and "r2_conversation_system_prompt" in retry_builder
-    and "RESPONSE CORRECTION" in retry_builder,
-    "corrective retry preserves the full identity/relationship policy instead of replacing it with a narrow prompt",
+    'r2_conversation_system_prompt' in core and 'R2_CONVERSATION_IDENTITY' in core,
+    "the first answer includes the robot's identity",
 )
 
 require(
-    impl.count("chat_with_relevant_memories(message)") >= 3
-    and "first contextual response attempt failed" in impl
-    and "returning a visible fallback and preserving the user turn" in impl,
-    "generation failure has a refreshed retry plus a visible final fallback",
+    impl.count("chat_with_relevant_memories(message)") == 2
+    and "Conversation generation failed; preserving the user turn." in impl,
+    "the answer and the action follow-up each have one generation path",
 )
 
 # A model response containing only internal markers must not trigger an action.
@@ -91,8 +84,8 @@ visible_gate = impl.find("if (!reply_has_visible_text(stripped_reply))")
 tool_execution = impl.find("char *tools = process_tools(stripped_reply)")
 require(
     visible_gate >= 0 and tool_execution > visible_gate
-    and "Retry still produced no visible reply" in impl,
-    "marker-only/empty model output is retried or replaced before tool execution",
+    and "I couldn't produce a reply to this turn." in impl,
+    "marker-only or empty model output reports the failed turn before tool execution",
 )
 require(
     "if (!tools)" in impl

@@ -212,8 +212,8 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         return False
 
     options: dict[str, Any] = {
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "temperature": 0.7,
+        "top_p": 0.8,
         "top_k": 20,
         "min_p": 0.0,
         "presence_penalty": 1.5,
@@ -232,10 +232,8 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         if 2048 <= requested_context <= 16384:
             context_tokens = requested_context
     options["num_ctx"] = context_tokens
-    # Exercise reasoning-enabled foreground generation with the real maximum
-    # answer budget. r2.c permits at most 2048 output tokens for a live reply;
-    # its larger context-dependent ceiling is not itself the requested budget.
-    options["num_predict"] = min(2048, max(256, context_tokens - 1536))
+    # Match the visible answer budget for a short foreground turn.
+    options["num_predict"] = 512 if context_tokens < 4096 else 1024
     # Match r2.c exactly: unset and explicit zero both use Ollama's automatic
     # placement. Only a nonzero explicit layer count becomes a num_gpu option.
     if ("R2_OLLAMA_NUM_GPU" in os.environ and
@@ -255,26 +253,12 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         "stream": False,
         "truncate": False,
         "shift": False,
-        "think": True,
+        "think": False,
         "keep_alive": "10m",
         "options": options,
     }
     try:
         reply = _read_json(f"{api_base}/api/chat", timeout=timeout, payload=text_payload)
-        message = reply.get("message")
-        if isinstance(message, dict) and message.get("role") == "assistant" and reply.get("done") is True:
-            content = message.get("content")
-            thinking = message.get("thinking")
-            reasoning_only = (
-                _is_complete_assistant_turn(reply)
-                and (content is None or isinstance(content, str) and not content.strip())
-                and isinstance(thinking, str) and bool(thinking.strip())
-            )
-            if reply.get("done_reason") == "length" or reasoning_only:
-                print("Ollama text probe is retrying once with thinking disabled, using the same conversation and limits.")
-                retry_options = dict(options, temperature=0.7, top_p=0.8)
-                reply = _read_json(f"{api_base}/api/chat", timeout=timeout,
-                                   payload=dict(text_payload, think=False, options=retry_options))
     except urllib.error.HTTPError as exc:
         print(
             f"ERROR: Ollama listed {MODEL} but real chat generation failed: {_http_error_detail(exc)}",

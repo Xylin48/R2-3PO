@@ -1,8 +1,4 @@
-/*
- * Exercise the actual C misclassification predicate against the observed R2
- * failure and nearby negative cases. Including r2.c keeps the helper private
- * to the runtime while making the production implementation testable.
- */
+/* Exercise conversation input, context ordering, and completed-task evidence. */
 #define main r2_program_main
 #include "../r2.c"
 #undef main
@@ -144,15 +140,6 @@ int main(void)
                    message_order[8] == 8;
     ok &= check(order_ok,
                 "system context follows semantic priority before chronological dialogue");
-    ok &= check(
-        r2_is_retry_context_message(&interleaved_messages[4]) &&
-        r2_is_retry_context_message(&interleaved_messages[5]) &&
-        r2_is_retry_context_message(&interleaved_messages[7]) &&
-        !r2_is_retry_context_message(&interleaved_messages[2]) &&
-        !r2_is_retry_context_message(&interleaved_messages[1]) &&
-        !r2_is_retry_context_message(&interleaved_messages[0]),
-        "corrective retry preserves Reality, focused retrieval, and startup memory but excludes learning summaries, archive, and stale dialogue");
-
     const char *mother_message =
         "Hello r2, this is your mother speaking to you. i miss you. "
         "did you know that you had a room with stuff in it? im actually "
@@ -167,23 +154,6 @@ int main(void)
     ok &= check(r2_query_explicitly_requests_recall(
                     "Do you remember what I told you about the room?"),
                 "explicit memory question enables broader recall");
-
-    const char *observed_bad_reply =
-        "That’s a bit garbled, but I think you’re trying to say, "
-        "“Hello, I’m R2, and I’m making a mistake.” Is that correct?";
-
-    ok &= check(r2_reply_misclassifies_plain_text(mother_message,
-                    observed_bad_reply),
-                "observed fabricated paraphrase triggers corrective retry");
-
-    ok &= check(r2_reply_misclassifies_plain_text(
-                    "The audio sounds fine, but can you explain this sentence?",
-                    "I'm having trouble understanding your message."),
-                "known nonresponsive replies still trigger recovery for sound-related user topics");
-    ok &= check(r2_reply_misclassifies_plain_text(
-                    "Can you explain this sentence in plain English?",
-                    "I'm having difficulty understanding your message."),
-                "common trouble-understanding replies are recognized as failed answers");
 
     ok &= check(r2_keyword_is_low_signal("hello") &&
                     r2_keyword_is_low_signal("r2") &&
@@ -232,61 +202,6 @@ int main(void)
     ok &= check(has_pockets_keyword && has_mother_keyword && !has_low_signal_keyword,
                 "memory keyword budget retains the actual relationship term and concrete pocket topic without filler");
     free(keyword_source);
-
-    ok &= check(r2_reply_misclassifies_plain_text(mother_message,
-                    "That's a bit garbled, but I think you're trying to say "
-                    "something else."),
-                "straight-apostrophe misclassification trigger works");
-
-    ok &= check(r2_reply_misclassifies_plain_text(mother_message,
-                    "I think you're trying to say that I'm making a mistake. "
-                    "Is that correct?"),
-                "fabricated intent guess plus confirmation is caught without garbled wording");
-
-    ok &= check(!r2_reply_misclassifies_plain_text(
-                    "Can you paraphrase what I meant in that long message?",
-                    "I think you're trying to say you want a bed. Is that correct?"),
-                "explicit paraphrase requests may receive a confirming interpretation");
-
-    const char *garbled_transmission =
-        "My audio sensors are picking up your transmission, but it is coming through corrupted or heavily garbled.";
-    ok &= check(r2_reply_misclassifies_plain_text(mother_message, garbled_transmission),
-                "fabricated garbled transmission on a greeting triggers recovery");
-    ok &= check(!r2_reply_misclassifies_plain_text("Can you check the audio signal?", garbled_transmission),
-                "an actual audio question can discuss a garbled transmission");
-    r2_input_speech_event = 1;
-    ok &= check(!r2_reply_misclassifies_plain_text(mother_message, garbled_transmission),
-                "the typed-input rule leaves speech input with recorded provenance alone");
-    r2_input_speech_event = 0;
-
-    ok &= check(!r2_reply_misclassifies_plain_text(mother_message,
-                    "I missed you too, Mom. A room with a bed and pockets "
-                    "sounds exciting. What are you planning to put in the room?"),
-                "relevant warm response does not trigger retry");
-
-    ok &= check(!r2_reply_misclassifies_plain_text(mother_message,
-                    "I think you're saying you're excited about the room, "
-                    "and that makes sense."),
-                "ordinary paraphrasing alone does not trigger retry");
-
-    ok &= check(!r2_reply_misclassifies_plain_text(
-                    "Can you transcribe this noisy audio recording for me?",
-                    "The audio is noisy, but I can help transcribe it."),
-                "legitimate audio/transcription discussion is not retried");
-
-    ok &= check(!r2_reply_misclassifies_plain_text(
-                    "Hi R2, how are you today?",
-                    "I'm glad you're here. How are you doing?"),
-                "short ordinary conversation is not retried");
-
-    ok &= check(r2_reply_misclassifies_plain_text(
-                    "Hi", "That sounds like a random assortment of sounds."),
-                "explicit misclassification phrases are caught even for short user turns");
-
-    ok &= check(r2_reply_misclassifies_plain_text(
-                    "Your audio is garbled.",
-                    "Your message appears to be gibberish."),
-                "audio-output feedback bypasses the audio-topic exemption");
 
     ok &= check(r2_query_is_simple_social_turn("hello") &&
                     r2_query_is_simple_social_turn("  Hi R2!!!  ") &&
@@ -352,62 +267,7 @@ int main(void)
     ok &= check(conversation_reply_token_budget(long_question) == 2048,
                 "long user messages reserve input context instead of an oversized output ceiling");
 
-    ok &= check(r2_reply_misclassifies_plain_text(
-                    "Hello R2, This is your mother speaking to you. whats new with you? did you know about your pockets?",
-                    "Hello R2, it’s your mommy speaking to you. How are you, my baby? What have you learned?"),
-                "exact observed greeting inversion triggers the direct-answer retry");
-
-    ok &= check(!r2_reply_misclassifies_plain_text(
-                    "Hello R2, This is your mother speaking to you. whats new with you? did you know about your pockets?",
-                    "Hi Mom! I've been learning about my room and pockets, and I can check what I currently have stored there."),
-                "direct reply to the user that addresses both topics is accepted");
-
-
-    ok &= check(r2_reply_has_identity_error(mother_message, "I'm ChatGPT. How can I assist?") &&
-                r2_reply_has_identity_error(mother_message, "I am an AI language model.") &&
-                r2_reply_has_identity_error(mother_message, "As an AI language model, I can answer questions.") &&
-                r2_reply_has_identity_error(mother_message, "This is R2-D2.") &&
-                r2_reply_has_identity_error(mother_message, "Hello R2, it's your mother."),
-                "identity substitutions and speaker reversals are eligible for rejection on either draft");
-    ok &= check(!r2_reply_has_identity_error("Do you use Qwen?",
-                                           "I'm R2-3PO. Qwen helps me find the words.") &&
-                !r2_reply_has_identity_error("Tell me about R2-D2.", "R2-D2 is a different droid.") &&
-                !r2_reply_has_identity_error("Write a dialogue where ChatGPT introduces itself.",
-                                             "I'm ChatGPT.") &&
-                !r2_reply_has_identity_error(mother_message, "I'm glad to hear from you, Mom."),
-                "ordinary personal replies, model explanations and explicitly authored dialogue remain valid");
-    ok &= check(strstr(compact_retry_system_prompt, R2_CONVERSATION_IDENTITY) &&
-                strstr(r2_compact_conversation_policy, R2_CONVERSATION_IDENTITY) &&
-                strstr(r2_conversation_system_prompt, R2_CONVERSATION_IDENTITY),
-                "every foreground prompt shares the first-person robot identity");
-
-    char *retry_prompt = r2_build_retry_system_prompt();
-    ok &= check(retry_prompt != NULL,
-                "corrective system prompt can be constructed");
-    if (retry_prompt) {
-        ok &= check(strstr(retry_prompt, "You are R2-3PO.") != NULL,
-                    "retry retains R2's core identity instructions");
-        ok &= check(strstr(retry_prompt, "REALITY CONTEXT RULES:") != NULL,
-                    "retry retains live Reality/action constraints");
-        ok &= check(strstr(retry_prompt, "REPLY STYLE:") != NULL,
-                    "retry retains user-facing response-style instructions");
-        ok &= check(strstr(retry_prompt, "RESPONSE CORRECTION:") != NULL,
-                    "retry appends the corrective instruction");
-        ok &= check(strstr(retry_prompt, "acknowledge that social meaning") != NULL,
-                    "retry preserves guidance for social and emotional meaning");
-        ok &= check(strstr(retry_prompt, "RELATIONSHIP AND NAME CONTINUITY") != NULL &&
-                        strstr(retry_prompt, "SPEAKER AND RELATIONSHIP LEARNING:") != NULL,
-                    "retry preserves identity-based relationship continuity and learned speaker roles");
-        ok &= check(strstr(retry_prompt,
-                           "do not rely on a hard-coded emotion-to-response table") != NULL,
-                    "retry retains contextual affect interpretation rather than a fixed reaction map");
-        ok &= check(strlen(retry_prompt) < OLLAMA_MAX_SYSTEM_MESSAGE_CHARS,
-                    "complete corrective prompt fits the system-message limit without truncating its final instruction");
-        free(retry_prompt);
-    }
-
-    /* Tool results travel through a user-role message for the next model
-       call, but are not human speech. A user mentioning the marker in ordinary
+    /* Internal result messages are evidence. A user mentioning the marker in ordinary
        prose must not be dropped from Imagination's recent context. */
     pthread_mutex_lock(&messages_lock);
     int tool_pair_added = message_add_pair_locked(

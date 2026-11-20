@@ -28,7 +28,7 @@ The resulting executable is `./r2`. To remove it, run `make clean`.
 ## Ollama model: conversation and vision
 
 R2's default conversation model and visual-perception model are both `qwen3.5:9b`.
-Foreground answers and their corrective retry use Qwen 3.5's thinking mode with its recommended general-task sampler (`temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). Vision and structured/background helper calls stay in non-thinking mode with the general-task instruct sampler (`temperature=0.7`, `top_p=0.8`) so their compact structured outputs do not spend tokens on a separate reasoning channel. The user-facing conversation reads only the final `message.content` field; private `message.thinking` is not shown.
+Foreground and helper calls use Qwen 3.5's non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
 Install the model locally before launching R2:
 
 ```sh
@@ -223,9 +223,9 @@ R2 keeps a bounded, short-lived RAM cache of persistent-memory retrieval results
 
 Ollama requests are serialized. Foreground conversations take priority over opportunistic vision and background model calls; an in-flight background request checks the foreground wait queue and yields when possible. The C application, SQLite, prompt construction, scheduling, and cache still use the CPU. System RAM holds the model/runtime working set and cached context; it cannot execute model layers itself. A supported GPU backend is required for actual GPU inference.
 
-If the text model returns a recognizable failure that labels an ordinary typed message as unintelligible audio/noise instead of answering it, R2 makes one bounded corrective attempt with the original conversation, retrieved context, and exact active user turn retained. Normal replies do not incur an extra model call. The retry is a targeted safeguard, not a general semantic guarantee. The conversation-quality checklist covers both the initial reply and the outcome of a corrective retry on the installed model.
+R2 sends the exact user text with its input source and first-person identity in the answer request. Completed actions supply their recorded result as a tool message for the first follow-up. An unanswered turn remains recorded, and a completed action's recorded result can still be displayed.
 
-Foreground conversation and its corrective retry allow up to six hours per request by default. Qwen's reasoning channel is enabled for those foreground answer calls, while structured/background helper calls remain in non-thinking mode; the private reasoning field is never shown as R2's reply. Foreground generation budgets are larger (up to 8,192 output tokens when context allows) so reasoning is less likely to consume the entire output allowance before a final answer. Set `R2_OLLAMA_TIMEOUT_SECONDS` before launching R2 to choose a timeout from 30 seconds up to 6 hours; for example, `export R2_OLLAMA_TIMEOUT_SECONDS=2700` sets a 45-minute limit. Invalid values fall back to the six-hour default. This changes the wait limit, not model speed, and shutdown can still interrupt an in-flight request.
+Foreground conversation requests allow up to six hours per request by default. Set `R2_OLLAMA_TIMEOUT_SECONDS` before launching R2 to choose a timeout from 30 seconds up to 6 hours; for example, `export R2_OLLAMA_TIMEOUT_SECONDS=2700` sets a 45-minute limit. Invalid values fall back to the six-hour default. This changes the wait limit, not model speed, and shutdown can still interrupt an in-flight request.
 
 ## Overnight service (start at boot and recover from crashes)
 
