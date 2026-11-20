@@ -936,6 +936,29 @@ static void check_action_result_under_history_pressure(void)
     free(file_text);
     free(user);
     message_free_all();
+    const char *unsaved = "This exchange must not produce unsourced learning.";
+    assert(sqlite3_exec(db, "CREATE TRIGGER block_fixture_archive "
+                        "BEFORE INSERT ON r2_log_pending_conversations "
+                        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    const char *decision_failures = "SELECT count(*) FROM r2_log_events "
+                                    "WHERE event_type='post_turn_memory_decision_failed';";
+    int failures_before = memory_fixture_count(decision_failures);
+    set_response("I received your words.", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk(unsaved);
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(reply && !strcmp(reply, "I received your words.\n\n"
+                                  "I couldn't save this exchange to my Life Log."));
+    assert(memory_fixture_count(decision_failures) == failures_before);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='This exchange must not produce unsourced learning.'") == 0);
+    assert(sqlite3_exec(db, "DROP TRIGGER block_fixture_archive;", NULL, NULL, NULL) == SQLITE_OK);
+    free(reply);
+    message_free_all();
+    puts("Failed archive commit left the reply visible with a storage warning and queued no learning.");
     r2_diary_shutdown();
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;

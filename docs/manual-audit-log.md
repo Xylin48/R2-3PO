@@ -2280,3 +2280,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 
 - Hosted run 44805306460 stopped at a source-level conversation recovery assertion. Its first-unlock lookup mistook the shutdown guard for the normal end of a live turn. The check now verifies both the early shutdown exit and the normal serialized turn.
 - The same test now follows the shared shutdown signal helper and checks cancellation precedes draining the foreground lock. The corrected source-level regression and related startup, camera, task and Ears checks passed locally.
+
+### R2-AUD-2026-11-20-254 — Verify behavior when the accepted turn cannot be saved
+
+- Manually followed the public conversation entry through generated replies, the exact Life Log transaction, and the post-turn worker. An unsuccessful transaction had no authoritative source event, but the worker could still evaluate and save a memory without an evidence link. The visible reply also omitted the failed save.
+- Preserve the generated answer and show the storage failure. Queue learning only when the source conversation transaction succeeded. A staged conversation with delayed archive projection still has its durable source and remains eligible for learning.
+- A locally compiled C runtime test suppresses the authoritative archive staging insert in a disposable SQLite store, drives the real conversation entry with a controlled model reply, and verifies the exact reply and storage notice, with no background memory decision or queued learning. This is a runtime behavior check independent of hosted CI. The installed databases, live model and peripheral hardware were outside this test.

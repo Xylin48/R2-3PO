@@ -14906,7 +14906,7 @@ static void resume_post_turn_learning(void)
 static void schedule_post_turn_processing(const char *user, const char *reply,
                                           int64_t event_id, char *tool_result)
 {
-    if (!user || !reply || shutting_down) {
+    if (!user || !reply || event_id <= 0 || shutting_down) {
         free(tool_result);
         return;
     }
@@ -14914,12 +14914,9 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
        learning worker and leave additional exchanges in that durable queue. */
     pthread_mutex_lock(&post_turn_lock);
     if (post_turn_active || atomic_load(&post_turn_replay_requested)) {
-        if (event_id > 0)
-            atomic_store(&post_turn_replay_requested, 1);
+        atomic_store(&post_turn_replay_requested, 1);
         pthread_mutex_unlock(&post_turn_lock);
         free(tool_result);
-        if (event_id <= 0)
-            log_post_turn_start_failure("unstaged turn while learning is busy", event_id);
         return;
     }
     post_turn_active++;
@@ -14929,27 +14926,27 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     if (!job) {
         free(tool_result);
         finish_post_turn_worker();
-        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
+        atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("job allocation", event_id);
         return;
     }
     job->user = strdup(user);
     job->reply = strdup(reply);
     job->event_id = event_id;
-    job->self_report_pending = event_id > 0 && *reply;
+    job->self_report_pending = *reply != '\0';
     job->memory_pending = 1;
     job->tool_result = tool_result;
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         finish_post_turn_worker();
-        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
+        atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("turn copy allocation", event_id);
         return;
     }
 
     if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
-        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
+        atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("thread creation", event_id);
         return;
     }
@@ -15530,6 +15527,15 @@ finalize_reply:
        continues independently and yields if a new foreground turn arrives. */
     schedule_post_turn_processing(message, generated_reply ? reply : "", turn_event_id,
                                   tool_evidence == reply ? strdup(reply) : tool_evidence);
+
+    if (turn_event_id <= 0) {
+        char *with_storage_status = NULL;
+        if (asprintf(&with_storage_status, "%s\n\nI couldn't save this exchange to my Life Log.",
+                     reply) >= 0) {
+            free(reply);
+            reply = with_storage_status;
+        }
+    }
 
     return reply;
 }
