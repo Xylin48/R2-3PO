@@ -14841,7 +14841,12 @@ static void *replay_pending_learning(void *opaque)
         if (rc != SQLITE_ROW || !copied) {
             free(job.user); free(job.reply); free(job.tool_result); free(job.extraction);
             fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay.\n");
-            if (rc != SQLITE_ROW) break;
+            if (rc != SQLITE_ROW) {
+                int result = rc & 0xff; /* Extended SQLite codes share the base result. */
+                if (result == SQLITE_BUSY || result == SQLITE_LOCKED || result == SQLITE_NOMEM)
+                    atomic_store(&post_turn_replay_requested, 1);
+                break;
+            }
             continue;
         }
         run_post_turn_job(&job);
@@ -14855,7 +14860,11 @@ static void resume_post_turn_learning(void)
     /* A turn holds its lock from staging through worker registration. A
        reflection reserves active work before staging. Exclude both while
        taking the cutoff, then release the locks before any inference. */
-    if (shutting_down || atomic_load(&foreground_conversation_waiting) > 0 ||
+    if (shutting_down) return;
+    /* Keep even startup and periodic requests pending until a sweep can
+       acquire the locks and inspect the durable queue. */
+    atomic_store(&post_turn_replay_requested, 1);
+    if (atomic_load(&foreground_conversation_waiting) > 0 ||
         pthread_mutex_trylock(&conversation_turn_lock) != 0)
         return;
 
@@ -14889,6 +14898,7 @@ static void resume_post_turn_learning(void)
     } else {
         finish_post_turn_worker();
     }
+    atomic_store(&post_turn_replay_requested, 1);
     log_post_turn_start_failure("pending learning replay", through);
 }
 
@@ -14919,6 +14929,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     if (!job) {
         free(tool_result);
         finish_post_turn_worker();
+        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("job allocation", event_id);
         return;
     }
@@ -14931,12 +14942,14 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     if (!job->user || !job->reply) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         finish_post_turn_worker();
+        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("turn copy allocation", event_id);
         return;
     }
 
     if (start_post_turn_worker(post_turn_worker, job) != 0) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
+        if (event_id > 0) atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("thread creation", event_id);
         return;
     }

@@ -536,15 +536,24 @@ static void check_post_turn_retry(void)
     int64_t source = r2_log_conversation_turn_for_learning(
         "What do you remember?", "I remember the blue door.", NULL, 0, NULL, 0, NULL);
     assert(source > 0);
+    assert(!atomic_load(&post_turn_replay_requested));
     pthread_mutex_lock(&conversation_turn_lock);
     resume_post_turn_learning();
-    assert(post_turn_active == 0);
+    assert(post_turn_active == 0 && atomic_load(&post_turn_replay_requested));
     pthread_mutex_unlock(&conversation_turn_lock);
 
+    pthread_mutex_lock(&db_lock);
+    resume_post_turn_learning();
+    assert(post_turn_active == 0 && atomic_load(&post_turn_replay_requested));
+    pthread_mutex_unlock(&db_lock);
+
+    /* The staged job below tests processing directly, without a poll. */
+    atomic_store(&post_turn_replay_requested, 0);
     begin_post_turn_work();
     resume_post_turn_learning();
-    assert(post_turn_active == 1);
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
     finish_post_turn_worker();
+    atomic_store(&post_turn_replay_requested, 0);
 
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     assert(job);
@@ -908,12 +917,16 @@ static void check_action_result_under_history_pressure(void)
 
     sqlite3_stmt *statement = NULL;
     assert(sqlite3_prepare_v2(db,
-        "SELECT user_text,assistant_text,tool_result FROM r2_log_pending_learning "
-        "WHERE user_text=?;", -1, &statement, NULL) == SQLITE_OK);
+        "SELECT l.user_text,l.assistant_text,l.tool_result,c.assistant_text,"
+        "EXISTS(SELECT 1 FROM r2_log_pending_self_reports s WHERE s.event_id=l.event_id) "
+        "FROM r2_log_pending_learning l JOIN r2_log_conversations c USING(event_id) "
+        "WHERE l.user_text=?;", -1, &statement, NULL) == SQLITE_OK);
     assert(sqlite3_bind_text(statement, 1, user, -1, SQLITE_STATIC) == SQLITE_OK);
     assert(sqlite3_step(statement) == SQLITE_ROW);
     assert(!strcmp((const char *)sqlite3_column_text(statement, 0), user));
-    assert(!strcmp((const char *)sqlite3_column_text(statement, 1), reply));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 1), ""));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 3), reply));
+    assert(sqlite3_column_int(statement, 4) == 0);
     assert(!strcmp((const char *)sqlite3_column_text(statement, 2), expected));
     assert(sqlite3_step(statement) == SQLITE_DONE);
     sqlite3_finalize(statement);
