@@ -2275,3 +2275,8 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Shutdown signals the shared cancellation path, waits for an accepted turn to release the conversation lock and declines new turns before they can touch closing subsystems. It rolls back any abandoned memory transaction before the shutdown Life Log writes and clears both volatile retrieval caches after workers exit. Reinitialization resets the last conversation timestamp to the new Life Log clock origin.
 - Reward recovery now treats a suppressed ledger update, unavailable Life Log event or missing memory pointer as unresolved. The source reward remains committed and eligible for a later reconciliation attempt. A fixture suppressed the link update, removed the fault and verified that only one completion was counted.
 - Disposable checks cover strict compilation, native inference and shutdown, Life Log legacy recovery, diary and Reward integration, startup failure cleanup, and offline startup and conversation. Hardware and the installed databases were outside the test workspace.
+
+### R2-AUD-2026-11-20-253 — Align hosted shutdown assertions with both execution paths
+
+- Hosted run 44805306460 stopped at a source-level conversation recovery assertion. Its first-unlock lookup mistook the shutdown guard for the normal end of a live turn. The check now verifies both the early shutdown exit and the normal serialized turn.
+- The same test now follows the shared shutdown signal helper and checks cancellation precedes draining the foreground lock. The corrected source-level regression and related startup, camera, task and Ears checks passed locally.

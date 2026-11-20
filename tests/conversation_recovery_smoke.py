@@ -135,12 +135,20 @@ require(
 lock = public.find("pthread_mutex_lock(&conversation_turn_lock)")
 intent = public.find("atomic_fetch_add(&foreground_conversation_waiting, 1)")
 call = public.find("r2_talk_impl(message)")
-unlock = public.find("pthread_mutex_unlock(&conversation_turn_lock)")
-decrement = public.find("atomic_fetch_sub(&foreground_conversation_waiting, 1)")
+unlock = public.rfind("pthread_mutex_unlock(&conversation_turn_lock)")
+decrement = public.rfind("atomic_fetch_sub(&foreground_conversation_waiting, 1)")
 require(
     intent >= 0 and lock > intent and call > lock and unlock > call
     and decrement > unlock,
     "foreground intent is announced before lock wait and turn ownership spans the full implementation",
+)
+shutdown_guard = public[lock:call]
+require(
+    "if (shutting_down)" in shutdown_guard
+    and "pthread_mutex_unlock(&conversation_turn_lock)" in shutdown_guard
+    and "atomic_fetch_sub(&foreground_conversation_waiting, 1)" in shutdown_guard
+    and "return xstrdup(" in shutdown_guard,
+    "shutdown rejects new turns before inference and releases the lock and waiting count",
 )
 require(
     "reply = xstrdup(" in public
@@ -189,14 +197,13 @@ require(
 )
 shutdown_start = core.find("void r2_shutdown(void)")
 shutdown_tail = core[shutdown_start:] if shutdown_start >= 0 else ""
-shutdown_lock = shutdown_tail.find("pthread_mutex_lock(&task_queue_lock)")
-shutdown_state = shutdown_tail.find("shutting_down = 1;")
-shutdown_wake = shutdown_tail.find("pthread_cond_broadcast(&task_queue_cond)")
-shutdown_unlock = shutdown_tail.find("pthread_mutex_unlock(&task_queue_lock)")
+shutdown_signal = shutdown_tail.find("r2_request_shutdown();")
+shutdown_drain = shutdown_tail.find("pthread_mutex_lock(&conversation_turn_lock)")
+shutdown_release = shutdown_tail.find("pthread_mutex_unlock(&conversation_turn_lock)", shutdown_drain)
+shutdown_log = shutdown_tail.find('r2_log_system_snapshot("shutdown_begin")')
 require(
-    shutdown_lock >= 0 and shutdown_state > shutdown_lock
-    and shutdown_wake > shutdown_state and shutdown_unlock > shutdown_wake,
-    "core shutdown changes the worker predicate and wakes it under the queue mutex",
+    0 <= shutdown_signal < shutdown_drain < shutdown_release < shutdown_log,
+    "core uses the shared worker cancellation path before draining active turns and writing shutdown events",
 )
 hands_join = shutdown_tail.find("pthread_join(hands_thread, NULL)")
 pending_drain = shutdown_tail.find("Task *pending_tasks = task_head")
