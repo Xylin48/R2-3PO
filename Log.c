@@ -1480,10 +1480,16 @@ static int log_stage_learning_locked(int64_t event_id, const char *user,
     return saved;
 }
 
+typedef enum {
+    LOG_TURN_ARCHIVE_ONLY,
+    LOG_TURN_LEARN_FROM_EVIDENCE,
+    LOG_TURN_LEARN_FROM_REPLY
+} LogTurnLearning;
+
 static int64_t log_conversation_turn_with_evidence(const char *user_text, const char *assistant_text,
                                                     const int64_t *speech_ids, size_t speech_count,
                                                     const int64_t *review_ids, size_t review_count,
-                                                    const char *tool_result, int stage_learning)
+                                                    const char *tool_result, LogTurnLearning learning)
 {
     if (!valid_text(user_text) || !valid_text(assistant_text) ||
         (speech_count && !speech_ids) || (review_count && !review_ids))
@@ -1546,9 +1552,12 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
-    if (saved && stage_learning)
-        saved = log_stage_learning_locked(event_id, user_text, assistant_text, tool_result) &&
-                log_stage_self_report_locked(event_id, assistant_text);
+    if (saved && learning != LOG_TURN_ARCHIVE_ONLY) {
+        const char *learning_reply = learning == LOG_TURN_LEARN_FROM_REPLY ? assistant_text : "";
+        saved = log_stage_learning_locked(event_id, user_text, learning_reply, tool_result);
+        if (saved && learning == LOG_TURN_LEARN_FROM_REPLY)
+            saved = log_stage_self_report_locked(event_id, assistant_text);
+    }
     saved = saved && log_stage_turn_links_locked(event_id, 0, speech_ids, speech_count) == 0 &&
                     log_stage_turn_links_locked(event_id, 1, review_ids, review_count) == 0;
     int result = log_finish_write(saved);
@@ -1569,7 +1578,7 @@ int64_t r2_log_conversation_turn_with_evidence(const char *user_text, const char
                                                const char *tool_result)
 {
     return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
-                                               review_ids, review_count, tool_result, 0);
+                                               review_ids, review_count, tool_result, LOG_TURN_ARCHIVE_ONLY);
 }
 
 int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char *assistant_text,
@@ -1578,7 +1587,16 @@ int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char 
                                               const char *tool_result)
 {
     return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
-                                               review_ids, review_count, tool_result, 1);
+                                               review_ids, review_count, tool_result, LOG_TURN_LEARN_FROM_REPLY);
+}
+
+int64_t r2_log_conversation_turn_with_fallback(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result)
+{
+    return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
+                                               review_ids, review_count, tool_result, LOG_TURN_LEARN_FROM_EVIDENCE);
 }
 
 int64_t r2_log_conversation_turn_with_links(const char *user_text, const char *assistant_text,

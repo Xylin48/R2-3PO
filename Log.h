@@ -240,6 +240,12 @@ int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char 
                                               const int64_t *review_ids, size_t review_count,
                                               const char *tool_result);
 
+/* Archive a runtime fallback and evaluate only the user and recorded tool evidence. */
+int64_t r2_log_conversation_turn_with_fallback(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result);
+
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
  * Records describe R2's expressed or explicitly evidenced state, not

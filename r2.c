@@ -10674,7 +10674,9 @@ static char *memory_decision(
         user ? "LATEST USER MESSAGE:\n" : "",
         user ? user : "",
         user ? "\n\n" : "",
-        user ? "LATEST R2 RESPONSE:\n" : "PRIVATE R2 REFLECTION (may contain speculation):\n",
+        !user ? "PRIVATE R2 REFLECTION (may contain speculation):\n" :
+        *reply ? "LATEST R2 RESPONSE:\n" :
+                 "NO GENERATED R2 RESPONSE. Evaluate only the user message and any recorded tool evidence.",
         reply,
         tool_result ? "RECORDED TOOL RESULT (data from this turn):\n" : "",
         tool_result ? tool_result : "",
@@ -14923,7 +14925,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->user = strdup(user);
     job->reply = strdup(reply);
     job->event_id = event_id;
-    job->self_report_pending = event_id > 0;
+    job->self_report_pending = event_id > 0 && *reply;
     job->memory_pending = 1;
     job->tool_result = tool_result;
     if (!job->user || !job->reply) {
@@ -15151,7 +15153,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2 Reality] Retry could not refresh Reality/learning context; using the previous valid snapshot.\n");
         reply = chat_with_relevant_memories(message);
     }
-    int hands_result_used = reply != NULL;
+    int generated_reply = 0;
     if (shutting_down) goto interrupted_reply;
     if (!reply) {
         /*
@@ -15169,6 +15171,7 @@ static char *r2_talk_impl(const char *message)
                     "[R2] Could not allocate the conversation fallback reply; preserving the user turn for the caller's fallback.\n");
             return NULL;
         }
+        goto finalize_reply;
     }
 
     /* Strip markers into a temporary copy before executing tools, so a
@@ -15178,7 +15181,6 @@ static char *r2_talk_impl(const char *message)
     if (!reply_has_visible_text(stripped_reply)) {
         /* Marker-only/whitespace output is not a valid conversational answer.
            Retry once before executing any tool action. */
-        hands_result_used = 0;
         free(reply);
         free(stripped_reply);
         reply = NULL;
@@ -15193,18 +15195,14 @@ static char *r2_talk_impl(const char *message)
             reply = xstrdup(
                 "I'm sorry—I couldn't produce a usable reply just now. "
                 "Your message hasn't been discarded; please try again in a moment.");
-            stripped_reply = reply ? r2_sounds_strip_markers_with_literals(reply, literal_tool_span) : NULL;
-            if (!reply || !reply_has_visible_text(stripped_reply)) {
-                free(reply);
-                free(stripped_reply);
+            if (!reply) {
                     fprintf(stderr,
                         "[R2] Could not allocate a visible fallback after empty model output; preserving the user turn.\n");
                 return NULL;
             }
             fprintf(stderr,
                     "[R2] Retry still produced no visible reply; returning a fallback and preserving the user turn.\n");
-        } else {
-            hands_result_used = 1;
+            goto finalize_reply;
         }
     }
 
@@ -15325,6 +15323,7 @@ static char *r2_talk_impl(const char *message)
             reply = recorded_action_reply(tool_evidence);
         } else {
             reply = sound_clean_reply;
+            generated_reply = 1;
         }
     } else {
         free(tools);
@@ -15346,6 +15345,7 @@ static char *r2_talk_impl(const char *message)
         } else {
             free(reply);
             reply = sound_clean_reply;
+            generated_reply = 1;
         }
     }
 
@@ -15369,11 +15369,12 @@ finalize_reply:
 
     const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
     const R2TurnContextReviews *reviews = r2_turn_context_reviews;
-    int64_t turn_event_id = (shutting_down ? r2_log_conversation_turn_with_evidence
-                                           : r2_log_conversation_turn_for_learning)(message, reply,
+    int64_t turn_event_id = (shutting_down ? r2_log_conversation_turn_with_evidence :
+                             generated_reply ? r2_log_conversation_turn_for_learning :
+                                               r2_log_conversation_turn_with_fallback)(message, reply,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
-    if (!shutting_down && hands_result_id > 0 && hands_result_used && turn_event_id > 0 &&
+    if (!shutting_down && hands_result_id > 0 && generated_reply && turn_event_id > 0 &&
         r2_log_deliver_hands_result(hands_result_id, turn_event_id) != 0)
         fprintf(stderr, "[R2] Hands result remains pending after the conversation write.\n");
     if (assistant_context_rc != 0) {
@@ -15514,7 +15515,7 @@ finalize_reply:
 
     /* Deliver the generated answer immediately; model-assisted bookkeeping
        continues independently and yields if a new foreground turn arrives. */
-    schedule_post_turn_processing(message, reply, turn_event_id,
+    schedule_post_turn_processing(message, generated_reply ? reply : "", turn_event_id,
                                   tool_evidence == reply ? strdup(reply) : tool_evidence);
 
     return reply;

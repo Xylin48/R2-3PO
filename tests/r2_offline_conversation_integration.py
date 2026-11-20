@@ -103,6 +103,8 @@ HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
 HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
 HANDS_REJECTED_REPLY_REQUEST = "Read the pending handoff with an unusable reply fixture."
 HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
+HANDS_ACTION_FALLBACK_REQUEST = "Save the fallback test note while the earlier result is pending."
+HANDS_ACTION_FALLBACK_FILE = "hands-fallback-note.txt"
 IMAGINE_TURN = "Imagine the long quartzlight scenario."
 IMAGINE_REQUEST = ("Imagine a quartzlight scene. " + "Keep the imagined snow visible ☃. " * 255
                    + "The final constraint is a green door.")
@@ -152,6 +154,14 @@ class LocalOllama(BaseHTTPRequestHandler):
             reply = REPLY if has_tool_result else f"I will queue the test command.\n[HAND] printf {HANDS_RESULT}"
         if current_index >= 0 and user_messages[current_index] == HANDS_REJECTED_REPLY_REQUEST:
             reply = "[WORLD] look"
+        if current_index >= 0 and user_messages[current_index] == HANDS_ACTION_FALLBACK_REQUEST:
+            result_recorded = any(
+                message.startswith(result_prefix) and HANDS_ACTION_FALLBACK_FILE in message
+                for message in user_messages[current_index + 1:]
+            )
+            reply = ("[WORLD] look" if result_recorded else
+                     f"I'll save the test note.\n[WRITE] {HANDS_ACTION_FALLBACK_FILE}\n"
+                     f"{FOLLOWUP_FILE_CONTENT}[END WRITE]")
         if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
             reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -1222,6 +1232,35 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
         assert db.execute(
             "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
         ).fetchone() == (None,)
+
+        db.executescript(
+            "CREATE TRIGGER retain_fallback_learning BEFORE DELETE ON r2_log_pending_learning "
+            f"WHEN OLD.user_text='{HANDS_ACTION_FALLBACK_REQUEST}' "
+            "BEGIN SELECT RAISE(IGNORE); END; "
+            "CREATE TRIGGER reject_fallback_self_report BEFORE INSERT ON r2_log_pending_self_reports "
+            "WHEN NEW.assistant_text LIKE '%Here is the recorded result:%hands-fallback-note.txt%' "
+            "BEGIN SELECT RAISE(ABORT,'runtime fallback must never become a self report'); END;"
+        )
+        try:
+            fallback = subprocess.run(
+                [str(binary)], cwd=workspace, env=env,
+                input=f"talk {HANDS_ACTION_FALLBACK_REQUEST}\nexit\n",
+                text=True, capture_output=True, timeout=30, check=True,
+            )
+            assert "Here is the recorded result:" in fallback.stdout, fallback.stdout + fallback.stderr
+            assert (workspace / HANDS_ACTION_FALLBACK_FILE).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
+            assert db.execute(
+                "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+            ).fetchone() == (None,)
+            row = db.execute(
+                "SELECT c.assistant_text,l.assistant_text,l.tool_result "
+                "FROM r2_log_conversations c JOIN r2_log_pending_learning l USING(event_id) "
+                "WHERE c.user_text=?", (HANDS_ACTION_FALLBACK_REQUEST,),
+            ).fetchone()
+            assert row and "Here is the recorded result:" in row[0] and row[1] == "", row
+            assert HANDS_ACTION_FALLBACK_FILE in row[2], row
+        finally:
+            db.executescript("DROP TRIGGER retain_fallback_learning; DROP TRIGGER reject_fallback_self_report;")
 
         db.executescript(
             "CREATE TRIGGER block_hands_delivery BEFORE UPDATE OF delivered_to ON r2_log_hands_results "
