@@ -5657,6 +5657,47 @@ static int r2_reply_claims_garbled_typed_audio(const char *reply)
            (strcasestr(reply, "heavily garbled") || strcasestr(reply, "coming through corrupted"));
 }
 
+/* A stock dismissal of the current typed message is not a clarification.
+   Restrict the veto to openings, so quoted examples and specific questions
+   about an unclear detail can still be delivered. */
+static int r2_reply_dismisses_typed_turn(const char *query, const char *reply)
+{
+    if (!query || !reply || r2_input_speech_event > 0 ||
+        r2_user_requests_written_dialogue(query))
+        return 0;
+    while (isspace((unsigned char)*reply)) ++reply;
+    static const char *const apologies[] = {"I'm sorry", "I’m sorry", "Sorry"};
+    for (size_t i = 0; i < sizeof(apologies) / sizeof(apologies[0]); ++i) {
+        size_t length = strlen(apologies[i]);
+        if (!strncasecmp(reply, apologies[i], length) &&
+            (strchr(" ,.:!?", reply[length]) ||
+             !strncmp(reply + length, "—", sizeof("—") - 1))) {
+            reply += length;
+            reply += strspn(reply, " ,.:!?");
+            if (!strncmp(reply, "—", sizeof("—") - 1)) reply += sizeof("—") - 1;
+            while (isspace((unsigned char)*reply)) ++reply;
+            if (!strncasecmp(reply, "but ", 4)) reply += 4;
+            break;
+        }
+    }
+
+    static const char *const openings[] = {
+        "i couldn't understand your message", "i couldn’t understand your message",
+        "i could not understand your message", "i didn't understand your message",
+        "i can't understand your message", "i cannot understand your message",
+        "i couldn't understand what you said", "i couldn't understand what you're saying",
+        "i'm having trouble understanding your message", "your message is unintelligible",
+        "your message appears to be gibberish"
+    };
+    for (size_t i = 0; i < sizeof(openings) / sizeof(openings[0]); ++i) {
+        size_t length = strlen(openings[i]);
+        if (!strncasecmp(reply, openings[i], length) &&
+            strchr(".!?\r\n", reply[length]))
+            return 1;
+    }
+    return 0;
+}
+
 static int r2_reply_misclassifies_plain_text(const char *query, const char *reply)
 {
     if (!query || !reply)
@@ -7096,7 +7137,8 @@ static char *chat_with_relevant_memories(
        Ordinary conversation does not require an extra model call. */
     int reply_misclassified =
         r2_reply_misclassifies_plain_text(query, reply ? reply : "");
-    if (retry_after_sanitize_failure || reply_misclassified) {
+    int original_dismissal = r2_reply_dismisses_typed_turn(query, reply);
+    if (retry_after_sanitize_failure || reply_misclassified || original_dismissal) {
         int original_fabricated_audio = reply_misclassified && r2_reply_claims_garbled_typed_audio(reply);
         int original_identity_error = r2_reply_has_identity_error(query, reply);
         char *retry = r2_retry_direct_answer(copy, base_count, query);
@@ -7109,8 +7151,9 @@ static char *chat_with_relevant_memories(
         }
 
         /* Broad relevance heuristics request a retry. Explicit identity
-           substitutions and false typed-audio claims veto either draft. */
+           substitutions, stock dismissals and false audio claims veto either draft. */
         if (r2_reply_has_identity_error(query, retry_user_facing) ||
+            r2_reply_dismisses_typed_turn(query, retry_user_facing) ||
             (r2_reply_claims_garbled_typed_audio(retry_user_facing) &&
              r2_reply_misclassifies_plain_text(query, retry_user_facing))) {
             free(retry_user_facing);
@@ -7121,12 +7164,14 @@ static char *chat_with_relevant_memories(
             reply = retry_user_facing;
         } else {
             free(retry_user_facing);
-            if (original_fabricated_audio || original_identity_error) {
+            if (original_fabricated_audio || original_identity_error || original_dismissal) {
                 free(reply);
                 reply = NULL;
                 fprintf(stderr, "%s\n", original_identity_error
                     ? "[R2 Conversation] Discarded an identity or speaker substitution after correction failed."
-                    : "[R2 Conversation] Discarded a fabricated audio claim on typed input after correction failed.");
+                    : original_dismissal
+                        ? "[R2 Conversation] Discarded a stock dismissal of typed input after correction failed."
+                        : "[R2 Conversation] Discarded a fabricated audio claim on typed input after correction failed.");
             } else {
                 fprintf(stderr,
                         "[R2 Conversation] Corrective inference returned no usable text; retaining the original model result.\n");
@@ -10626,6 +10671,7 @@ static char *memory_decision(
         "did, preferred, understood, or reasonably concluded "
         "from real interaction.\n"
         "\n"
+        "An explicit durable fact told by the user can be saved as their report even when R2 could not generate a reply. Preserve who said it and any uncertainty.\n"
         "Do not invent memories.\n"
         "Do not turn hypothetical statements into memories.\n"
         "Do not turn roleplay into memories.\n"
@@ -10692,7 +10738,9 @@ static char *memory_decision(
         0
     };
 
-    int budget = 128;
+    /* Include room for a complete relationship or experience and its
+       uncertainty. A length-limited line is never submitted to the ledger. */
+    int budget = 384;
     char *res;
     if (r2_fit_complete_input(strlen(sys) + strlen(u), r2_ollama_context_tokens(), &budget) == 0) {
         res = ollama_chat_with_limit(&m, 1, sys, budget, 90L);

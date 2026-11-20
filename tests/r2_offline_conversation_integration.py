@@ -78,6 +78,13 @@ FABRICATED_AUDIO_REPLY = (
 )
 
 
+DISMISSAL_GREETING = "Hi R2, it's good to see you today."
+DISMISSAL_LEARNING_REQUEST = "Remember that I keep the spare blue key in the kitchen tin."
+DISMISSAL_LEARNED = "The user said they keep the spare blue key in the kitchen tin."
+DISMISSAL_RECOVERED_REPLY = "It's good to see you too."
+TYPED_DISMISSAL = ("I'm sorry, but I couldn't understand your message. Can you clarify?"
+                   "\n[WRITE] rejected-dismissal.txt\nThis should never be written.\n[END WRITE]")
+
 IDENTITY_GUARD_REQUEST = "Hi R2, do you remember the brass compass I told you about?"
 IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
 IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
@@ -282,6 +289,21 @@ class LocalOllama(BaseHTTPRequestHandler):
                 message["content"] = IDENTITY_REPLY if has_relationship_evidence else IDENTITY_REVERSED_DRAFT
             else:
                 message["content"] = IDENTITY_BAD_DRAFT
+        if (current_index >= 0 and IDENTITY_ANCHOR in system
+                and user_messages[current_index] in (DISMISSAL_GREETING, DISMISSAL_LEARNING_REQUEST)):
+            correction = "RESPONSE CORRECTION:" in system or "Correct the prior draft" in system
+            message["content"] = (DISMISSAL_RECOVERED_REPLY
+                                  if correction and user_messages[current_index] == DISMISSAL_GREETING
+                                  else TYPED_DISMISSAL)
+        if "memory-evaluation system" in system and any(
+            DISMISSAL_LEARNING_REQUEST in text and "NO GENERATED R2 RESPONSE" in text
+            for text in user_messages
+        ):
+            if payload["options"]["num_predict"] >= 384:
+                message["content"] = "knowledge | " + DISMISSAL_LEARNED
+            else:
+                done_reason = "length"
+                message["content"] = "knowledge | The user said they keep"
         body = json.dumps({
             "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
             "message": message,
@@ -456,6 +478,48 @@ def reject_repeated_fabricated_audio(binary: Path, workspace: Path, url: str) ->
         assert "heavily garbled" not in replies[0][0]
     print("PASS: repeated fabricated audio claims on typed input stayed out of replies and actions.")
 
+
+def recover_typed_dismissal_and_learn(binary: Path, workspace: Path, url: str) -> None:
+    log_path = workspace.parent / "typed-dismissal.log"
+    database = workspace / "R2" / "r2_memory.db"
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(f"{DISMISSAL_GREETING}\n{DISMISSAL_LEARNING_REQUEST}\n")
+            proc.stdin.flush()
+            learned = None
+            deadline = time.monotonic() + 35
+            while proc.poll() is None and time.monotonic() < deadline:
+                with closing(sqlite3.connect(database)) as db:
+                    learned = db.execute(
+                        "SELECT c.user_text,c.assistant_text FROM r2_log_links l "
+                        "JOIN r2_log_events m ON m.id=l.from_event_id "
+                        "JOIN r2_log_conversations c ON c.event_id=l.to_event_id "
+                        "WHERE l.relationship='memory_learned_from' AND m.details=?",
+                        (DISMISSAL_LEARNED,),
+                    ).fetchone()
+                if learned:
+                    break
+                time.sleep(0.1)
+            assert learned and learned[0] == DISMISSAL_LEARNING_REQUEST, log_path.read_text()[-13000:]
+            assert "couldn't produce a usable reply" in learned[1], learned
+            proc.stdin.write("exit\n")
+            proc.stdin.flush()
+            assert proc.wait(timeout=20) == 0
+        finally:
+            proc.stdin.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    assert not (workspace / "rejected-dismissal.txt").exists()
+    output = log_path.read_text()
+    assert output.count("R2-3PO: " + DISMISSAL_RECOVERED_REPLY) == 1, output
+    assert "R2-3PO: I'm sorry, but I couldn't understand your message." not in output
+    print("PASS: typed dismissal repaired when possible; repeated failure still learned the user's reported fact.")
 
 def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
     with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
@@ -1556,6 +1620,7 @@ def main() -> int:
             recover_post_action_response(binary, workspace, url)
             reject_repeated_fabricated_audio(binary, workspace, url)
             preserve_robot_identity(binary, workspace, url)
+            recover_typed_dismissal_and_learn(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")
