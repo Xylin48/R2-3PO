@@ -1145,6 +1145,57 @@ static void check_isolated_response_replay(void)
     assert(problem && !strcmp(problem, "embedded NUL byte") && offset == 2);
 }
 
+static void *shutdown_fixture_worker(void *unused)
+{
+    (void)unused;
+    r2_shutdown();
+    return NULL;
+}
+
+static void check_shutdown_drain_and_rollback(void)
+{
+    assert(init_db() == 0);
+    core_initialized = 1;
+    context_cache_store("previous session", 3, "stale context");
+    r2_associative_query_cache_store("previous session", "stale plan");
+    assert(sqlite3_exec(db, "BEGIN IMMEDIATE;"
+                        "INSERT INTO memories(memory,category) VALUES"
+                        "('Incomplete shutdown fixture','knowledge');",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    /* Treat the held turn lock as an inference which is finishing delivery. */
+    pthread_mutex_lock(&conversation_turn_lock);
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, shutdown_fixture_worker, NULL) == 0);
+    const struct timespec pause = {.tv_nsec = 10000000L};
+    for (int i = 0; i < 200 && !shutting_down; ++i) nanosleep(&pause, NULL);
+    assert(shutting_down);
+    assert(pthread_tryjoin_np(thread, NULL) == EBUSY);
+    assert(r2_log_is_initialized());
+    pthread_mutex_unlock(&conversation_turn_lock);
+    assert(pthread_join(thread, NULL) == 0);
+    assert(!r2_log_is_initialized() && db == NULL);
+    assert(context_cache_get("previous session", 3) == NULL);
+    assert(r2_associative_query_cache_lookup("previous session") == NULL);
+
+    char *reply = r2_talk("A turn arrived after shutdown.");
+    assert(reply && strstr(reply, "couldn't start this turn"));
+    free(reply);
+
+    sqlite3 *reader = NULL;
+    assert(sqlite3_open_v2(R2_DIARY_DATABASE, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(reader, "SELECT memory FROM memories WHERE memory='Incomplete shutdown fixture';",
+                              -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(reader, "SELECT 1 FROM r2_log_events WHERE event_type='shutdown_begin';",
+                              -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    sqlite3_close(reader);
+    puts("Shutdown waited for the active turn and rolled back an unfinished memory write.");
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -1304,7 +1355,7 @@ int main(void)
     check_staged_imagination();
     check_stale_needs_decision();
     check_action_result_under_history_pressure();
-    r2_log_shutdown();
+    check_shutdown_drain_and_rollback();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);
     if (captured) json_object_put(captured);

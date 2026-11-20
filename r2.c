@@ -15548,6 +15548,11 @@ char *r2_talk(const char *message)
     atomic_fetch_add(&foreground_conversation_waiting, 1);
     record_conversation_activity(r2_log_elapsed_ms());
     pthread_mutex_lock(&conversation_turn_lock);
+    if (shutting_down) {
+        pthread_mutex_unlock(&conversation_turn_lock);
+        atomic_fetch_sub(&foreground_conversation_waiting, 1);
+        return xstrdup("I'm shutting down and couldn't start this turn.");
+    }
     int previous_turn_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
     R2TurnContextReviews context_reviews = {0};
@@ -15800,7 +15805,7 @@ static int verify_initialized_database_set(void)
             char name[64];
             snprintf(name, sizeof(name), "%s%s", stores[i].name, suffixes[j]);
             if (fstatat(core_storage_lock, name, &entry, AT_SYMLINK_NOFOLLOW) == 0) {
-                if (present[i] && S_ISREG(entry.st_mode) &&
+                if (present[i] && S_ISREG(entry.st_mode) && entry.st_nlink == 1 &&
                     faccessat(core_storage_lock, name, R_OK | W_OK, AT_EACCESS) == 0)
                     continue;
             } else if (errno == ENOENT) {
@@ -16260,6 +16265,9 @@ int r2_init(void)
        START BACKGROUND THREADS
        ======================================================== */
 
+    /* Life Log starts a fresh elapsed-time origin on each initialization. */
+    atomic_store(&last_conversation_activity_ms, 0);
+
     if (r2_startup_thread_create(&hands_thread, hands_worker, NULL,
                                     "R2_TEST_FAIL_HANDS_THREAD_CREATE") != 0) {
         /* main() owns the single complete unwind through r2_shutdown(). */
@@ -16358,17 +16366,23 @@ void r2_shutdown(void)
         !curl_global_initialized)
         return;
 
-    /* Stop task submission atomically with the Hands worker's queue predicate. */
-    pthread_mutex_lock(&task_queue_lock);
-    shutting_down = 1;
-    pthread_cond_broadcast(&task_queue_cond);
-    pthread_mutex_unlock(&task_queue_lock);
-
-    r2_ears_cancel_pending_inputs(0);
-    r2_ears_extra_cancel_pending();
+    r2_request_shutdown();
     atomic_store(&diary_running, 0);
     watch_running = 0;
+
+    /* Finish any accepted foreground turn before releasing the stores and
+       devices it still owns. New turns observe shutdown under this lock. */
+    pthread_mutex_lock(&conversation_turn_lock);
+    pthread_mutex_unlock(&conversation_turn_lock);
+
     r2_vision_watch_stop();
+
+    /* Release any abandoned memory write before the Life Log uses its
+       separate connection to record shutdown. Active writers hold db_lock. */
+    pthread_mutex_lock(&db_lock);
+    if (db && !sqlite3_get_autocommit(db))
+        (void)db_exec("ROLLBACK;");
+    pthread_mutex_unlock(&db_lock);
 
     if (r2_log_is_initialized()) {
         r2_log_system_snapshot("shutdown_begin");
@@ -16485,27 +16499,23 @@ void r2_shutdown(void)
         diary_initialized = 0;
     }
 
+    pthread_mutex_lock(&db_lock);
     if (db) {
-        pthread_mutex_lock(&db_lock);
-
-        sqlite3_exec(
-            db,
-            "COMMIT",
-            NULL,
-            NULL,
-            NULL
-        );
-
-        pthread_mutex_unlock(&db_lock);
-
-        sqlite3_close(db);
+        /* A write left uncommitted by its owner must be rolled back on
+           close. Shutdown cannot establish that the write was complete. */
+        int rc = sqlite3_close_v2(db);
+        if (rc != SQLITE_OK)
+            fprintf(stderr, "[R2] Could not close the memory database: %s.\n", sqlite3_errstr(rc));
         db = NULL;
     }
+    pthread_mutex_unlock(&db_lock);
 
     if (curl_global_initialized) {
         curl_global_cleanup();
         curl_global_initialized = 0;
     }
+    context_cache_invalidate();
+    r2_associative_query_cache_clear();
     message_free_all();
     if (core_storage_lock >= 0) {
         (void)flock(core_storage_lock, LOCK_UN);

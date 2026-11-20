@@ -1504,6 +1504,11 @@ def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
             check_refused("Invalid SQLite sidecar at startup")
         finally:
             sidecar.unlink()
+        sidecar.hardlink_to(memory)
+        try:
+            check_refused("Invalid SQLite sidecar at startup")
+        finally:
+            sidecar.unlink()
         if os.geteuid() != 0:
             mode = last_store.stat().st_mode & 0o777
             last_store.chmod(0o400)

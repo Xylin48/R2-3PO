@@ -838,6 +838,22 @@ static int log_restore_missing_event_links(void)
  * INITIALIZATION / SHUTDOWN
  * ------------------------------------------------------------ */
 
+static int log_ensure_location_baseline(void)
+{
+    /* Startup at home is not a return-home event. Preserve an existing row. */
+    if (exec_sql("INSERT OR IGNORE INTO r2_log_location_state "
+                 "(id,current_location,is_home,was_away,updated_utc) "
+                 "VALUES (1,'home',1,0,strftime('%Y-%m-%dT%H:%M:%SZ','now'));") != 0)
+        return -1;
+
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_location_state WHERE id=1;", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? 0 : -1;
+}
+
 int r2_log_init(void)
 {
     int rc;
@@ -873,22 +889,16 @@ int r2_log_init(void)
         return -1;
     }
 
-    sqlite3_busy_timeout(log_db, 5000);
-    sqlite3_exec(log_db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;", NULL, NULL, NULL);
-
-    if (ensure_tables() != 0) {
+    if (sqlite3_busy_timeout(log_db, 5000) != SQLITE_OK ||
+        exec_sql("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") != 0 ||
+        ensure_tables() != 0 ||
+        log_ensure_location_baseline() != 0) {
+        fprintf(stderr, "[R2 Life Log] Could not initialize durable storage or location state.\n");
         sqlite3_close(log_db);
         log_db = NULL;
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
-
-    /* Quiet initial baseline: startup at home is not a return-home event. */
-    sqlite3_exec(log_db,
-        "INSERT OR IGNORE INTO r2_log_location_state "
-        "(id,current_location,is_home,was_away,updated_utc) "
-        "VALUES (1,'home',1,0,strftime('%Y-%m-%dT%H:%M:%SZ','now'));",
-        NULL, NULL, NULL);
 
     log_initialized = 1;
     pthread_mutex_unlock(&log_lock);
