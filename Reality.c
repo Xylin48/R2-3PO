@@ -666,15 +666,36 @@ static int money_journal_mark_committed(void)
     return 0;
 }
 
+static const char money_authority_sql[] =
+    "INSERT INTO r2_reality_meta(key,value) VALUES('initial_cash_seeded','1') "
+    "ON CONFLICT(key) DO UPDATE SET value='1';"
+    "INSERT INTO r2_reality_meta(key,value) VALUES('money_files_authoritative','1') "
+    "ON CONFLICT(key) DO UPDATE SET value='1';";
+
+/* Until this transaction commits, the startup journal owns both balances. */
+static int money_finish_legacy_materialization(void)
+{
+    if (exec_sql("BEGIN IMMEDIATE") != 0) return -1;
+    int rc = exec_sql(money_authority_sql);
+    if (rc == 0) rc = exec_sql(
+        "DELETE FROM r2_money_transfer_journal WHERE id=1 "
+        "AND operation='legacy_materialization' AND phase='pending'");
+    if (rc == 0 && sqlite3_changes(reality_db) != 1) rc = -1;
+    if (rc == 0) rc = exec_sql("COMMIT");
+    if (rc != 0) (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+    return rc;
+}
+
 /* Resolve a durable two-directory transfer intent before trusting balances. */
 static int money_journal_recover(int *was_committed)
 {
     sqlite3_stmt *st = NULL;
     sqlite3_int64 old_cash = 0, old_bank = 0, new_cash = 0, new_bank = 0;
     char phase[24] = {0};
+    int legacy_materialization = 0;
     if (was_committed) *was_committed = 0;
     int rc = sqlite3_prepare_v2(reality_db,
-        "SELECT old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,phase "
+        "SELECT old_cash_cents,old_bank_cents,new_cash_cents,new_bank_cents,phase,operation "
         "FROM r2_money_transfer_journal WHERE id=1", -1, &st, NULL);
     if (rc != SQLITE_OK) return -1;
     rc = sqlite3_step(st);
@@ -686,26 +707,38 @@ static int money_journal_recover(int *was_committed)
     new_bank = sqlite3_column_int64(st, 3);
     const unsigned char *p = sqlite3_column_text(st, 4);
     snprintf(phase, sizeof(phase), "%s", p ? (const char *)p : "");
+    const unsigned char *operation = sqlite3_column_text(st, 5);
+    legacy_materialization = operation &&
+        sqlite3_column_bytes(st, 5) == (int)strlen("legacy_materialization") &&
+        strcmp((const char *)operation, "legacy_materialization") == 0;
     sqlite3_finalize(st);
 
+    if (legacy_materialization && strcmp(phase, "pending")) return -1;
     if (!strcmp(phase, "pending")) {
         char wallet[1200], piggybank[1200];
         money_dir_path(0, wallet, sizeof(wallet));
         money_dir_path(1, piggybank, sizeof(piggybank));
-        if (money_set_dir_balance(wallet, old_cash, NULL) != 0 ||
-            money_set_dir_balance(piggybank, old_bank, NULL) != 0 ||
+        sqlite3_int64 target_cash = legacy_materialization ? new_cash : old_cash;
+        sqlite3_int64 target_bank = legacy_materialization ? new_bank : old_bank;
+        if (target_cash < 0 || target_bank < 0 ||
+            target_cash > 100000000LL || target_bank > 100000000LL) return -1;
+        rc = money_set_dir_balance(wallet, target_cash, NULL);
+#ifdef R2_MONEY_TEST_FAILURE_INJECTION
+        if (rc == 0 && legacy_materialization &&
+            getenv("R2_TEST_MONEY_MIGRATION_INTERRUPT_AFTER_WALLET")) return -1;
+#endif
+        if (rc != 0 || money_set_dir_balance(piggybank, target_bank, NULL) != 0 ||
             money_read_locked(NULL, NULL) != 0) {
             fprintf(stderr, "[R2 Money] Pending transfer recovery failed; durable journal retained for retry.\n");
             return -1;
         }
-        return money_journal_clear();
+        return legacy_materialization ? money_finish_legacy_materialization()
+                                      : money_journal_clear();
     }
     if (strcmp(phase, "committed")) return -1;
     if (was_committed) *was_committed = 1;
     /* Physical files remain authoritative; this refreshes the derived SQLite summary. */
     if (money_read_locked(NULL, NULL) != 0) return -1;
-    (void)new_cash;
-    (void)new_bank;
     return money_journal_clear();
 }
 
@@ -764,15 +797,13 @@ static int money_initialize_files(int previously_seeded)
             sqlite3_int64 cash = sqlite3_column_int64(st, 0);
             sqlite3_int64 bank = sqlite3_column_int64(st, 1);
             sqlite3_finalize(st);
-            if (money_set_dir_balance(wallet, cash, NULL) != 0 ||
-                money_set_dir_balance(piggybank, bank, NULL) != 0) return -1;
+            if (cash < 0 || bank < 0 || cash > 100000000LL || bank > 100000000LL ||
+                money_journal_begin(0, 0, cash, bank, "legacy_materialization") != 0)
+                return -1;
+            return money_journal_recover(NULL);
         }
     }
-    return exec_sql(
-        "INSERT INTO r2_reality_meta(key,value) VALUES('initial_cash_seeded','1') "
-        "ON CONFLICT(key) DO UPDATE SET value='1';"
-        "INSERT INTO r2_reality_meta(key,value) VALUES('money_files_authoritative','1') "
-        "ON CONFLICT(key) DO UPDATE SET value='1';");
+    return exec_sql(money_authority_sql);
 }
 
 /* Move only generated mirror files when upgrading the old room-local layout.
@@ -2737,57 +2768,39 @@ int r2_reality_fridge_eat_with_experience(const char *food, double fullness,
     return 0;
 }
 
-static int legacy_table_exists(const char *name)
+/* A failed schema read is different from an older schema missing a field. */
+static int legacy_schema_has(const char *sql, const char *name, const char *column)
 {
     sqlite3_stmt *st = NULL;
-    int found = 0;
-    if (sqlite3_prepare_v2(reality_db,
-        "SELECT 1 FROM legacy.sqlite_master WHERE type='table' AND name=?",
-        -1, &st, NULL) == SQLITE_OK) {
-        bind_text(st, 1, name);
-        found = sqlite3_step(st) == SQLITE_ROW;
-    }
-    if (st) sqlite3_finalize(st);
-    return found;
+    int rc = sqlite3_prepare_v2(reality_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK && column)
+        rc = sqlite3_bind_text(st, 2, column, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_ROW) return 1;
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
-/* One-time, non-destructive migration from older releases where Reality
- * tables lived inside r2_memory.db. Life Log and memory stay in that file. */
+static int legacy_table_exists(const char *name)
+{
+    return legacy_schema_has(
+        "SELECT 1 FROM legacy.sqlite_master WHERE type='table' AND name=?", name, NULL);
+}
+
 static int legacy_column_exists(const char *table, const char *column)
 {
-    if (!table || !column) return 0;
-    char sql[256];
-    int n = snprintf(sql, sizeof(sql), "PRAGMA legacy.table_info(%s)", table);
-    if (n <= 0 || (size_t)n >= sizeof(sql)) return 0;
-    sqlite3_stmt *st = NULL;
-    int found = 0;
-    if (sqlite3_prepare_v2(reality_db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) { found = 1; break; }
-        }
-    }
-    if (st) sqlite3_finalize(st);
-    return found;
+    return legacy_schema_has(
+        "SELECT 1 FROM pragma_table_info(?,'legacy') WHERE name=? COLLATE NOCASE",
+        table, column);
 }
 
 static const char *legacy_column_expr(const char *table, const char *column,
                                       const char *fallback)
 {
-    return legacy_column_exists(table, column) ? column : fallback;
-}
-
-static int legacy_table_has_rows(const char *table)
-{
-    char sql[256];
-    int n = snprintf(sql, sizeof(sql), "SELECT 1 FROM legacy.%s LIMIT 1", table);
-    if (n <= 0 || (size_t)n >= sizeof(sql)) return 0;
-    sqlite3_stmt *st = NULL;
-    int found = 0;
-    if (sqlite3_prepare_v2(reality_db, sql, -1, &st, NULL) == SQLITE_OK)
-        found = sqlite3_step(st) == SQLITE_ROW;
-    if (st) sqlite3_finalize(st);
-    return found;
+    int found = legacy_column_exists(table, column);
+    if (found < 0) return NULL;
+    return found ? column : fallback;
 }
 
 /* Copy a legacy table using explicit destination columns. Missing optional
@@ -2797,12 +2810,12 @@ static int legacy_table_has_rows(const char *table)
 static int legacy_copy_table(const char *table,
                              const char *const *columns,
                              const char *const *fallbacks, size_t column_count,
-                             const char *const *required, size_t required_count,
-                             int replace_conflicts)
+                             const char *const *required, size_t required_count)
 {
-    if (!legacy_table_exists(table)) return 0;
+    int exists = legacy_table_exists(table);
+    if (exists <= 0) return exists;
     for (size_t i = 0; i < required_count; ++i) {
-        if (!legacy_column_exists(table, required[i])) {
+        if (legacy_column_exists(table, required[i]) != 1) {
             fprintf(stderr,
                     "[R2 Reality] Legacy table %s is missing required column %s; refusing incomplete migration.\n",
                     table, required[i]);
@@ -2820,8 +2833,7 @@ static int legacy_copy_table(const char *table,
         } \
         used += (size_t)written; \
     } while (0)
-    LEGACY_APPEND_SQL("INSERT OR %s INTO main.%s (",
-                      replace_conflicts ? "REPLACE" : "IGNORE", table);
+    LEGACY_APPEND_SQL("INSERT INTO main.%s (", table);
     for (size_t i = 0; i < column_count; ++i)
         LEGACY_APPEND_SQL("%s%s", i ? "," : "", columns[i]);
     LEGACY_APPEND_SQL(") SELECT ");
@@ -2835,7 +2847,7 @@ static int legacy_copy_table(const char *table,
         }
         LEGACY_APPEND_SQL("%s%s", i ? "," : "", expr);
     }
-    LEGACY_APPEND_SQL(" FROM legacy.%s", table);
+    LEGACY_APPEND_SQL(" FROM legacy.%s WHERE 1 ON CONFLICT DO NOTHING", table);
 #undef LEGACY_APPEND_SQL
     return exec_sql(sql);
 }
@@ -2845,8 +2857,9 @@ static int legacy_copy_table(const char *table,
  * safe to retry after any interrupted startup. */
 static int legacy_merge_preference_table(const char *table, const char *key_column)
 {
-    if (!legacy_table_exists(table)) return 0;
-    if (!legacy_column_exists(table, key_column)) {
+    int exists = legacy_table_exists(table);
+    if (exists <= 0) return exists;
+    if (legacy_column_exists(table, key_column) != 1) {
         fprintf(stderr, "[R2 Reality] Legacy preference table %s lacks %s.\n",
                 table, key_column);
         return -1;
@@ -2854,6 +2867,7 @@ static int legacy_merge_preference_table(const char *table, const char *key_colu
     const char *sum = legacy_column_expr(table, "satisfaction_sum", "0");
     const char *count = legacy_column_expr(table, "rating_count", "0");
     const char *updated = legacy_column_expr(table, "updated_at", "0");
+    if (!sum || !count || !updated) return -1;
     char sql[4096];
     int n = snprintf(sql, sizeof(sql),
         "INSERT INTO main.%s(%s,satisfaction_sum,rating_count,updated_at) "
@@ -2874,22 +2888,22 @@ static int legacy_merge_preference_table(const char *table, const char *key_colu
  * is never cleared or rewritten; Life Log and searchable memory stay there. */
 static int migrate_legacy_reality(void)
 {
-    if (access(R2_DIARY_DATABASE, F_OK) != 0) return 0;
+    if (access(R2_DIARY_DATABASE, F_OK) != 0) return errno == ENOENT ? 0 : -1;
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(reality_db,
+    int rc = sqlite3_prepare_v2(reality_db,
         "SELECT value FROM r2_reality_meta WHERE key='legacy_reality_migrated'",
-        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) {
-        if (st) sqlite3_finalize(st);
-        return 0;
-    }
-    if (st) sqlite3_finalize(st);
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_ROW) return 0;
+    if (rc != SQLITE_DONE) return -1;
     st = NULL;
     if (sqlite3_prepare_v2(reality_db, "ATTACH DATABASE ? AS legacy", -1, &st, NULL) != SQLITE_OK) {
         if (st) sqlite3_finalize(st);
         return -1;
     }
     bind_text(st, 1, R2_DIARY_DATABASE);
-    int rc = sqlite3_step(st);
+    rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         (void)sqlite3_exec(reality_db, "DETACH DATABASE legacy", NULL, NULL, NULL);
@@ -2907,17 +2921,18 @@ static int migrate_legacy_reality(void)
     const char *tick_defaults[] = {NULL,NULL,"current_tick-previous_tick","CURRENT_TIMESTAMP"};
     const char *tick_required[] = {"previous_tick","current_tick"};
     const char *object_cols[] = {"name","description","quantity","container","owner","created_at","updated_at"};
-    const char *object_container_default = legacy_column_exists("r2_reality_objects", "location")
-        ? "location" : "'room'";
+    const char *object_container_default =
+        legacy_column_expr("r2_reality_objects", "location", "'room'");
     const char *object_defaults[] = {NULL,"NULL","1",object_container_default,"'R2'","CURRENT_TIMESTAMP","CURRENT_TIMESTAMP"};
     const char *object_required[] = {"name"};
-    const char *legacy_collected_at_default =
-        legacy_column_exists("r2_reality_item_memory", "created_at")
+    int legacy_created_at = legacy_column_exists("r2_reality_item_memory", "created_at");
+    const char *legacy_collected_at_default = legacy_created_at == 1
             ? "CAST(strftime('%s',created_at) AS INTEGER)"
             : "CAST(strftime('%s','now') AS INTEGER)";
     const char *legacy_decay_at_default =
-        legacy_column_exists("r2_reality_item_memory", "collected_at")
-            ? "collected_at" : legacy_collected_at_default;
+        legacy_column_expr("r2_reality_item_memory", "collected_at", legacy_collected_at_default);
+    if (!object_container_default || legacy_created_at < 0 || !legacy_decay_at_default)
+        result = -1;
     const char *item_memory_cols[] = {"item_name","description","exact_quantity","approximate_quantity","precision","collected_at","last_decay_at"};
     const char *item_memory_defaults[] = {NULL,"NULL","NULL","NULL","'exact'",legacy_collected_at_default,legacy_decay_at_default};
     const char *item_memory_required[] = {"item_name"};
@@ -2943,74 +2958,62 @@ static int migrate_legacy_reality(void)
     const char *vcr_state_defaults[] = {"1","NULL",NULL,"CURRENT_TIMESTAMP"};
     const char *vcr_state_required[] = {"transport"};
 
-    const struct { const char *table, *sql; } simple_copies[] = {
-        {"r2_reality_meta", "INSERT OR IGNORE INTO main.r2_reality_meta(key,value) SELECT key,value FROM legacy.r2_reality_meta"}
-    };
-    for (size_t i = 0; result == 0 && i < sizeof(simple_copies)/sizeof(simple_copies[0]); ++i) {
-        if (legacy_table_exists(simple_copies[i].table))
-            result = exec_sql(simple_copies[i].sql);
-    }
+    if (result == 0)
+        result = legacy_copy_table("r2_reality_meta", food_meta_cols, food_meta_defaults,
+                                   sizeof(food_meta_cols)/sizeof(food_meta_cols[0]),
+                                   food_meta_required, sizeof(food_meta_required)/sizeof(food_meta_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_reality_containers", container_cols, container_defaults,
                                    sizeof(container_cols)/sizeof(container_cols[0]),
-                                   container_required, sizeof(container_required)/sizeof(container_required[0]), 0);
+                                   container_required, sizeof(container_required)/sizeof(container_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_reality_self_facts", fact_cols, fact_defaults,
                                    sizeof(fact_cols)/sizeof(fact_cols[0]),
-                                   fact_required, sizeof(fact_required)/sizeof(fact_required[0]), 0);
+                                   fact_required, sizeof(fact_required)/sizeof(fact_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_reality_ticks", tick_cols, tick_defaults,
                                    sizeof(tick_cols)/sizeof(tick_cols[0]),
-                                   tick_required, sizeof(tick_required)/sizeof(tick_required[0]), 0);
+                                   tick_required, sizeof(tick_required)/sizeof(tick_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_reality_item_memory", item_memory_cols, item_memory_defaults,
                                    sizeof(item_memory_cols)/sizeof(item_memory_cols[0]),
-                                   item_memory_required, sizeof(item_memory_required)/sizeof(item_memory_required[0]), 0);
+                                   item_memory_required, sizeof(item_memory_required)/sizeof(item_memory_required[0]));
 
-    if (result == 0 && legacy_table_exists("r2_reality_objects") &&
-        legacy_column_exists("r2_reality_objects", "container")) {
-        result = exec_sql(
-            "INSERT OR IGNORE INTO main.r2_reality_containers(name,kind,description,parent) "
-            "SELECT DISTINCT legacy_objects.container,'container','Recovered legacy object container','room' "
-            "FROM legacy.r2_reality_objects AS legacy_objects "
-            "LEFT JOIN main.r2_reality_containers AS known ON known.name=legacy_objects.container "
-            "WHERE legacy_objects.container IS NOT NULL AND legacy_objects.container<>'' AND known.name IS NULL");
+    int has_objects = legacy_table_exists("r2_reality_objects");
+    const char *object_container =
+        legacy_column_expr("r2_reality_objects", "container", object_container_default);
+    if (has_objects < 0 || !object_container) result = -1;
+    if (result == 0 && has_objects) {
+        char sql[1024];
+        int n = snprintf(sql, sizeof(sql),
+            "INSERT INTO main.r2_reality_containers(name,kind,description,parent) "
+            "SELECT DISTINCT %s,'container','Recovered legacy object container','room' "
+            "FROM legacy.r2_reality_objects WHERE %s IS NOT NULL AND %s<>'' "
+            "ON CONFLICT(name) DO NOTHING",
+            object_container, object_container, object_container);
+        result = n > 0 && (size_t)n < sizeof(sql) ? exec_sql(sql) : -1;
     }
     if (result == 0)
         result = legacy_copy_table("r2_reality_objects", object_cols, object_defaults,
                                    sizeof(object_cols)/sizeof(object_cols[0]),
-                                   object_required, sizeof(object_required)/sizeof(object_required[0]), 0);
+                                   object_required, sizeof(object_required)/sizeof(object_required[0]));
 
-    if (result == 0 && legacy_table_exists("r2_reality_self")) {
-        if (!legacy_column_exists("r2_reality_self", "id") ||
-            !legacy_column_exists("r2_reality_self", "hunger")) {
-            fprintf(stderr, "[R2 Reality] Legacy self-state table lacks id/hunger; refusing incomplete migration.\n");
-            result = -1;
-        } else {
-            const char *satisfaction = legacy_column_expr("r2_reality_self", "satisfaction", "100");
-            const char *since = legacy_column_expr("r2_reality_self", "seconds_since_meal", "0");
-            const char *sleep = legacy_column_expr("r2_reality_self", "sleepiness", "0");
-            const char *energy = legacy_column_expr("r2_reality_self", "energy", "100");
-            const char *last = legacy_column_expr("r2_reality_self", "last_tick", "0");
-            const char *updated = legacy_column_expr("r2_reality_self", "updated_at", "CURRENT_TIMESTAMP");
-            char sql[2048];
-            int n = snprintf(sql, sizeof(sql),
-                "INSERT OR REPLACE INTO main.r2_reality_self"
-                "(id,hunger,satisfaction,seconds_since_meal,sleepiness,energy,last_tick,updated_at) "
-                "SELECT id,hunger,%s,%s,%s,%s,%s,%s FROM legacy.r2_reality_self",
-                satisfaction, since, sleep, energy, last, updated);
-            result = n > 0 && (size_t)n < sizeof(sql) ? exec_sql(sql) : -1;
-        }
-    }
+    const char *self_cols[] = {"id","hunger","satisfaction","seconds_since_meal","sleepiness","energy","last_tick","updated_at"};
+    const char *self_defaults[] = {NULL,NULL,"100","0","0","100","0","CURRENT_TIMESTAMP"};
+    const char *self_required[] = {"id","hunger"};
+    if (result == 0)
+        result = legacy_copy_table("r2_reality_self", self_cols, self_defaults,
+                                   sizeof(self_cols)/sizeof(self_cols[0]),
+                                   self_required, sizeof(self_required)/sizeof(self_required[0]));
 
     if (result == 0)
         result = legacy_copy_table("r2_food_experiences", food_experience_cols, food_experience_defaults,
                                    sizeof(food_experience_cols)/sizeof(food_experience_cols[0]),
-                                   food_experience_required, sizeof(food_experience_required)/sizeof(food_experience_required[0]), 0);
+                                   food_experience_required, sizeof(food_experience_required)/sizeof(food_experience_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_food_experience_meta", food_meta_cols, food_meta_defaults,
                                    sizeof(food_meta_cols)/sizeof(food_meta_cols[0]),
-                                   food_meta_required, sizeof(food_meta_required)/sizeof(food_meta_required[0]), 0);
+                                   food_meta_required, sizeof(food_meta_required)/sizeof(food_meta_required[0]));
     if (result == 0)
         result = legacy_merge_preference_table("r2_food_preferences", "food_name");
     if (result == 0)
@@ -3019,36 +3022,24 @@ static int migrate_legacy_reality(void)
     if (result == 0)
         result = legacy_copy_table("r2_money_account", money_cols, money_defaults,
                                    sizeof(money_cols)/sizeof(money_cols[0]),
-                                   money_required, sizeof(money_required)/sizeof(money_required[0]), 1);
+                                   money_required, sizeof(money_required)/sizeof(money_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_tv_devices", tv_device_cols, tv_device_defaults,
                                    sizeof(tv_device_cols)/sizeof(tv_device_cols[0]),
-                                   tv_device_required, sizeof(tv_device_required)/sizeof(tv_device_required[0]), 0);
+                                   tv_device_required, sizeof(tv_device_required)/sizeof(tv_device_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_tv_vcr_tapes", tape_cols, tape_defaults,
                                    sizeof(tape_cols)/sizeof(tape_cols[0]),
-                                   tape_required, sizeof(tape_required)/sizeof(tape_required[0]), 0);
+                                   tape_required, sizeof(tape_required)/sizeof(tape_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_tv_state", tv_state_cols, tv_state_defaults,
                                    sizeof(tv_state_cols)/sizeof(tv_state_cols[0]),
-                                   tv_state_required, sizeof(tv_state_required)/sizeof(tv_state_required[0]), 1);
+                                   tv_state_required, sizeof(tv_state_required)/sizeof(tv_state_required[0]));
     if (result == 0)
         result = legacy_copy_table("r2_tv_vcr_state", vcr_state_cols, vcr_state_defaults,
                                    sizeof(vcr_state_cols)/sizeof(vcr_state_cols[0]),
-                                   vcr_state_required, sizeof(vcr_state_required)/sizeof(vcr_state_required[0]), 1);
+                                   vcr_state_required, sizeof(vcr_state_required)/sizeof(vcr_state_required[0]));
 
-    if (result == 0 && legacy_table_exists("r2_reality_meta"))
-        result = exec_sql(
-            "UPDATE main.r2_reality_meta SET value=(SELECT value FROM legacy.r2_reality_meta "
-            "WHERE legacy.r2_reality_meta.key=main.r2_reality_meta.key) "
-            "WHERE key IN (SELECT key FROM legacy.r2_reality_meta)");
-    /* If a legacy account existed, its balance must be materialized into the
-       physical wallet on first migration rather than replaced by the new-user
-       seed. The physical files still win when they already exist. */
-    if (result == 0 && legacy_table_has_rows("r2_money_account"))
-        result = exec_sql(
-            "INSERT INTO main.r2_reality_meta(key,value) VALUES('initial_cash_seeded','1') "
-            "ON CONFLICT(key) DO UPDATE SET value='1'");
     if (result == 0)
         result = exec_sql(
             "INSERT INTO main.r2_reality_meta(key,value) VALUES('legacy_reality_migrated','yes') "
@@ -3245,13 +3236,6 @@ static int migrate_reality_self_schema(void)
         if (reality_ensure_self_column(columns[i][0], columns[i][1]) != 0)
             return -1;
     }
-    if (exec_sql(
-        "INSERT OR IGNORE INTO r2_reality_self"
-        "(id,hunger,satisfaction,seconds_since_meal,sleepiness,energy,last_tick) "
-        "VALUES(1,0,100,0,0,100,strftime('%s','now'));"
-        "UPDATE r2_reality_self SET updated_at=CURRENT_TIMESTAMP "
-        "WHERE updated_at IS NULL OR updated_at='';") != 0)
-        return -1;
     return 0;
 }
 
@@ -3324,10 +3308,7 @@ int r2_reality_init(void)
     }
     const char *schema =
         "CREATE TABLE IF NOT EXISTS r2_reality_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
-        "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('world_elapsed_seconds','0');"
-        "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('current_location','home');"
         "CREATE TABLE IF NOT EXISTS r2_location_delivery (id INTEGER PRIMARY KEY CHECK(id=1),location TEXT NOT NULL,is_home INTEGER NOT NULL CHECK(is_home IN (0,1)));"
-        "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('initial_cash_seeded','0');"
         "CREATE TABLE IF NOT EXISTS r2_reality_item_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, item_name TEXT NOT NULL COLLATE NOCASE, description TEXT, exact_quantity INTEGER, approximate_quantity INTEGER, precision TEXT NOT NULL DEFAULT 'exact' CHECK(precision IN ('exact','approximate','vague')), collected_at INTEGER NOT NULL, last_decay_at INTEGER NOT NULL);"
         "CREATE INDEX IF NOT EXISTS r2_reality_item_memory_age_idx ON r2_reality_item_memory(collected_at);"
         "CREATE TABLE IF NOT EXISTS r2_food_experiences (id INTEGER PRIMARY KEY AUTOINCREMENT, food_name TEXT NOT NULL COLLATE NOCASE, ingredients TEXT, fullness REAL NOT NULL, energy_bonus REAL NOT NULL, satisfaction INTEGER, notes TEXT, eaten_at INTEGER NOT NULL, rated_at INTEGER, taste TEXT);"
@@ -3339,17 +3320,14 @@ int r2_reality_init(void)
         "CREATE TABLE IF NOT EXISTS r2_reality_self (id INTEGER PRIMARY KEY CHECK(id=1), hunger REAL NOT NULL DEFAULT 0, satisfaction REAL NOT NULL DEFAULT 100, seconds_since_meal REAL NOT NULL DEFAULT 0, sleepiness REAL NOT NULL DEFAULT 0, energy REAL NOT NULL DEFAULT 100, last_tick INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_reality_self_facts (key TEXT PRIMARY KEY, value TEXT NOT NULL, evidence TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_money_account (id INTEGER PRIMARY KEY CHECK(id=1),cash_cents INTEGER NOT NULL DEFAULT 0 CHECK(cash_cents>=0),bank_cents INTEGER NOT NULL DEFAULT 0 CHECK(bank_cents>=0),updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
-        "INSERT OR IGNORE INTO r2_money_account(id,cash_cents,bank_cents) VALUES(1,0,0);"
         "CREATE TABLE IF NOT EXISTS r2_money_transfer_journal (id INTEGER PRIMARY KEY CHECK(id=1),old_cash_cents INTEGER NOT NULL,old_bank_cents INTEGER NOT NULL,new_cash_cents INTEGER NOT NULL,new_bank_cents INTEGER NOT NULL,operation TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('pending','committed')),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_purchase_journal (id INTEGER PRIMARY KEY CHECK(id=1),old_cash_cents INTEGER NOT NULL,old_bank_cents INTEGER NOT NULL,new_cash_cents INTEGER NOT NULL,new_bank_cents INTEGER NOT NULL,item_name TEXT NOT NULL,item_description TEXT NOT NULL,destination TEXT NOT NULL,pre_quantity INTEGER NOT NULL,pre_container TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('pending','committed')),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
          "CREATE TABLE IF NOT EXISTS r2_inventory_transfer_journal (id INTEGER PRIMARY KEY CHECK(id=1),operation TEXT NOT NULL,item_name TEXT NOT NULL COLLATE NOCASE,reality_exists INTEGER NOT NULL,reality_description TEXT NOT NULL,reality_quantity INTEGER NOT NULL,reality_container TEXT NOT NULL,reality_owner TEXT NOT NULL,item_memory_max_id INTEGER NOT NULL,fridge_exists INTEGER NOT NULL,fridge_description TEXT NOT NULL,fridge_quantity INTEGER NOT NULL,fridge_fullness REAL NOT NULL,fridge_energy REAL NOT NULL,fridge_ingredients TEXT NOT NULL,fridge_taste TEXT NOT NULL,self_snapshot_valid INTEGER NOT NULL DEFAULT 0,self_hunger REAL NOT NULL DEFAULT 0,self_satisfaction REAL NOT NULL DEFAULT 100,self_seconds_since_meal REAL NOT NULL DEFAULT 0,self_sleepiness REAL NOT NULL DEFAULT 0,self_energy REAL NOT NULL DEFAULT 100,self_last_tick INTEGER NOT NULL DEFAULT 0,self_updated_at TEXT NOT NULL DEFAULT '',starvation_fact_exists INTEGER NOT NULL DEFAULT 0,starvation_fact_value TEXT NOT NULL DEFAULT '',starvation_fact_evidence TEXT NOT NULL DEFAULT '',food_experience_max_id INTEGER NOT NULL DEFAULT 0,phase TEXT NOT NULL CHECK(phase IN ('pending','committed')),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_tv_state (id INTEGER PRIMARY KEY CHECK(id=1), power INTEGER NOT NULL DEFAULT 0 CHECK(power IN (0,1)), source_kind TEXT NOT NULL DEFAULT 'input', source_value INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
-        "INSERT OR IGNORE INTO r2_tv_state(id,power,source_kind,source_value) VALUES(1,0,'input',1);"
         "CREATE TABLE IF NOT EXISTS r2_tv_devices (name TEXT PRIMARY KEY COLLATE NOCASE, connection_kind TEXT NOT NULL CHECK(connection_kind IN ('input','rf')), port INTEGER NOT NULL, connected INTEGER NOT NULL DEFAULT 1 CHECK(connected IN (0,1)), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, CHECK((connection_kind='input' AND port BETWEEN 2 AND 4) OR (connection_kind='rf' AND port BETWEEN 2 AND 13)));"
         "CREATE UNIQUE INDEX IF NOT EXISTS r2_tv_one_device_per_port ON r2_tv_devices(connection_kind,port) WHERE connected=1;"
         "CREATE TABLE IF NOT EXISTS r2_tv_vcr_tapes (media_path TEXT PRIMARY KEY, position_seconds REAL NOT NULL DEFAULT 0 CHECK(position_seconds>=0), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_tv_vcr_state (id INTEGER PRIMARY KEY CHECK(id=1), cassette_path TEXT, transport TEXT NOT NULL DEFAULT 'stop' CHECK(transport IN ('play','pause','stop')), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(cassette_path) REFERENCES r2_tv_vcr_tapes(media_path));"
-        "INSERT OR IGNORE INTO r2_tv_vcr_state(id,cassette_path,transport) VALUES(1,NULL,'stop');"
         "CREATE TABLE IF NOT EXISTS r2_reality_containers (name TEXT PRIMARY KEY, kind TEXT NOT NULL, description TEXT, parent TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);"
         "CREATE TABLE IF NOT EXISTS r2_reality_objects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT, quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity>0), container TEXT NOT NULL DEFAULT 'room', owner TEXT NOT NULL DEFAULT 'R2', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(container) REFERENCES r2_reality_containers(name));"
         "CREATE INDEX IF NOT EXISTS r2_reality_objects_container_idx ON r2_reality_objects(container);"
@@ -3408,6 +3386,29 @@ int r2_reality_init(void)
     }
     if (migrate_legacy_reality() != 0) {
         fprintf(stderr, "[R2 Reality] Legacy migration failed; refusing to discard old state.\n");
+        sqlite3_close(reality_db); reality_db = NULL;
+        pthread_mutex_unlock(&reality_lock); return -1;
+    }
+    /* Seed absent rows after import. Existing dedicated rows are authoritative,
+       while an actual legacy account (including an empty one) is already seeded. */
+    if (exec_sql(
+        "BEGIN IMMEDIATE;"
+        "INSERT INTO r2_reality_meta(key,value) "
+        "SELECT 'initial_cash_seeded',CASE WHEN EXISTS(SELECT 1 FROM r2_money_account WHERE id=1) "
+        "THEN '1' ELSE '0' END WHERE 1 ON CONFLICT(key) DO NOTHING;"
+        "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('world_elapsed_seconds','0');"
+        "INSERT OR IGNORE INTO r2_reality_meta(key,value) VALUES('current_location','home');"
+        "INSERT OR IGNORE INTO r2_money_account(id,cash_cents,bank_cents) VALUES(1,0,0);"
+        "INSERT OR IGNORE INTO r2_tv_state(id,power,source_kind,source_value) VALUES(1,0,'input',1);"
+        "INSERT OR IGNORE INTO r2_tv_vcr_state(id,cassette_path,transport) VALUES(1,NULL,'stop');"
+        "INSERT OR IGNORE INTO r2_reality_self"
+        "(id,hunger,satisfaction,seconds_since_meal,sleepiness,energy,last_tick) "
+        "VALUES(1,0,100,0,0,100,strftime('%s','now'));"
+        "UPDATE r2_reality_self SET updated_at=CURRENT_TIMESTAMP "
+        "WHERE updated_at IS NULL OR updated_at='';"
+        "COMMIT;") != 0) {
+        (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+        fprintf(stderr, "[R2 Reality] Could not initialize missing persistent state.\n");
         sqlite3_close(reality_db); reality_db = NULL;
         pthread_mutex_unlock(&reality_lock); return -1;
     }
