@@ -80,7 +80,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("r2_ollama_chat_url(ollama_url, sizeof(ollama_url))", (ROOT / "Visual.c").read_text(encoding="utf-8"))
         self.assertIn("export R2_OLLAMA_BASE_URL", source)
         self.assertIn("--wait-seconds 60 --timeout 180", source)
-        self.assertIn("real chat completion", source)
+        self.assertIn("Llama 3.1 conversation and Qwen3-VL visual generation", source)
         self.assertIn("LD_PRELOAD", source)
         self.assertIn("FAKETIME_DONT_RESET=1", source)
         self.assertIn("FAKETIME_DONT_FAKE_MONOTONIC=1", source)
