@@ -1440,7 +1440,7 @@ def unreadable_startup_snapshot(binary: Path, workspace: Path, url: str) -> None
             [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
             input=f"{query}\nexit\n", capture_output=True, text=True, check=True, timeout=30,
         )
-        assert "Startup snapshot unavailable" in run.stderr
+        assert "Startup omitted 1 record(s) with embedded NUL bytes" in run.stderr
         assert run.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, run.stderr
         assert "R2-3PO: " + REPLY in run.stdout
         with sqlite3.connect(database) as db:
@@ -1448,7 +1448,7 @@ def unreadable_startup_snapshot(binary: Path, workspace: Path, url: str) -> None
     finally:
         with sqlite3.connect(database) as db:
             db.execute("DELETE FROM memories WHERE id=?", (row_id,))
-    print("PASS: an unreadable startup snapshot preserved the source bytes and allowed one first answer.")
+    print("PASS: an invalid startup record preserved the source bytes and allowed one first answer.")
 
 
 def oversized_startup_memory(binary: Path, workspace: Path, url: str) -> None:

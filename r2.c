@@ -221,7 +221,7 @@ static atomic_int shutting_down = ATOMIC_VAR_INIT(0);
 /*
  * Small RAM cache for historical context retrieval.
  *
- * Only query-derived memories and Life Log history are cached. Live Reality
+ * Only query-derived persistent memories are cached. Life Log and live Reality
  * and live vision are rebuilt separately, so hunger, inventory, and current
  * sensory state never come from this cache. Exact-query matching, a short
  * monotonic TTL, bounded entry/value sizes, and explicit invalidation limit
@@ -243,6 +243,7 @@ typedef struct {
 static pthread_mutex_t context_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ContextCacheEntry context_cache[R2_CONTEXT_CACHE_ENTRIES];
 static unsigned long long context_cache_clock = 0;
+static uint64_t context_cache_generation = 0;
 
 static int context_cache_is_expired(struct timespec now, struct timespec then)
 {
@@ -269,11 +270,12 @@ static void context_cache_clear_locked(void)
 static void context_cache_invalidate(void)
 {
     pthread_mutex_lock(&context_cache_lock);
+    ++context_cache_generation;
     context_cache_clear_locked();
     pthread_mutex_unlock(&context_cache_lock);
 }
 
-static char *context_cache_get(const char *query, int limit)
+static char *context_cache_get(const char *query, int limit, uint64_t *generation)
 {
     if (!query || strlen(query) > R2_CONTEXT_CACHE_MAX_QUERY)
         return NULL;
@@ -284,6 +286,7 @@ static char *context_cache_get(const char *query, int limit)
 
     char *copy = NULL;
     pthread_mutex_lock(&context_cache_lock);
+    if (generation) *generation = context_cache_generation;
     for (size_t i = 0; i < R2_CONTEXT_CACHE_ENTRIES; ++i) {
         R2ContextCacheEntry *entry = &context_cache[i];
         if (!entry->query)
@@ -304,7 +307,8 @@ static char *context_cache_get(const char *query, int limit)
     return copy;
 }
 
-static void context_cache_store(const char *query, int limit, const char *value)
+static void context_cache_store(const char *query, int limit, const char *value,
+                                uint64_t generation)
 {
     if (!query || !value ||
         strlen(query) > R2_CONTEXT_CACHE_MAX_QUERY ||
@@ -327,6 +331,13 @@ static void context_cache_store(const char *query, int limit, const char *value)
     }
 
     pthread_mutex_lock(&context_cache_lock);
+    /* A query can finish just before a concurrent write clears the cache. */
+    if (generation != context_cache_generation) {
+        pthread_mutex_unlock(&context_cache_lock);
+        free(query_copy);
+        free(value_copy);
+        return;
+    }
     size_t slot = R2_CONTEXT_CACHE_ENTRIES;
     size_t empty_slot = R2_CONTEXT_CACHE_ENTRIES;
     size_t oldest_slot = R2_CONTEXT_CACHE_ENTRIES;
@@ -1696,6 +1707,8 @@ static int save_memory(const char *memory, const char *category)
    Dynamic retrieval continues to read full records from SQLite.
 */
 
+enum { MEMORY_FIELD_ERROR = -1, MEMORY_FIELD_OK, MEMORY_FIELD_EMBEDDED_NUL };
+
 static int memory_read_fields(sqlite3_stmt *statement, int first, int count,
                               const char **fields)
 {
@@ -1703,14 +1716,15 @@ static int memory_read_fields(sqlite3_stmt *statement, int first, int count,
         int column = first + i;
         int type = sqlite3_column_type(statement, column);
         const char *value = (const char *)sqlite3_column_text(statement, column);
-        if ((!value && type != SQLITE_NULL) ||
-            (value && strlen(value) != (size_t)sqlite3_column_bytes(statement, column))) {
-            fprintf(stderr, "[R2 memory] Stored row contains an unreadable or non-text field.\n");
-            return -1;
+        if (!value && type != SQLITE_NULL) {
+            fprintf(stderr, "[R2 memory] Could not read a stored text field.\n");
+            return MEMORY_FIELD_ERROR;
         }
+        if (value && strlen(value) != (size_t)sqlite3_column_bytes(statement, column))
+            return MEMORY_FIELD_EMBEDDED_NUL;
         fields[i] = value;
     }
-    return 0;
+    return MEMORY_FIELD_OK;
 }
 
 static char *get_startup_memories(int limit)
@@ -1725,7 +1739,7 @@ static char *get_startup_memories(int limit)
        the active turn and its evidence. Reserve space for the scope note. */
     size_t cap = (size_t)r2_ollama_context_tokens();
     size_t len = 0;
-    unsigned deferred = 0;
+    unsigned deferred = 0, unreadable = 0;
     char *out = malloc(cap);
     if (!out)
         return NULL;
@@ -1766,7 +1780,12 @@ static char *get_startup_memories(int limit)
 
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         const char *fields[3];
-        if (memory_read_fields(st, 0, 3, fields) != 0) break;
+        int field_status = memory_read_fields(st, 0, 3, fields);
+        if (field_status == MEMORY_FIELD_EMBEDDED_NUL) {
+            ++unreadable;
+            continue;
+        }
+        if (field_status != MEMORY_FIELD_OK) break;
         const char *memory = fields[0] ? fields[0] : "";
         const char *category = fields[1] ? fields[1] : "general";
         const char *updated = fields[2] ? fields[2] : "";
@@ -1784,7 +1803,7 @@ static char *get_startup_memories(int limit)
             return NULL;
         }
         size_t needed = memory_len + category_len + updated_len + 7;
-        if (needed > cap - 160 - len) {
+        if (needed > cap - 256 - len) {
             ++deferred;
             continue;
         }
@@ -1813,9 +1832,15 @@ static char *get_startup_memories(int limit)
     sqlite3_finalize(st);
     pthread_mutex_unlock(&db_lock);
     if (deferred)
-        snprintf(out + len, cap - len,
+        len += (size_t)snprintf(out + len, cap - len,
                  "%u recent records exceeded the startup space. Their complete text remains available through memory retrieval.\n",
                  deferred);
+    if (unreadable) {
+        snprintf(out + len, cap - len,
+                 "%u recent records contain embedded NUL bytes and could not be supplied as text.\n",
+                 unreadable);
+        fprintf(stderr, "[R2 memory] Startup omitted %u record(s) with embedded NUL bytes.\n", unreadable);
+    }
     return out;
 }
 
@@ -2075,8 +2100,10 @@ static int append_memory_record(char **out, size_t *length, size_t *capacity,
     return 0;
 }
 
-static char *get_relevant_memories(const char *query, int limit, size_t byte_budget)
+static char *get_relevant_memories(const char *query, int limit, size_t byte_budget,
+                                   int *partial)
 {
+    if (partial) *partial = 0;
     if (limit <= 0)
         return xstrdup("");
     if (limit > MAX_RELEVANT_MEMORIES)
@@ -2147,7 +2174,12 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             }
 
             const char *fields[3];
-            if (memory_read_fields(st, 1, 3, fields) != 0) {
+            int field_status = memory_read_fields(st, 1, 3, fields);
+            if (field_status == MEMORY_FIELD_EMBEDDED_NUL && partial) {
+                *partial = 1;
+                continue;
+            }
+            if (field_status != MEMORY_FIELD_OK) {
                 failed = 1;
                 break;
             }
@@ -2286,7 +2318,12 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                 break;
             }
             const char *fields[2];
-            if (memory_read_fields(st, 0, 2, fields) != 0) {
+            int field_status = memory_read_fields(st, 0, 2, fields);
+            if (field_status == MEMORY_FIELD_EMBEDDED_NUL && partial) {
+                *partial = 1;
+                continue;
+            }
+            if (field_status != MEMORY_FIELD_OK) {
                 failed = 1;
                 break;
             }
@@ -5001,8 +5038,8 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     int money = r2_query_matches_any_term(query, money_terms, sizeof(money_terms) / sizeof(money_terms[0]));
     int tv = r2_query_matches_any_term(query, tv_terms, sizeof(tv_terms) / sizeof(tv_terms[0]));
     int recalled = r2_query_explicitly_requests_recall(query);
-    if (count > SIZE_MAX / sizeof(Message) - 2) return NULL;
-    Message *selected = calloc(count + 2, sizeof(*selected));
+    if (count > SIZE_MAX / sizeof(Message) - 3) return NULL;
+    Message *selected = calloc(count + 3, sizeof(*selected));
     if (!selected) return NULL;
 
     char *room_state = room ? r2_reality_room_look() : NULL;
@@ -5127,17 +5164,21 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
             char *plan = r2_associative_query_cache_lookup(query);
+            static char notice[] =
+                "Focused memory retrieval was incomplete. Use the supplied evidence; "
+                "an incomplete search does not prove a memory is absent.";
+            int partial = 0;
+            size_t row_budget = input_bytes - total - heading_bytes;
+            if (row_budget > sizeof(notice) - 1) row_budget -= sizeof(notice) - 1;
             char *records = get_relevant_memories(plan ? plan : query, R2_TURN_MEMORY_LIMIT,
-                                                 input_bytes - total - heading_bytes);
+                                                 row_budget, &partial);
             free(plan);
-            if (!records) {
-                static char notice[] =
-                    "Focused memory retrieval was unavailable. Use the supplied evidence; "
-                    "an incomplete search does not prove a memory is absent.";
+            if (!records || partial) {
                 if (sizeof(notice) - 1 <= capacity - total)
                     selected[selected_count++] = (Message){.role = "system", .content = notice};
-                fprintf(stderr, "[R2 Context] Focused memory retrieval was unavailable.\n");
-            } else {
+                fprintf(stderr, "[R2 Context] Focused memory retrieval was incomplete.\n");
+            }
+            if (records) {
                 if (*records && asprintf(&focused_retrieval, "%s%s", heading, records) < 0) {
                     free(records);
                     focused_retrieval = NULL;
@@ -5174,19 +5215,21 @@ cleanup:
    required evidence and complete historical blocks that still fit. */
 static char *r2_answer_after_failed_history_review(Message *messages, size_t count,
                                                    const char *system, size_t remaining,
-                                                   int num_predict, long timeout)
+                                                   int num_predict, long timeout, int archived)
 {
-    static const char notice[] =
-        "Earlier evidence review was unavailable for this request. "
-        "The complete source is retained separately. Answer from the exact current message "
-        "and the evidence supplied here. Acknowledge any resulting uncertainty.";
-    if (remaining < sizeof(notice) - 1 || count >= SIZE_MAX / sizeof(Message))
+    const char *notice = archived
+        ? "Earlier evidence review was unavailable for this request. The complete source was archived. "
+          "Answer from the current message and available evidence, acknowledging gaps where relevant."
+        : "Earlier evidence review was unavailable for this request and lacks a confirmed archive link. "
+          "Answer from the current message and available evidence, acknowledging gaps where relevant.";
+    size_t notice_length = strlen(notice);
+    if (remaining < notice_length || count >= SIZE_MAX / sizeof(Message))
         return NULL;
     Message *selected = calloc(count + 1, sizeof(*selected));
     if (!selected) return NULL;
     size_t used = 0;
     selected[used++] = (Message){.role = "system", .content = (char *)notice};
-    remaining -= sizeof(notice) - 1;
+    remaining -= notice_length;
     for (size_t i = 0; i < count; ++i) {
         if (r2_context_can_be_reviewed(&messages[i])) {
             size_t length = strlen(messages[i].content);
@@ -5233,6 +5276,7 @@ static char *r2_foreground_chat(Message *messages, size_t count,
             immutable += n;
     }
     int conversation_policy = system == r2_conversation_system_prompt;
+    int optional_history = conversation_policy || system == r2_compact_conversation_policy;
     if (conversation_policy && required > capacity &&
         (immutable >= capacity || capacity - immutable < 384))
         return r2_compact_foreground_chat(messages, count, user, query,
@@ -5267,13 +5311,12 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     if (!notes) {
         free(trace);
         char *answer = NULL;
-        if (!shutting_down &&
-            (conversation_policy || system == r2_compact_conversation_policy)) {
+        if (!shutting_down && optional_history) {
             int64_t archive = r2_log_archive_context_review(query, snapshot,
                 "Historical review failed. The original evidence is retained here verbatim.");
-            if (archive > 0 && r2_context_turn_record(archive) == 0)
-                answer = r2_answer_after_failed_history_review(messages, count, system,
-                                                               capacity - immutable, num_predict, timeout);
+            int archived = archive > 0 && r2_context_turn_record(archive) == 0;
+            answer = r2_answer_after_failed_history_review(messages, count, system,
+                                                           capacity - immutable, num_predict, timeout, archived);
         }
         free(snapshot);
         return answer;
@@ -5293,7 +5336,10 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     free(snapshot); free(trace);
     if (archive_id <= 0 || r2_context_turn_record(archive_id) != 0) {
         free(notes);
-        return NULL;
+        return optional_history && !shutting_down
+            ? r2_answer_after_failed_history_review(messages, count, system,
+                                                   capacity - immutable, num_predict, timeout, 0)
+            : NULL;
     }
     char *replacement = NULL;
     if (asprintf(&replacement, heading_format, (long long)archive_id, notes) < 0) {
@@ -6281,12 +6327,14 @@ static char *chat_with_relevant_memories(
 
     int memory_unavailable = 0, history_unavailable = 0;
     int diary_unavailable = 0, visual_unavailable = 0, archive_unavailable = 0;
-    char *memory_context = context_cache_get(associative_query, memory_limit);
+    uint64_t cache_generation = 0;
+    char *memory_context = context_cache_get(associative_query, memory_limit, &cache_generation);
     if (!memory_context) {
-        memory_context = get_relevant_memories(associative_query, memory_limit, SIZE_MAX);
-        if (memory_context)
-            context_cache_store(associative_query, memory_limit, memory_context);
-        else {
+        memory_context = get_relevant_memories(associative_query, memory_limit, SIZE_MAX,
+                                               &memory_unavailable);
+        if (memory_context && !memory_unavailable)
+            context_cache_store(associative_query, memory_limit, memory_context, cache_generation);
+        else if (!memory_context) {
             memory_unavailable = 1;
             memory_context = xstrdup("");
         }
@@ -10422,7 +10470,7 @@ char *r2_retrieve_memories(const char *query)
 {
     return get_relevant_memories(
         query ? query : "",
-        MAX_RELEVANT_MEMORIES, SIZE_MAX
+        MAX_RELEVANT_MEMORIES, SIZE_MAX, NULL
     );
 }
 

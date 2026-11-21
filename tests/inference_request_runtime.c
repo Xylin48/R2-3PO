@@ -537,9 +537,29 @@ static void check_failed_optional_history_review(void)
     char *stored = r2_log_read_context_review(scope.archives[0]);
     assert(stored && strstr(stored, history) && strstr(stored, "Historical review failed"));
     free(stored);
+    free(answer);
+
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER reject_optional_context_archive BEFORE INSERT ON r2_log_context_reviews "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    for (int fail_review = 0; fail_review < 2; ++fail_review) {
+        before = perform_count;
+        if (fail_review) fail_transport_at = before + 1;
+        answer = r2_foreground_chat(turn, 6, r2_conversation_system_prompt, query, 1024, 60);
+        fail_transport_at = 0;
+        assert(answer && !strcmp(answer, "It's good to see you again, Mom."));
+        assert(fail_review ? perform_count == before + 2 : perform_count > before + 1);
+        assert(captured_contains(query) && captured_contains(handoff) && captured_contains(fitting));
+        assert(captured_contains("lacks a confirmed archive link") && !captured_contains("source was archived"));
+        assert(!captured_contains("historical evidence review; model interpretations") && scope.count == 1);
+        free(answer);
+    }
+    assert(sqlite3_exec(fixture, "DROP TRIGGER reject_optional_context_archive;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(fixture) == SQLITE_OK);
     free(scope.archives);
     free(history);
-    free(answer);
     r2_turn_context_reviews = NULL;
     ollama_foreground_turn_mode = 0;
     ollama_audit_stage = NULL;
@@ -1057,7 +1077,7 @@ static void check_compact_ranked_memory(void)
            json_object_get_int(value) == 8192);
     assert(json_object_object_get_ex(options, "num_predict", &value) &&
            json_object_get_int(value) == 1024);
-    char *full = get_relevant_memories("orchard", 10, SIZE_MAX);
+    char *full = get_relevant_memories("orchard", 10, SIZE_MAX, NULL);
     assert(full && strstr(full, large) && strstr(full, first) && strstr(full, second) &&
            strstr(full, third));
     free(full);
@@ -1144,6 +1164,21 @@ static int deny_memory_reads(void *data, int action, const char *table,
     return action == SQLITE_READ && table && !strcmp(table, "memories") ? SQLITE_DENY : SQLITE_OK;
 }
 
+static void check_context_cache_write_overlap(void)
+{
+    const char *key = "concurrent memory fixture";
+    uint64_t before, after;
+    assert(!context_cache_get(key, 10, &before));
+    context_cache_invalidate();
+    assert(!context_cache_get(key, 10, &after) && before != after);
+    context_cache_store(key, 10, "fresh after write", after);
+    context_cache_store(key, 10, "stale pre-write result", before);
+    char *cached = context_cache_get(key, 10, NULL);
+    assert(cached && !strcmp(cached, "fresh after write"));
+    free(cached);
+    context_cache_invalidate();
+}
+
 static void check_first_answer_with_unavailable_source(void)
 {
     const char *query = "Do you remember the azurite fixture?";
@@ -1171,8 +1206,17 @@ static void check_first_answer_with_unavailable_source(void)
     free(reply);
 
     assert(sqlite3_set_authorizer(db, NULL, NULL) == SQLITE_OK);
+    assert(db_exec("INSERT INTO memories VALUES(2,'azurite invalid'||char(0)||'tail','fact','now');") == 0);
     reply = chat_with_relevant_memories(query);
     assert(reply && perform_count == requests + 2 && captured_contains(memory));
+    assert(captured_contains("could not be read fully: persistent memory"));
+    assert(!captured_contains("azurite invalid"));
+    free(reply);
+
+    assert(db_exec("UPDATE memories SET memory='azurite recovered sibling' WHERE id=2;") == 0);
+    reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 3 && captured_contains(memory));
+    assert(captured_contains("azurite recovered sibling"));
     assert(!captured_contains("could not be read fully: persistent memory"));
     free(reply);
     context_cache_invalidate();
@@ -1231,7 +1275,9 @@ static void check_shutdown_drain_and_rollback(void)
 {
     assert(init_db() == 0);
     core_initialized = 1;
-    context_cache_store("previous session", 3, "stale context");
+    uint64_t cache_generation;
+    assert(context_cache_get("previous session", 3, &cache_generation) == NULL);
+    context_cache_store("previous session", 3, "stale context", cache_generation);
     r2_associative_query_cache_store("previous session", "stale plan");
     assert(sqlite3_exec(db, "BEGIN IMMEDIATE;"
                         "INSERT INTO memories(memory,category) VALUES"
@@ -1249,7 +1295,7 @@ static void check_shutdown_drain_and_rollback(void)
     pthread_mutex_unlock(&conversation_turn_lock);
     assert(pthread_join(thread, NULL) == 0);
     assert(!r2_log_is_initialized() && db == NULL);
-    assert(context_cache_get("previous session", 3) == NULL);
+    assert(context_cache_get("previous session", 3, NULL) == NULL);
     assert(r2_associative_query_cache_lookup("previous session") == NULL);
 
     char *reply = r2_talk("A turn arrived after shutdown.");
@@ -1283,6 +1329,7 @@ int main(void)
     check_foreground_context_review();
     check_failed_optional_history_review();
     check_compact_ranked_memory();
+    check_context_cache_write_overlap();
     check_first_answer_with_unavailable_source();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
