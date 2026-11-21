@@ -314,15 +314,16 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     # Check text-model placement before visual generation can evict it from memory.
     text_gpu_verified = False
     text_mixed_verified = False
-    try:
-        ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
-        active = next((item for item in ps.get("models", []) if _is_required_model(item, MODEL)), None)
-        if active is not None:
-            vram, total = int(active.get("size_vram", 0)), int(active.get("size", 0))
-            text_gpu_verified = vram > 0
-            text_mixed_verified = vram > 0 and total > vram
-    except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
-        pass
+    if require_gpu_offload:
+        try:
+            ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
+            active = next((item for item in ps.get("models", []) if _is_required_model(item, MODEL)), None)
+            if active is not None:
+                vram, total = int(active.get("size_vram", 0)), int(active.get("size", 0))
+                text_gpu_verified = vram > 0
+                text_mixed_verified = vram > 0 and total > vram
+        except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
+            pass
 
     # Exercise the same 640x480 image dimensions, JSON response mode, GPU/context
     # policy and context-dependent output cap used by Visual.c. This catches
