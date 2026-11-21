@@ -214,7 +214,7 @@ systemctl --no-pager --full status r2-3po.service
 journalctl -u r2-3po.service -n 100 --no-pager
 ```
 
-Expected state is `enabled` and `active`. The journal should report successful text and synthetic-image Ollama preflights and the core readiness marker (`[R2 READY] Core initialized; entering shell.`). The installer checks the readiness marker for the active service invocation. It allows up to 90 minutes for model preflight and core startup, and rolls back sooner if that invocation stops or restarts. If the unit keeps restarting, inspect the logs; common causes are a missing `qwen3.5:9b` model, missing `libfaketime`, inaccessible workspace/database files, or Ollama not running.
+Expected state is `enabled` and `active`. The journal should report successful text and synthetic-image Ollama preflights and the core readiness marker (`[R2 READY] Core initialized; entering shell.`). The installer checks the readiness marker for the active service invocation. It allows up to 90 minutes for model preflight and core startup, and rolls back sooner if that invocation stops or restarts. If the unit keeps restarting, inspect the logs; common causes are a missing `llama3.1:8b` or `qwen3-vl:4b-instruct-q4_K_M` model, missing `libfaketime`, inaccessible workspace/database files, or Ollama not running.
 
 Follow live logs with `journalctl -u r2-3po.service -f`.
 
