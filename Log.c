@@ -3376,7 +3376,8 @@ static int append_archived_conversation(sqlite3_stmt *archive, int64_t event_id,
         event_id, fields[0], fields[1]);
 }
 
-static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
+static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
+                          int conversational)
 {
     sqlite3_stmt *statement = NULL;
     sqlite3_stmt *link_statement = NULL;
@@ -3406,11 +3407,13 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     const char *sql_search =
         "SELECT id, utc_time, local_time, category, event_type, summary, "
         "details, source, memory_saved FROM r2_log_events "
-        "WHERE instr(lower(summary),lower(?1))>0 OR instr(lower(details),lower(?1))>0 "
+        "WHERE (?3=0 OR NOT (COALESCE(source,'')='r2_init' AND "
+        "COALESCE(category,'') IN ('continuity','lifecycle','system'))) AND ("
+        "instr(lower(summary),lower(?1))>0 OR instr(lower(details),lower(?1))>0 "
         "OR instr(lower(event_type),lower(?1))>0 OR instr(lower(category),lower(?1))>0 "
         "OR instr(lower(source),lower(?1))>0 "
         "OR EXISTS (SELECT 1 FROM r2_log_conversations c WHERE c.event_id=r2_log_events.id "
-        "AND (instr(lower(c.user_text),lower(?1))>0 OR instr(lower(c.assistant_text),lower(?1))>0)) "
+        "AND (instr(lower(c.user_text),lower(?1))>0 OR instr(lower(c.assistant_text),lower(?1))>0))) "
         "ORDER BY id DESC LIMIT ?2;";
 
     rc = sqlite3_prepare_v2(
@@ -3426,6 +3429,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
     if (query) {
         rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, conversational);
     } else {
         rc = sqlite3_bind_int(statement, 1, limit);
     }
@@ -3445,8 +3449,10 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
             "SELECT l.relationship, l.notes, e.id, e.category, e.event_type, "
             "e.summary, e.details, e.source "
             "FROM r2_log_links l JOIN r2_log_events e ON e.id = "
-            "CASE WHEN l.from_event_id = ? THEN l.to_event_id ELSE l.from_event_id END "
-            "WHERE l.from_event_id = ? OR l.to_event_id = ? "
+            "CASE WHEN l.from_event_id = ?1 THEN l.to_event_id ELSE l.from_event_id END "
+            "WHERE (l.from_event_id = ?1 OR l.to_event_id = ?1) "
+            "AND (?2=0 OR NOT (COALESCE(e.source,'')='r2_init' AND "
+            "COALESCE(e.category,'') IN ('continuity','lifecycle','system'))) "
             "ORDER BY l.id DESC LIMIT 4;";
         rc = sqlite3_prepare_v2(log_db, sql_links, -1, &link_statement, NULL);
         if (rc != SQLITE_OK) {
@@ -3525,9 +3531,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
             sqlite3_clear_bindings(link_statement);
             int link_bind_rc = sqlite3_bind_int64(link_statement, 1, id);
             if (link_bind_rc == SQLITE_OK)
-                link_bind_rc = sqlite3_bind_int64(link_statement, 2, id);
-            if (link_bind_rc == SQLITE_OK)
-                link_bind_rc = sqlite3_bind_int64(link_statement, 3, id);
+                link_bind_rc = sqlite3_bind_int(link_statement, 2, conversational);
             if (link_bind_rc != SQLITE_OK) {
                 free(output);
                 output = NULL;
@@ -3621,7 +3625,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch)
 
 char *r2_log_recent(int limit)
 {
-    return query_events(NULL, limit, NULL);
+    return query_events(NULL, limit, NULL, 0);
 }
 
 char *r2_log_search(const char *query, int limit)
@@ -3629,16 +3633,27 @@ char *r2_log_search(const char *query, int limit)
     if (!valid_text(query))
         return r2_log_recent(limit);
 
-    return query_events(query, limit, NULL);
+    return query_events(query, limit, NULL, 0);
+}
+
+static int search_record_batch(const char *query, int limit, R2LogRecordBatch *batch,
+                               int conversational)
+{
+    if (!batch) { errno = EINVAL; return -1; }
+    memset(batch, 0, sizeof(*batch));
+    batch->text = query_events(valid_text(query) ? query : NULL, limit, batch, conversational);
+    if (!batch->text) { r2_log_release_records(batch); return -1; }
+    return 0;
 }
 
 int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch)
 {
-    if (!batch) { errno = EINVAL; return -1; }
-    memset(batch, 0, sizeof(*batch));
-    batch->text = query_events(valid_text(query) ? query : NULL, limit, batch);
-    if (!batch->text) { r2_log_release_records(batch); return -1; }
-    return 0;
+    return search_record_batch(query, limit, batch, 0);
+}
+
+int r2_log_search_conversation_records(const char *query, int limit, R2LogRecordBatch *batch)
+{
+    return search_record_batch(query, limit, batch, 1);
 }
 
 void r2_log_release_records(R2LogRecordBatch *batch)

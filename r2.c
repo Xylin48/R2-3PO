@@ -1760,6 +1760,8 @@ static char *get_startup_memories(int limit)
     const char *sql =
         "SELECT memory,category,updated_at "
         "FROM memories "
+        "WHERE NOT (COALESCE(category,'')='experience' AND COALESCE(memory,'') "
+        "GLOB 'Life Log event [0-9]*: [[]world/reality_engine_started] R2''s persistent reality engine started.') "
         "ORDER BY updated_at DESC, id DESC "
         "LIMIT ?";
     sqlite3_stmt *st = NULL;
@@ -6430,7 +6432,10 @@ static char *chat_with_relevant_memories(
 
             R2LogRecordBatch found = {0};
             ++searches;
-            if (r2_log_search_records(keywords[k], 3, &found) != 0 ||
+            int rc = explicit_recall
+                ? r2_log_search_records(keywords[k], 3, &found)
+                : r2_log_search_conversation_records(keywords[k], 3, &found);
+            if (rc != 0 ||
                 r2_history_append_unique_records(&life_history, &found) != 0) {
                 r2_log_release_records(&found);
                 history_unavailable = 1;

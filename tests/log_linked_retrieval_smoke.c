@@ -135,12 +135,19 @@ int main(void)
 
     int64_t anchor = r2_log_event(R2_LOG_MEMORY, "archive_anchor",
                                   "deep_archive%marker", "unique related pointer", "link-smoke");
+    int64_t maintenance = r2_log_event(R2_LOG_CONTINUITY, "continuity_updated",
+        "Startup maintenance deep_archive%marker", "Launch bookkeeping", "r2_init");
     R2LogRecordBatch records = {0};
     int archive_ok = current_exact && preview_ok && archived > 0 && anchor > archived &&
+        maintenance > anchor &&
         r2_log_link(anchor, archived, "archive_evidence", NULL) == 0 &&
-        r2_log_search_records("deep_archive%marker", 10, &records) == 0 &&
+        r2_log_link(anchor, maintenance, "maintenance_related", NULL) == 0 &&
+        r2_log_search_conversation_records("deep_archive%marker", 10, &records) == 0 &&
         records.count == 2 && strstr(records.text, archived_user) &&
-        strstr(records.text, archived_reply);
+        strstr(records.text, archived_reply) && !strstr(records.text, "Startup maintenance");
+    r2_log_release_records(&records);
+    archive_ok = archive_ok && r2_log_search_records("deep_archive%marker", 10, &records) == 0 &&
+        records.count == 3 && strstr(records.text, "Startup maintenance");
     r2_log_release_records(&records);
     char *literal_miss = r2_log_search("deepXarchive%marker", 10);
     archive_ok = archive_ok && literal_miss &&

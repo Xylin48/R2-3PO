@@ -3627,7 +3627,7 @@ int r2_reality_init(void)
     }
     money_mirror_write(carried_cash, bank_cash);
     bridge_event("reality_engine_started", "R2's persistent reality engine started.",
-        "Self-continuity and world-continuity are stored in dedicated r2_reality.db; Life Log and searchable memory remain in r2_memory.db. Physical hierarchy: room/shelf/box and piggybank under room; portable pockets/wallet and fixed home fridge under R2_Home; factual events in log/log.txt.", 1, 0);
+        "Self-continuity and world-continuity are stored in dedicated r2_reality.db; Life Log and searchable memory remain in r2_memory.db. Physical hierarchy: room/shelf/box and piggybank under room; portable pockets/wallet and fixed home fridge under R2_Home; factual events in log/log.txt.", 0, 0);
     return 0;
 }
 

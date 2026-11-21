@@ -358,6 +358,8 @@ typedef struct {
     size_t count;
 } R2LogRecordBatch;
 int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch);
+/* Implicit conversation retrieval skips internal initialization records. */
+int r2_log_search_conversation_records(const char *query, int limit, R2LogRecordBatch *batch);
 void r2_log_release_records(R2LogRecordBatch *batch);
 
 char *r2_log_search(const char *query, int limit);

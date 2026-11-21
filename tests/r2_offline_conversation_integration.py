@@ -401,6 +401,8 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         assert "Keep simple greetings brief and personal" in system[0]
         assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
         assert IDENTITY_ANCHOR in system[0]
+        assert "Summary: R2 Life Log integration" not in system[0]
+        assert "[world/reality_engine_started]" not in system[0]
         assert "The current user message is spoken by the user" not in system[0]
         assert "RESPONSE CORRECTION:" not in system[0]
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
