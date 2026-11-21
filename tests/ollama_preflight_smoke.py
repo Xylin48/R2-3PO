@@ -95,6 +95,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         replies = [
             {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},
             {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"models": [{"name": "llama3.1:8b", "size": 500000, "size_vram": 123456}]},
             {"done": True, "message": {"role": "assistant", "content": "{\"color\":\"blue\"}"}},
             {"models": [{"name": "qwen3-vl:4b-instruct-q4_K_M", "size": 500000, "size_vram": 123456}]},
         ]
@@ -109,7 +110,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         options = read.call_args_list[1].kwargs["payload"]["options"]
         self.assertEqual(options["num_gpu"], 20)
         self.assertEqual(options["num_ctx"], 8192)
-        vision_payload = read.call_args_list[2].kwargs["payload"]
+        vision_payload = read.call_args_list[3].kwargs["payload"]
         self.assertIs(vision_payload["truncate"], False)
         self.assertIs(vision_payload["shift"], False)
         self.assertEqual(vision_payload["options"]["num_gpu"], 20)
@@ -145,6 +146,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
              patch.object(probe, "_read_json", side_effect=[
                  {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},
                  {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+                 {"models": [{"name": "llama3.1:8b", "size": 500000, "size_vram": 0}]},
                  {"done": True, "message": {"role": "assistant", "content": "{\"color\":\"blue\"}"}},
                  {"models": [{"name": "qwen3-vl:4b-instruct-q4_K_M", "size_vram": 0}]},
              ]), patch.object(probe.subprocess, "run", return_value=SimpleNamespace(
@@ -157,6 +159,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         replies = [
             {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},
             {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"models": [{"name": "llama3.1:8b", "size": 500000, "size_vram": 123456}]},
             {"done": True, "message": {"role": "assistant", "content": "{\"color\":\"blue\"}"}},
             {"models": [{"name": "qwen3-vl:4b-instruct-q4_K_M", "size": 500000, "size_vram": 123456}]},
         ]
@@ -167,7 +170,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
              )):
             self.assertTrue(probe.preflight(timeout=1, require_gpu_offload=True))
         self.assertNotIn("num_gpu", read.call_args_list[1].kwargs["payload"]["options"])
-        self.assertEqual(read.call_args_list[2].kwargs["payload"]["options"]["num_predict"], 512)
+        self.assertEqual(read.call_args_list[3].kwargs["payload"]["options"]["num_predict"], 512)
 
     def test_unapproved_non_loopback_endpoint_is_rejected(self) -> None:
         errors = io.StringIO()
@@ -234,12 +237,13 @@ class OllamaPreflightSmoke(unittest.TestCase):
         with patch.object(probe, "_read_json", side_effect=[
             {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},
             {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"models": [{"name": "llama3.1:8b", "size": 500000, "size_vram": 123456}]},
             {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}},
             {"models": [{"name": "qwen3-vl:4b-instruct-q4_K_M-other",
                          "size": 500000, "size_vram": 123456}]},
         ]) as read, contextlib.redirect_stderr(errors):
             self.assertFalse(probe.preflight(timeout=1, require_gpu_offload=True))
-        self.assertEqual(read.call_count, 4)
+        self.assertEqual(read.call_count, 5)
         self.assertIn("mixed CPU/GPU placement was required", errors.getvalue())
 
     def test_missing_model_fails_without_waiting_or_network(self) -> None:
