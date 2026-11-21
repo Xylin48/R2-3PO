@@ -28,8 +28,8 @@ The resulting executable is `./r2`. To remove it, run `make clean`.
 ## Ollama model: conversation and vision
 
 R2 uses `llama3.1:8b` for conversation and `qwen3-vl:4b-instruct-q4_K_M` for camera/TV visual perception. Both use the existing local Ollama endpoint and share R2's memory; the visual model supplies evidence rather than a second conversational identity.
-Foreground and helper calls use Qwen 3.5's non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
-Install the model locally before launching R2:
+Foreground and helper calls use the current explicit non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
+Install both models locally before launching R2 (no automatic downloads):
 
 ```sh
 ollama pull llama3.1:8b
@@ -37,14 +37,15 @@ ollama pull qwen3-vl:4b-instruct-q4_K_M
 ollama run llama3.1:8b
 ```
 
-At the Ollama prompt, test a short message and then enter `/bye`. The launch script
-also reports the expected model name. Qwen 3.5 9B uses the same model for text and image input; it does not accept raw microphone PCM as a chat input. Ears therefore remains a format-agnostic PCM capture layer, and speech transcription requires a separate audio/ASR component;
-visual inference shares the Ollama request lock with conversation and yields when a
-foreground conversation is waiting. Active model turns can receive an available camera
-frame and a separate display frame while R2 has chosen to watch. The request labels the
-sources actually attached. A selected display can supply the only image when the camera
-is unavailable. Watch continues capturing frames independently of model interpretation.
-The visual library records a result after a completed analysis.
+At the Ollama prompt, test a short message and then enter `/bye`. The launcher
+reports both required model names. Llama 3.1 handles text, while Qwen3-VL
+interprets images from the camera and chosen display as separate, source-labeled
+observations. Raw images are never sent to the text-only Llama model. Neither
+model takes raw microphone PCM through this chat API; Ears still uses a separate
+local Whisper speech-to-text path. Inference shares the existing Ollama request
+lock; conversation-owned visual observations queue ahead of opportunistic
+background work. Watch continues raw capture without automatically producing
+descriptions. The Visual library records completed explicit analyses separately.
 
 R2 builds a completed conversational response from the current user message and
 relevant memories/perceptions. A separate intent-summary inference is not used as an
