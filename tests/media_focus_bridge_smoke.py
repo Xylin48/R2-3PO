@@ -65,12 +65,12 @@ turn = core[core.index("size_t ordered_count = r2_order_inference_messages("):
 assert "owned_image = r2_vision_current_frame_base64()" in turn
 assert "if (atomic_load(&media_attention_selected))" in turn
 assert "owned_media_image = r2_vision_media_current_frame_base64()" in turn
-assert '"CAMERA", owned_image, &eyes_source_revision, camera_revision' in turn
-assert '"MEDIA DISPLAY", owned_media_image, &media_source_revision, media_revision' in turn
+assert '"CAMERA", owned_image, camera_description, &camera' in turn
+assert '"MEDIA DISPLAY", owned_media_image, media_description, &media' in turn
 assert "limits[i], NULL, NULL)" in turn
 assert 'r2_visual_describe_encoded_frame(' in core
 assert "r2_vision_request_source_changed()" in core
-assert "vision_request_source = &origin;" in core
+assert "vision_request_source = origin;" in core
 assert "vision_request_source = previous_origin;" in core
 assert "CURRENT %s VISUAL INPUT: a frame was captured but visual interpretation" in core
 assert "free(owned_media_image);" in turn and "free(owned_image);" in turn
