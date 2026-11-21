@@ -81,3 +81,11 @@ These fixes do not certify the whole file or real hardware. Separate overlay
 publication ownership, stable-ID association deduplication, staged oversized
 evidence, broader manual inspection and physical/overnight acceptance remain
 continuation work.
+
+
+## November 20–21, 2026 — Separate Llama/Qwen3-VL inference candidate
+
+- **Latest working draft:** https://github.com/Xylin48/R2-3PO/pull/189 on `integrate/r2-llama31-qwen3vl-completion-2026-11-20`, branched from PR #188 exact head `603afd8b860fb6bb96794cdfba070c2bd12287c7`. PR #185, #186 and #187 were verified to be ancestors of the starting head. Do not merge to `main`.
+- **Model target:** `llama3.1:8b` conversation, `qwen3-vl:4b-instruct-q4_K_M` visual perception. Existing local Whisper handles speech transcription; current migration does not create raw-audio semantic recognition. Raw camera and independent media frames must go to the visual model and become source-attributed evidence before text-only Llama receives the current user turn. Retain user text, tool-role provenance, independent attention, and databases.
+- **Deployment:** interactive and overnight services and private Ollama model-copy now require both already-installed models; no automatic pull. Verify both real-model generation and GPU placement on the actual host after installation. The reviewed bootstrap's SHA and immutable source commit must match; check the present files, not an old handoff.
+- **Verification:** Strict CI is required on the latest PR #189 head. Early and mid-run fixtures passed on intermediate commits, but this does not certify the final head. Important remaining traces include visual-evidence prompt budget, stale visual source generation during slow model inference, the exact conversation first reply, and physical/overnight acceptance. See manual audit entry R2-AUD-2026-11-20-267 for concrete changes and caveats.
