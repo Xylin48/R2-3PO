@@ -1520,6 +1520,32 @@ const char *r2_visual_model_name(void)
     return model_snapshot;
 }
 
+/* One-shot perception for text-only Llama conversation turns. The existing
+ * Ollama request gate serializes Qwen3-VL and Llama to avoid GPU contention.
+ * No raw image is ever handed to the text-only model. */
+char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *question)
+{
+    if (!jpeg_base64 || !*jpeg_base64 || r2_ollama_vision_request_should_abort())
+        return NULL;
+    char model[sizeof(visual_model)];
+    pthread_mutex_lock(&visual_lock);
+    int available = visual_initialized && visual_db;
+    if (available)
+        snprintf(model, sizeof(model), "%s", visual_model);
+    pthread_mutex_unlock(&visual_lock);
+    if (!available) return NULL;
+    char *json = call_vision_model(jpeg_base64, question, model);
+    if (!json) return NULL;
+    json_object *focus = NULL;
+    char *description = extract_visual_description(json, &focus);
+    if (focus) json_object_put(focus);
+    if (!description)
+        r2_log_sensory("vision_invalid_description",
+                      "Visual perception returned no valid description.", json, model);
+    free(json);
+    return description;
+}
+
 char *r2_visual_analyze_frame(const R2VisionFrame *frame,
                               const char *source,
                               const char *question)
