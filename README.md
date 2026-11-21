@@ -27,13 +27,14 @@ The resulting executable is `./r2`. To remove it, run `make clean`.
 
 ## Ollama model: conversation and vision
 
-R2's default conversation model and visual-perception model are both `qwen3.5:9b`.
+R2 uses `llama3.1:8b` for conversation and `qwen3-vl:4b-instruct-q4_K_M` for camera/TV visual perception. Both use the existing local Ollama endpoint and share R2's memory; the visual model supplies evidence rather than a second conversational identity.
 Foreground and helper calls use Qwen 3.5's non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
 Install the model locally before launching R2:
 
 ```sh
-ollama pull qwen3.5:9b
-ollama run qwen3.5:9b
+ollama pull llama3.1:8b
+ollama pull qwen3-vl:4b-instruct-q4_K_M
+ollama run llama3.1:8b
 ```
 
 At the Ollama prompt, test a short message and then enter `/bye`. The launch script
@@ -234,7 +235,8 @@ For an unattended session, install the systemd service from the repository at it
 Before installing, make sure the local Ollama installation has the required model. This project intentionally does not download models or update package indexes during service startup:
 
 ```sh
-ollama pull qwen3.5:9b
+ollama pull llama3.1:8b
+ollama pull qwen3-vl:4b-instruct-q4_K_M
 ```
 
 Complete the [rollout-readiness checklist](docs/rollout-readiness.md) before installing R2 or launching him with his live data. For the final activation, verify and install the root-owned bootstrap using the [overnight service guide](docs/overnight-service.md), then run it from its installed location:
@@ -255,7 +257,7 @@ sudo systemctl start r2-3po.service
 sudo systemctl disable r2-3po.service
 ```
 
-The supervisor restarts unexpected exits during normal service. The service runner checks the local Ollama API and completes real text and image probes with `qwen3.5:9b` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for the core readiness marker before enabling the service at boot. If activation fails, it stops and disables the service before restoring an available previous executable, which stays stopped. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
+The supervisor restarts unexpected exits during normal service. The service runner checks the local Ollama API and completes real text and image probes with `llama3.1:8b` and `qwen3-vl:4b-instruct-q4_K_M` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for the core readiness marker before enabling the service at boot. If activation fails, it stops and disables the service before restoring an available previous executable, which stays stopped. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
 
 Sound assets remain host-local at `/home/x/R2_Home/R2_sounds/FX`. Check the speaker, camera, microphone, and VLC dependencies with standalone tools in the desktop session before final activation. Use `R2_Launch_Code.sh` for the interactive desktop shell and Observer window after signoff.
 
