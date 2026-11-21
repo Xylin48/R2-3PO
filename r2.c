@@ -3662,7 +3662,37 @@ static int ollama_json_append_message_with_image_sources(struct json_object *arr
     return ollama_json_append_message(array, role, content, length, camera, media);
 }
 
-/* Qwen's chat format expects one leading system turn. Keep the selected
+/* The conversational Llama model cannot decode images. Qwen3-VL reads each
+ * independently captured source and returns observation evidence, which is
+ * presented to Llama without changing or duplicating the user's exact words.
+ * Failed visual inference must not become a fabricated observation. */
+static int ollama_append_visual_observation(struct json_object *array,
+                                            const char *source, const char *jpeg_base64)
+{
+    if (!jpeg_base64 || !*jpeg_base64) return 0;
+    char *description = r2_visual_describe_encoded_frame(
+        jpeg_base64, "Describe only what is visible in this frame. Distinguish direct visual evidence from uncertainty.");
+    char *evidence = NULL;
+    int rc;
+    if (description) {
+        rc = asprintf(&evidence,
+            "CURRENT %s VISUAL EVIDENCE (Qwen3-VL interpretation of one captured frame, "
+            "not an observation by the language model; motion between frames not established):\\n%s",
+            source, description);
+    } else {
+        rc = asprintf(&evidence,
+            "CURRENT %s VISUAL INPUT: a frame was captured but visual interpretation "
+            "was unavailable. Do not invent its contents.", source);
+    }
+    free(description);
+    if (rc < 0 || !evidence) return -1;
+    int appended = ollama_json_append_message(array, "system", evidence,
+                                              strlen(evidence), NULL, NULL);
+    free(evidence);
+    return appended;
+}
+
+/* Keep one leading system turn for Llama, with ordered context sections. Keep the selected
  * sections in priority order, then preserve every conversational role,
  * tool result and image exactly as serialized. */
 static struct json_object *ollama_json_chat_messages(struct json_object *sections)
@@ -4506,10 +4536,16 @@ static char *ollama_chat_with_limit(
             if (atomic_load(&media_attention_selected))
                 owned_media_image = r2_vision_media_current_frame_base64();
         }
-        int append_rc = ollama_json_append_message_with_image_sources(
-            arr, role, content, limits[i], owned_image, owned_media_image);
+        /* Describe the two independent sensory sources through Qwen3-VL.
+         * Never attach JPEG data to the text-only Llama conversation model. */
+        int append_rc = ollama_append_visual_observation(arr, "CAMERA", owned_image);
+        if (append_rc == 0)
+            append_rc = ollama_append_visual_observation(arr, "MEDIA DISPLAY", owned_media_image);
         free(owned_media_image);
         free(owned_image);
+        if (append_rc == 0)
+            append_rc = ollama_json_append_message(
+                arr, role, content, limits[i], NULL, NULL);
         if (append_rc != 0) {
             fprintf(stderr,
                     "[R2 Ollama] refusing inference: could not serialize message %zu/%zu; no partial payload will be sent.\n",
@@ -6482,9 +6518,9 @@ static char *chat_with_relevant_memories(
 
     /*
      * Historical visual records are memory, not a substitute for current sight.
-     * When Eyes is open, the current raw frame is attached to the active user
-     * message as an image. The conversation brain—not a background watcher—
-     * decides what, if anything, deserves attention. Ordinary conversation
+     * When Eyes is open, Qwen3-VL interprets the captured frame and supplies
+     * explicitly attributed textual sensory evidence to the Llama conversation
+     * brain. A background watcher does not force attention. Ordinary conversation
      * never opens a camera silently.
      */
     if (visual_requested && atomic_load(&eyes_auto_allowed) &&
