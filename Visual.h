@@ -20,10 +20,14 @@ int r2_visual_is_initialized(void);
 int r2_visual_set_model(const char *model);
 const char *r2_visual_model_name(void);
 
-/* Encode a real Eyes frame as a malloc-owned JPEG base64 string for direct
- * delivery to R2's multimodal conversation brain. This performs encoding only;
- * it does not interpret the image or create a visual memory. */
+/* Encode a captured Eyes or display frame as malloc-owned JPEG base64.
+ * Encoding alone performs no recognition and creates no visual memory. */
 char *r2_visual_frame_base64(const R2VisionFrame *frame);
+
+/* Interpret an already captured JPEG through the visual model for the text-only
+ * conversation brain. Returns an owned description, or NULL when unavailable.
+ * The caller preserves the source identity and supplies it as evidence. */
+char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *question);
 
 /* Analyze one real Eyes frame only when R2 deliberately requests inspection. */
 char *r2_visual_analyze_frame(const R2VisionFrame *frame,
