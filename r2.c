@@ -3084,8 +3084,16 @@ int r2_ollama_vision_request_begin(void)
         (atomic_load(&foreground_conversation_waiting) > 0 &&
          !ollama_foreground_turn_mode))
         return 0;
-    if (pthread_mutex_trylock(&ollama_request_lock) != 0)
+    if (ollama_foreground_turn_mode) {
+        /* This frame is evidence requested by the current conversation.
+         * Give it the same queue priority as the forthcoming Llama reply;
+         * background visual polling remains opportunistic below. */
+        atomic_fetch_add(&foreground_ollama_waiting, 1);
+        pthread_mutex_lock(&ollama_request_lock);
+        atomic_fetch_sub(&foreground_ollama_waiting, 1);
+    } else if (pthread_mutex_trylock(&ollama_request_lock) != 0) {
         return 0;
+    }
     if (shutting_down || atomic_load(&foreground_ollama_waiting) > 0 ||
         (atomic_load(&foreground_conversation_waiting) > 0 &&
          !ollama_foreground_turn_mode)) {
