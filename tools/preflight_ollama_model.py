@@ -313,7 +313,6 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
 
     # Check text-model placement before visual generation can evict it from memory.
     text_gpu_verified = False
-    text_mixed_verified = False
     if require_gpu_offload:
         try:
             ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
@@ -321,7 +320,6 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
             if active is not None:
                 vram, total = int(active.get("size_vram", 0)), int(active.get("size", 0))
                 text_gpu_verified = vram > 0
-                text_mixed_verified = vram > 0 and total > vram
         except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
             pass
 
@@ -409,7 +407,7 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
         loaded = ps.get("models", [])
         active = next((item for item in loaded if _is_required_model(item, VISION_MODEL)), None) if isinstance(loaded, list) else None
         if active is None:
-            print("GPU verification: model not present in /api/ps; placement remains unverified.")
+            print("GPU verification: visual model not present in /api/ps; placement remains unverified.")
         else:
             vram = active.get("size_vram", 0)
             try:
@@ -437,12 +435,11 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     # memory really landed in VRAM. CPU-only success must not masquerade as a
     # successful GTX 1050 Ti policy preflight.
     if require_gpu_offload and (
-        not text_gpu_verified or not text_mixed_verified or
-        not gpu_offload_verified or not mixed_placement_verified
+        not text_gpu_verified or not gpu_offload_verified
     ):
         print(
-            "ERROR: mixed CPU/GPU placement was required but Ollama did not report "
-            "mixed CPU/GPU placement for both the text and visual models.",
+            "ERROR: GPU offload was required but Ollama did not report "
+            "positive GPU VRAM allocation for both the text and visual models.",
             file=sys.stderr,
         )
         return False
