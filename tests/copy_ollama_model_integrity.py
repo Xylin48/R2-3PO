@@ -36,6 +36,46 @@ class CopyOllamaModelIntegrityTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         return blob_paths
 
+    def test_two_required_models_coexist_in_one_private_store(self) -> None:
+        text_model = "llama3.1:8b"
+        vision_model = "qwen3-vl:4b-instruct-q4_K_M"
+        with tempfile.TemporaryDirectory(prefix="r2-two-model-copy-") as temporary:
+            base = Path(temporary)
+            source, destination = base / "source", base / "destination"
+            self._write_model(source, text_model, {b"config": "unused", b"weights": "unused"})
+            self._write_model(source, vision_model, {b"config": "unused", b"weights": "unused"})
+
+            # Give the vision model different content-addressed blobs so the
+            # second copy cannot accidentally reuse or replace Llama weights.
+            vision_manifest_path = source / copier.model_manifest_relative(vision_model)
+            vision_manifest = json.loads(vision_manifest_path.read_text(encoding="utf-8"))
+            for part, payload in (("config", b"vision-config"), ("layers", b"vision-weights")):
+                digest = hashlib.sha256(payload).hexdigest()
+                (source / "blobs" / ("sha256-" + digest)).write_bytes(payload)
+                if part == "config":
+                    vision_manifest["config"]["digest"] = "sha256:" + digest
+                else:
+                    vision_manifest["layers"][0]["digest"] = "sha256:" + digest
+            vision_manifest_path.write_text(json.dumps(vision_manifest), encoding="utf-8")
+
+            copier.copy_model(source, destination, text_model, "")
+            text_path = destination / copier.model_manifest_relative(text_model)
+            text_before = text_path.read_bytes()
+            copier.copy_model(source, destination, vision_model, "")
+            vision_path = destination / copier.model_manifest_relative(vision_model)
+            self.assertEqual(text_path.read_bytes(), text_before)
+            self.assertEqual(vision_path.read_bytes(), vision_manifest_path.read_bytes())
+            for payload in (b"config", b"weights", b"vision-config", b"vision-weights"):
+                digest = hashlib.sha256(payload).hexdigest()
+                self.assertEqual(
+                    (destination / "blobs" / ("sha256-" + digest)).read_bytes(), payload
+                )
+
+            # Re-running the first model's installer must not discard the vision model.
+            copier.copy_model(source, destination, text_model, "")
+            self.assertEqual(text_path.read_bytes(), text_before)
+            self.assertEqual(vision_path.read_bytes(), vision_manifest_path.read_bytes())
+
     def test_overlapping_stores_are_rejected_without_changing_source(self) -> None:
         with tempfile.TemporaryDirectory(prefix="r2-model-copy-test-") as temporary:
             source = Path(temporary) / "source"
