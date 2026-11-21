@@ -16,6 +16,7 @@ import urllib.request
 from typing import Any
 
 DEFAULT_API_BASE = "http://127.0.0.1:11434"
+LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_API_BASES = {
     "http://127.0.0.1:11434",
     "http://127.0.0.1:11435",
@@ -111,7 +112,7 @@ def _read_json(url: str, timeout: float, payload: dict[str, Any] | None = None) 
         headers={"Content-Type": "application/json"} if data is not None else {},
         method="POST" if data is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with LOCAL_OPENER.open(request, timeout=timeout) as response:
         result = json.load(response)
     if not isinstance(result, dict):
         raise ValueError("Ollama returned a non-object JSON response")
@@ -316,10 +317,11 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     if require_gpu_offload:
         try:
             ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
-            active = next((item for item in ps.get("models", []) if _is_required_model(item, MODEL)), None)
-            if active is not None:
-                vram, total = int(active.get("size_vram", 0)), int(active.get("size", 0))
-                text_gpu_verified = vram > 0
+            loaded = ps.get("models")
+            if isinstance(loaded, list):
+                active = next((item for item in loaded if _is_required_model(item, MODEL)), None)
+                if active is not None:
+                    text_gpu_verified = int(active.get("size_vram", 0)) > 0
         except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
             pass
 
@@ -475,7 +477,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180,
                         help="timeout in seconds for each inference request")
     parser.add_argument("--require-gpu-offload", action="store_true",
-                        help="fail unless Ollama reports both VRAM allocation and model memory outside VRAM")
+                        help="fail unless Ollama reports VRAM allocation for both models")
     args = parser.parse_args()
     if args.timeout <= 0 or args.wait_seconds < 0:
         parser.error("--timeout must be positive and --wait-seconds cannot be negative")

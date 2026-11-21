@@ -4796,6 +4796,7 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
         } \
     } while (0)
     R2_OLLAMA_SETOPT(CURLOPT_URL, ollama_url);
+    R2_OLLAMA_SETOPT(CURLOPT_NOPROXY, "127.0.0.1");
     R2_OLLAMA_SETOPT(CURLOPT_HTTPHEADER, headers);
     R2_OLLAMA_SETOPT(CURLOPT_POST, 1L);
     R2_OLLAMA_SETOPT(CURLOPT_POSTFIELDS, payload);

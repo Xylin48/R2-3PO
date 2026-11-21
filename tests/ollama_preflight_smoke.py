@@ -213,6 +213,30 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 self.assertTrue(probe.preflight(timeout=1))
         self.assertEqual(errors.getvalue(), "")
 
+    def test_text_gpu_report_requires_only_valid_vram_and_a_model_list(self) -> None:
+        cases = [
+            ({"models": [{"name": probe.MODEL, "size_vram": 123456, "size": None}]}, True),
+            ({"models": None}, False),
+            ({"models": 123}, False),
+        ]
+        for processes, expected in cases:
+            with self.subTest(processes=processes), patch.object(probe, "_read_json", side_effect=[
+                {"models": [{"name": probe.MODEL}, {"name": probe.VISION_MODEL}]},
+                {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+                processes,
+                {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}},
+                {"models": [{"name": probe.VISION_MODEL, "size_vram": 123456}]},
+            ]), patch.object(probe.subprocess, "run", side_effect=FileNotFoundError("nvidia-smi")):
+                self.assertEqual(probe.preflight(timeout=1, require_gpu_offload=True), expected)
+
+    def test_loopback_requests_bypass_http_proxy_environment(self) -> None:
+        with patch.dict("os.environ", {"http_proxy": "http://127.0.0.1:9", "no_proxy": ""}):
+            response = io.StringIO('{"models":[]}')
+            response.code, response.msg, response.info = 200, "OK", lambda: {}
+            with patch("urllib.request.HTTPHandler.http_open", return_value=response) as request:
+                self.assertEqual(probe._read_json(probe.DEFAULT_API_BASE + "/api/tags", 1), {"models": []})
+            self.assertEqual(request.call_args.args[0].host, "127.0.0.1:11434")
+
     def test_wrong_color_json_blocks_ready_status(self) -> None:
         errors = io.StringIO()
         red_literal = json.dumps({"color": "red"})
