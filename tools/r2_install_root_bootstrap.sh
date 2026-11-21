@@ -42,7 +42,8 @@ R2_EXEC="$R2_ROOT/r2"
 RUNNER_SOURCE="$R2_SOURCE/tools/r2_service_runner.sh"
 OLLAMA_RUNNER_SOURCE="$R2_SOURCE/tools/r2_ollama_runner.sh"
 MODEL_COPY_SCRIPT="$R2_SOURCE/tools/copy_ollama_model.py"
-R2_MODEL="qwen3.5:9b"
+R2_MODEL="llama3.1:8b"
+R2_VISION_MODEL="qwen3-vl:4b-instruct-q4_K_M"
 R2_OLLAMA_BASE_URL="http://127.0.0.1:11435"
 UNIT_DEST="/etc/systemd/system/r2-3po.service"
 OLLAMA_UNIT_DEST="/etc/systemd/system/r2-ollama.service"
@@ -363,7 +364,8 @@ Environment=USER=r2
 Environment=LOGNAME=r2
 Environment=OLLAMA_HOST=127.0.0.1:11435
 Environment=OLLAMA_MODELS=/home/x/R2_Home/.ollama/models
-Environment=R2_MODEL=qwen3.5:9b
+Environment=R2_MODEL=llama3.1:8b
+Environment=R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M
 # Apply egress isolation before the model server starts. This rule remains active
 # for as long as this service is running, including when the R2 conversation
 # service stops. Only the two local Ollama ports are allowed: 11435 for this service and 11434 for the interactive launcher.
@@ -406,7 +408,8 @@ Environment=R2_SOURCE=/home/x/R2_Home/R2
 Environment=R2_EXEC=/home/x/R2_Home/r2
 Environment=R2_FX_DIR=/home/x/R2_Home/R2_sounds/FX
 Environment=R2_SERVICE_MODE=1
-Environment=R2_MODEL=qwen3.5:9b
+Environment=R2_MODEL=llama3.1:8b
+Environment=R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M
 Environment=R2_OLLAMA_BASE_URL=http://127.0.0.1:11435
 # Per-UID egress isolation: only local Ollama TCP port 11435 is allowed for r2.
 # These inline root commands avoid executing a mutable script from R2's

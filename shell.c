@@ -689,8 +689,8 @@ static void shell_help(void)
         "  vision search <text>\n"
         "      Search the visual experience library.\n"
         "\n"
-        "  vision model qwen3.5:9b\n"
-        "      Confirm the single model shared by conversation and vision.\n"
+        "  vision model qwen3-vl:4b-instruct-q4_K_M\n"
+        "      Confirm the dedicated visual-perception model.\n"
         "\n"
         "  vision close\n"
         "      Close the current visual source.\n"
@@ -1245,7 +1245,7 @@ static void shell_vision(const char *argument)
 
     if (!strcasecmp(argument, "watch start")) {
         if (r2_vision_watch_start() == 0)
-            printf("[Eyes is capturing continuously; the conversation brain receives the latest image with its turn and chooses what to attend to. No background image descriptions are generated.]\n");
+            printf("[Eyes is capturing continuously; the vision model can interpret the latest frame for an active conversation turn. No background image descriptions are generated.]\n");
         else
             printf("[Could not start visual observation. Check the vision model and R2 status.]\n");
         return;
@@ -1300,10 +1300,10 @@ static void shell_vision(const char *argument)
     if (shell_starts_with(argument, "model ")) {
         const char *model = shell_trim((char *)argument + 6);
         if (r2_vision_set_model(model) == 0)
-            printf("[Conversation and vision both use %s.]\n", r2_vision_model_name());
+            printf("[Vision uses %s; conversation uses %s.]\n", r2_vision_model_name(), r2_model_name());
         else
-            printf("[This build requires %s for both conversation and vision; separate models are disabled.]\n",
-                   r2_vision_model_name());
+            printf("[This build requires visual model %s; conversation remains on %s.]\n",
+                   r2_vision_model_name(), r2_model_name());
         return;
     }
 

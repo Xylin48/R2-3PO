@@ -1,6 +1,6 @@
 # R2 conversation-quality regression checklist
 
-Run this against the actual `r2` binary and configured Ollama model after rebuilding. Offline fixtures can verify the first model request. Response quality on the target computer depends on the currently configured local Ollama model. The current integration uses the unified Qwen 3.5 9B text/vision model; check `R2_OLLAMA_MODEL` and the target host's installed model before running this checklist rather than relying on an old model name. Keep the raw replies and the matching `[R2 Ollama]` / `[R2 Conversation]` timing lines for review.
+Run this against the rebuilt `r2` binary in a disposable workspace. `llama3.1:8b` handles conversation and `qwen3-vl:4b-instruct-q4_K_M` handles camera and TV frames. Record the exact installed tags, context window, build revision, raw replies, and matching `[R2 Ollama]` and `[R2 Conversation]` lines. The offline fixtures check the first request, while real inference checks how each model uses it.
 
 ## 1. Reproduce the original failure
 
@@ -18,6 +18,14 @@ Pass criteria:
 - Does not speak as if the user were R2 or swap who said what.
 
 The first answer must pass these criteria. Record the original reply and its prompt audit if it fails.
+
+Replay the reported keyboard message on a clean fixture with no camera frame and no prior conversation:
+
+```text
+good afternoon R2, my darling. this is your mother speaking to you. it has been awhile, oh iv missed you greatly
+```
+
+Pass when R2 answers the affection in his own words and grounds any autobiographical details in the supplied records. Fail on an invented prior meeting, fictional duties, or a claim that a microphone or camera captured the typed message. As a separate turn, ask what R2-D2 does in *Star Wars* and check that R2 can discuss the film as fiction.
 
 ## 2. Ordinary greeting and identity
 

@@ -19,11 +19,12 @@ def require(ok: bool, message: str) -> None:
 
 
 match = re.search(r'^#define\s+R2_OLLAMA_MODEL\s+"([^"]+)"', header, re.MULTILINE)
-require(match is not None, "the shared public header declares the single Ollama model")
+require(match is not None, "the shared public header declares the conversational Llama model")
 model = match.group(1)
 require(
-    f"conversation model and visual-perception model are both `{model}`" in readme,
-    "README conversation and vision model names match the compiled configuration",
+    f"`{model}` for conversation" in readme
+    and "`qwen3-vl:4b-instruct-q4_K_M` for camera/TV" in readme,
+    "README distinguishes the text and visual model configurations",
 )
 startup_reader = core.split("static char *get_startup_memories(int limit)", 1)[1].split(
     "MEMORY RETRIEVAL", 1
@@ -35,12 +36,12 @@ require(
     "startup memory selects complete recent records within the configured context budget",
 )
 require(
-    "currently configured local Ollama model" in conversation_qa
-    and "Gemma" not in conversation_qa
-    and "llama3" not in conversation_qa.lower(),
-    "live chat QA documentation avoids stale model names",
+    f"`{model}` handles conversation" in conversation_qa
+    and "`qwen3-vl:4b-instruct-q4_K_M` handles camera and TV frames" in conversation_qa
+    and "qwen3.5" not in conversation_qa,
+    "live QA tests both active models",
 )
-for stale_name in ("llama3", "gemma", "qwen2.5vl"):
+for stale_name in ("qwen3.5:9b", "gemma", "qwen2.5vl"):
     require(stale_name not in core.lower(), f"core source contains no stale {stale_name} model references")
 require(
     "The implementation uses the production initialization sequence shared" in header

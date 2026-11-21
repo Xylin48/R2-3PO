@@ -415,8 +415,8 @@ else
         echo
         echo "R2 was NOT launched."
         echo "The real model preflight failed. See its reported cause above."
-        echo "Start the local Ollama service and ensure 'ollama list' includes qwen3.5:9b."
-        echo "If the model is missing, run: ollama pull qwen3.5:9b"
+        echo "Start the local Ollama service and ensure 'ollama list' includes both required models."
+        echo "Missing models can be installed later: ollama pull llama3.1:8b; ollama pull qwen3-vl:4b-instruct-q4_K_M"
         echo "Then launch R2 again."
         read -p "Press Enter to exit..."
         exit 1
@@ -764,9 +764,9 @@ echo "Compilation successful."
 echo "Executable updated:"
 echo "    $R2_EXEC"
 echo
-echo "Unified conversation + vision model: qwen3.5:9b"
-echo "R2 uses one shared Ollama model for text and image perception."
-echo "If needed, install it with: ollama pull qwen3.5:9b"
+echo "Conversation model: llama3.1:8b"
+echo "Visual perception model: qwen3-vl:4b-instruct-q4_K_M"
+echo "Required local models: llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M"
 echo
 echo "Modules compiled:"
 echo "    r2.c"
@@ -833,7 +833,7 @@ run_as_r2 env \
     R2_GAMEBOY_ROOT="$R2_GAMEBOY_ROOT" \
     R2_GAMEBOY_DIR="$R2_GAMEBOY_DIR" \
     R2_CAMERA_DEVICE="${R2_CAMERA_DEVICE:-/dev/video0}" \
-    R2_VISION_MODEL="qwen3.5:9b" \
+    R2_VISION_MODEL="qwen3-vl:4b-instruct-q4_K_M" \
     R2_FX_DIR="$R2_FX_DIR" \
     bash -c '
         if [[ "$3" == 1 ]]; then

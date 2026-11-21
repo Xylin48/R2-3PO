@@ -22,9 +22,31 @@ require("r2_bound_context_records" not in body and "final_context_limit" not in 
         "selected evidence is not clipped by intermediate character caps")
 require("r2_append_association_section(&memory_context" in body,
         "diary and visual sections use checked complete allocations")
-require('json_object_object_add(message, "images", images)' in core
-        and "r2_vision_current_frame_base64()" in core,
-        "current raw visual input is serialized separately from historical evidence")
+require("r2_vision_current_frame_base64()" in core
+        and "r2_vision_media_current_frame_base64()" in core
+        and "r2_visual_describe_encoded_frame(" in core,
+        "camera and media frames are translated into evidence independently from historical records")
+# Qwen generates its descriptions only after the provisional prompt allocation.
+# Inspect the final Llama messages and refit the generation budget rather than
+# letting independent visual evidence silently overflow the chosen context.
+final_start = core.find("size_t final_input_bytes = 0;")
+final_end = core.find("const char *payload = json_object_to_json_string_ext(root", final_start)
+require(final_start > 0 and final_end > final_start,
+        "completed visual evidence is budgeted before serialization")
+require("int translated_visual_inputs = 0;" in core
+        and "if (owned_image || owned_media_image)" in core
+        and "translated_visual_inputs = 1;" in core
+        and "if (translated_visual_inputs) {" in core[final_start - 80:final_start],
+        "only visual turns reallocate the final Llama generation budget; ordinary text turns remain unchanged")
+final_wire = core[final_start:final_end]
+require("json_object_array_length(chat_messages)" in final_wire
+        and "json_object_get_string_len(content_value)" in final_wire
+        and "final_input_bytes += content_bytes + 64U;" in final_wire
+        and "r2_fit_complete_input(final_input_bytes, num_ctx, &num_predict)" in final_wire
+        and 'ollama_json_object_add_checked(request_options, "num_predict"' in final_wire
+        and "json_object_put(arr);" in final_wire,
+        "full translated observations preserve the input and fit output or fail visibly")
+
 require(body.find("if (life_history.length)") < body.find("size_t base_count"),
         "complete Life Log evidence is assembled before prompt construction")
 require("r2_preserve_inference_units(msgs, count" in core

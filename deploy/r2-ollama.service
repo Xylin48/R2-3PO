@@ -16,7 +16,8 @@ Environment=USER=r2
 Environment=LOGNAME=r2
 Environment=OLLAMA_HOST=127.0.0.1:11435
 Environment=OLLAMA_MODELS=/home/x/R2_Home/.ollama/models
-Environment=R2_MODEL=qwen3.5:9b
+Environment=R2_MODEL=llama3.1:8b
+Environment=R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M
 # Apply egress isolation before the model server starts. This rule remains active
 # for as long as this service is running, including when the R2 conversation
 # service stops. Only the two local Ollama ports are allowed: 11435 for this service and 11434 for the interactive launcher.

@@ -51,13 +51,17 @@ require(all(name in required for name in sources),
 
 model_match = re.search(r'^#define\s+R2_OLLAMA_MODEL\s+"([^"]+)"',
                         header, re.MULTILINE)
-require(model_match is not None, "shared model constant exists")
-if model_match:
-    model = model_match.group(1)
-    require(f'R2_VISION_MODEL="{model}"' in launcher,
-            "launcher vision model matches the single compiled conversation model")
-    require(f"Unified conversation + vision model: {model}" in launcher,
-            "launcher status text matches the configured unified model")
+vision_match = re.search(r'^#define\s+R2_VISION_DEFAULT_MODEL\s+"([^"]+)"',
+                        header, re.MULTILINE)
+require(model_match is not None and vision_match is not None,
+        "independent conversation and vision model constants exist")
+if model_match and vision_match:
+    conversation, vision = model_match.group(1), vision_match.group(1)
+    require(f'R2_VISION_MODEL="{vision}"' in launcher,
+            "launcher selects the compiled dedicated vision model")
+    require(f"Conversation model: {conversation}" in launcher
+            and f"Visual perception model: {vision}" in launcher,
+            "launcher status text identifies both compiled models")
 
 require('R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}"' in launcher,
         "launcher passes the configured long-running inference timeout")

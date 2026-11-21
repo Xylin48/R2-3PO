@@ -244,7 +244,7 @@ else
   pass "no competing R2 Ollama server detected on 127.0.0.1:11435"
 fi
 
-section "Ollama and unified Qwen 3.5 model"
+section "Ollama Llama conversation and Qwen3-VL vision models"
 if TAGS="$(curl --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
   if printf '%s' "$TAGS" | python3 -c '
 import json
@@ -252,14 +252,16 @@ import sys
 
 data = json.load(sys.stdin)
 models = data.get("models") if isinstance(data, dict) else None
-found = isinstance(models, list) and any(
-    isinstance(model, dict) and model.get("name") == "qwen3.5:9b"
-    for model in models
+required = ("llama3.1:8b", "qwen3-vl:4b-instruct-q4_K_M")
+found = isinstance(models, list) and all(
+    any(isinstance(model, dict) and model.get("name") == name
+        for model in models)
+    for name in required
 )
 sys.exit(0 if found else 1)
 ' >/dev/null 2>&1; then
-    pass "local Ollama API responds and qwen3.5:9b is installed"
-  else fail "Ollama responds but qwen3.5:9b is not installed"; fi
+    pass "local Ollama API responds; llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M are installed"
+  else fail "Ollama responds but both required models (llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M) are not installed"; fi
 else fail "Ollama API unreachable at $OLLAMA_URL"; fi
 if have ollama; then
   printf 'Ollama placement (when a model is loaded):\n'

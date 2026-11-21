@@ -27,7 +27,6 @@
 #include <ctype.h>
 #include <signal.h>
 
-#define R2_VISION_DEFAULT_MODEL R2_OLLAMA_MODEL
 #define R2_VISION_MAX_IMAGE_BYTES (20U * 1024U * 1024U)
 #define R2_VISION_MAX_RESPONSE (1024U * 1024U)
 
@@ -1394,7 +1393,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     if (configured && *configured &&
         strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0) {
         fprintf(stderr,
-                "[R2 Vision] Ignoring R2_VISION_MODEL=%s; this build uses the unified model %s.\n",
+                "[R2 Vision] Ignoring R2_VISION_MODEL=%s; this build requires the configured visual model %s.\n",
                 configured, R2_VISION_DEFAULT_MODEL);
     }
     snprintf(visual_model, sizeof(visual_model), "%s", R2_VISION_DEFAULT_MODEL);
@@ -1490,7 +1489,7 @@ int r2_visual_set_model(const char *model)
     }
     if (strcmp(model, R2_VISION_DEFAULT_MODEL) != 0) {
         fprintf(stderr,
-                "[R2 Vision] Rejected model %s; conversation and vision must share %s.\n",
+                "[R2 Vision] Rejected model %s; this build requires the configured visual model %s.\n",
                 model, R2_VISION_DEFAULT_MODEL);
         return -1;
     }
@@ -1519,6 +1518,32 @@ const char *r2_visual_model_name(void)
              visual_model[0] ? visual_model : R2_VISION_DEFAULT_MODEL);
     pthread_mutex_unlock(&visual_lock);
     return model_snapshot;
+}
+
+/* One-shot perception for text-only Llama conversation turns. The existing
+ * Ollama request gate serializes Qwen3-VL and Llama to avoid GPU contention.
+ * No raw image is ever handed to the text-only model. */
+char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *question)
+{
+    if (!jpeg_base64 || !*jpeg_base64 || r2_ollama_vision_request_should_abort())
+        return NULL;
+    char model[sizeof(visual_model)];
+    pthread_mutex_lock(&visual_lock);
+    int available = visual_initialized && visual_db;
+    if (available)
+        snprintf(model, sizeof(model), "%s", visual_model);
+    pthread_mutex_unlock(&visual_lock);
+    if (!available) return NULL;
+    char *json = call_vision_model(jpeg_base64, question, model);
+    if (!json) return NULL;
+    json_object *focus = NULL;
+    char *description = extract_visual_description(json, &focus);
+    if (focus) json_object_put(focus);
+    if (!description)
+        r2_log_sensory("vision_invalid_description",
+                      "Visual perception returned no valid description.", json, model);
+    free(json);
+    return description;
 }
 
 char *r2_visual_analyze_frame(const R2VisionFrame *frame,

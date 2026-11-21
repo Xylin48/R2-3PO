@@ -168,7 +168,7 @@ fi
 # This is localhost-only; no model downloads or external network requests occur.
 [[ -r "$R2_SOURCE/tools/preflight_ollama_model.py" ]] ||
     fail "shared Ollama inference preflight is missing: $R2_SOURCE/tools/preflight_ollama_model.py"
-log "Waiting for local Qwen 3.5 model availability and a real chat completion..."
+log "Waiting for local Llama 3.1 conversation and Qwen3-VL visual generation..."
 if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
     :
 else
@@ -217,7 +217,7 @@ else
         [[ "$R2_OLLAMA_PREFLIGHT_OK" == "1" ]] ||
             fail "Ollama did not pass preflight. See the last reported failure above; systemd will retry automatically."
     else
-        fail "Ollama did not complete a real qwen3.5:9b chat preflight under the active model policy. Check the local model/server; systemd will retry automatically."
+        fail "Ollama did not complete a real Llama 3.1 conversation and Qwen3-VL vision preflight under the active model policy. Check the local model/server; systemd will retry automatically."
     fi
 fi
 
@@ -259,7 +259,7 @@ R2_ENV=(/usr/bin/env
     "R2_GAMEBOY_EXECUTABLE=$R2_GAMEBOY_EXECUTABLE"
     "R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"
     "R2_GAMEBOY_DIR=$R2_GAMEBOY_DIR"
-    "R2_VISION_MODEL=qwen3.5:9b"
+    "R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M"
     "$R2_EXEC")
 
 # The inhibitor, when available, already wraps this entire runner and its child.
