@@ -59,7 +59,8 @@ class OvernightServiceTests(unittest.TestCase):
 
     def test_runner_checks_local_model_and_private_clock(self):
         source = (ROOT / "tools/r2_service_runner.sh").read_text(encoding="utf-8")
-        self.assertIn("qwen3.5:9b", source)
+        self.assertIn("Llama 3.1 conversation and Qwen3-VL visual generation", source)
+        self.assertIn("R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M", source)
         self.assertIn("refusing symlinked R2 database", source)
         self.assertIn("r2_fridge.db", source)
         self.assertIn("r2_rewards.db", source)
@@ -126,7 +127,8 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("R2_SERVICE_MODE=1", source)
         self.assertIn("r2-ollama.service", source)
         self.assertIn("Environment=R2_OLLAMA_BASE_URL=http://127.0.0.1:11435", source)
-        self.assertIn("Environment=R2_MODEL=qwen3.5:9b", source)
+        self.assertIn("Environment=R2_MODEL=llama3.1:8b", source)
+        self.assertIn("Environment=R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M", source)
         # GPU layer policy is selected by the runner from actual hardware or
         # an explicit override, not hard-coded in the systemd unit.
         self.assertNotIn("Environment=R2_OLLAMA_NUM_GPU=", source)
@@ -137,7 +139,8 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn('TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"', launcher)
         self.assertIn('if [ -e "$TEMP_EXEC" ] || [ -L "$TEMP_EXEC" ]; then', launcher)
         self.assertIn("preflight_ollama_model.py", launcher)
-        self.assertIn("qwen3.5:9b", launcher)
+        self.assertIn("Conversation model: llama3.1:8b", launcher)
+        self.assertIn("Visual perception model: qwen3-vl:4b-instruct-q4_K_M", launcher)
         self.assertLess(launcher.index("Checking the local Ollama API"), launcher.index('echo "[3/4] Recompiling R2..."'))
         self.assertIn("systemctl is-active --quiet r2-3po.service", launcher)
         self.assertIn("two R2 cores", launcher)
