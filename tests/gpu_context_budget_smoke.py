@@ -29,7 +29,7 @@ for label, source in (("interactive launcher", launcher), ("overnight service", 
     start = source.index("if run_as_r2 env" if source is launcher else
                          'if python3 "$R2_SOURCE/tools/preflight_ollama_model.py"',
                          source.index('echo "[preflight] Checking' if source is launcher else
-                                      'log "Waiting for local Qwen'))
+                                      'log "Waiting for local Llama 3.1 conversation and Qwen3-VL visual generation...'))
     block = source[start:source.index("\nfi\n", start) + len("\nfi\n")]
     setup = """
 set -euo pipefail
