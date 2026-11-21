@@ -151,7 +151,7 @@ Do **not** run a source-tree script with `sudo`. The checkout under `/home/x/R2_
 Do **not** copy the bootstrap directly from `/home/x/R2_Home/R2`: that tree is writable by `r2`, so checking it and then running `sudo install` from the same path leaves a time-of-check/time-of-use gap. Fetch the reviewed bootstrap from an immutable commit into the desktop user's home (outside the R2-writable tree), verify its Git blob ID, then install that exact file:
 
 ```sh
-BOOTSTRAP_COMMIT=b24a9f31e43371f5ce1028e2d5b6e33584c01750
+BOOTSTRAP_COMMIT=5ea1eed350a178cc6ad984e9c1dcaf0a7c56b405
 BOOTSTRAP_BLOB_SHA=9c34c9987a7ee023f020a265a9f1da2a9df8f66e
 umask 077
 curl -fsSL \
