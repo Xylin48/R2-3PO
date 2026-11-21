@@ -3676,11 +3676,24 @@ static int ollama_json_append_message_with_image_sources(struct json_object *arr
  * presented to Llama without changing or duplicating the user's exact words.
  * Failed visual inference must not become a fabricated observation. */
 static int ollama_append_visual_observation(struct json_object *array,
-                                            const char *source, const char *jpeg_base64)
+                                            const char *source, const char *jpeg_base64,
+                                            const atomic_uint_fast64_t *revision,
+                                            uint_fast64_t expected)
 {
     if (!jpeg_base64 || !*jpeg_base64) return 0;
-    char *description = r2_visual_describe_encoded_frame(
-        jpeg_base64, "Describe only what is visible in this frame. Distinguish direct visual evidence from uncertainty.");
+    R2VisionRequestSource origin = {revision, expected};
+    const R2VisionRequestSource *previous_origin = vision_request_source;
+    vision_request_source = &origin;
+    char *description = r2_vision_request_source_changed() ? NULL :
+        r2_visual_describe_encoded_frame(
+            jpeg_base64, "Describe only what is visible in this frame. Distinguish direct visual evidence from uncertainty.");
+    int source_changed = r2_vision_request_source_changed();
+    vision_request_source = previous_origin;
+    if (source_changed ||
+        (!strcmp(source, "MEDIA DISPLAY") && !atomic_load(&media_attention_selected))) {
+        free(description);
+        description = NULL;
+    }
     char *evidence = NULL;
     int rc;
     if (description) {
@@ -4534,6 +4547,8 @@ static char *ollama_chat_with_limit(
         const char *content = msgs[i].content ? msgs[i].content : "";
         char *owned_image = NULL;
         char *owned_media_image = NULL;
+        uint_fast64_t camera_revision = atomic_load(&eyes_source_revision);
+        uint_fast64_t media_revision = atomic_load(&media_source_revision);
         int active_foreground_turn = ollama_authoritative_user_query &&
             *ollama_authoritative_user_query &&
             strstr(content, ollama_authoritative_user_query);
@@ -4547,9 +4562,11 @@ static char *ollama_chat_with_limit(
         }
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
-        int append_rc = ollama_append_visual_observation(arr, "CAMERA", owned_image);
+        int append_rc = ollama_append_visual_observation(
+            arr, "CAMERA", owned_image, &eyes_source_revision, camera_revision);
         if (append_rc == 0)
-            append_rc = ollama_append_visual_observation(arr, "MEDIA DISPLAY", owned_media_image);
+            append_rc = ollama_append_visual_observation(
+                arr, "MEDIA DISPLAY", owned_media_image, &media_source_revision, media_revision);
         free(owned_media_image);
         free(owned_image);
         if (append_rc == 0)
