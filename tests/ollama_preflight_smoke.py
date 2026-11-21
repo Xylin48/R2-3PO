@@ -153,9 +153,9 @@ class OllamaPreflightSmoke(unittest.TestCase):
                  returncode=0, stdout="NVIDIA GeForce GTX 1050 Ti, 4096 MiB, 0 MiB", stderr=""
              )), contextlib.redirect_stderr(errors):
             self.assertFalse(probe.preflight(timeout=1, require_gpu_offload=True))
-        self.assertIn("mixed CPU/GPU placement was required", errors.getvalue())
+        self.assertIn("GPU offload was required", errors.getvalue())
 
-    def test_automatic_layer_placement_passes_only_with_verified_mixed_use(self) -> None:
+    def test_automatic_layer_placement_passes_with_verified_offload(self) -> None:
         replies = [
             {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},
             {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
@@ -171,6 +171,24 @@ class OllamaPreflightSmoke(unittest.TestCase):
             self.assertTrue(probe.preflight(timeout=1, require_gpu_offload=True))
         self.assertNotIn("num_gpu", read.call_args_list[1].kwargs["payload"]["options"])
         self.assertEqual(read.call_args_list[3].kwargs["payload"]["options"]["num_predict"], 512)
+
+    def test_fully_gpu_resident_vision_model_is_accepted(self) -> None:
+        # A 4B Qwen visual model can fit in VRAM even when Llama is split.
+        # Positive offload, not forced mixed placement, is the capability check.
+        replies = [
+            {"models": [{"name": probe.MODEL}, {"name": probe.VISION_MODEL}]},
+            {"done": True, "message": {"role": "assistant", "content": "R2_READY"}},
+            {"models": [{"name": probe.MODEL, "size": 500000, "size_vram": 123456}]},
+            {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}},
+            {"models": [{"name": probe.VISION_MODEL, "size": 123456, "size_vram": 123456}]},
+        ]
+        with patch.dict(probe.os.environ, {"R2_OLLAMA_NUM_GPU": "20"}), \
+             patch.object(probe, "_read_json", side_effect=replies) as read, \
+             patch.object(probe.subprocess, "run", return_value=SimpleNamespace(
+                 returncode=0, stdout="GTX 1050 Ti, 4096 MiB, 100 MiB", stderr=""
+             )):
+            self.assertTrue(probe.preflight(timeout=1, require_gpu_offload=True))
+        self.assertEqual(read.call_count, 5)
 
     def test_unapproved_non_loopback_endpoint_is_rejected(self) -> None:
         errors = io.StringIO()
@@ -244,7 +262,7 @@ class OllamaPreflightSmoke(unittest.TestCase):
         ]) as read, contextlib.redirect_stderr(errors):
             self.assertFalse(probe.preflight(timeout=1, require_gpu_offload=True))
         self.assertEqual(read.call_count, 5)
-        self.assertIn("mixed CPU/GPU placement was required", errors.getvalue())
+        self.assertIn("GPU offload was required", errors.getvalue())
 
     def test_missing_model_fails_without_waiting_or_network(self) -> None:
         errors = io.StringIO()
