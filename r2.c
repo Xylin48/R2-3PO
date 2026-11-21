@@ -3677,7 +3677,7 @@ static int ollama_append_visual_observation(struct json_object *array,
     if (description) {
         rc = asprintf(&evidence,
             "CURRENT %s VISUAL EVIDENCE (Qwen3-VL interpretation of one captured frame, "
-            "not an observation by the language model; motion between frames not established):\\n%s",
+            "not an observation by the language model; motion between frames not established):\n%s",
             source, description);
     } else {
         rc = asprintf(&evidence,
@@ -3694,7 +3694,7 @@ static int ollama_append_visual_observation(struct json_object *array,
 
 /* Keep one leading system turn for Llama, with ordered context sections. Keep the selected
  * sections in priority order, then preserve every conversational role,
- * tool result and image exactly as serialized. */
+ * tool result and translated visual evidence exactly as serialized. */
 static struct json_object *ollama_json_chat_messages(struct json_object *sections)
 {
     struct json_object *messages = json_object_new_array();
