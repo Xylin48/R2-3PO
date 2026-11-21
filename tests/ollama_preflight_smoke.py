@@ -340,6 +340,25 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertIn("HTTP 500 Internal Server Error", errors.getvalue())
         self.assertIn("CUDA out of memory while allocating KV cache", errors.getvalue())
 
+    def test_cli_identifies_only_reported_inference_capacity_errors(self) -> None:
+        tags = {"models": [{"name": "qwen3.5:9b"}]}
+        text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
+        for preceding in ([tags], [tags, text]):
+            for status, detail, expected in (
+                (500, "CUDA out of memory allocating buffers", probe.CAPACITY_EXIT),
+                (500, "image processor failed", 1),
+                (400, "bad request contains out of memory", 1),
+            ):
+                failure = urllib.error.HTTPError(
+                    "http://127.0.0.1:11434/api/chat", status, "Probe error", hdrs=None,
+                    fp=io.BytesIO(('{"error":"' + detail + '"}').encode()),
+                )
+                with self.subTest(status=status, detail=detail, phase=len(preceding)), \
+                     patch.object(probe.sys, "argv", ["preflight", "--timeout", "1"]), \
+                     patch.object(probe, "_read_json", side_effect=[*preceding, failure]), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(probe.main(), expected)
+
     def test_http_500_body_is_preserved_for_vision_generation(self) -> None:
         errors = io.StringIO()
         failure = urllib.error.HTTPError(

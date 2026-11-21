@@ -1426,6 +1426,31 @@ def oversized_imagination_request(binary: Path, workspace: Path, url: str) -> No
     print("PASS: an over-8-KiB request reached Imagination in full and survived restart in Choice Lab and Life Log.")
 
 
+def unreadable_startup_snapshot(binary: Path, workspace: Path, url: str) -> None:
+    database = workspace / "R2" / "r2_memory.db"
+    exact = "unreadable\x00startup fixture"
+    with sqlite3.connect(database) as db:
+        row_id = db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?,'fixture','2036-01-01','2036-01-01')", (exact,),
+        ).lastrowid
+    try:
+        query = "Hello R2, the azurite startup fixture is here."
+        run = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            input=f"{query}\nexit\n", capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert "Startup snapshot unavailable" in run.stderr
+        assert run.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, run.stderr
+        assert "R2-3PO: " + REPLY in run.stdout
+        with sqlite3.connect(database) as db:
+            assert db.execute("SELECT memory FROM memories WHERE id=?", (row_id,)).fetchone() == (exact,)
+    finally:
+        with sqlite3.connect(database) as db:
+            db.execute("DELETE FROM memories WHERE id=?", (row_id,))
+    print("PASS: an unreadable startup snapshot preserved the source bytes and allowed one first answer.")
+
+
 def oversized_startup_memory(binary: Path, workspace: Path, url: str) -> None:
     database = workspace / "R2" / "r2_memory.db"
     exact = "LONG_STARTUP_MEMORY_4982 " + ("é" * (17 * 1024 * 1024)) + " end of record ☃"
@@ -1632,6 +1657,7 @@ def main() -> int:
             recover_completed_hands_result(binary, workspace, url)
             gameboy_shell_cartridge_name(binary, workspace, url)
             oversized_imagination_request(binary, workspace, url)
+            unreadable_startup_snapshot(binary, workspace, url)
             oversized_startup_memory(binary, workspace, url)
             legacy_memory_only_startup(binary, workspace, url)
         finally:

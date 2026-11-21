@@ -294,7 +294,7 @@ static void check_context_and_isolated_inputs(void)
         {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
         {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
     };
-    answer = r2_chat_with_input_source(action_turn, 3, r2_conversation_system_prompt, query, 512, 60);
+    answer = r2_chat_with_input_source(action_turn, 3, r2_conversation_system_prompt, query, 512, 60, NULL);
     assert(answer && captured_contains(query) && captured_contains(tool_result));
     free(answer);
 
@@ -1137,6 +1137,51 @@ static void check_isolated_response_replay(void)
     assert(problem && !strcmp(problem, "embedded NUL byte") && offset == 2);
 }
 
+static int deny_memory_reads(void *data, int action, const char *table,
+                             const char *column, const char *schema, const char *origin)
+{
+    (void)data; (void)column; (void)schema; (void)origin;
+    return action == SQLITE_READ && table && !strcmp(table, "memories") ? SQLITE_DENY : SQLITE_OK;
+}
+
+static void check_first_answer_with_unavailable_source(void)
+{
+    const char *query = "Do you remember the azurite fixture?";
+    const char *life = "The azurite fixture links to a complete Life Log record.";
+    const char *memory = "The azurite fixture has this exact recovered memory.";
+    assert(db == NULL && sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY, memory TEXT, category TEXT, updated_at TEXT);"
+        "INSERT INTO memories VALUES(1,'The azurite fixture has this exact recovered memory.','fact','now');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(message_add("user", query) == 0);
+    assert(r2_log_event(R2_LOG_MEMORY, "retrieval_source_fixture", life, life, "fixture") > 0);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    r2_associative_query_cache_store(query, "azurite");
+    assert(sqlite3_set_authorizer(db, deny_memory_reads, NULL) == SQLITE_OK);
+    set_response("I can use what the Life Log recorded.", "stop", 1);
+    int requests = perform_count;
+    int64_t camera_before = unavailable_camera_events();
+    char *reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 1);
+    assert(captured_contains(query) && captured_contains(life));
+    assert(captured_contains("CURRENT TURN RETRIEVAL STATUS:") &&
+           captured_contains("could not be read fully: persistent memory"));
+    assert(!captured_contains(memory) && unavailable_camera_events() == camera_before);
+    free(reply);
+
+    assert(sqlite3_set_authorizer(db, NULL, NULL) == SQLITE_OK);
+    reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 2 && captured_contains(memory));
+    assert(!captured_contains("could not be read fully: persistent memory"));
+    free(reply);
+    context_cache_invalidate();
+    r2_associative_query_cache_clear();
+    message_free_all();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_foreground_input_provenance(void)
 {
     const char *query = "Hi, I missed you.";
@@ -1147,7 +1192,7 @@ static void check_foreground_input_provenance(void)
     for (int i = 0; i < 2; ++i) {
         /* Transcribed input remains speech even if logging its event failed. */
         r2_input_speech_event = i ? -1 : 0;
-        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60);
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60, NULL);
         assert(reply && captured_contains(query));
         assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
                                      "CURRENT USER INPUT: typed keyboard text."));
@@ -1238,6 +1283,7 @@ int main(void)
     check_foreground_context_review();
     check_failed_optional_history_review();
     check_compact_ranked_memory();
+    check_first_answer_with_unavailable_source();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");

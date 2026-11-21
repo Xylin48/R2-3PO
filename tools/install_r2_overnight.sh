@@ -10,7 +10,7 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
 fi
 
 BOOTSTRAP="/usr/local/sbin/r2-3po-install"
-EXPECTED_BOOTSTRAP_BLOB_SHA="b007ba62d34d160579efbcd6f9a66833d074378b"
+EXPECTED_BOOTSTRAP_BLOB_SHA="daab1b83c1e54f2e71c01e3cf5eaf58caeec7820"
 if [[ ! -f "$BOOTSTRAP" || -L "$BOOTSTRAP" || ! -x "$BOOTSTRAP" ]]; then
     echo "ERROR: the trusted root-owned R2 installer has not been installed." >&2
     echo "Use the immutable-commit and Git blob hash verification procedure in:" >&2

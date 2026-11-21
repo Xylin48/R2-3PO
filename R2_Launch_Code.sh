@@ -344,13 +344,17 @@ if [[ ! -r "$R2_SOURCE/tools/preflight_ollama_model.py" ]]; then
     read -p "Press Enter to exit..."
     exit 1
 fi
-if ! run_as_r2 env \
+if run_as_r2 env \
     R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
     R2_OLLAMA_NUM_CTX="${R2_OLLAMA_NUM_CTX:-}" \
     R2_OLLAMA_NUM_GPU="$R2_OLLAMA_NUM_GPU" \
     R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}" \
     python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
-    if [[ "$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&
+    :
+else
+    R2_OLLAMA_PREFLIGHT_STATUS=$?
+    if [[ "$R2_OLLAMA_PREFLIGHT_STATUS" == "75" &&
+          "$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&
           "$R2_NVIDIA_QUERY_OK" == "1" ]] &&
        printf '%s\n' "$R2_NVIDIA_GPU_NAMES" | grep -qi 'GTX 1050 Ti'; then
         R2_OLLAMA_PREFLIGHT_OK=0
@@ -382,6 +386,8 @@ if ! run_as_r2 env \
                         python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
                         R2_OLLAMA_PREFLIGHT_OK=1
                         break 2
+                    elif [[ "$?" != "75" ]]; then
+                        break 2
                     fi
                 done
             else
@@ -394,11 +400,13 @@ if ! run_as_r2 env \
                     python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --timeout 180 "${R2_OLLAMA_PREFLIGHT_ARGS[@]}"; then
                     R2_OLLAMA_PREFLIGHT_OK=1
                     break
+                elif [[ "$?" != "75" ]]; then
+                    break
                 fi
             fi
         done
         if [[ "$R2_OLLAMA_PREFLIGHT_OK" != "1" ]]; then
-            echo "ERROR: All configured GPU-layer/context preflight combinations failed."
+            echo "ERROR: The model did not pass preflight. See the last reported failure above."
             echo "R2 was NOT launched; check the local model/server logs."
             read -p "Press Enter to exit..."
             exit 1
@@ -406,7 +414,7 @@ if ! run_as_r2 env \
     else
         echo
         echo "R2 was NOT launched."
-        echo "The explicitly configured GPU/context policy failed the real model preflight."
+        echo "The real model preflight failed. See its reported cause above."
         echo "Start the local Ollama service and ensure 'ollama list' includes qwen3.5:9b."
         echo "If the model is missing, run: ollama pull qwen3.5:9b"
         echo "Then launch R2 again."
