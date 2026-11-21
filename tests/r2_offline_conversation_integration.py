@@ -281,7 +281,7 @@ class LocalOllama(BaseHTTPRequestHandler):
                 done_reason = "length"
                 message["content"] = "knowledge | The user said they keep"
         body = json.dumps({
-            "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
+            "model": "llama3.1:8b", "done": True, "done_reason": done_reason,
             "message": message,
         }).encode("utf-8")
         self.send_response(200)
