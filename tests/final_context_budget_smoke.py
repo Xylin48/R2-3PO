@@ -33,6 +33,11 @@ final_start = core.find("size_t final_input_bytes = 0;")
 final_end = core.find("const char *payload = json_object_to_json_string_ext(root", final_start)
 require(final_start > 0 and final_end > final_start,
         "completed visual evidence is budgeted before serialization")
+require("int translated_visual_inputs = 0;" in core
+        and "if (owned_image || owned_media_image)" in core
+        and "translated_visual_inputs = 1;" in core
+        and "if (translated_visual_inputs) {" in core[final_start - 80:final_start],
+        "only visual turns reallocate the final Llama generation budget; ordinary text turns remain unchanged")
 final_wire = core[final_start:final_end]
 require("json_object_array_length(chat_messages)" in final_wire
         and "json_object_get_string_len(content_value)" in final_wire
