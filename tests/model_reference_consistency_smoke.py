@@ -36,10 +36,10 @@ require(
     "startup memory selects complete recent records within the configured context budget",
 )
 require(
-    "currently configured local Ollama model" in conversation_qa
-    and "Gemma" not in conversation_qa
-    and "llama3" not in conversation_qa.lower(),
-    "live chat QA documentation avoids stale model names",
+    f"`{model}` handles conversation" in conversation_qa
+    and "`qwen3-vl:4b-instruct-q4_K_M` handles camera and TV frames" in conversation_qa
+    and "qwen3.5" not in conversation_qa,
+    "live QA tests both active models",
 )
 for stale_name in ("qwen3.5:9b", "gemma", "qwen2.5vl"):
     require(stale_name not in core.lower(), f"core source contains no stale {stale_name} model references")
