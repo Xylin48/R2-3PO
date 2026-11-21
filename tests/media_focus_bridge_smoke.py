@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chosen media focus carries independent live display pixels alongside camera Eyes."""
+"""Chosen media focus translates independently captured camera and display frames for Llama."""
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
@@ -65,7 +65,11 @@ turn = core[core.index("size_t ordered_count = r2_order_inference_messages("):
 assert "owned_image = r2_vision_current_frame_base64()" in turn
 assert "if (atomic_load(&media_attention_selected))" in turn
 assert "owned_media_image = r2_vision_media_current_frame_base64()" in turn
-assert "limits[i], owned_image, owned_media_image)" in turn
+assert 'ollama_append_visual_observation(arr, "CAMERA", owned_image)' in turn
+assert 'ollama_append_visual_observation(arr, "MEDIA DISPLAY", owned_media_image)' in turn
+assert "limits[i], NULL, NULL)" in turn
+assert 'r2_visual_describe_encoded_frame(' in core
+assert "CURRENT %s VISUAL INPUT: a frame was captured but visual interpretation" in core
 assert "free(owned_media_image);" in turn and "free(owned_image);" in turn
 
 diary = core[core.index("/* Autonomous reflection can deliberately use"):
@@ -83,4 +87,4 @@ close_sources = core[core.index("static int r2_eyes_stop_with_media(void)\n{"):
 assert "r2_eyes_stop_with_media();" in close_eyes
 assert "r2_eyes_stop_with_media();" in stop_eyes
 assert "r2_vision_media_set_attention(0);" in close_sources
-print("Autonomous media focus, primary camera priority, dual-image serialization and no forced interpretation passed.")
+print("Autonomous media focus, camera/display source identity, Qwen-to-Llama evidence, and no forced background interpretation passed.")
