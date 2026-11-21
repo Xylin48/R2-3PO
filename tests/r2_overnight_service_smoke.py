@@ -91,7 +91,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn('export HOME="$R2_ROOT"', source)
         self.assertIn('"HOME=$R2_ROOT"', source)
         self.assertIn("systemd-inhibit --what=sleep", source)
-        self.assertLess(source.index("exec systemd-inhibit"), source.index('log "Waiting for local Qwen 3.5 model availability and a real chat completion..."'))
+        self.assertLess(source.index("exec systemd-inhibit"), source.index('log "Waiting for local Llama 3.1 conversation and Qwen3-VL visual generation..."'))
         self.assertIn("FAKETIME_OFFSET=-852076800", source)
         self.assertIn("R2_EPOCH=$((REAL_EPOCH + FAKETIME_OFFSET))", source)
         self.assertNotIn('R2_START="1999-${CURRENT_MONTH}', source)
