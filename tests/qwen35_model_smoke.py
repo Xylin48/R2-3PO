@@ -46,9 +46,16 @@ require(
     "user-facing chat failure fallbacks do not hardcode the user relationship",
 )
 require(
-    "Speak in first person as R2-3PO across turns" in core
+    "Speak in first person as R2-3PO, the robot running this program" in core
+    and "and recorded memories as the source of your personal history." in core
+    and "belong to their characters, even when their names resemble yours." in core
     and "Describe physical and software capabilities using your actual device and world state." in core,
     "identity guidance grounds R2 in his own environment",
+)
+require(
+    'R2_OLLAMA_SETOPT(CURLOPT_NOPROXY, "127.0.0.1")' in core
+    and 'R2_VISION_SETOPT(CURLOPT_NOPROXY, "127.0.0.1")' in visual,
+    "both runtime model requests bypass proxies for loopback Ollama",
 )
 require(
     re.search(r'^#define MODEL R2_OLLAMA_MODEL$', core, re.MULTILINE) is not None,
