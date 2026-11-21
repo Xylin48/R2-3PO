@@ -217,7 +217,7 @@ else
         [[ "$R2_OLLAMA_PREFLIGHT_OK" == "1" ]] ||
             fail "Ollama did not pass preflight. See the last reported failure above; systemd will retry automatically."
     else
-        fail "Ollama did not complete a real qwen3.5:9b chat preflight under the active model policy. Check the local model/server; systemd will retry automatically."
+        fail "Ollama did not complete a real Llama 3.1 conversation and Qwen3-VL vision preflight under the active model policy. Check the local model/server; systemd will retry automatically."
     fi
 fi
 
@@ -259,7 +259,7 @@ R2_ENV=(/usr/bin/env
     "R2_GAMEBOY_EXECUTABLE=$R2_GAMEBOY_EXECUTABLE"
     "R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"
     "R2_GAMEBOY_DIR=$R2_GAMEBOY_DIR"
-    "R2_VISION_MODEL=qwen3.5:9b"
+    "R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M"
     "$R2_EXEC")
 
 # The inhibitor, when available, already wraps this entire runner and its child.
