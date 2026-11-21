@@ -240,6 +240,12 @@ int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char 
                                               const int64_t *review_ids, size_t review_count,
                                               const char *tool_result);
 
+/* Archive a runtime fallback and evaluate only the user and recorded tool evidence. */
+int64_t r2_log_conversation_turn_with_fallback(const char *user_text, const char *assistant_text,
+                                               const int64_t *speech_ids, size_t speech_count,
+                                               const int64_t *review_ids, size_t review_count,
+                                               const char *tool_result);
+
 /*
  * Structured self-state. Confidence is 0.0..1.0, or negative if unknown.
  * Records describe R2's expressed or explicitly evidenced state, not
@@ -301,6 +307,8 @@ int64_t r2_log_continuity_with_evidence(const char *item_key, const char *item_t
 int64_t r2_log_complete_reflection(int64_t diary_id);
 /* Retry every pending reflection once. Returns -1 if any remain blocked. */
 int r2_log_replay_reflections(void);
+/* Retry accepted conversation archives and evidence links in event order. */
+int r2_log_replay_conversation_archives(void);
 
 /* Link two events by a named relationship. */
 int r2_log_link(int64_t from_event_id, int64_t to_event_id,
@@ -350,6 +358,8 @@ typedef struct {
     size_t count;
 } R2LogRecordBatch;
 int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch);
+/* Implicit conversation retrieval skips internal initialization records. */
+int r2_log_search_conversation_records(const char *query, int limit, R2LogRecordBatch *batch);
 void r2_log_release_records(R2LogRecordBatch *batch);
 
 char *r2_log_search(const char *query, int limit);

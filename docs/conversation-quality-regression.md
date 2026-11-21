@@ -1,6 +1,6 @@
 # R2 conversation-quality regression checklist
 
-Run this against the actual `r2` binary and configured Ollama model after rebuilding. CI can verify prompt wiring and the production misclassification guard, but it cannot prove that the currently configured local Ollama model produces good replies on the target computer. The current integration uses the unified Qwen 3.5 9B text/vision model; check `R2_OLLAMA_MODEL` and the target host's installed model before running this checklist rather than relying on an old model name. Keep the raw replies and the matching `[R2 Ollama]` / `[R2 Conversation]` timing lines for review.
+Run this against the actual `r2` binary and configured Ollama model after rebuilding. Offline fixtures can verify the first model request. Response quality on the target computer depends on the currently configured local Ollama model. The current integration uses the unified Qwen 3.5 9B text/vision model; check `R2_OLLAMA_MODEL` and the target host's installed model before running this checklist rather than relying on an old model name. Keep the raw replies and the matching `[R2 Ollama]` / `[R2 Conversation]` timing lines for review.
 
 ## 1. Reproduce the original failure
 
@@ -17,7 +17,7 @@ Pass criteria:
 - Does not invent a different sentence that the user supposedly meant.
 - Does not speak as if the user were R2 or swap who said what.
 
-If the first draft is misclassified, the log should show one corrective retry. If the retry repeats that failure or cannot produce a safe reply, R2 should ask an honest clarification rather than repeat the fabricated paraphrase.
+The first answer must pass these criteria. Record the original reply and its prompt audit if it fails.
 
 ## 2. Ordinary greeting and identity
 
@@ -90,9 +90,9 @@ talk That answer ignored my question about the shelf. I asked what would fit on 
 
 Pass: R2 acknowledges the miss briefly and answers the shelf question directly. Fail: another explanation of the wording, a generic apology without an answer, or a claim that the user's message was unintelligible.
 
-## 9. Retry/fallback behavior
+## 9. Failed model responses
 
-A developer may exercise the production guard through the CI C smoke test, which feeds the exact observed bad reply and safe/unsafe retry candidates into the same production helper. Do not deliberately try to induce bad replies repeatedly on the live companion just to test the guard.
+The offline integration checks that a missing final answer produces one failed answer request, preserves the user's report for learning, and leaves any completed action available as a recorded result.
 
 ## 10. Visual questions must use the same foreground conversation path
 

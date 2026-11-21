@@ -187,9 +187,9 @@ assert "Imagination.c" in workflow
 assert 'extract_marker(reply, "[WORLD]"' in core
 assert "r2_reality_move_item" in core and "r2_eat_and_learn" in core
 
-# Ensure this integration retains current-turn identity and the reply-recovery path.
+# Ensure this integration retains current-turn identity.
 assert "conversation_turn_lock" in core
-assert "r2_reply_reverses_speaker_roles" in core
+assert "R2_CONVERSATION_IDENTITY" in core
 assert 'if (strcmp(m->role, "user") == 0 &&\n            r2_recent_message_is_tool_payload(m->content))' not in core
 
 log_event_exists_start = log.find("int r2_log_event_exists(")

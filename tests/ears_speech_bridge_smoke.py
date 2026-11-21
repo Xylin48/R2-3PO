@@ -45,7 +45,7 @@ assert "fwrite(output, 2U, count, normalized)" in convert
 assert 'source_rate != 48000U' in convert
 assert "r2_wav_put_u32(target_header + 24, 16000U)" in convert
 assert "system(" not in bridge and "popen(" not in bridge
-assert "seconds < 1U || seconds > 15U" in bridge
+assert "seconds < 1U || seconds > R2_EARS_MAX_WAV_SECONDS" in bridge
 assert "O_EXCL | O_CLOEXEC, 0600" in bridge
 assert "r2_ears_close(ears)" in bridge
 assert "unlink(wav_path)" in bridge and "unlink(transcript_path)" in bridge
@@ -84,7 +84,8 @@ assert re.search(
     shell, re.S
 ), "typed conversation must use the same shell_talk entry point as speech transcripts"
 assert 'strncasecmp(argument, "listen", 6)' in shell
-assert "ears listen [1-15 seconds]" in shell
+assert "ears listen [seconds]" in shell
+assert "parsed > R2_EARS_MAX_WAV_SECONDS" in shell
 assert 'R2_WHISPER_MODEL="${R2_WHISPER_MODEL:-}"' in launcher
 assert 'R2_WHISPER_CLI="${R2_WHISPER_CLI:-}"' in launcher
 assert "Local Whisper is not configured" in launcher

@@ -21,6 +21,11 @@ ALLOWED_API_BASES = {
     "http://127.0.0.1:11435",
 }
 MODEL = "qwen3.5:9b"
+CAPACITY_EXIT = 75  # Both launchers use this for a smaller default-placement probe.
+
+
+class CapacityError(RuntimeError):
+    """Ollama explicitly reported insufficient memory for inference."""
 
 def _is_required_model(item: Any) -> bool:
     """Match the requested Ollama model, not a similarly prefixed tag.
@@ -134,15 +139,26 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
     return f"HTTP {exc.code} {exc.reason} (Ollama returned no error body)"
 
 
+def _report_inference_http_error(exc: urllib.error.HTTPError, failure: str) -> None:
+    detail = _http_error_detail(exc)
+    print(f"ERROR: {failure}: {detail}", file=sys.stderr)
+    if exc.code in (500, 503, 507) and any(
+        reason in detail.lower()
+        for reason in ("out of memory", "requires more system memory",
+                       "not enough memory", "insufficient memory")
+    ):
+        raise CapacityError(detail)
+
+
 def _is_complete_assistant_turn(reply: dict[str, Any]) -> bool:
     """Match the core's non-streaming Ollama completion contract."""
     message = reply.get("message")
-    reason = reply.get("done_reason", "")
+    reason = reply.get("done_reason", "missing")
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and reply.get("done") is True
-        and isinstance(reason, str) and "\x00" not in reason and reason != "length"
+        and isinstance(reason, str) and bool(reason) and "\x00" not in reason and reason != "length"
     )
 
 
@@ -175,7 +191,7 @@ def _vision_probe_image_base64() -> str:
     return base64.b64encode(png).decode("ascii")
 
 
-def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload: bool = False) -> bool:
+def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload: bool = False) -> bool:
     """Check local model availability and one real, bounded inference."""
     try:
         api_base = _configured_api_base()
@@ -212,8 +228,8 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         return False
 
     options: dict[str, Any] = {
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "temperature": 0.7,
+        "top_p": 0.8,
         "top_k": 20,
         "min_p": 0.0,
         "presence_penalty": 1.5,
@@ -232,39 +248,35 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
         if 2048 <= requested_context <= 16384:
             context_tokens = requested_context
     options["num_ctx"] = context_tokens
-    # Exercise reasoning-enabled foreground generation with the real maximum
-    # answer budget. r2.c permits at most 2048 output tokens for a live reply;
-    # its larger context-dependent ceiling is not itself the requested budget.
-    options["num_predict"] = min(2048, max(256, context_tokens - 1536))
+    # Match the visible answer budget for a short foreground turn.
+    options["num_predict"] = 512 if context_tokens < 4096 else 1024
     # Match r2.c exactly: unset and explicit zero both use Ollama's automatic
     # placement. Only a nonzero explicit layer count becomes a num_gpu option.
     if ("R2_OLLAMA_NUM_GPU" in os.environ and
             os.environ["R2_OLLAMA_NUM_GPU"].strip() and gpu_layers != 0):
         options["num_gpu"] = gpu_layers
 
+    # Keep the expected answer in an earlier turn so the probe checks
+    # conversational role and context handling on the real model.
+    text_payload = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": "You are R2-3PO. Follow the user's request and preserve literal codes."},
+            {"role": "user", "content": "The local readiness code is R2_READY."},
+            {"role": "assistant", "content": "I have the readiness code."},
+            {"role": "user", "content": "What code did I give you? Return exactly the code and nothing else."},
+        ],
+        "stream": False,
+        "truncate": False,
+        "shift": False,
+        "think": False,
+        "keep_alive": "10m",
+        "options": options,
+    }
     try:
-        reply = _read_json(
-            f"{api_base}/api/chat",
-            timeout=timeout,
-            payload={
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": "Reply with exactly this token and no other text: R2_READY",
-                }],
-                "stream": False,
-                "truncate": False,
-                "shift": False,
-                "think": True,
-                "keep_alive": "10m",
-                "options": options,
-            },
-        )
+        reply = _read_json(f"{api_base}/api/chat", timeout=timeout, payload=text_payload)
     except urllib.error.HTTPError as exc:
-        print(
-            f"ERROR: Ollama listed {MODEL} but real chat generation failed: {_http_error_detail(exc)}",
-            file=sys.stderr,
-        )
+        _report_inference_http_error(exc, f"Ollama listed {MODEL} but real chat generation failed")
         return False
     except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
         print(f"ERROR: Ollama listed {MODEL} but real chat generation failed: {exc}", file=sys.stderr)
@@ -275,7 +287,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     if not isinstance(content, str) or not content.strip():
         thinking = message.get("thinking") if isinstance(message, dict) else None
         if isinstance(thinking, str) and thinking.strip():
-            detail = "Ollama returned thinking output but no final answer text, despite the reasoning-enabled foreground probe."
+            detail = "Ollama returned thinking output but no final answer text."
         else:
             detail = "Ollama returned an empty final answer field."
         print(f"ERROR: Ollama listed {MODEL} but chat generation produced no usable final answer. {detail}", file=sys.stderr)
@@ -337,10 +349,7 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
             },
         )
     except urllib.error.HTTPError as exc:
-        print(
-            f"ERROR: {MODEL} passed text generation but image-bearing chat failed: {_http_error_detail(exc)}",
-            file=sys.stderr,
-        )
+        _report_inference_http_error(exc, f"{MODEL} passed text generation but image-bearing chat failed")
         return False
     except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
         print(f"ERROR: {MODEL} passed text generation but image-bearing chat failed: {exc}", file=sys.stderr)
@@ -437,6 +446,13 @@ def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload
     return True
 
 
+def preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offload: bool = False) -> bool:
+    try:
+        return _preflight(wait_seconds, timeout, require_gpu_offload)
+    except CapacityError:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wait-seconds", type=float, default=0,
@@ -448,7 +464,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.timeout <= 0 or args.wait_seconds < 0:
         parser.error("--timeout must be positive and --wait-seconds cannot be negative")
-    return 0 if preflight(args.wait_seconds, args.timeout, args.require_gpu_offload) else 1
+    try:
+        return 0 if _preflight(args.wait_seconds, args.timeout, args.require_gpu_offload) else 1
+    except CapacityError:
+        return CAPACITY_EXIT
 
 
 if __name__ == "__main__":

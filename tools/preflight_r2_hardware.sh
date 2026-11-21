@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only deployment readiness report. Never installs, rebuilds, edits DBs, or starts/stops R2.
+# Read-only deployment readiness report. Checks database path permissions without opening SQLite.
 set -uo pipefail
 R2_ROOT="${R2_ROOT:-/home/x/R2_Home}"
 R2_SOURCE="${R2_SOURCE:-$R2_ROOT/R2}"
@@ -8,8 +8,8 @@ R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"
 OLLAMA_URL="${R2_OLLAMA_URL:-http://127.0.0.1:11434/api/tags}"
 
 # Run the complete report as the dedicated runtime account, with the same
-# supplementary audio group the interactive launcher grants R2. No persistent
-# ownership, ACL, or group-membership changes are made.
+# supplementary audio and video groups the interactive launcher grants R2.
+# No persistent ownership, ACL, or group-membership changes are made.
 if [[ "$(id -un)" != "r2" ]]; then
   if ! id r2 >/dev/null 2>&1; then
     printf '[FAIL] Linux account r2 is missing; cannot run runtime preflight.\n' >&2
@@ -19,13 +19,15 @@ if [[ "$(id -un)" != "r2" ]]; then
   R2_GID="$(id -g r2)"
   R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
   R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
-  AUDIO_GID="$(getent group audio 2>/dev/null | cut -d: -f3 || true)"
-  if [[ "$AUDIO_GID" =~ ^[0-9]+$ ]]; then
-    case ",$R2_RUNTIME_GROUPS," in
-      *,"$AUDIO_GID",*) ;;
-      *) R2_RUNTIME_GROUPS+=",${AUDIO_GID}" ;;
-    esac
-  fi
+  for DEVICE_GROUP in audio video; do
+    if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
+       [[ "$DEVICE_GID" =~ ^[0-9]+$ ]]; then
+      case ",$R2_RUNTIME_GROUPS," in
+        *,"$DEVICE_GID",*) ;;
+        *) R2_RUNTIME_GROUPS+=",${DEVICE_GID}" ;;
+      esac
+    fi
+  done
   if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
     printf '[FAIL] Could not resolve the r2 runtime identity.\n' >&2
     exit 1
@@ -169,6 +171,8 @@ for file in \
   deploy/r2-ollama.service \
   tools/r2_ollama_runner.sh \
   tools/copy_ollama_model.py \
+  tools/preflight_ollama_model.py \
+  tools/r2_install_root_bootstrap.sh \
   tools/install_r2_overnight.sh \
   tools/audit_r2_databases.py \
   tools/audit_r2_sound_assets.py \
@@ -177,9 +181,9 @@ for file in \
 done
 if [[ -x "$R2_EXEC" ]]; then pass "installed R2 executable exists"; else warn "installed executable missing; installer must build it before activation."; fi
 if have systemctl && systemctl is-active --quiet r2-3po.service 2>/dev/null; then
-  warn "overnight service is active; stop it before installation or database preflight."
+  warn "overnight service is active; stop it before final activation or taking deployment backups."
 elif have pgrep && pgrep -x r2 >/dev/null 2>&1; then
-  warn "interactive R2 is running; stop it before installation or database preflight."
+  warn "interactive R2 is running; stop it before final activation or taking deployment backups."
 else printf '[INFO] no active R2 core detected\n'; fi
 
 section "Dedicated user, workspace, and sound assets"
@@ -205,9 +209,10 @@ if [[ -d "$R2_ROOT" && -d "$R2_SOURCE" ]]; then
       fi
     done
     for database in "$R2_SOURCE/r2_memory.db" "$R2_SOURCE/r2_reality.db" "$R2_SOURCE/r2_fridge.db" "$R2_SOURCE/r2_rewards.db" "$R2_SOURCE/r2_addictions.db"; do
-      [[ -e "$database" ]] || continue
       if [[ -L "$database" ]]; then
         fail "refusing symlinked runtime database: $database"
+      elif [[ ! -e "$database" ]]; then
+        continue
       elif run_as_r2 test -f "$database" && run_as_r2 test -r "$database" && run_as_r2 test -w "$database"; then
         pass "r2 can read/write database $database"
       else
@@ -241,7 +246,18 @@ fi
 
 section "Ollama and unified Qwen 3.5 model"
 if TAGS="$(curl --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
-  if printf '%s' "$TAGS" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(m.get("name") == "qwen3.5:9b" or m.get("name","").startswith("qwen3.5:9b-") for m in d.get("models",[])) else 1)' >/dev/null 2>&1; then
+  if printf '%s' "$TAGS" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+models = data.get("models") if isinstance(data, dict) else None
+found = isinstance(models, list) and any(
+    isinstance(model, dict) and model.get("name") == "qwen3.5:9b"
+    for model in models
+)
+sys.exit(0 if found else 1)
+' >/dev/null 2>&1; then
     pass "local Ollama API responds and qwen3.5:9b is installed"
   else fail "Ollama responds but qwen3.5:9b is not installed"; fi
 else fail "Ollama API unreachable at $OLLAMA_URL"; fi
@@ -257,40 +273,13 @@ if have ollama; then
   # model is an inconsistent state (often another endpoint or a stale runner).
   # Do not kill it blindly; stop the owning service after identifying it.
   if have pgrep && pgrep -af '[l]lama-server' >/dev/null 2>&1 &&
-     ! printf '%s\n' "$OLLAMA_PS_OUTPUT" | awk 'NR > 1 && NF && $1 != "NAME" { found=1 } END { exit found ? 0 : 1 }'; then
-    fail "llama-server process exists but ollama ps reports no loaded model on the interactive endpoint; a separate or stale runner may be consuming GPU memory. Inspect: systemctl status ollama.service r2-ollama.service"
+     { [[ "$OLLAMA_PS_RC" -ne 0 ]] ||
+       ! printf '%s\n' "$OLLAMA_PS_OUTPUT" | awk 'NR > 1 && NF && $1 != "NAME" { found=1 } END { exit found ? 0 : 1 }'; }; then
+    fail "llama-server process exists but ollama ps cannot confirm a loaded model on the interactive endpoint; a separate or stale runner may be consuming GPU memory. Inspect: systemctl status ollama.service r2-ollama.service"
   fi
 else
   warn "ollama CLI not found on PATH."
 fi
-
-section "Read-only SQLite integrity"
-python3 - "$R2_SOURCE" <<'PY'
-import pathlib, sqlite3, sys
-from urllib.parse import quote
-root = pathlib.Path(sys.argv[1])
-names = ("r2_memory.db", "r2_reality.db", "r2_fridge.db", "r2_rewards.db", "r2_addictions.db")
-existing = bad = 0
-for name in names:
-    path = root / name
-    if path.is_symlink():
-        print(f"[FAIL] refusing symlinked database: {path}"); bad += 1; continue
-    if not path.exists():
-        print(f"[INFO] not created yet: {name}"); continue
-    existing += 1
-    try:
-        uri = "file:" + quote(str(path.resolve()), safe="/") + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=3) as db:
-            result = db.execute("PRAGMA integrity_check").fetchone()
-        if result and result[0] == "ok": print(f"[PASS] {name}: integrity_check=ok (read-only)")
-        else: print(f"[FAIL] {name}: integrity_check={result!r}"); bad += 1
-    except Exception as exc:
-        print(f"[FAIL] {name}: read-only check failed: {exc}"); bad += 1
-if not existing: print("[WARN] no existing database files; first-run DB initialization remains unverified")
-sys.exit(1 if bad else 0)
-PY
-db_rc=$?
-if [[ "$db_rc" -ne 0 ]]; then fail "existing database integrity check failed"; fi
 
 section "Audio, microphone, camera, TV, and emulator"
 if have mpg123 || have ffplay || have mpv; then pass "supported local MP3 playback process available"
@@ -383,6 +372,6 @@ if [[ "$FAILURES" -gt 0 ]]; then
 elif [[ "$WARNINGS" -gt 0 ]]; then
   printf 'CORE CHECKS PASSED WITH WARNINGS. Review optional device/audio/GUI warnings before relying on those features.\n'
 else
-  printf 'PREFLIGHT PASSED. Still test a real conversation and physical speaker/microphone/camera after activation.\n'
+  printf 'PREFLIGHT PASSED. Check local model inference and physical audio/camera independently before activation.\n'
 fi
 exit 0

@@ -2,6 +2,7 @@
 """Static safety/regression checks for R2's unattended overnight service."""
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,10 +40,15 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("atomic_is_lock_free(&shell_shutdown)", source)
         self.assertIn("static atomic_int tv_control_stop", source)
         self.assertIn("int server_fd = tv_control_fd", source)
-        self.assertIn("accept(server_fd", source)
+        self.assertIn("accept4(server_fd", source)
         core = (ROOT / "r2.c").read_text(encoding="utf-8")
         self.assertIn("r2_shutdown();", core)
-        self.assertIn("[R2 READY] Core initialized; entering shell.", core)
+        loop = source[source.index("int r2_shell_run(void)"):]
+        marker = loop.index("[R2 READY] Core initialized; entering shell.")
+        self.assertLess(loop.index("signal(SIGTERM, shell_signal_handler)"), marker)
+        self.assertLess(loop.index("tv_control_start()"), marker)
+        self.assertLess(loop.index("shell_watch_start()"), marker)
+        self.assertLess(loop.index("!sigismember(&pending, SIGTERM)"), marker)
         self.assertIn("static atomic_int shutting_down", core)
         self.assertIn("atomic_is_lock_free(&shutting_down)", core)
         self.assertIn("setvbuf(stdout, NULL, _IOLBF, 0)", core)
@@ -148,7 +154,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertNotIn("FAKETIME_OFFSET=$((R2_EPOCH - REAL_EPOCH))", launcher)
         self.assertIn("no relaunch reset", launcher)
         self.assertIn('R2_OLLAMA_TIMEOUT_SECONDS="${R2_OLLAMA_TIMEOUT_SECONDS:-}"', launcher)
-        self.assertIn('sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2', launcher)
+        self.assertIn('run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2', launcher)
         self.assertIn('if [[ -z "${R2_OLLAMA_NUM_GPU+x}" ]]; then', launcher)
         self.assertIn("GTX 1050 Ti", launcher)
         self.assertIn("export R2_OLLAMA_NUM_GPU=20", launcher)
@@ -156,7 +162,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("R2_RUNTIME_GROUPS=", launcher)
         self.assertIn('R2_RUNTIME_GROUPS+=",${DEVICE_GID}"', launcher)
         self.assertIn("for DEVICE_GROUP in audio video; do", launcher)
-        self.assertIn('sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --', launcher)
+        self.assertIn('R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --', launcher)
         self.assertNotIn('sudo -u r2 -g r2 -G "$R2_RUNTIME_GROUPS"', launcher)
         self.assertNotIn("usermod -aG audio", launcher)
 
@@ -177,14 +183,31 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("trap cleanup_on_exit EXIT", source)
         self.assertIn('run_as_r2 chmod 0755 "$R2_EXEC"', source)
         self.assertIn("refusing symlinked existing executable", source)
-        self.assertEqual(source.count("rollback_previous_executable || log"), 2)
+        self.assertEqual(source.count("rollback_previous_executable || log"), 3)
         self.assertLess(source.index('cp "$R2_EXEC" "$BACKUP_EXEC"'),
                         source.index('mv -f "$TEMP_EXEC" "$R2_EXEC"'))
         self.assertLess(
             source.index('python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60'),
             source.index('BACKUP_EXEC="$(run_as_r2 mktemp "$R2_ROOT/r2.previous.XXXXXX")"'),
         )
-        self.assertIn("systemctl enable --now r2-3po.service", source)
+        self.assertIn('if ! root_run systemctl start r2-3po.service; then', source)
+        self.assertLess(source.index('if ! wait_for_core_ready; then'),
+                        source.index('if ! root_run systemctl enable r2-3po.service; then'))
+        self.assertNotIn("systemctl enable --now r2-3po.service", source)
+        self.assertEqual(source.count("systemctl start r2-3po.service"), 1)
+        bootstrap = ROOT / "tools/r2_install_root_bootstrap.sh"
+        desktop = ROOT / "R2_Launch_Code.sh"
+        for entrypoint, args in (
+            (bootstrap, []),
+            (bootstrap, ["--help"]),
+            (bootstrap, ["--activate-reviewed", "extra"]),
+            (desktop, ["--help"]),
+            (desktop, ["--activate-reviewed", "extra"]),
+        ):
+            result = subprocess.run(["bash", str(entrypoint), *args], capture_output=True,
+                                    text=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("No action taken", result.stderr)
         self.assertIn("copy_ollama_model.py", source)
         self.assertIn("R2_OLLAMA_UNIT_EOF", source)
         self.assertIn("R2_SERVICE_UNIT_EOF", source)
@@ -275,6 +298,44 @@ root_run() {
                 self.assertEqual(result.stdout.splitlines()[-1], f"{status} {elapsed}")
 
 
+    def test_interrupted_activation_stops_core_before_restoring_executable(self):
+        source = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")
+        cleanup = source[source.index("cleanup_unit_staging() {"):
+                         source.index("wait_for_core_ready() {")]
+        for stop_status in (0, 1):
+            with self.subTest(stop_status=stop_status), tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                live = folder / "r2"
+                backup = folder / "previous"
+                live.write_text("candidate")
+                backup.write_text("previous")
+                script = """
+set -euo pipefail
+R2_ROOT="$1"
+R2_EXEC="$1/r2"
+BACKUP_EXEC="$1/previous"
+TEMP_EXEC="$1/pending"
+UNIT_STAGING_DIR=""
+INSTALL_SUCCEEDED=0
+NEW_EXEC_INSTALLED=1
+CORE_START_ATTEMPTED=1
+OLLAMA_STATE_CAPTURED=0
+STOP_STATUS="$2"
+log() { printf '%s\\n' "$*"; }
+root_run() {
+    [[ "$*" == "systemctl disable --now r2-3po.service" ]] || return 2
+    [[ "$(cat "$R2_EXEC")" == candidate ]] || return 2
+    printf 'stop attempted\\n'
+    return "$STOP_STATUS"
+}
+run_as_r2() { "$@"; }
+""" + cleanup + 'kill -TERM "$BASHPID"\n'
+                result = subprocess.run(["bash", "-c", script, "fixture", temp, str(stop_status)],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 143, result)
+                self.assertIn("stop attempted", result.stdout)
+                self.assertEqual(live.read_text(), "previous" if stop_status == 0 else "candidate")
+
     def test_installer_restores_private_ollama_state_after_early_failure(self):
         installer = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")
         self.assertIn("OLLAMA_WAS_ACTIVE=0", installer)
@@ -291,8 +352,9 @@ root_run() {
         self.assertIn("enabled|enabled-runtime|linked|linked-runtime) OLLAMA_WAS_ENABLED=1 ;;", installer)
         self.assertIn("OLLAMA_STATE_CAPTURED=1", installer)
         self.assertIn('if [[ "$INSTALL_SUCCEEDED" != "1"', installer)
-        self.assertIn('R2_ROLLBACK_RESTARTED=1', installer)
+        self.assertIn('systemctl disable --now r2-3po.service', installer)
         self.assertIn('INSTALL_SUCCEEDED=1', installer)
+        self.assertIn('--gameboy-root "$R2_ROOT/Devices/GameBoyAdvance"', installer)
         self.assertIn('run_as_r2 rm -f -- "$R2_EXEC"', installer)
         self.assertIn('root_run systemctl disable r2-3po.service >/dev/null 2>&1 || true', installer)
         self.assertIn('NEW_EXEC_INSTALLED=0', installer)

@@ -54,12 +54,16 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertTrue(read.call_args_list[1].args[0].endswith("/api/chat"))
         payload = read.call_args_list[1].kwargs["payload"]
         self.assertEqual(payload["model"], "qwen3.5:9b")
-        self.assertIs(payload["think"], True)
+        self.assertIs(payload["think"], False)
+        self.assertEqual([message["role"] for message in payload["messages"]],
+                         ["system", "user", "assistant", "user"])
+        self.assertIn("R2_READY", payload["messages"][1]["content"])
+        self.assertNotIn("R2_READY", payload["messages"][-1]["content"])
         self.assertIs(payload["truncate"], False)
         self.assertIs(payload["shift"], False)
-        self.assertEqual(payload["options"]["num_predict"], min(2048, max(256, payload["options"]["num_ctx"] - 1536)))
-        self.assertEqual(payload["options"]["temperature"], 1.0)
-        self.assertEqual(payload["options"]["top_p"], 0.95)
+        self.assertEqual(payload["options"]["num_predict"], 512 if payload["options"]["num_ctx"] < 4096 else 1024)
+        self.assertEqual(payload["options"]["temperature"], 0.7)
+        self.assertEqual(payload["options"]["top_p"], 0.8)
         self.assertEqual(payload["options"]["top_k"], 20)
         self.assertEqual(payload["options"]["min_p"], 0.0)
         self.assertEqual(payload["options"]["presence_penalty"], 1.5)
@@ -255,15 +259,15 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 self.assertFalse(probe.preflight(timeout=1))
         self.assertIn("chat generation produced no usable final answer", errors.getvalue())
 
-    def test_thinking_without_final_text_reports_the_actual_reasoning_mode(self) -> None:
-        errors = io.StringIO()
-        with patch.object(probe, "_read_json", side_effect=[
-            {"models": [{"name": "qwen3.5:9b"}]},
-            {"done": True, "message": {"role": "assistant", "content": "", "thinking": "internal reasoning only"}},
-        ]), contextlib.redirect_stderr(errors):
-            self.assertFalse(probe.preflight(timeout=1))
-        self.assertIn("despite the reasoning-enabled foreground probe", errors.getvalue())
-        self.assertNotIn("even with think=false", errors.getvalue())
+    def test_text_probe_does_not_replay_incomplete_answers(self) -> None:
+        for content, reason in (("R2_READY", "length"), ("", "stop")):
+            with self.subTest(reason=reason), patch.object(probe, "_read_json", side_effect=[
+                {"models": [{"name": "qwen3.5:9b"}]},
+                {"done": True, "done_reason": reason,
+                 "message": {"role": "assistant", "content": content, "thinking": "internal"}},
+            ]) as read, contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(probe.preflight(timeout=1))
+                self.assertEqual(read.call_count, 2)
 
     def test_nonmatching_foreground_reply_does_not_pass_preflight(self) -> None:
         errors = io.StringIO()
@@ -302,7 +306,9 @@ class OllamaPreflightSmoke(unittest.TestCase):
                 text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
                 image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
                 (image if vision else text)["done_reason"] = "length"
-                replies = [{"models": [{"name": "qwen3.5:9b"}]}, text, image]
+                replies = [{"models": [{"name": "qwen3.5:9b"}]}, text]
+                if vision:
+                    replies.append(image)
                 with patch.object(probe, "_read_json", side_effect=replies) as read, \
                      contextlib.redirect_stderr(io.StringIO()):
                     self.assertFalse(probe.preflight(timeout=1))
@@ -333,6 +339,25 @@ class OllamaPreflightSmoke(unittest.TestCase):
             self.assertFalse(probe.preflight(timeout=1))
         self.assertIn("HTTP 500 Internal Server Error", errors.getvalue())
         self.assertIn("CUDA out of memory while allocating KV cache", errors.getvalue())
+
+    def test_cli_identifies_only_reported_inference_capacity_errors(self) -> None:
+        tags = {"models": [{"name": "qwen3.5:9b"}]}
+        text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
+        for preceding in ([tags], [tags, text]):
+            for status, detail, expected in (
+                (500, "CUDA out of memory allocating buffers", probe.CAPACITY_EXIT),
+                (500, "image processor failed", 1),
+                (400, "bad request contains out of memory", 1),
+            ):
+                failure = urllib.error.HTTPError(
+                    "http://127.0.0.1:11434/api/chat", status, "Probe error", hdrs=None,
+                    fp=io.BytesIO(('{"error":"' + detail + '"}').encode()),
+                )
+                with self.subTest(status=status, detail=detail, phase=len(preceding)), \
+                     patch.object(probe.sys, "argv", ["preflight", "--timeout", "1"]), \
+                     patch.object(probe, "_read_json", side_effect=[*preceding, failure]), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(probe.main(), expected)
 
     def test_http_500_body_is_preserved_for_vision_generation(self) -> None:
         errors = io.StringIO()

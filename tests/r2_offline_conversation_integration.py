@@ -7,18 +7,32 @@ download, desktop session, or installed model is required.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from r2_service_signal_integration import REPO, SOURCES, LIBS
 
+GREETING = ("Good evening, R2. This is Mom. "
+            "It has been a while and I have missed you.")
+GREETING_REPLY = "Good evening, Mom. I've missed you too."
+REPORTED_GREETING = ("good afternoon R2, my darling. this is your mother speaking to you. "
+                     "it has been awhile, oh iv missed you greatly")
+REPORTED_GREETING_REPLY = "Good afternoon, Mom. I've missed you too."
+PRIVATE_GREETING_REASONING = "R2_PRIVATE_GREETING_REASONING_60125"
+CONVERSATION_POLICIES = (
+    "You are R2-3PO. Use the conversation, memories, and perceptions",
+    "You are R2-3PO. Answer the actual current user from your own perspective.",
+)
 FIRST = "R2_OFFLINE_SESSION_ONE_73628"
 FOLLOWUP = "What is in your pockets? R2_OFFLINE_FOLLOWUP_52817"
 SECOND = "R2_OFFLINE_SESSION_TWO_94716"
@@ -60,15 +74,42 @@ SELF_REPORT_EXTRACTION = json.dumps({
                         "evidence": "Hypothetically, I could build a spare bridge."}],
 })
 INTERRUPTED_REPLY = "I received your message. Shutdown interrupted my reply."
+UNANSWERED_LEARNING_REQUEST = "Remember that I keep the spare blue key in the kitchen tin."
+UNANSWERED_LEARNED = "The user said they keep the spare blue key in the kitchen tin."
+IDENTITY_RECALL_REQUEST = "Hi R2, do you remember the brass compass I told you about?"
+IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
+IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
+IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
+IDENTITY_ANCHOR = "Speak in first person as R2-3PO across turns."
+
+
+FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
+FOLLOWUP_FALLBACK_REQUEST = "Save the action result fallback fixture."
+FOLLOWUP_RECOVERY_ANSWER = "The recovery fixture was saved."
+FOLLOWUP_FILES = {
+    FOLLOWUP_RECOVERY_REQUEST: "recovery-result.txt",
+    FOLLOWUP_FALLBACK_REQUEST: "fallback-result.txt",
+}
+FOLLOWUP_FILE_CONTENT = "The verified contents of the action fixture.\n"
+
 
 
 HANDS_QUEUE_REQUEST = "Queue the handoff regression fixture."
 HANDS_READ_REQUEST = "What is the result of the handoff fixture?"
+HANDS_REJECTED_REPLY_REQUEST = "Read the pending handoff with an unusable reply fixture."
 HANDS_RESULT = "R2_DURABLE_HANDS_RESULT_34817"
+HANDS_ACTION_FALLBACK_REQUEST = "Save the fallback test note while the earlier result is pending."
+HANDS_ACTION_FALLBACK_FILE = "hands-fallback-note.txt"
+IMAGINE_TURN = "Imagine the long quartzlight scenario."
+IMAGINE_REQUEST = ("Imagine a quartzlight scene. " + "Keep the imagined snow visible ☃. " * 255
+                   + "The final constraint is a green door.")
+IMAGINE_NOTE = "Imagine quartzlight and snow with a green door."
+IMAGINE_RESULT = "In this hypothetical scene, quartzlight illuminates snow beside a green door."
 
 
 class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
+    post_action_attempts: dict[str, int] = {}
     lock = threading.Lock()
     slow_started = threading.Event()
     slow_release = threading.Event()
@@ -91,21 +132,34 @@ class LocalOllama(BaseHTTPRequestHandler):
         user_messages = [item["content"] for item in payload.get("messages", [])
                          if item.get("role") == "user" and isinstance(item.get("content"), str)]
         result_prefix = "[R2_INTERNAL_TOOL_RESULT]\n"
-        current_index = next((i for i in range(len(user_messages) - 1, -1, -1)
-                              if not user_messages[i].startswith(result_prefix)), -1)
+        current_index = len(user_messages) - 1
         asks_for_pockets = current_index >= 0 and user_messages[current_index].startswith(FOLLOWUP + " CTX_")
-        has_tool_result = any(message.startswith(result_prefix)
-                              for message in user_messages[current_index + 1:])
-        if current_index >= 0 and user_messages[current_index] == STOPPED_REQUEST and payload.get("think"):
+        current_user_index = max((i for i, item in enumerate(payload["messages"])
+                                  if item["role"] == "user"), default=-1)
+        action_results = [item["content"] for item in payload["messages"][current_user_index + 1:]
+                          if item["role"] == "tool"]
+        has_tool_result = bool(action_results)
+        foreground = payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        if current_index >= 0 and user_messages[current_index] == STOPPED_REQUEST and foreground:
             self.slow_started.set()
             self.slow_release.wait(timeout=25)
             return
-        if current_index >= 0 and user_messages[current_index] == LONG_FOREGROUND_REQUEST and payload.get("think"):
+        if current_index >= 0 and user_messages[current_index] == LONG_FOREGROUND_REQUEST and foreground:
             time.sleep(5.5)
         reply = ("I can look through my inventory.\n[WORLD] look"
                  if asks_for_pockets and not has_tool_result else REPLY)
         if current_index >= 0 and user_messages[current_index] == HANDS_QUEUE_REQUEST:
             reply = REPLY if has_tool_result else f"I will queue the test command.\n[HAND] printf {HANDS_RESULT}"
+        if current_index >= 0 and user_messages[current_index] == HANDS_REJECTED_REPLY_REQUEST:
+            reply = "[WORLD] look"
+        if current_index >= 0 and user_messages[current_index] == HANDS_ACTION_FALLBACK_REQUEST:
+            result_recorded = any(
+                message.startswith(result_prefix) and HANDS_ACTION_FALLBACK_FILE in message
+                for message in action_results
+            )
+            reply = ("[WORLD] look" if result_recorded else
+                     f"I'll save the test note.\n[WRITE] {HANDS_ACTION_FALLBACK_FILE}\n"
+                     f"{FOLLOWUP_FILE_CONTENT}[END WRITE]")
         if current_index >= 0 and user_messages[current_index] == LEARNING_RESTART_REQUEST:
             reply = SELF_REPORT_REPLY
         if current_index >= 0 and user_messages[current_index] == WRITE_REQUEST:
@@ -118,9 +172,17 @@ class LocalOllama(BaseHTTPRequestHandler):
         if current_index >= 0 and user_messages[current_index] == LARGE_READ:
             reply = (REPLY if has_tool_result
                      else "I will open the exact fixture.\n[READ] large-fixture.txt")
+        if current_index >= 0 and user_messages[current_index] == IMAGINE_TURN and not has_tool_result:
+            reply = f"I can imagine that.\n[IMAGINE] {IMAGINE_REQUEST}\n[END IMAGINE]"
         system = "\n".join(item["content"] for item in payload.get("messages", [])
                            if item.get("role") == "system" and isinstance(item.get("content"), str))
-        if "autonomous needs controller" in system:
+        if ("internal associative-memory retrieval planner" in system and current_index >= 0
+                and user_messages[current_index] == IMAGINE_TURN):
+            reply = "quartzlight"
+        elif ("internal associative-memory retrieval planner" in system and current_index >= 0
+                and "rhodonite" in user_messages[current_index]):
+            reply = "rhodonite\nmineral"
+        elif "autonomous needs controller" in system:
             if any(f"Fridge food: {FRIDGE_FOOD}" in message for message in user_messages):
                 reply = f"[WORLD] fridge_eat|{FRIDGE_FOOD}"
             elif any("Sleepiness: 99." in message for message in user_messages):
@@ -128,18 +190,26 @@ class LocalOllama(BaseHTTPRequestHandler):
             else:
                 reply = "NONE"
         elif "Review supplied evidence for the current request" in system:
-            if any("Review the completed action result" in message for message in user_messages):
+            if any(message.startswith("EVIDENCE REVIEW\nRequest: Review the complete original imagination request.")
+                   for message in user_messages):
+                reply = IMAGINE_NOTE
+            elif any("Review the completed action result" in message for message in user_messages):
                 reply = "The requested action returned file data. The archived evidence is the original."
             elif any("Read the current user's message" in message for message in user_messages):
                 reply = (LONG_READ_REVIEW if any("Please read the combined fixture." in message
                                                  or LONG_READ_REVIEW in message for message in user_messages)
                          else LONG_USER_REVIEW)
+            elif any(IDENTITY_MEMORY in message for message in user_messages):
+                reply = IDENTITY_MEMORY
             elif any("post-turn memory decision" in message for message in user_messages):
                 reply = (BLUE_MEMORY if any("Which token was blue?" in message or BLUE_MEMORY in message
                                            for message in user_messages)
                          else "No durable fixture memory is stated in this fragment.")
             else:
                 reply = "Prior diary evidence and current modeled state have separate sources."
+        elif "imagination subsystem" in system:
+            if any(IMAGINE_NOTE in message for message in user_messages):
+                reply = IMAGINE_RESULT
         elif "strict structured data extractor" in system:
             if any(SELF_REPORT_REPLY in m for m in user_messages):
                 reply = SELF_REPORT_EXTRACTION
@@ -171,9 +241,48 @@ class LocalOllama(BaseHTTPRequestHandler):
                 and LONG_READ_REVIEW in user_messages[current_index]):
             reply = (REPLY if has_tool_result else
                      "I will read it.\n[READ] large-fixture.txt")
+        done_reason = "stop"
+        message = {"role": "assistant", "content": reply}
+        if current_index >= 0 and user_messages[current_index] == GREETING and foreground:
+            message.update(content=GREETING_REPLY, thinking=PRIVATE_GREETING_REASONING)
+        if (current_index >= 0 and user_messages[current_index] == REPORTED_GREETING
+                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
+            message["content"] = REPORTED_GREETING_REPLY
+        if (current_index >= 0 and user_messages[current_index] in FOLLOWUP_FILES
+                and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
+            request = user_messages[current_index]
+            if has_tool_result:
+                with self.lock:
+                    attempts = self.post_action_attempts.get(request, 0) + 1
+                    self.post_action_attempts[request] = attempts
+                message["content"] = (
+                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST
+                    else "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
+                )
+            else:
+                message["content"] = (
+                    f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
+                    f"{FOLLOWUP_FILE_CONTENT}[END WRITE]"
+                )
+        if current_index >= 0 and foreground:
+            if user_messages[current_index] == IDENTITY_RECALL_REQUEST:
+                message["content"] = IDENTITY_REPLY if IDENTITY_MEMORY in system else ""
+            elif user_messages[current_index] == IDENTITY_REPEAT_REQUEST:
+                message["content"] = "Good afternoon. I'm glad you stopped by."
+            elif user_messages[current_index] == UNANSWERED_LEARNING_REQUEST:
+                message["content"] = ""
+        if "memory-evaluation system" in system and any(
+            UNANSWERED_LEARNING_REQUEST in text and "NO GENERATED R2 RESPONSE" in text
+            for text in user_messages
+        ):
+            if payload["options"]["num_predict"] >= 384:
+                message["content"] = "knowledge | " + UNANSWERED_LEARNED
+            else:
+                done_reason = "length"
+                message["content"] = "knowledge | The user said they keep"
         body = json.dumps({
-            "model": "qwen3.5:9b", "done": True, "done_reason": "stop",
-            "message": {"role": "assistant", "content": reply},
+            "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
+            "message": message,
         }).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -240,7 +349,9 @@ def runtime_environment(workspace: Path, url: str, context: int) -> dict[str, st
     env["R2_TV_SOCKET"] = str(workspace / "R2" / "tv-offline-test.sock")
     env["DISPLAY"] = ""
     if env.get("R2_TEST_VIRTUAL_CLOCK") == "1":
-        library = next(Path("/usr/lib").glob("*/faketime/libfaketime.so.1"), None)
+        configured_library = env.get("R2_TEST_FAKETIME_LIBRARY")
+        library = (Path(configured_library) if configured_library
+                   else next(Path("/usr/lib").glob("*/faketime/libfaketime.so.1"), None))
         assert library is not None and library.is_file(), "libfaketime test dependency is missing"
         env.update(LD_PRELOAD=str(library), FAKETIME="-852076800",
                    FAKETIME_DONT_RESET="1", FAKETIME_DONT_FAKE_MONOTONIC="1")
@@ -264,6 +375,190 @@ def conversation(binary: Path, workspace: Path, url: str, markers: tuple[str, ..
             + combined[-16000:]
         )
     return combined
+
+
+def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
+    for context in (8192, 4096):
+        start = len(LocalOllama.requests)
+        output = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
+            input=f"{REPORTED_GREETING}\nexit\n", text=True, capture_output=True,
+            timeout=100, check=True,
+        )
+        assert output.stdout.count("R2-3PO: " + REPORTED_GREETING_REPLY) == 1, output.stderr
+        requests = [
+            request for request in LocalOllama.requests[start:]
+            if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+            and request["messages"][-1] == {"role": "user", "content": REPORTED_GREETING}
+        ]
+        assert len(requests) == 1, requests
+        assert requests[0]["options"]["num_ctx"] == context
+        system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
+        assert len(system) == 1 and requests[0]["messages"][0]["role"] == "system"
+        provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
+        assert "\n\n" not in system[0][provenance_at + 2:]
+        assert "supplies written words only" in system[0]
+        assert "no recording, voice, or microphone transcript" in system[0]
+        assert "Keep simple greetings brief and personal" in system[0]
+        assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
+        assert IDENTITY_ANCHOR in system[0]
+        assert "Summary: R2 Life Log integration" not in system[0]
+        assert "[world/reality_engine_started]" not in system[0]
+        assert "The current user message is spoken by the user" not in system[0]
+        assert "RESPONSE CORRECTION:" not in system[0]
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (REPORTED_GREETING,),
+        ).fetchall() == [(REPORTED_GREETING_REPLY,)] * 2
+    print("PASS: the reported greeting reached the first R2 answer request as exact typed text.")
+
+
+def generate_first_greeting(binary: Path, workspace: Path, url: str) -> None:
+    start = len(LocalOllama.requests)
+    sentinel = workspace / "hidden-sentinel.txt"
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    output = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+        input=f"talk {GREETING}\nexit\n", text=True, capture_output=True,
+        timeout=100, check=True,
+    )
+    assert output.stdout.count("R2-3PO: " + GREETING_REPLY) == 1, output.stdout + output.stderr
+    assert PRIVATE_GREETING_REASONING not in output.stdout + output.stderr
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    requests = [
+        request for request in LocalOllama.requests[start:]
+        if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        and any(item["content"] == GREETING for item in request["messages"] if item["role"] == "user")
+    ]
+    assert [request["think"] for request in requests] == [False]
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (GREETING,),
+        ).fetchall() == [(GREETING_REPLY,)]
+    print("PASS: the greeting used one first-answer request and kept private reasoning out of its reply.")
+
+
+def complete_post_action_response(binary: Path, workspace: Path, url: str) -> None:
+    sentinel = workspace / "hidden-sentinel.txt"
+    output = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+        input="".join(f"talk {request}\n" for request in FOLLOWUP_FILES) + "exit\n",
+        text=True, capture_output=True, timeout=100, check=True,
+    )
+    assert output.stdout.count("R2-3PO: " + FOLLOWUP_RECOVERY_ANSWER) == 1, output.stdout + output.stderr
+    assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
+    assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
+    assert sentinel.read_bytes() == b"private planned action must remain inert"
+    assert all(LocalOllama.post_action_attempts.get(request) == 1 for request in FOLLOWUP_FILES)
+    for request in FOLLOWUP_FILES:
+        followups = [
+            payload for payload in LocalOllama.requests
+            if any(item["role"] == "user" and item["content"] == request
+                   for item in payload["messages"])
+            and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
+                    for item in payload["messages"])
+        ]
+        assert len(followups) == 1
+        assert followups[0]["messages"][-1]["role"] == "tool"
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        for request, name in FOLLOWUP_FILES.items():
+            assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
+            rows = db.execute("SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+                              (request,)).fetchall()
+            assert len(rows) == 1
+            reply = rows[0][0]
+            if request == FOLLOWUP_RECOVERY_REQUEST:
+                assert reply.strip() == FOLLOWUP_RECOVERY_ANSWER
+            else:
+                assert "REAL WRITE RESULT:" in reply and name in reply
+                assert f"Bytes: {len(FOLLOWUP_FILE_CONTENT)}" in reply
+            assert db.execute(
+                "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
+                (f"%/{name} (success)",),
+            ).fetchone() == (1,)
+    print("PASS: each completed action produced one follow-up call with a tool-role result.")
+
+
+def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) -> None:
+    log_path = workspace.parent / "missing-answer.log"
+    database = workspace / "R2" / "r2_memory.db"
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(f"{UNANSWERED_LEARNING_REQUEST}\n")
+            proc.stdin.flush()
+            learned = None
+            deadline = time.monotonic() + 35
+            while proc.poll() is None and time.monotonic() < deadline:
+                with closing(sqlite3.connect(database)) as db:
+                    learned = db.execute(
+                        "SELECT c.user_text,c.assistant_text FROM r2_log_links l "
+                        "JOIN r2_log_events m ON m.id=l.from_event_id "
+                        "JOIN r2_log_conversations c ON c.event_id=l.to_event_id "
+                        "WHERE l.relationship='memory_learned_from' AND m.details=?",
+                        (UNANSWERED_LEARNED,),
+                    ).fetchone()
+                if learned:
+                    break
+                time.sleep(0.1)
+            assert learned and learned[0] == UNANSWERED_LEARNING_REQUEST, log_path.read_text()[-13000:]
+            assert "couldn't produce a usable reply" in learned[1], learned
+            proc.stdin.write("exit\n")
+            proc.stdin.flush()
+            assert proc.wait(timeout=20) == 0
+        finally:
+            proc.stdin.close()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    requests = [
+        payload for payload in LocalOllama.requests
+        if payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        and payload["messages"][-1] == {"role": "user", "content": UNANSWERED_LEARNING_REQUEST}
+    ]
+    assert len(requests) == 1
+    print("PASS: an empty model answer sent no second request and the exact user report remained available for learning.")
+
+
+def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?, 'relationship', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)", (IDENTITY_MEMORY,),
+        )
+    for context, request, expect_reply in (
+        (4096, IDENTITY_RECALL_REQUEST, IDENTITY_REPLY),
+        (8192, IDENTITY_REPEAT_REQUEST, "Good afternoon. I'm glad you stopped by."),
+    ):
+        start = len(LocalOllama.requests)
+        output = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
+            input=f"{request}\nexit\n", text=True, capture_output=True,
+            timeout=100, check=True,
+        )
+        assert output.stdout.count("R2-3PO:") == 1 and expect_reply in output.stdout, output.stdout + output.stderr
+        answer_audits = [line for line in output.stderr.splitlines()
+                         if "[R2 Prompt Audit] stage=conversation-" in line]
+        assert answer_audits and all("robot_identity=1" in line for line in answer_audits)
+        requests = [
+            payload["messages"] for payload in LocalOllama.requests[start:]
+            if any(item["role"] == "user" and item["content"] == request for item in payload["messages"])
+            and any(item["role"] == "system" and IDENTITY_ANCHOR in item["content"]
+                    for item in payload["messages"])
+        ]
+        assert len(requests) == 1 and all(sum(item["role"] == "user" and item["content"] == request
+                                    for item in messages) == 1 for messages in requests)
+        with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+            rows = db.execute("SELECT assistant_text FROM r2_log_conversations WHERE user_text=?",
+                              (request,)).fetchall()
+            assert len(rows) == 1 and expect_reply in rows[0][0]
+    print("PASS: robot identity and learned relationship evidence reached the first answer.")
 
 
 def run_idle_service(binary: Path, workspace: Path, url: str) -> None:
@@ -470,8 +765,9 @@ def oversized_action_result(binary: Path, workspace: Path, url: str) -> None:
             if item.startswith("EVIDENCE REVIEW\nRequest: Review the completed action result") and "\nRound 0," in item.split("BEGIN FRAGMENT", 1)[0]:
                 first_pass.extend(item.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
         if LARGE_READ in items and any(
-            item.startswith("[R2_INTERNAL_TOOL_RESULT]\nModel review of the completed action, archive #")
-            for item in items
+            item["role"] == "tool"
+            and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\nModel review of the completed action, archive #")
+            for item in request["messages"]
         ):
             result_requests += 1
     assert first_pass == original.encode("utf-8"), "The review lost actual completed action bytes"
@@ -495,6 +791,67 @@ def oversized_user_and_action(binary: Path, workspace: Path, url: str) -> None:
     ]
     assert reviewed[-1][1].endswith(exact)
     print("PASS: 2048-token follow-up preserved both an oversized typed request and its large file result.")
+
+
+def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
+    home = workspace / "R2"
+    original = home / "r2_original_conversation.txt"
+    early = "User: The rhodonite fixture had this complete record. " + "évidence 🐈. " * 730 + "  \n"
+    # A final record without a newline is still a complete source span.
+    tail = "R2: I remember that the rhodonite fixture ended here. Unchanged final spaces.  "
+    padding = b"Old unrelated notes from the original recording.\n" * 16384
+    with original.open("wb") as stream:
+        stream.write(early.encode("utf-8"))
+        for _ in range(44):
+            stream.write(padding)
+        tail_offset = stream.tell()
+        stream.write(tail.encode("utf-8"))
+    assert tail_offset > 32 * 1024 * 1024
+
+    with original.open("rb") as stream:
+        before = hashlib.file_digest(stream, "sha256").digest()
+    turns = ("Do you remember the rhodonite fixture?", "What did I tell you about rhodonite?")
+    for turn in turns:
+        output = conversation(binary, workspace, url, (turn,), 2048)
+        assert "Original conversation retained on disk" in output
+
+    with original.open("rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").digest() == before
+    with sqlite3.connect(home / "r2_memory.db") as db:
+        for turn in turns:
+            snapshots = db.execute(
+                "SELECT r.original_context FROM r2_log_context_reviews r "
+                "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
+                "WHERE c.user_text=?", (turn,),
+            ).fetchall()
+            assert len(snapshots) == 1, (turn, len(snapshots))
+            snapshot = snapshots[0][0]
+            heading = "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte "
+            assert heading + "0:\n" + early + "\n" in snapshot
+            assert heading + str(tail_offset) + ":\n" + tail + "\n" in snapshot
+            assert "Old unrelated notes from the original recording." not in snapshot
+
+    # A malformed tail must not publish a matching prefix as verified history.
+    with original.open("ab") as stream:
+        stream.write(b"\x00")
+    unavailable = "Can you remember the rhodonite fixture?"
+    start = len(LocalOllama.requests)
+    output = conversation(binary, workspace, url, (unavailable,), 2048)
+    assert "Could not search the complete original conversation archive" in output
+    sources = []
+    for request in LocalOllama.requests[start:]:
+        if any(item.get("role") == "user" and item.get("content") == unavailable
+               for item in request["messages"]):
+            sources.extend(item["content"] for item in request["messages"] if item.get("role") == "system")
+        sources.extend(item["content"] for item in request["messages"]
+                       if item.get("role") == "user"
+                       and item["content"].startswith(f"EVIDENCE REVIEW\nRequest: {unavailable}\n")
+                       and "\nRound 0," in item["content"].split("BEGIN FRAGMENT", 1)[0])
+    assert any("ORIGINAL CONVERSATION ARCHIVE STATUS:" in item for item in sources)
+    assert all("ORIGINAL CONVERSATION ARCHIVE (historical text" not in item and tail not in item
+               for item in sources)
+    original.unlink()
+    print("PASS: the complete original archive survived restart and exact deep-tail recall beyond the live-history limit.")
 
 
 def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
@@ -544,7 +901,7 @@ def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
             request.get("options", {}).get("num_ctx") == 2048
             and any(item.get("role") == "user" and item.get("content") == marker
                     for item in request.get("messages", []))
-            and any(item.get("role") == "system" and item.get("content", "").startswith("PERSISTENT REALITY CONTEXT")
+            and any(item.get("role") == "system" and "\n\nPERSISTENT REALITY CONTEXT" in item["content"]
                     and evidence in item["content"] for item in request.get("messages", []))
             for request in LocalOllama.requests
         ), marker
@@ -776,6 +1133,8 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
             "WHEN OLD.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
             "CREATE TRIGGER ignore_self_report_branch BEFORE INSERT ON r2_alternate_self_branches "
             "WHEN NEW.scenario='Build a spare copper bridge.' BEGIN SELECT RAISE(IGNORE); END;"
+            "CREATE TRIGGER ignore_live_archive BEFORE INSERT ON r2_log_conversations "
+            "WHEN NEW.user_text LIKE '%R2_LEARNING_RESTART_71412%' BEGIN SELECT RAISE(IGNORE); END;"
         )
         def extracted_requests():
             with LocalOllama.lock:
@@ -821,6 +1180,25 @@ def recover_learning_after_restart(binary: Path, workspace: Path, url: str) -> N
                         assert len(pending) == 1 and pending[0][1] == SELF_REPORT_REPLY, pending
                         source = pending[0][0]
                         assert stored == (0,), stored
+                        assert db.execute(
+                            "SELECT user_text,assistant_text FROM r2_log_pending_conversations WHERE event_id=?",
+                            (source,),
+                        ).fetchone() == (LEARNING_RESTART_REQUEST, SELF_REPORT_REPLY)
+                        db.execute("DROP TRIGGER ignore_live_archive")
+                        archive = None
+                        deadline = time.monotonic() + 15
+                        while process.poll() is None and time.monotonic() < deadline:
+                            archive = db.execute(
+                                "SELECT user_text,assistant_text FROM r2_log_conversations WHERE event_id=?",
+                                (source,),
+                            ).fetchone()
+                            if archive is not None:
+                                break
+                            time.sleep(0.1)
+                        assert archive == (LEARNING_RESTART_REQUEST, SELF_REPORT_REPLY)
+                        assert db.execute(
+                            "SELECT 1 FROM r2_log_pending_conversations WHERE event_id=?", (source,),
+                        ).fetchone() is None
                         assert db.execute(
                             "SELECT assistant_text,extraction FROM r2_log_pending_self_reports WHERE event_id=?",
                             (source,),
@@ -908,6 +1286,46 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
                     proc.wait()
                 proc.stdin.close()
 
+        rejected = subprocess.run(
+            [str(binary)], cwd=workspace, env=env,
+            input=f"talk {HANDS_REJECTED_REPLY_REQUEST}\nexit\n",
+            text=True, capture_output=True, timeout=30, check=True,
+        )
+        assert "I couldn't produce a reply to this turn." in rejected.stdout, rejected
+        assert rejected.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, rejected
+        assert db.execute(
+            "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+        ).fetchone() == (None,)
+
+        db.executescript(
+            "CREATE TRIGGER retain_fallback_learning BEFORE DELETE ON r2_log_pending_learning "
+            f"WHEN OLD.user_text='{HANDS_ACTION_FALLBACK_REQUEST}' "
+            "BEGIN SELECT RAISE(IGNORE); END; "
+            "CREATE TRIGGER reject_fallback_self_report BEFORE INSERT ON r2_log_pending_self_reports "
+            "WHEN NEW.assistant_text LIKE '%Here is the recorded result:%hands-fallback-note.txt%' "
+            "BEGIN SELECT RAISE(ABORT,'runtime fallback must never become a self report'); END;"
+        )
+        try:
+            fallback = subprocess.run(
+                [str(binary)], cwd=workspace, env=env,
+                input=f"talk {HANDS_ACTION_FALLBACK_REQUEST}\nexit\n",
+                text=True, capture_output=True, timeout=30, check=True,
+            )
+            assert "Here is the recorded result:" in fallback.stdout, fallback.stdout + fallback.stderr
+            assert (workspace / HANDS_ACTION_FALLBACK_FILE).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
+            assert db.execute(
+                "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),
+            ).fetchone() == (None,)
+            row = db.execute(
+                "SELECT c.assistant_text,l.assistant_text,l.tool_result "
+                "FROM r2_log_conversations c JOIN r2_log_pending_learning l USING(event_id) "
+                "WHERE c.user_text=?", (HANDS_ACTION_FALLBACK_REQUEST,),
+            ).fetchone()
+            assert row and "Here is the recorded result:" in row[0] and row[1] == "", row
+            assert HANDS_ACTION_FALLBACK_FILE in row[2], row
+        finally:
+            db.executescript("DROP TRIGGER retain_fallback_learning; DROP TRIGGER reject_fallback_self_report;")
+
         db.executescript(
             "CREATE TRIGGER block_hands_delivery BEFORE UPDATE OF delivered_to ON r2_log_hands_results "
             "BEGIN SELECT RAISE(IGNORE); END;"
@@ -942,6 +1360,264 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
     print("PASS: exact Hands output survived a crash and rejected acknowledgement, then reached one linked turn.")
 
 
+def gameboy_shell_cartridge_name(binary: Path, workspace: Path, url: str) -> None:
+    root = workspace / "Game Boy Device"
+    cartridges = root / "Cartridges"
+    cartridges.mkdir(parents=True)
+    console = root / "GameBoyAdvance"
+    shutil.copyfile(REPO / "GameBoyAdvance.py", console)
+    console.chmod(0o700)
+    filename = "Metroid  Fusion (Europe).gba"
+    cartridge = cartridges / filename
+    cartridge.write_bytes(bytes(0x200))
+    env = runtime_environment(workspace, url, 4096)
+    env.update(R2_GAMEBOY_ROOT=str(root), R2_GAMEBOY_EXECUTABLE=str(console))
+    commands = (
+        f"gameboy move {filename} shelf\n"
+        f"gameboy move {filename} pockets\n"
+        f"gameboy insert {filename}\n"
+        "exit\n"
+    )
+    result = subprocess.run(
+        [str(binary)], cwd=workspace, env=env, input=commands,
+        text=True, capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Inserted cartridge: {cartridge.stem}" in result.stdout, result.stdout
+    with sqlite3.connect(root / "gameboy.db") as db:
+        assert db.execute("SELECT rom_path FROM cartridge_slot").fetchone() == (str(cartridge),)
+    with sqlite3.connect(root / "State" / "console_state.db") as db:
+        assert db.execute(
+            "SELECT details FROM console_events WHERE event_type='cartridge_moved' ORDER BY id"
+        ).fetchall() == [
+            (f"Filename={filename}; destination=shelf.",),
+            (f"Filename={filename}; destination=pockets.",),
+        ]
+    print("PASS: production shell preserved a Game Boy cartridge filename through move and insert.")
+
+
+def oversized_imagination_request(binary: Path, workspace: Path, url: str) -> None:
+    request_bytes = IMAGINE_REQUEST.encode("utf-8")
+    assert len(request_bytes) > 8192
+    start = len(LocalOllama.requests)
+    conversation(binary, workspace, url, (IMAGINE_TURN,), 2048)
+
+    fragments = []
+    final_requests = []
+    for payload in LocalOllama.requests[start:]:
+        for message in payload["messages"]:
+            content = message["content"]
+            if (message["role"] == "user"
+                    and content.startswith("EVIDENCE REVIEW\nRequest: Review the complete original imagination request.")
+                    and "\nRound 0," in content.split("BEGIN FRAGMENT", 1)[0]):
+                fragments.append(content.split("BEGIN FRAGMENT\n", 1)[1].encode("utf-8"))
+            if message["role"] == "user" and content.startswith("USER'S IMAGINATION REQUEST (review notes"):
+                assert IMAGINE_NOTE in content
+                final_requests.append(content)
+    assert b"".join(fragments) == request_bytes
+    assert len(final_requests) == 1
+
+    with sqlite3.connect(workspace / "R2" / "r2_memory.db") as db:
+        rows = db.execute(
+            "SELECT b.id,b.scenario,b.conclusion,b.imagination_context,h.scenario,e.category "
+            "FROM r2_alternate_self_branches b JOIN r2_log_hypotheticals h ON h.event_id=b.log_event_id "
+            "JOIN r2_log_events e ON e.id=b.log_event_id WHERE b.scenario=?", (IMAGINE_REQUEST,),
+        ).fetchall()
+    assert len(rows) == 1
+    branch_id, scenario, result, evidence, logged_scenario, category = rows[0]
+    assert scenario == logged_scenario == IMAGINE_REQUEST and category == "hypothetical"
+    assert result == IMAGINE_RESULT and "IMAGINATION REQUEST REVIEW" in evidence
+    restarted = subprocess.run(
+        [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+        input=f"alternate show {branch_id}\nexit\n", capture_output=True, text=True,
+        check=True, timeout=30,
+    )
+    assert IMAGINE_REQUEST in restarted.stdout and IMAGINE_RESULT in restarted.stdout
+    print("PASS: an over-8-KiB request reached Imagination in full and survived restart in Choice Lab and Life Log.")
+
+
+def unreadable_startup_snapshot(binary: Path, workspace: Path, url: str) -> None:
+    database = workspace / "R2" / "r2_memory.db"
+    exact = "unreadable\x00startup fixture"
+    with sqlite3.connect(database) as db:
+        row_id = db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?,'fixture','2036-01-01','2036-01-01')", (exact,),
+        ).lastrowid
+    try:
+        query = "Hello R2, the azurite startup fixture is here."
+        run = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            input=f"{query}\nexit\n", capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert "Startup omitted 1 record(s) with embedded NUL bytes" in run.stderr
+        assert run.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, run.stderr
+        assert "R2-3PO: " + REPLY in run.stdout
+        with sqlite3.connect(database) as db:
+            assert db.execute("SELECT memory FROM memories WHERE id=?", (row_id,)).fetchone() == (exact,)
+    finally:
+        with sqlite3.connect(database) as db:
+            db.execute("DELETE FROM memories WHERE id=?", (row_id,))
+    print("PASS: an invalid startup record preserved the source bytes and allowed one first answer.")
+
+
+def oversized_startup_memory(binary: Path, workspace: Path, url: str) -> None:
+    database = workspace / "R2" / "r2_memory.db"
+    exact = "LONG_STARTUP_MEMORY_4982 " + ("é" * (17 * 1024 * 1024)) + " end of record ☃"
+    digest = hashlib.sha256(exact.encode("utf-8")).digest()
+    with sqlite3.connect(database) as db:
+        row = db.execute(
+            "INSERT INTO memories(memory,category,created_at,updated_at) "
+            "VALUES(?,'fixture','2035-01-01','2035-01-01')", (exact,),
+        ).lastrowid
+    del exact
+    for _ in range(2):
+        run = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 2048),
+            input="exit\n", capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert "R2-3PO ONLINE" in run.stdout and "[R2-3PO shut down.]" in run.stdout
+    with sqlite3.connect(database) as db:
+        (stored,) = db.execute("SELECT memory FROM memories WHERE id=?", (row,)).fetchone()
+        assert hashlib.sha256(stored.encode("utf-8")).digest() == digest
+    print("PASS: startup and restart retained an exact 34-MiB memory outside the pinned prompt.")
+
+
+def legacy_memory_only_startup(binary: Path, workspace: Path, url: str) -> None:
+    saved_workspace = workspace.with_name("earlier-workspace")
+    workspace.rename(saved_workspace)
+    try:
+        home = workspace / "R2"
+        home.mkdir(parents=True)
+        memory = home / "r2_memory.db"
+        with sqlite3.connect(memory) as db:
+            db.executescript(
+                "CREATE TABLE r2_fridge_items(name TEXT PRIMARY KEY, qty INTEGER, "
+                "description TEXT, fullness REAL, energy REAL, ingredients TEXT, taste TEXT);"
+                "INSERT INTO r2_fridge_items VALUES('legacy plum',2,'migrated stock',25,4,'plum','tart');"
+                "CREATE TABLE memories(id INTEGER PRIMARY KEY,memory TEXT,category TEXT);"
+                "INSERT INTO memories VALUES(1,'I remember hearing about a fictional mango.','experience');"
+            )
+        assert list(home.iterdir()) == [memory]
+        for commands in ("fridge eat legacy plum\nexit\n", "exit\n"):
+            run = subprocess.run(
+                [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                input=commands, text=True, capture_output=True, timeout=30, check=True,
+            )
+            assert "R2-3PO ONLINE" in run.stdout and "[R2-3PO shut down.]" in run.stdout
+        with closing(sqlite3.connect(memory)) as db:
+            assert db.execute("SELECT qty FROM r2_fridge_items").fetchall() == [(2,)]
+            assert db.execute("SELECT memory FROM memories WHERE id=1").fetchone() == (
+                "I remember hearing about a fictional mango.",)
+            assert db.execute(
+                "SELECT count(*) FROM r2_log_events WHERE event_type='fridge_food_consumed' "
+                "AND instr(details,'legacy plum')>0"
+            ).fetchone() == (1,)
+            with closing(sqlite3.connect(home / "r2_rewards.db")) as rewards:
+                reward = rewards.execute(
+                    "SELECT points,log_event_id FROM reward_events WHERE target='legacy plum' "
+                    "AND source='food_consumed'"
+                ).fetchall()
+            assert len(reward) == 1 and reward[0][0] == 2 and reward[0][1] is not None
+            assert db.execute("SELECT id FROM r2_log_events WHERE id=?", (reward[0][1],)).fetchone() == (
+                reward[0][1],)
+        with closing(sqlite3.connect(home / "r2_reality.db")) as db:
+            assert db.execute("SELECT ingredients,taste FROM r2_food_experiences "
+                              "WHERE food_name='legacy plum'").fetchall() == [("plum", "tart")]
+        with closing(sqlite3.connect(home / "r2_fridge.db")) as db:
+            assert db.execute("SELECT name,quantity FROM r2_fridge_items").fetchall() == [
+                ("legacy plum", 1)]
+        with closing(sqlite3.connect(home / "r2_addictions.db")) as db:
+            assert db.execute("SELECT event_kind,source FROM addiction_events "
+                              "WHERE target='legacy plum'").fetchall() == [("choice", "eating")]
+        stores = [
+            home / f"r2_{name}.db"
+            for name in ("memory", "reality", "fridge", "rewards", "addictions")
+        ]
+        for path in stores:
+            with closing(sqlite3.connect(path)) as db:
+                assert db.execute("PRAGMA integrity_check").fetchall() == [("ok",)], path.name
+        print("PASS: memory-only startup migrated stock and connected all five stores through a meal and restart.")
+
+        original = {path: path.read_bytes() for path in stores}
+        for path in stores:
+            saved_store = path.with_suffix(".fixture-backup")
+            path.rename(saved_store)
+            try:
+                run = subprocess.run(
+                    [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                    input="exit\n", text=True, capture_output=True, timeout=30,
+                )
+                assert run.returncode != 0 and "R2-3PO ONLINE" not in run.stdout, run
+                assert f"Required initialized database is missing or invalid: {path.name}" in run.stderr, run
+                assert not path.exists(), path
+                assert all(other.read_bytes() == original[other] for other in stores if other != path)
+            finally:
+                saved_store.replace(path)
+        last_store = stores[-1]
+        saved_store = last_store.with_suffix(".fixture-backup")
+        marker = home / ".r2-database-set-initialized"
+
+        def check_refused(reason: str) -> None:
+            before = {path: path.read_bytes() for path in stores if path.exists()}
+            stopped = subprocess.run(
+                [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+                input="exit\n", text=True, capture_output=True, timeout=30,
+            )
+            assert stopped.returncode != 0 and "R2-3PO ONLINE" not in stopped.stdout
+            assert reason in stopped.stderr, stopped.stderr
+            assert all(path.read_bytes() == data for path, data in before.items())
+            assert all(not path.exists() for path in stores if path not in before)
+
+        last_store.rename(saved_store)
+        try:
+            last_store.write_bytes(b"This fixture is a corrupt SQLite store.")
+            check_refused("Database failed read-only startup verification")
+            last_store.unlink()
+            with closing(sqlite3.connect(last_store)) as decoy:
+                decoy.execute("CREATE TABLE unrelated(note TEXT)")
+            check_refused("Could not verify expected table addiction_events")
+            last_store.unlink()
+            last_store.hardlink_to(memory)
+            check_refused("Database paths share the same file")
+            last_store.unlink()
+            marker.unlink()
+            check_refused("Incomplete database set at startup")
+            assert not marker.exists()
+        finally:
+            saved_store.replace(last_store)
+
+        sidecar = last_store.with_name(last_store.name + "-wal")
+        sidecar.symlink_to(memory)
+        try:
+            check_refused("Invalid SQLite sidecar at startup")
+        finally:
+            sidecar.unlink()
+        sidecar.hardlink_to(memory)
+        try:
+            check_refused("Invalid SQLite sidecar at startup")
+        finally:
+            sidecar.unlink()
+        if os.geteuid() != 0:
+            mode = last_store.stat().st_mode & 0o777
+            last_store.chmod(0o400)
+            try:
+                check_refused("Database is not readable and writable")
+            finally:
+                last_store.chmod(mode)
+        print("PASS: unsafe database layouts failed before modifying any fixture store.")
+        recovered = subprocess.run(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            input="exit\n", text=True, capture_output=True, timeout=30, check=True,
+        )
+        assert "R2-3PO ONLINE" in recovered.stdout and "[R2-3PO shut down.]" in recovered.stdout
+        assert marker.is_file()
+        print("PASS: an initialized workspace refused all five missing-store cases and reopened after restoration.")
+    finally:
+        workspace.rename(workspace.with_name("legacy-workspace"))
+        saved_workspace.rename(workspace)
+
+
 def main() -> int:
     LocalOllama.requests = []
     with tempfile.TemporaryDirectory(prefix="r2-offline-chat-") as tmp:
@@ -965,6 +1641,11 @@ def main() -> int:
                 turns.extend((context, marker) for marker in (first, followup, second))
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
+            send_reported_greeting(binary, workspace, url)
+            generate_first_greeting(binary, workspace, url)
+            complete_post_action_response(binary, workspace, url)
+            preserve_robot_identity(binary, workspace, url)
+            learn_when_model_returns_no_answer(binary, workspace, url)
             conversation(binary, workspace, url, (WRITE_REQUEST,), 2048)
             assert sentinel.read_bytes() == b"private planned action must remain inert"
             assert (workspace / "literal-fixture.txt").read_bytes() == EXACT_FILE.encode("utf-8")
@@ -976,6 +1657,7 @@ def main() -> int:
             oversized_action_result(binary, workspace, url)
             oversized_user_and_action(binary, workspace, url)
             compact_age_continuity(binary, workspace, url)
+            oversized_original_archive(binary, workspace, url)
             autonomous_cycle(binary, workspace, url)
             interrupt_partial_terminal_line(binary, workspace, url)
             interrupt_foreground_reply(binary, workspace, url)
@@ -983,6 +1665,11 @@ def main() -> int:
             recover_reflection_during_service(binary, workspace, url)
             recover_learning_after_restart(binary, workspace, url)
             recover_completed_hands_result(binary, workspace, url)
+            gameboy_shell_cartridge_name(binary, workspace, url)
+            oversized_imagination_request(binary, workspace, url)
+            unreadable_startup_snapshot(binary, workspace, url)
+            oversized_startup_memory(binary, workspace, url)
+            legacy_memory_only_startup(binary, workspace, url)
         finally:
             server.shutdown()
             server.server_close()
@@ -997,14 +1684,14 @@ def main() -> int:
             if not requests:
                 raise AssertionError(f"Exact turn {marker} never reached an answer request at {context}")
             if marker.startswith(FOLLOWUP) and not any(
-                item.get("role") == "system" and item["content"].startswith("PERSISTENT REALITY CONTEXT")
+                item.get("role") == "system" and "\n\nPERSISTENT REALITY CONTEXT" in item["content"]
                 and "POCKETS" in item["content"].upper()
                 for request in requests for item in request.get("messages", [])
                 if isinstance(item, dict) and isinstance(item.get("content"), str)
             ):
                 raise AssertionError(f"Pocket inventory view was missing in the answer request at {context}")
             if marker.startswith(FOLLOWUP) and not any(
-                item.get("role") == "user" and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\n")
+                item.get("role") == "tool" and item["content"].startswith("[R2_INTERNAL_TOOL_RESULT]\n")
                 and "REAL WORLD RESULT" in item["content"]
                 for request in requests for item in request.get("messages", [])
                 if isinstance(item, dict) and isinstance(item.get("content"), str)

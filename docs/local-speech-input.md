@@ -5,7 +5,7 @@ this project accepts text and images, not raw microphone PCM, so microphone
 capture alone cannot make spoken words part of a conversation. The explicit
 `ears listen` command connects the layers:
 
-1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects one exact 1–15 second interval without changing either live source.
+1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects one exact interval without changing either live source.
 2. Write that captured interval to a temporary raw WAV in a private `0700` directory.
 3. Convert **only the completed temporary clip** to 16 kHz, mono, 16-bit PCM WAV for `whisper.cpp` (using an exact 3:1 downsampling ratio and averaging stereo sample groups). The original audio buffers and live capture formats remain unchanged.
 4. Run a local `whisper.cpp` `whisper-cli` executable against the converted WAV and a local GGML Whisper model.
@@ -34,7 +34,7 @@ launching R2:
 ```sh
 export R2_WHISPER_MODEL=/home/x/R2_Home/models/ggml-base.en.bin
 export R2_WHISPER_CLI=/usr/local/bin/whisper-cli
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 Adjust the paths to match the actual installed model and executable. If
@@ -61,10 +61,16 @@ This is a deliberate tool action, not an automatic consequence of microphone
 capture. Recent-buffer listening requires Ears continuous capture to be active.
 - `ears stop` — stop continuous capture and clear its transient audio buffer.
 
-The capture duration is limited to 1–15 seconds. Local transcription is
-terminated if it exceeds 90 seconds or R2 begins shutting down. If the model
-or executable is missing, R2 reports that speech recognition is unavailable
-instead of pretending it understood audio.
+Recent mode uses only audio still available in that source's rolling 16-second
+buffer. Live mode streams the selected interval to the private file and can
+run longer than the buffer. The PCM WAV size field limits the longest clip.
+If the selected source changes before capture completes or the collector
+falls behind the rolling buffer, the incomplete recording is discarded.
+
+Local transcription can be cancelled and shuts down with R2. Its deadline
+is 90 seconds for clips up to 15 seconds and six seconds per second of audio
+for longer clips. If the model or executable is missing, speech recognition
+is unavailable.
 
 ## Watch coordinator
 
@@ -107,7 +113,7 @@ different node, set `R2_CAMERA_DEVICE` before launching R2, for example:
 
 ```sh
 export R2_CAMERA_DEVICE=/dev/video2
-/home/x/R2_Home/R2_Launch_Code.sh
+/home/x/R2_Home/R2_Launch_Code.sh --activate-reviewed
 ```
 
 The selected V4L2 device must support the current capture mode (640×480 at

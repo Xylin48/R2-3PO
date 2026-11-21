@@ -51,43 +51,22 @@ static int is_hidden_close(const char *p, size_t *length)
    must not close the outer block early and expose the intervening text. */
 static const char *find_hidden_close_balanced_until(const char *p,
                                                      const HiddenBlock *block,
-                                                     const char *limit)
+                                                     const char *limit,
+                                                     const HiddenBlock **stack,
+                                                     size_t capacity)
 {
-    /*
-       Bound stack memory by actual nested tag openings. When sanitizing code,
-       limit the search to that code span so a literal opener cannot pair with
-       a closing token from unrelated prose or another example.
-    */
-    size_t nested_open_count = 0;
-    const char *scan = p;
-    while (*scan && (!limit || scan < limit)) {
-        const HiddenBlock *nested = NULL;
-        const char *after_open = find_hidden_open(scan, &nested);
-        if (after_open && (!limit || after_open <= limit)) {
-            if (nested_open_count == (size_t)-1) return NULL;
-            ++nested_open_count;
-            scan = after_open;
-        } else {
-            ++scan;
-        }
-    }
-
-    if (nested_open_count == (size_t)-1) return NULL;
-    size_t capacity = nested_open_count + 1;
-    if (capacity > (size_t)-1 / sizeof(const HiddenBlock *)) return NULL;
-    const HiddenBlock **stack = malloc(capacity * sizeof(*stack));
-    if (!stack) return NULL;
-
+    if (!capacity) return NULL;
     size_t depth = 1;
     stack[0] = block;
     while (*p && (!limit || p < limit)) {
+        if (*p != '<') {
+            ++p;
+            continue;
+        }
         const HiddenBlock *opened = NULL;
         const char *after_open = find_hidden_open(p, &opened);
         if (after_open && (!limit || after_open <= limit)) {
-            if (depth >= capacity) {
-                free(stack);
-                return NULL;
-            }
+            if (depth >= capacity) return NULL;
             stack[depth++] = opened;
             p = after_open;
             continue;
@@ -102,10 +81,7 @@ static const char *find_hidden_close_balanced_until(const char *p,
             const char *expected = stack[depth - 1]->close;
             if (!strncasecmp(p, expected, strlen(expected))) {
                 --depth;
-                if (depth == 0) {
-                    free(stack);
-                    return p;
-                }
+                if (depth == 0) return p;
             }
             /* A close for an outer tag cannot close through an unclosed
                nested tag. Ignore it until the nested block is closed. */
@@ -114,7 +90,6 @@ static const char *find_hidden_close_balanced_until(const char *p,
         }
         ++p;
     }
-    free(stack);
     return NULL;
 }
 
@@ -279,9 +254,17 @@ char *r2_reply_sanitize_with_literals(const char *reply,
     }
     /* Code examples keep their tag delimiters but replace the body with a
        fixed placeholder, so reserve space for every possible expansion. */
-    if (block_count > ((size_t)-1 - len - 1) / 32) return NULL;
+    if (block_count > ((size_t)-1 - len - 1) / 32 ||
+        block_count > (size_t)-1 / sizeof(const HiddenBlock *)) return NULL;
     char *clean = malloc(len + block_count * 32 + 1);
     if (!clean) return NULL;
+    /* The initial tag count also bounds nesting depth. Reuse one stack so
+       each block only scans through its own matching close. */
+    const HiddenBlock **stack = block_count ? malloc(block_count * sizeof(*stack)) : NULL;
+    if (block_count && !stack) {
+        free(clean);
+        return NULL;
+    }
 
     size_t src = 0, dst = 0;
     size_t inline_ticks = 0;
@@ -290,6 +273,7 @@ char *r2_reply_sanitize_with_literals(const char *reply,
     char fence_char = 0;
     size_t fence_length = 0;
     size_t fence_close_after = (size_t)-1;
+    const char *fence_close = NULL;
     while (src < len) {
         if (fence_close_after != (size_t)-1 && src >= fence_close_after) {
             in_fence = 0;
@@ -334,6 +318,7 @@ char *r2_reply_sanitize_with_literals(const char *reply,
                 in_fence = 1;
                 fence_char = opening_char;
                 fence_length = opening_length;
+                fence_close = NULL;
                 src += prefix_length;
                 continue;
             }
@@ -360,20 +345,21 @@ char *r2_reply_sanitize_with_literals(const char *reply,
 
         int inside_code = in_fence || inline_ticks != 0;
         const HiddenBlock *block = NULL;
-        const char *after_open = find_hidden_open(start + src, &block);
+        const char *after_open = start[src] == '<' ? find_hidden_open(start + src, &block) : NULL;
         if (after_open) {
             const char *code_limit = NULL;
-            if (in_fence)
-                code_limit = reply_find_fence_close(start, len, src,
-                                                    fence_char, fence_length);
-            else if (inline_ticks != 0 && inline_close_pos != (size_t)-1)
+            if (in_fence) {
+                if (!fence_close)
+                    fence_close = reply_find_fence_close(start, len, src, fence_char, fence_length);
+                code_limit = fence_close;
+            } else if (inline_ticks != 0 && inline_close_pos != (size_t)-1)
                 code_limit = start + inline_close_pos;
             if (inside_code && code_limit && after_open > code_limit) {
                 clean[dst++] = start[src++];
                 continue;
             }
             const char *close = find_hidden_close_balanced_until(
-                after_open, block, inside_code ? code_limit : NULL);
+                after_open, block, inside_code ? code_limit : NULL, stack, block_count);
             if (!close) {
                 if (inside_code) {
                     size_t open_len = (size_t)(after_open - (start + src));
@@ -412,13 +398,14 @@ char *r2_reply_sanitize_with_literals(const char *reply,
         }
 
         size_t close_len = 0;
-        if (is_hidden_close(start + src, &close_len) && !inside_code) {
+        if (start[src] == '<' && !inside_code && is_hidden_close(start + src, &close_len)) {
             src += close_len;
             continue;
         }
 
         clean[dst++] = start[src++];
     }
+    free(stack);
     clean[dst] = '\0';
     trim_reply(clean);
 

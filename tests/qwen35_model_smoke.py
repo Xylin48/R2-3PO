@@ -46,10 +46,9 @@ require(
     "user-facing chat failure fallbacks do not hardcode the user relationship",
 )
 require(
-    "You are not merely a generic AI assistant." in core
-    and "answer honestly" in core
-    and "Never claim an unverified capability." in core,
-    "identity guidance avoids generic AI disclaimers without denying the robot's actual environment",
+    "Speak in first person as R2-3PO across turns" in core
+    and "Describe physical and software capabilities using your actual device and world state." in core,
+    "identity guidance grounds R2 in his own environment",
 )
 require(
     re.search(r'^#define MODEL R2_OLLAMA_MODEL$', core, re.MULTILINE) is not None,
@@ -155,17 +154,10 @@ require(
     "empty final answers are written to the R2 error log with model/stage diagnostics",
 )
 require(
-    'int allow_reasoning = ollama_audit_stage &&' in core
-    and '"conversation-answer"' in core
-    and '"conversation-retry"' in core
-    and 'ollama_json_object_add_checked(root, "think",' in core
-    and "message.thinking is measured for diagnostics but never displayed" in core,
-    "foreground answer and corrective retry can reason while only final content is user-facing",
-)
-require(
-    "double temperature = allow_reasoning ? 1.0 : 0.7;" in core
-    and "double top_p = allow_reasoning ? 0.95 : 0.8;" in core,
-    "foreground reasoning uses Qwen3.5 thinking-mode sampling while helper calls retain non-thinking sampling",
+    'ollama_json_object_add_checked(root, "think",\n                                       json_object_new_boolean(0))' in core
+    and '"temperature", json_object_new_double(0.7)' in core
+    and '"top_p", json_object_new_double(0.8)' in core,
+    "the first answer uses the non-thinking sampler and reserves output tokens for the answer",
 )
 for setting, expected in [
     ('"top_k", json_object_new_int(20)', "top_k=20"),
@@ -201,10 +193,8 @@ require(
     and "safe_max = (int)requested;" in core
     and "int context_is_configured = 0;" in core
     and "int fitted_output_floor = input_fitted_output < 64" in core
-    and "r2_recent_conversation_context_complete(query)" in core
     and "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):" in core
-    and "if (r2_ollama_context_tokens() <= 4096)" in core
-    and "static const char compact_retry_system_prompt[]" in core
+    and "static const char r2_compact_conversation_policy[]" in core
     and 'R2_OLLAMA_ADD_OPTION("num_batch", json_object_new_int(128));' in core
     and "size_t identity_used = 0;" in core
     and "size_t reality_used = 0;" in core
@@ -347,20 +337,19 @@ conversation_impl_end = core.find("\nchar *r2_talk(const char *message)", conver
 conversation_impl = core[conversation_impl_start:conversation_impl_end]
 require(
     conversation_impl_start >= 0 and conversation_impl_end > conversation_impl_start
-    and "Conversation generation failed after one refreshed retry" in conversation_impl
+    and "Conversation generation failed; preserving the user turn." in conversation_impl
     and "Your message hasn't been discarded" in conversation_impl
     and "message_rollback_turn(message)" not in conversation_impl,
     "conversation failures preserve the user turn even if allocating an in-core fallback fails",
 )
 require(
     "reply_has_visible_text" in core
-    and "Model output contained no visible reply after marker cleanup; retrying once." in core
-    and "Retry still produced no visible reply" in core,
-    "empty or marker-only model output triggers recovery and never intentionally drops a turn without a fallback",
+    and "I couldn't produce a reply to this turn." in core,
+    "empty or marker-only model output reports the failed turn without model replay",
 )
 
 require(
-    "Follow-up generation failed after one refreshed retry; returning a visible reply and preserving the action result." in core
+    "reply = recorded_action_reply(tool_evidence);" in core
     and "Tool processing failed; returning a visible reply and preserving the user turn." in core
     and "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in core
     and "goto finalize_reply;" in core,
@@ -385,19 +374,19 @@ require(
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
     and "Append the internal assistant tool-call and its tool-result as one logical" in core
     and "Cannot fit complete assistant/tool history pair without evicting protected context." in core
-    and "i != preserve_index && !evict[i] && !messages.items[i].pinned" in core
+    and "i != preserve_index && !evict[i] && !message_is_protected(&messages.items[i])" in core
     and "raw [WORLD]/[RUN]/etc. commands into later model context" in core
     and "do not repeat it unless the user asks again" in core,
     "tool-result history stays atomic and trusted while executed control syntax is not replayed as dialogue",
 )
 
 tool_pair_start = core.find('const char tool_result_prefix[] = "[R2_INTERNAL_TOOL_RESULT]\\n"')
-tool_pair_end = core.find("reply = chat_with_relevant_memories(message);", tool_pair_start)
+tool_pair_end = core.find("chat_with_relevant_memories(message);", tool_pair_start)
 require(
     tool_pair_start >= 0 and tool_pair_end > tool_pair_start
-    and "Here is the recorded result:\\n%s" in core[tool_pair_start:tool_pair_end]
-    and "reply = tools;" in core[tool_pair_start:tool_pair_end]
-    and core.find("free(tools);", tool_pair_start) > core.find("if (pair_rc != 0)", tool_pair_start),
+    and "Here is the recorded result:\\n%s" in core
+    and "tool_evidence = tools;" in core[tool_pair_start:tool_pair_end]
+    and "reply = recorded_action_reply(tool_evidence);" in core[tool_pair_start:tool_pair_end],
     "if tool-history persistence fails, R2 retains and reports the actual tool result without rerunning the action",
 )
 
@@ -414,7 +403,7 @@ require(
 require(
     "if (r2_reality_tick() != 0)" in core
     and "preserving the previous snapshot" in core
-    and "Retry could not refresh Reality/learning context" in core,
+    and "Could not refresh state after the completed action" in core,
     "Reality tick failures are reported and never silently treated as a successful context refresh",
 )
 require(

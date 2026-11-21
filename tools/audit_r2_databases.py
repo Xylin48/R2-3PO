@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -42,8 +43,44 @@ def _readonly_connection(path: Path) -> sqlite3.Connection:
     return db
 
 
+def _existing_sqlite_paths(path: Path) -> list[Path]:
+    candidates = [path, *(path.with_name(path.name + suffix)
+                          for suffix in ("-wal", "-shm", "-journal"))]
+    return [candidate for candidate in candidates
+            if candidate.exists() or candidate.is_symlink()]
+
+
+def _invalid_database_path(path: Path, existing: list[Path]) -> str | None:
+    for candidate in existing:
+        if candidate.is_symlink():
+            return f"SQLite path is a symlink; refusing to follow it: {candidate.name}"
+        if not candidate.is_file():
+            return f"SQLite path is not a regular file: {candidate.name}"
+    if existing and path not in existing:
+        return "database file is missing but SQLite sidecars exist: " + ", ".join(
+            candidate.name for candidate in existing
+        )
+    return None
+
+
 def snapshot_database(source: Path, destination: Path) -> None:
     """Create a private, consistent SQLite backup without changing the source."""
+    conflicts = _existing_sqlite_paths(destination)
+    if conflicts:
+        raise FileExistsError(f"refusing existing snapshot path: {conflicts[0]}")
+    busy_since: float | None = None
+
+    def check_backup_progress(status: int, _remaining: int, _total: int) -> None:
+        nonlocal busy_since
+        if status not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            busy_since = None
+            return
+        now = time.monotonic()
+        if busy_since is None:
+            busy_since = now
+        elif now - busy_since >= 2.0:
+            raise sqlite3.OperationalError("database remained locked during snapshot")
+
     source_db: sqlite3.Connection | None = None
     target_db: sqlite3.Connection | None = None
     created = False
@@ -53,8 +90,8 @@ def snapshot_database(source: Path, destination: Path) -> None:
         fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         os.close(fd)
         created = True
-        target_db = sqlite3.connect(destination)
-        source_db.backup(target_db)
+        target_db = sqlite3.connect(destination, timeout=2.0)
+        source_db.backup(target_db, pages=256, progress=check_backup_progress, sleep=0.05)
         target_db.commit()
     except Exception:
         if target_db is not None:
@@ -73,13 +110,16 @@ def snapshot_database(source: Path, destination: Path) -> None:
             target_db.close()
 
 
-def _path_has_symlink_component(root: Path, relative: str) -> bool:
-    current = root
-    for part in Path(relative).parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
+def _database_paths(root: Path, gameboy_root: Path | None) -> dict[str, Path]:
+    paths = {name: root / name for name in ALL_DATABASES}
+    if gameboy_root is not None:
+        for name in OPTIONAL_DATABASES:
+            paths[name] = gameboy_root / Path(name).relative_to("Devices/GameBoyAdvance")
+    return paths
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    return any(component.is_symlink() for component in (*reversed(path.parents), path))
 
 
 def _reject_snapshot_symlink_components(path: Path) -> None:
@@ -90,35 +130,42 @@ def _reject_snapshot_symlink_components(path: Path) -> None:
             raise OSError(f"refusing symlinked snapshot destination: {component}")
 
 
-def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
+def create_snapshot_set(root: Path, snapshot_dir: Path, *,
+                        gameboy_root: Path | None = None) -> list[Path]:
     """Create snapshots for required and present optional DBs, never overwriting."""
     _reject_snapshot_symlink_components(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     _reject_snapshot_symlink_components(snapshot_dir)
-    targets = [snapshot_dir / name for name in ALL_DATABASES]
-    conflicts = [path for path in targets if path.exists() or path.is_symlink()]
+    conflicts = [path for name in ALL_DATABASES
+                 for path in _existing_sqlite_paths(snapshot_dir / name)]
     if conflicts:
         joined = ", ".join(str(path.relative_to(snapshot_dir)) for path in conflicts)
         raise FileExistsError(f"refusing to mix with existing snapshot file(s): {joined}")
 
     # Refuse a database or parent-directory symlink before reading/copying it.
-    linked_sources = [name for name in ALL_DATABASES
-                      if _path_has_symlink_component(root, name)]
+    paths = _database_paths(root, gameboy_root)
+    linked_sources = [name for name, path in paths.items() if _path_has_symlink_component(path)]
     if linked_sources:
         joined = ", ".join(linked_sources)
         raise OSError(f"refusing symlink database path(s): {joined}")
 
+    sources = []
+    for name, path in paths.items():
+        existing = _existing_sqlite_paths(path)
+        error = _invalid_database_path(path, existing)
+        if error is not None:
+            raise OSError(f"{name}: {error}")
+        if existing:
+            sources.append(name)
+
     created: list[Path] = []
     try:
-        for name in ALL_DATABASES:
-            source = root / name
-            if not source.is_file():
-                continue
+        for name in sources:
             destination = snapshot_dir / name
             _reject_snapshot_symlink_components(destination.parent)
             destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _reject_snapshot_symlink_components(destination.parent)
-            snapshot_database(source, destination)
+            snapshot_database(paths[name], destination)
             created.append(destination)
     except Exception:
         for path in created:
@@ -131,17 +178,20 @@ def create_snapshot_set(root: Path, snapshot_dir: Path) -> list[Path]:
 
 
 def audit_database(path: Path) -> dict[str, Any]:
+    existing = _existing_sqlite_paths(path)
     report: dict[str, Any] = {
         "path": str(path),
-        "exists": path.is_file() or path.is_symlink(),
+        # An incomplete store with orphaned sidecars needs review as well.
+        "exists": bool(existing),
         "integrity": None,
         "tables": {},
         "legacy_phantom_food_records": [],
         "foreign_key_violations": [],
         "error": None,
     }
-    if path.is_symlink():
-        report["error"] = "database path is a symlink; refusing to follow it"
+    error = _invalid_database_path(path, existing)
+    if error is not None:
+        report["error"] = error
         return report
     if not report["exists"]:
         report["error"] = "database file not found"
@@ -225,8 +275,9 @@ def _relationship_check(
         if source_table not in source_tables or target_table not in target_tables:
             result["reason"] = "legacy schema is missing a source or target table"
             return result
-        if source_column not in _table_columns(source_db, source_table) or \
-           target_column not in _table_columns(target_db, target_table):
+        source_columns = _table_columns(source_db, source_table)
+        target_columns = _table_columns(target_db, target_table)
+        if source_column not in source_columns or target_column not in target_columns:
             result["reason"] = "legacy schema is missing a source or target column"
             return result
         qs = '"' + source_table.replace('"', '""') + '"'
@@ -252,21 +303,39 @@ def _relationship_check(
             ("r2_log_links", "from_event_id"),
             ("r2_log_links", "to_event_id"),
         }
-        select_sql = f"SELECT {qc} FROM {qs}" + ("" if required else f" WHERE {qc} IS NOT NULL")
-        values = [row[0] for row in source_db.execute(select_sql)]
+        select_columns = qc
+        match_conditions = ""
+        if (source_table == "reward_once_keys"
+                and {"target", "source"} <= source_columns & target_columns):
+            # Reward retries resolve a receipt by ID and its owning key.
+            select_columns += ", target, source"
+            match_conditions = " AND target=? AND source=?"
+        select_sql = f"SELECT {select_columns} FROM {qs}" + (
+            "" if required else f" WHERE {qc} IS NOT NULL"
+        )
+        # These older reward records use zero for a relationship that has
+        # not been established yet. Check every populated ID.
+        if (source_table, source_column) in {
+            ("reward_events", "log_event_id"),
+            ("reward_once_keys", "reward_event_id"),
+        }:
+            select_sql += f" AND {qc} <> 0"
         qt = '"' + target_table.replace('"', '""') + '"'
         qtc = '"' + target_column.replace('"', '""') + '"'
         orphan_values: list[Any] = []
         orphan_count = 0
-        for value in values:
+        checked_rows = 0
+        for row in source_db.execute(select_sql):
+            value = row[0]
+            checked_rows += 1
             if value is None or target_db.execute(
-                f"SELECT 1 FROM {qt} WHERE {qtc}=? LIMIT 1", (value,)
+                f"SELECT 1 FROM {qt} WHERE {qtc}=?{match_conditions} LIMIT 1", tuple(row)
             ).fetchone() is None:
                 orphan_count += 1
                 if len(orphan_values) < 50:
                     orphan_values.append(value)
         result["status"] = "checked"
-        result["checked_rows"] = len(values)
+        result["checked_rows"] = checked_rows
         result["orphan_count"] = orphan_count
         result["orphan_values"] = orphan_values
     except sqlite3.Error as exc:
@@ -282,7 +351,7 @@ def audit_relationships(
     connections: dict[str, sqlite3.Connection | None] = {}
     for name in ("r2_memory.db", "r2_rewards.db"):
         path = root / name
-        if not path.is_file() or path.is_symlink():
+        if reports[name]["error"] is not None or not reports[name]["exists"]:
             connections[name] = None
             continue
         try:
@@ -317,6 +386,7 @@ def audit_relationships(
         ("r2_memory.db", "r2_sensory_journal_reflection_links", "event_id", "r2_memory.db", "r2_log_events", "id"),
         ("r2_memory.db", "r2_sensory_journal_reflection_links", "diary_entry_id", "r2_memory.db", "diary_entries", "id"),
         ("r2_rewards.db", "reward_events", "log_event_id", "r2_memory.db", "r2_log_events", "id"),
+        ("r2_rewards.db", "reward_once_keys", "reward_event_id", "r2_rewards.db", "reward_events", "id"),
     ]
     output = []
     try:
@@ -332,14 +402,13 @@ def audit_relationships(
     return output
 
 
-def audit_root(root: Path) -> dict[str, Any]:
+def audit_root(root: Path, *, gameboy_root: Path | None = None) -> dict[str, Any]:
     reports: dict[str, dict[str, Any]] = {}
-    for name in ALL_DATABASES:
-        path = root / name
-        if _path_has_symlink_component(root, name):
+    for name, path in _database_paths(root, gameboy_root).items():
+        if _path_has_symlink_component(path):
             reports[name] = {
                 "path": str(path),
-                "exists": path.exists() or path.is_symlink(),
+                "exists": True,
                 "integrity": None,
                 "tables": {},
                 "legacy_phantom_food_records": [],
@@ -504,6 +573,10 @@ def main() -> int:
                         help="R2 data directory containing SQLite database files")
     parser.add_argument("--snapshot-dir", type=Path,
                         help="optional destination for non-overwriting SQLite snapshots")
+    parser.add_argument("--gameboy-root", type=Path,
+                        help="installed Game Boy directory when it is outside --root")
+    parser.add_argument("--legacy-memory-only", action="store_true",
+                        help="allow a snapshotted memory-only installation with structured legacy state")
     parser.add_argument("--visual-library", type=Path,
                         help="compare a Visual JPEG directory with its SQLite index")
     parser.add_argument("--visual-db", type=Path,
@@ -514,12 +587,15 @@ def main() -> int:
     if args.visual_db is not None and args.visual_library is None:
         parser.error("--visual-db requires --visual-library")
 
+    if args.legacy_memory_only and args.snapshot_dir is None:
+        parser.error("--legacy-memory-only requires --snapshot-dir")
+
     audit_root_path = args.root
     snapshot_errors: list[str] = []
     snapshot_created = False
     if args.snapshot_dir is not None:
         try:
-            created = create_snapshot_set(args.root, args.snapshot_dir)
+            created = create_snapshot_set(args.root, args.snapshot_dir, gameboy_root=args.gameboy_root)
             if created:
                 audit_root_path = args.snapshot_dir
                 snapshot_created = True
@@ -529,7 +605,24 @@ def main() -> int:
             # accidentally treating an old/partial snapshot as current data.
             audit_root_path = args.root
 
-    report = audit_root(audit_root_path)
+    report = audit_root(audit_root_path, gameboy_root=None if snapshot_created else args.gameboy_root)
+    summary = report["summary"]
+    memory_tables = report["databases"]["r2_memory.db"]["tables"]
+    legacy_missing = set(DATABASES) - {"r2_memory.db"}
+    recognized_legacy = (
+        args.legacy_memory_only and snapshot_created
+        and set(summary["missing"]) == legacy_missing
+        and (
+            {"name", "container", "quantity"} <= set(
+                memory_tables.get("r2_reality_objects", {}).get("columns", []))
+            or (
+                "name" in memory_tables.get("r2_fridge_items", {}).get("columns", [])
+                and bool({"quantity", "qty", "amount"} & set(
+                    memory_tables.get("r2_fridge_items", {}).get("columns", [])))
+            )
+        )
+    )
+    summary["legacy_memory_only"] = recognized_legacy
     report["source_root"] = str(args.root.resolve())
     report["snapshot_errors"] = snapshot_errors
     report["snapshot_created"] = snapshot_created
@@ -574,6 +667,8 @@ def main() -> int:
                   f"orphan_values={relationship.get('orphan_values', [])}")
         if summary["missing"]:
             print("Note: missing files are reported, not created.")
+        if recognized_legacy:
+            print("Structured memory-only layout verified. R2 will initialize dedicated stores on startup.")
         if summary["legacy_phantom_food_records"]:
             print("Note: suspicious legacy rows are reported only; no rows are changed.")
         if snapshot_created:
@@ -589,11 +684,10 @@ def main() -> int:
                         print(f"  {label}: {json.dumps(items)}")
                 print("Unindexed files are candidates. Stop R2 before interpreting archive differences.")
 
-    # Missing expected databases are a failed preflight, not a clean pass.
-    # The report remains read-only and still lists every missing path.
+    # Only an explicitly selected and snapshotted legacy layout may omit the dedicated stores.
     return 2 if (report["summary"]["integrity_failures"] or
                   report["summary"]["relationship_failures"] or
-                  report["summary"]["missing"] or snapshot_errors or
+                  (summary["missing"] and not recognized_legacy) or snapshot_errors or
                   report.get("visual_archive", {}).get("error")) else 0
 
 

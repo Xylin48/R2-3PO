@@ -29,7 +29,7 @@ checks = {
     "launcher checks both sound module files": '"$R2_SOURCE/R2Sounds.h"' in launcher,
     "launcher preflights FX access as the runtime user": 'find "$1" -maxdepth 1 -type f -iname "*.mp3"' in launcher and "WARNING: r2 cannot find readable MP3 effects" in launcher,
     "launcher forwards the selected FX directory into the runtime": 'R2_FX_DIR="$R2_FX_DIR"' in launcher,
-    "launcher runs the read-only sound inventory as r2 when deployed": 'sudo -n -u r2 env HOME="$R2_ROOT" USER=r2 LOGNAME=r2' in launcher and 'python3 "$SOUND_AUDIT" --root "$R2_FX_DIR"' in launcher,
+    "launcher runs the read-only sound inventory as r2 when deployed": 'run_as_r2' in launcher and 'python3 "$SOUND_AUDIT" --root "$R2_FX_DIR"' in launcher,
     "Makefile builds and tracks the sound module": "R2Sounds.c" in makefile and "R2Sounds.h" in makefile,
     "sound selection scans the configured FX directory": "R2_SOUNDS_DEFAULT_FX_DIR" in sounds and "opendir(fx_dir)" in sounds,
     "sound scheduling records an event in the existing Life Log": 'r2_log_event(R2_LOG_SENSORY, "sound_effect_scheduled"' in sounds,
@@ -37,7 +37,7 @@ checks = {
     "core resets sound lifecycle during initialization": "r2_sounds_init();" in r2 and "void r2_sounds_init(void)" in sounds,
     "sound marker recognition is case-insensitive and ignores Markdown code examples": "strncasecmp(reply + pos, marker_text, marker_length)" in sounds and "inline_ticks == 0" in sounds and "sound_fence_line" in sounds and "if (in_fence)" in sounds,
     "marker cleanup failure returns a visible fallback instead of exposing control text": "Reply cleanup produced no visible text; returning a visible reply and preserving the user turn." in r2 and "if (!reply_has_visible_text(sound_clean_reply))" in r2,
-    "empty or marker-only replies trigger recovery before a visible fallback is returned": "Model output contained no visible reply after marker cleanup; retrying once." in r2 and "Retry still produced no visible reply" in r2 and "Your message hasn't been discarded" in r2,
+    "empty or marker-only replies report the failed turn before tool execution": "if (!reply_has_visible_text(stripped_reply))" in r2 and "I couldn't produce a reply to this turn." in r2,
     "tool output append preserves full action output with exact-size allocation": "asprintf(&_part, __VA_ARGS__)" in r2 and "memcpy(results + len, _part, (size_t)_n)" in r2 and "[tool output truncated]" not in r2 and "snprintf(results, cap, \"%s\", _capture_failure)" in r2,
     "reply sanitizer classifies scratch and finds the answer in visible text": "visible_looks_private" in reply_module and "reply_find_final_content(visible, literal_span)" in reply_module,
 }

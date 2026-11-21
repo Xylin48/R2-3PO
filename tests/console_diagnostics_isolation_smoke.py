@@ -19,12 +19,13 @@ require(
     "launcher creates the canonical R2_Log directory as the runtime user",
 )
 require(
-    'sh -c \'exec "$1" 2>>"$2"\' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt"' in launcher,
-    "R2 stderr is appended to Debug.txt by the r2 runtime user",
+    'run_as_r2 env' in launcher and 'exec "$1" 2>>"$2"' in launcher
+    and '"$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"' in launcher,
+    "R2 appends stderr to its private log by default under the shared runtime user",
 )
 require(
-    'R2_FX_DIR="$R2_FX_DIR" \\\n    sh -c' in launcher,
-    "diagnostic redirection wraps only the executable and preserves its runtime environment",
+    '2> >(tee -a -- "$2" >&2)' in launcher,
+    "opt-in live diagnostics show stderr while retaining the log",
 )
 require(
     '2>>"$2"' in launcher and '1>>"$2"' not in launcher,

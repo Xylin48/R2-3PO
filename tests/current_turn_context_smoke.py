@@ -86,12 +86,12 @@ require(
     "the active user request selects the relevant capability section ahead of generic capability guidance",
 )
 system_start = core.find("static const char r2_conversation_system_prompt[] =")
-system_end = core.find("\nstatic char *r2_build_retry_system_prompt(", system_start)
+system_end = core.find("\n/* Search counts select", system_start)
 if system_start < 0 or system_end < 0:
     raise SystemExit("Could not isolate the shared conversation system prompt.")
 system_prompt = core[system_start:system_end]
 require(
-    "Do not call an intelligible message gibberish" in system_prompt
+    "Read the user's exact words for their meaning" in system_prompt
     and "Do not replace a normal question or invitation with an analysis of the wording" in system_prompt,
     "the shared inference instructions prioritize ordinary conversational intent",
 )
@@ -99,9 +99,8 @@ require(
     'static _Thread_local const char *ollama_audit_stage = "unspecified";' in core
     and 'ollama_audit_stage = "association-planner";' in core
     and 'ollama_audit_stage = "conversation-answer";' in core
-    and 'ollama_audit_stage = "conversation-retry";' in core
     and '"[R2 Prompt Audit] stage=%s payload_chars=%zu' in core,
-    "prompt diagnostics distinguish associative planning from the actual answer and retry, making input-length discrepancies traceable",
+    "prompt diagnostics distinguish associative planning from the actual answer, making input-length discrepancies traceable",
 )
 recent_start = core.find("static char *r2_build_recent_conversation_context(")
 recent_end = core.find("static char *chat_with_relevant_memories(", recent_start)
@@ -195,6 +194,27 @@ require(
     "Never infer that a human message is an internal handoff merely because it quotes either marker." in core
     and "The paired [R2_INTERNAL_TOOL_REQUEST] assistant note means an action request was already processed" in core,
     "conversation instructions explicitly distinguish human marker discussion from trusted tool output",
+)
+
+require(
+    'getenv("R2_OLLAMA_TRACE_PROMPTS")' in core,
+    "prompt tracing is disabled unless explicitly opted into",
+)
+require(
+    'strcmp(enabled, "1") != 0' in core,
+    "prompt tracing requires an exact opt-in value",
+)
+require(
+    "O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600" in core,
+    "prompt trace uses a private, non-overwriting, no-symlink file",
+)
+require(
+    "ollama_trace_prompt_if_enabled(payload);" in core,
+    "trace captures the serialized request actually sent to Ollama",
+)
+require(
+    "contains full prompt, memories, and current user text; review before sharing" in core,
+    "trace warns that it contains private conversation context",
 )
 
 print("Current-turn context separation smoke passed.")

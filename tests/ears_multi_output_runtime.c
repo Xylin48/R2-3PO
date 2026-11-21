@@ -202,13 +202,16 @@ int main(void)
     for (int recent = 0; recent <= 1; ++recent) {
         FILE *wav = tmpfile();
         assert(wav);
-        assert(r2_ears_extra_write_pcm(names[3], 1920, wav, recent,
-                                       NULL, NULL) == 0);
+        const uint32_t bytes = recent ? 1920U : 17U * R2_EARS_PCM_BYTES_PER_SECOND;
+        assert(r2_ears_extra_write_pcm(names[3], bytes, wav, recent, NULL, NULL) == 0);
         rewind(wav);
         unsigned char raw[1920];
-        assert(fread(raw, 1, sizeof(raw), wav) == sizeof(raw));
-        for (size_t k = 0; k < sizeof(raw); ++k)
-            assert(raw[k] == 19); /* index3 starts as opened slot2 */
+        for (uint32_t offset = 0; offset < bytes; offset += sizeof(raw)) {
+            assert(fread(raw, 1, sizeof(raw), wav) == sizeof(raw));
+            for (size_t k = 0; k < sizeof(raw); ++k)
+                assert(raw[k] == 19); /* index3 starts as opened slot2 */
+        }
+        assert(fgetc(wav) == EOF);
         fclose(wav);
     }
     char *source_list = r2_ears_desktop_available_sources();

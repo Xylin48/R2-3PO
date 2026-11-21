@@ -25,9 +25,14 @@ require(
     f"conversation model and visual-perception model are both `{model}`" in readme,
     "README conversation and vision model names match the compiled configuration",
 )
+startup_reader = core.split("static char *get_startup_memories(int limit)", 1)[1].split(
+    "MEMORY RETRIEVAL", 1
+)[0]
 require(
-    "Load the newest 100 persistent memories as one pinned context" in core,
-    "startup memory comments describe the compact pinned-memory design",
+    "r2_ollama_context_tokens()" in startup_reader
+    and "complete text remains available through memory retrieval" in startup_reader
+    and "ORDER BY updated_at DESC, id DESC" in startup_reader,
+    "startup memory selects complete recent records within the configured context budget",
 )
 require(
     "currently configured local Ollama model" in conversation_qa

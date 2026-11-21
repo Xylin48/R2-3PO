@@ -24,10 +24,10 @@ static void write_executable(const char *path, const char *contents)
     assert(file && fputs(contents, file) >= 0 && fclose(file) == 0 && chmod(path, 0700) == 0);
 }
 
-static void verify_model_images(const char *media)
+static void verify_model_images(const char *media, int has_camera)
 {
     char *camera = r2_vision_current_frame_base64();
-    assert(camera && !strcmp(camera, "CAMERA"));
+    assert(has_camera ? camera && !strcmp(camera, "CAMERA") : !camera);
     char *display = NULL;
     for (int i = 0; media && !display && i < 400; ++i) {
         display = r2_vision_media_current_frame_base64();
@@ -40,13 +40,23 @@ static void verify_model_images(const char *media)
     else assert(!r2_vision_media_current_frame_base64());
 
     struct json_object *messages = json_object_new_array(), *images = NULL;
-    assert(messages && ollama_json_append_message(messages, "user", "What is here?", 13,
-                                                  camera, display) == 0);
-    assert(json_object_object_get_ex(json_object_array_get_idx(messages, 0), "images", &images));
-    assert(json_object_array_length(images) == (media ? 2U : 1U));
-    assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 0)), "CAMERA"));
-    if (media)
-        assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 1)), media));
+    assert(messages && ollama_json_append_message_with_image_sources(
+        messages, "user", "What is here?", 13, camera, display) == 0);
+    if (camera || display) {
+        struct json_object *label = NULL;
+        assert(json_object_object_get_ex(json_object_array_get_idx(messages, 0), "content", &label));
+        assert(json_object_object_get_ex(json_object_array_get_idx(messages, 1), "images", &images));
+        assert(json_object_array_length(images) == (camera && display ? 2U : 1U));
+        if (camera)
+            assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 0)), "CAMERA"));
+        if (display) {
+            assert(strstr(json_object_get_string(label), camera ? "Image 2" : "No camera frame"));
+            assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, camera ? 1 : 0)), media));
+        }
+    } else {
+        assert(json_object_array_length(messages) == 1);
+        assert(!json_object_object_get_ex(json_object_array_get_idx(messages, 0), "images", &images));
+    }
     json_object_put(messages);
     free(camera);
     free(display);
@@ -134,20 +144,20 @@ static void test_file_reads(void)
     assert(fd >= 0 && write(fd, "complete-original", 17) == 17 && close(fd) == 0);
     for (read_fault = 1; read_fault <= 2; ++read_fault) {
         errno = 0;
-        assert(read_entire_file(path) == NULL && errno == EIO);
+        assert(read_entire_open_file(fopen(path, "rb")) == NULL && errno == EIO);
     }
     read_fault = 3;
     growing_file = path;
-    char *text = read_entire_file(path);
+    char *text = read_entire_open_file(fopen(path, "rb"));
     assert(text && !strcmp(text, "complete-original-GROWN-END"));
     free(text);
     read_fault = 0;
     FILE *stream = fopen(path, "wb");
     assert(stream && fwrite("abc\0hidden", 1, 10, stream) == 10 && fclose(stream) == 0);
-    assert(read_entire_file(path) == NULL);
+    assert(read_entire_open_file(fopen(path, "rb")) == NULL);
     stream = fopen(path, "wb");
     assert(stream && fclose(stream) == 0);
-    text = read_entire_file(path);
+    text = read_entire_open_file(fopen(path, "rb"));
     assert(text && !*text);
     free(text);
     assert(unlink(path) == 0);
@@ -204,7 +214,7 @@ static void test_workspace_replacement(void)
     sync_failure = 1;
     assert(workspace_write("write-fixture", "failed replacement", output) == -1);
     assert(sync_failure == 0);
-    char *text = read_entire_file(target);
+    char *text = workspace_read("write-fixture");
     assert(text && strcmp(text, "original") == 0);
     free(text);
 
@@ -212,7 +222,7 @@ static void test_workspace_replacement(void)
     assert(workspace_write("write-fixture", "new complete version", output) ==
            WORKSPACE_WRITE_SYNC_UNCONFIRMED);
     assert(sync_failure == 0);
-    text = read_entire_file(target);
+    text = workspace_read("write-fixture");
     assert(text && strcmp(text, "new complete version") == 0);
     free(text);
     struct stat state;
@@ -308,9 +318,9 @@ int main(void)
     assert(r2_eyes_open_file(eyes, "fixture-camera") == 0);
     assert(r2_vision_watch_start() == 0);
     assert(r2_vision_open_file("fixture-media-a") == 0);
-    verify_model_images(NULL);
+    verify_model_images(NULL, 1);
     assert(r2_vision_media_set_attention(1) == 0);
-    verify_model_images("MEDIA_A");
+    verify_model_images("MEDIA_A", 1);
 
     /* A primary lifecycle update can stall independently. An already
      * published extra source must still reach ASR and persist its exact ID. */
@@ -350,14 +360,16 @@ int main(void)
 
     assert(r2_vision_open_file("fixture-media-b") == 0);
     assert(!r2_vision_media_attention_status());
-    verify_model_images(NULL);
+    verify_model_images(NULL, 1);
     assert(r2_vision_media_set_attention(1) == 0);
-    verify_model_images("MEDIA_B");
-    assert(r2_vision_media_stop() == 0);
-    verify_model_images(NULL);
+    verify_model_images("MEDIA_B", 1);
     assert(r2_vision_watch_stop() == 0);
     r2_eyes_shutdown(eyes);
     eyes = NULL;
+    verify_model_images("MEDIA_B", 0);
+    assert(r2_vision_media_set_attention(0) == 0);
+    verify_model_images(NULL, 0);
+    assert(r2_vision_media_stop() == 0);
     r2_eyes_shutdown(media_eyes);
     media_eyes = NULL;
     r2_visual_shutdown();

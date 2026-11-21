@@ -91,7 +91,7 @@ require(
     "default Makefile build treats compiler warnings as errors",
 )
 require(
-    'sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2 \\' in launcher,
+    'run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2 \\' in launcher,
     "interactive launcher uses the same strict compiler policy",
 )
 require(
@@ -263,8 +263,9 @@ bootstrap_bytes = (ROOT / "tools/r2_install_root_bootstrap.sh").read_bytes()
 git_blob_sha = hashlib.sha1(b"blob " + str(len(bootstrap_bytes)).encode("ascii") + bytes([0]) + bootstrap_bytes).hexdigest()
 pinned_bootstrap_sha = re.search(r"^BOOTSTRAP_BLOB_SHA=([0-9a-f]{40})$", overnight_docs, re.MULTILINE)
 require(
-    pinned_bootstrap_sha is not None and pinned_bootstrap_sha.group(1) == git_blob_sha,
-    "one-time trusted bootstrap pin matches the exact reviewed source blob",
+    pinned_bootstrap_sha is not None and pinned_bootstrap_sha.group(1) == git_blob_sha
+    and f'EXPECTED_BOOTSTRAP_BLOB_SHA="{git_blob_sha}"' in installer_wrapper,
+    "deployment instructions and installer pin the same reviewed bootstrap blob",
 )
 require(
     'https://raw.githubusercontent.com/Xylin48/R2-3PO/${BOOTSTRAP_COMMIT}/tools/r2_install_root_bootstrap.sh' in overnight_docs

@@ -6,8 +6,50 @@
 #include <stdio.h>
 #include <unistd.h>
 
+static void test_memory_only_inventory(void)
+{
+    char path[] = "/tmp/r2-fridge-memory-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0 && close(fd) == 0);
+    sqlite3 *legacy = NULL;
+    assert(sqlite3_open(path, &legacy) == SQLITE_OK);
+    assert(sqlite3_exec(legacy,
+        "CREATE TABLE r2_fridge_items(name TEXT PRIMARY KEY,amount INTEGER,description TEXT);"
+        "INSERT INTO r2_fridge_items VALUES('legacy pears',3,'preserve the old stock'),"
+        "('broken entry',0,NULL);", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_open(":memory:", &fridge_db) == SQLITE_OK);
+    assert(fridge_migrate_schema(path) != SQLITE_OK);
+    assert(!fridge_column_exists("quantity"));
+    assert(sqlite3_exec(legacy, "DELETE FROM r2_fridge_items WHERE amount=0;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(fridge_migrate_schema(path) == SQLITE_OK);
+
+    sqlite3_stmt *row = NULL;
+    assert(sqlite3_prepare_v2(fridge_db,
+        "SELECT quantity,description FROM r2_fridge_items WHERE name='legacy pears'",
+        -1, &row, NULL) == SQLITE_OK);
+    assert(sqlite3_step(row) == SQLITE_ROW && sqlite3_column_int(row, 0) == 3);
+    assert(strcmp((const char *)sqlite3_column_text(row, 1), "preserve the old stock") == 0);
+    sqlite3_finalize(row);
+    assert(sqlite3_exec(fridge_db, "DELETE FROM r2_fridge_items;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(fridge_migrate_schema(path) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(fridge_db, "SELECT 1 FROM r2_fridge_items",
+        -1, &row, NULL) == SQLITE_OK);
+    assert(sqlite3_step(row) == SQLITE_DONE);
+    sqlite3_finalize(row);
+    assert(sqlite3_prepare_v2(legacy, "SELECT amount FROM r2_fridge_items",
+        -1, &row, NULL) == SQLITE_OK);
+    assert(sqlite3_step(row) == SQLITE_ROW && sqlite3_column_int(row, 0) == 3);
+    sqlite3_finalize(row);
+    assert(sqlite3_close(legacy) == SQLITE_OK);
+    assert(sqlite3_close(fridge_db) == SQLITE_OK);
+    fridge_db = NULL;
+    assert(unlink(path) == 0);
+}
+
 int main(void)
 {
+    test_memory_only_inventory();
     char path[] = "/tmp/r2-fridge-legacy-smoke-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0);
@@ -27,11 +69,11 @@ int main(void)
         "CREATE TRIGGER fail_quantity_copy BEFORE UPDATE ON r2_fridge_items "
         "BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
         NULL, NULL, NULL) == SQLITE_OK);
-    assert(fridge_migrate_schema() != SQLITE_OK);
+    assert(fridge_migrate_schema(NULL) != SQLITE_OK);
     assert(!fridge_column_exists("quantity"));
     assert(sqlite3_exec(fridge_db, "DROP TRIGGER fail_quantity_copy",
                         NULL, NULL, NULL) == SQLITE_OK);
-    assert(fridge_migrate_schema() == SQLITE_OK);
+    assert(fridge_migrate_schema(NULL) == SQLITE_OK);
     sqlite3_stmt *st = NULL;
     assert(sqlite3_prepare_v2(fridge_db,
         "SELECT quantity,qty,amount FROM r2_fridge_items WHERE name='legacy apples'",

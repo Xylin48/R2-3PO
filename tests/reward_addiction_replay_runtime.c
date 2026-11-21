@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #define R2_HOME "/tmp/r2-reward-addiction-replay-fixture"
+#define R2_DIARY_DATABASE R2_HOME "/r2_memory.db"
 #include "../Reward.c"
 
 static int log_ready = 0;
@@ -84,6 +85,7 @@ int main(void)
                  i == 0 ? "" : i == 1 ? "-wal" : "-shm");
         if (unlink(path) != 0) assert(errno == ENOENT);
     }
+    if (unlink(R2_DIARY_DATABASE) != 0) assert(errno == ENOENT);
     if (rmdir(R2_HOME) != 0) assert(errno == ENOENT);
     assert(mkdir(R2_HOME, 0700) == 0);
 
@@ -202,6 +204,27 @@ int main(void)
         "SELECT reward_event_id=(SELECT id FROM reward_events "
         "WHERE target='unfinished') FROM reward_once_keys WHERE target='unfinished'") == 1);
     assert(scalar(reward_db, "SELECT points FROM reward_totals WHERE id=1") == 7);
+    /* SQLite can finish a suppressed UPDATE with no error code. The link
+       remains pending until a later sweep actually changes its ledger row. */
+    exec_sql(reward_db, "UPDATE reward_events SET log_event_id=900,memory_indexed=1;");
+    sqlite3 *memory = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &memory) == SQLITE_OK);
+    exec_sql(memory, "CREATE TABLE r2_log_events(id INTEGER PRIMARY KEY,memory_saved INTEGER);"
+                     "INSERT INTO r2_log_events VALUES(920,1);");
+    exec_sql(reward_db,
+        "INSERT INTO reward_events(target,source,points,reason,occurred_at,modifier,"
+        "expires_at,log_event_id,memory_indexed) "
+        "VALUES('blocked-link','fixture',1,'complete',110,2,1900,920,0);"
+        "CREATE TRIGGER ignore_reward_link BEFORE UPDATE OF memory_indexed ON reward_events "
+        "WHEN OLD.target='blocked-link' BEGIN SELECT RAISE(IGNORE); END;");
+    assert(r2_reward_reconnect_history(1) == -1);
+    assert(scalar(reward_db, "SELECT memory_indexed FROM reward_events WHERE target='blocked-link'") == 0);
+    exec_sql(reward_db, "DROP TRIGGER ignore_reward_link;");
+    assert(r2_reward_reconnect_history(1) == 1);
+    assert(scalar(reward_db, "SELECT memory_indexed FROM reward_events WHERE target='blocked-link'") == 1);
+    assert(r2_reward_reconnect_history(1) == 0);
+    sqlite3_close(memory);
+
     /* A corrupt legacy field stays pending and cannot starve later rows. */
     exec_sql(reward_db,
         "UPDATE reward_events SET log_event_id=900,memory_indexed=1;"

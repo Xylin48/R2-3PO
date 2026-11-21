@@ -1,6 +1,8 @@
 import contextlib
 import importlib.util
 import io
+import json
+import os
 import sqlite3
 import stat
 import tempfile
@@ -96,6 +98,66 @@ class DatabasePreflightTests(unittest.TestCase):
             snapshot = sqlite3.connect(created[0])
             self.assertEqual(snapshot.execute("SELECT value FROM safe").fetchone()[0], "source")
             snapshot.close()
+
+    def test_snapshot_refuses_leftover_sidecars_before_copying_any_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            source = root / "r2_reality.db"
+            sqlite3.connect(source).close()
+            destination = Path(directory) / "snapshots"
+            destination.mkdir()
+            for suffix in ("-wal", "-shm", "-journal"):
+                with self.subTest(suffix=suffix):
+                    stale = destination / ("r2_fridge.db" + suffix)
+                    stale.write_bytes(b"preserve this file")
+                    with self.assertRaisesRegex(FileExistsError, stale.name):
+                        audit.create_snapshot_set(root, destination)
+                    with self.assertRaisesRegex(FileExistsError, stale.name):
+                        audit.snapshot_database(source, destination / "r2_fridge.db")
+                    self.assertEqual(stale.read_bytes(), b"preserve this file")
+                    self.assertEqual(list(destination.iterdir()), [stale])
+                    stale.unlink()
+
+    def test_snapshot_copies_committed_wal_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.db"
+            destination = Path(directory) / "snapshot.db"
+            with contextlib.closing(sqlite3.connect(source)) as writer:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE memory(value TEXT)")
+                writer.execute("INSERT INTO memory VALUES ('committed')")
+                writer.commit()
+                wal = source.with_name(source.name + "-wal")
+                before = wal.read_bytes()
+
+                audit.snapshot_database(source, destination)
+
+                self.assertEqual(wal.read_bytes(), before)
+                with contextlib.closing(sqlite3.connect(destination)) as copy:
+                    self.assertEqual(copy.execute("SELECT value FROM memory").fetchall(),
+                                     [("committed",)])
+
+    def test_snapshot_stops_retrying_a_locked_source_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "r2_fridge.db"
+            destination = root / "snapshots"
+            sqlite3.connect(root / "r2_reality.db").close()
+            with contextlib.closing(sqlite3.connect(source)) as writer:
+                writer.execute("CREATE TABLE stock(value TEXT)")
+                writer.execute("BEGIN EXCLUSIVE")
+                with patch.object(audit.time, "monotonic", side_effect=[0.0, 3.0]):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "remained locked"):
+                        audit.create_snapshot_set(root, destination)
+                self.assertEqual(list(destination.iterdir()), [])
+                writer.rollback()
+
+            created = audit.create_snapshot_set(root, destination)
+            self.assertEqual([path.name for path in created], ["r2_reality.db", "r2_fridge.db"])
+            for snapshot in created:
+                self.assertEqual(audit.audit_database(snapshot)["integrity"], ["ok"])
 
     def test_snapshot_directory_symlink_is_rejected_before_copy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -218,6 +280,69 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertEqual(snapshot_report["summary"]["optional_found"], 2)
             self.assertEqual(snapshot_report["summary"]["integrity_failures"], [])
 
+    def test_cli_audits_installed_gameboy_stores_beside_core_and_reopens_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "R2"
+            root.mkdir()
+            for name in audit.DATABASES:
+                sqlite3.connect(root / name).close()
+            device = home / "Devices" / "GameBoyAdvance"
+            (device / "State").mkdir(parents=True)
+            originals = {}
+            for relative in ("gameboy.db", "State/console_state.db"):
+                path = device / relative
+                with contextlib.closing(sqlite3.connect(path)) as db:
+                    db.execute("CREATE TABLE history(record TEXT)")
+                    db.execute("INSERT INTO history VALUES(?)", (relative,))
+                    db.commit()
+                originals[relative] = path.read_bytes()
+
+            snapshots = home / "snapshots"
+            args = [str(SCRIPT), "--root", str(root), "--gameboy-root", str(device), "--json"]
+            output = io.StringIO()
+            with patch("sys.argv", [*args, "--snapshot-dir", str(snapshots)]), contextlib.redirect_stdout(output):
+                self.assertEqual(audit.main(), 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["summary"]["optional_found"], 2)
+            for relative, original in originals.items():
+                name = f"Devices/GameBoyAdvance/{relative}"
+                snapshot = snapshots / name
+                self.assertEqual(report["databases"][name]["path"], str(snapshot))
+                self.assertEqual((device / relative).read_bytes(), original)
+                with contextlib.closing(sqlite3.connect(snapshot)) as copy:
+                    self.assertEqual(copy.execute("SELECT record FROM history").fetchall(), [(relative,)])
+
+            (device / "State" / "console_state.db").write_bytes(b"corrupt fixture")
+            output = io.StringIO()
+            with patch("sys.argv", args), contextlib.redirect_stdout(output):
+                self.assertEqual(audit.main(), 2)
+            self.assertIn("Devices/GameBoyAdvance/State/console_state.db",
+                          json.loads(output.getvalue())["summary"]["integrity_failures"])
+
+    def test_explicit_memory_only_snapshot_keeps_modern_missing_database_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "source"
+            root.mkdir()
+            memory = root / "r2_memory.db"
+            with sqlite3.connect(memory) as db:
+                db.executescript(
+                    "CREATE TABLE r2_fridge_items(name TEXT PRIMARY KEY, qty INTEGER);"
+                    "INSERT INTO r2_fridge_items VALUES('legacy pear',2);"
+                )
+            first = Path(directory) / "legacy-snapshot"
+            with patch("sys.argv", ["audit_r2_databases.py", "--root", str(root),
+                            "--snapshot-dir", str(first), "--legacy-memory-only"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(), 0)
+            self.assertEqual(sorted(p.name for p in first.iterdir()), ["r2_memory.db"])
+            self.assertFalse((root / "r2_fridge.db").exists())
+
+            sqlite3.connect(root / "r2_fridge.db").close()
+            second = Path(directory) / "partial-snapshot"
+            with patch("sys.argv", ["audit_r2_databases.py", "--root", str(root),
+                            "--snapshot-dir", str(second), "--legacy-memory-only"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(), 2)
+
     def test_cli_fails_preflight_when_expected_databases_are_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -230,6 +355,35 @@ class DatabasePreflightTests(unittest.TestCase):
             self.assertIn("MISSING  r2_memory.db", output.getvalue())
             self.assertIn("MISSING  r2_rewards.db", output.getvalue())
             self.assertIn("MISSING  r2_addictions.db", output.getvalue())
+
+    def test_memory_only_snapshot_refuses_nonregular_paths_and_orphaned_sidecars(self):
+        for obstruction in ("directory", "fifo", "orphaned wal"):
+            with self.subTest(obstruction=obstruction), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with sqlite3.connect(root / "r2_memory.db") as db:
+                    db.execute("CREATE TABLE r2_fridge_items (name TEXT, quantity INTEGER)")
+                fridge = root / "r2_fridge.db"
+                if obstruction == "directory":
+                    fridge.mkdir()
+                elif obstruction == "fifo":
+                    os.mkfifo(fridge)
+                else:
+                    fridge = root / "r2_fridge.db-wal"
+                    fridge.write_bytes(b"preserve recovery evidence")
+
+                snapshot = root / "snapshot"
+                args = [str(SCRIPT), "--root", str(root), "--snapshot-dir",
+                        str(snapshot), "--legacy-memory-only", "--json"]
+                output = io.StringIO()
+                with patch("sys.argv", args), contextlib.redirect_stdout(output):
+                    self.assertEqual(audit.main(), 2)
+                report = audit.audit_root(root)
+                self.assertIn("r2_fridge.db", report["summary"]["integrity_failures"])
+                self.assertNotIn("r2_fridge.db", report["summary"]["missing"])
+                self.assertEqual(list(snapshot.iterdir()), [])
+                self.assertTrue(fridge.exists())
+                if obstruction == "orphaned wal":
+                    self.assertEqual(fridge.read_bytes(), b"preserve recovery evidence")
 
 
 if __name__ == "__main__":

@@ -345,6 +345,7 @@ static int store_log_link(sqlite3_int64 reward_id, int64_t log_event_id,
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 2, memory_indexed ? 1 : 0);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 3, reward_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(reward_db) != 1) rc = SQLITE_NOTFOUND;
     if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&reward_lock);
     return rc == SQLITE_DONE ? 0 : -1;
@@ -687,10 +688,15 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     if (r2_log_is_initialized()) {
         int64_t log_event_id = r2_log_event_with_memory(R2_LOG_WORLD,
             "enjoyment_changed", summary, details, "Reward.c", 0);
+        int linked = 0;
         if (log_event_id > 0) {
             int memory_indexed = ensure_reward_memory_pointer(log_event_id, summary);
-            (void)store_log_link(reward_id, log_event_id, memory_indexed > 0);
+            linked = store_log_link(reward_id, log_event_id, memory_indexed > 0) == 0 &&
+                     memory_indexed > 0;
         }
+        if (!linked)
+            fprintf(stderr, "[R2 Reward] Reward committed; Life Log or memory linkage for event %lld remains pending.\n",
+                    (long long)reward_id);
     }
 
     if (voluntary_choice && reward_deliver_addiction_choice(&event) != 0)
@@ -799,11 +805,16 @@ int r2_reward_reconnect_history(int limit)
             if (log_event_id <= 0)
                 log_event_id = r2_log_event_with_memory(R2_LOG_WORLD,
                     "enjoyment_changed", summary, details, "Reward.c", 0);
-            if (log_event_id > 0 &&
-                (!item->memory_indexed || item->log_event_id <= 0)) {
+            if (log_event_id <= 0) {
+                replay_failed = 1;
+                continue;
+            }
+            if (!item->memory_indexed || item->log_event_id <= 0) {
                 int memory_indexed = ensure_reward_memory_pointer(log_event_id, summary);
-                if (store_log_link(item->id, log_event_id, memory_indexed > 0) == 0 &&
-                    memory_indexed > 0)
+                if (store_log_link(item->id, log_event_id, memory_indexed > 0) != 0 ||
+                    memory_indexed <= 0)
+                    replay_failed = 1;
+                else
                     linked++;
             }
         }

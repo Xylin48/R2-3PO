@@ -10,7 +10,7 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
 fi
 
 BOOTSTRAP="/usr/local/sbin/r2-3po-install"
-EXPECTED_BOOTSTRAP_BLOB_SHA="10489001918f3155fbb28a00aec0f14534268c94"
+EXPECTED_BOOTSTRAP_BLOB_SHA="daab1b83c1e54f2e71c01e3cf5eaf58caeec7820"
 if [[ ! -f "$BOOTSTRAP" || -L "$BOOTSTRAP" || ! -x "$BOOTSTRAP" ]]; then
     echo "ERROR: the trusted root-owned R2 installer has not been installed." >&2
     echo "Use the immutable-commit and Git blob hash verification procedure in:" >&2
@@ -34,5 +34,5 @@ if [[ "$ACTUAL_BOOTSTRAP_BLOB_SHA" != "$EXPECTED_BOOTSTRAP_BLOB_SHA" ]]; then
 fi
 
 echo "Trusted bootstrap is installed."
-echo "Run the protected entrypoint directly (not this source-tree script with sudo):"
-echo "  sudo /usr/local/sbin/r2-3po-install"
+echo "After final release signoff, run the protected activation entrypoint:"
+echo "  sudo /usr/local/sbin/r2-3po-install --activate-reviewed"

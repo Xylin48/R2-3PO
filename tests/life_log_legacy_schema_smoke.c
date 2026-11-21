@@ -294,6 +294,18 @@ int main(void)
     sqlite3_close(db);
 
     r2_log_shutdown();
+    assert(sqlite3_open(R2_DIARY_DATABASE, &writer) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "DELETE FROM r2_log_location_state;"
+        "CREATE TRIGGER ignore_location_baseline BEFORE INSERT ON r2_log_location_state "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_init() == -1 && !r2_log_is_initialized());
+    assert(sqlite3_exec(writer, "DROP TRIGGER ignore_location_baseline;",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_init() == 0 && r2_log_is_initialized());
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_location_state WHERE id=1;") == 1);
+    r2_log_shutdown();
+    sqlite3_close(writer);
     puts("Life Log legacy schema migration preserved old events and accepted new writable events.");
     return 0;
 }

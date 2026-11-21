@@ -21,8 +21,6 @@
 #include <string.h>
 #include <strings.h>
 
-#define IMAGINE_REQUEST_MAX 1200
-
 static pthread_mutex_t imagination_lock = PTHREAD_MUTEX_INITIALIZER;
 static int imagination_ready;
 
@@ -75,7 +73,7 @@ static int mentions_any(const char *text, const char *const *terms, size_t count
     return 0;
 }
 
-static char *collect_context(const char *request)
+static char *collect_context(const char *request, const char *original_request)
 {
     ImagineBuffer b = {0};
 
@@ -116,7 +114,7 @@ static char *collect_context(const char *request)
         "cooking", "eat", "eating", "snack", "burger", "sandwich",
         "leftovers", "hungry", "kitchen", "taste", "recipe"
     };
-    if (mentions_any(request, food_terms, sizeof(food_terms)/sizeof(food_terms[0])) &&
+    if (mentions_any(original_request, food_terms, sizeof(food_terms)/sizeof(food_terms[0])) &&
         append_source(&b, "FRIDGE STATE (conditional context; modeled stock, not an invitation to alter it)",
                       r2_fridge_context()) != 0)
         goto failed;
@@ -234,22 +232,51 @@ failed:
     return NULL;
 }
 
-static char *generate_with_context(const char *system, const char *request,
-                                   const char *context, char **archive)
+static const char imagination_prompt_format[] =
+    "%s:\n%s\n\n%s:\n%s\n\n"
+    "Construct the imagined possibility now. Keep it explicitly hypothetical.";
+static const char exact_request_heading[] = "USER'S IMAGINATION REQUEST";
+static const char reviewed_request_heading[] =
+    "USER'S IMAGINATION REQUEST (review notes from the complete archived request)";
+static const char reviewed_context_heading[] =
+    "REVIEW NOTES (model interpretations of the archived evidence; preserve uncertainty)";
+
+static size_t imagination_input_capacity(void)
 {
-    static const char format[] =
-        "USER'S IMAGINATION REQUEST:\n%s\n\n%s:\n%s\n\n"
-        "Construct the imagined possibility now. Keep it explicitly hypothetical.";
+    int ctx = r2_ollama_context_tokens();
+    return ctx > 1212 ? (size_t)(ctx - 1212) * 32U / 10U : 0;
+}
+
+static char *review_imagination_request(const char *system, const char *request, char **trace)
+{
+    size_t capacity = imagination_input_capacity();
+    int framing = snprintf(NULL, 0, imagination_prompt_format, reviewed_request_heading,
+                           "", reviewed_context_heading, "");
+    size_t system_length = strlen(system);
+    if (framing < 0 || system_length >= capacity ||
+        (size_t)framing >= capacity - system_length) return NULL;
+    size_t shared_budget = capacity - system_length - (size_t)framing;
+    /* Keep room for retrieved evidence even when the request fills the window. */
+    size_t evidence_reserve = 512;
+    if (shared_budget <= evidence_reserve) return NULL;
+    if (strlen(request) <= shared_budget - evidence_reserve) return strdup(request);
+    return r2_review_context(
+        "Review the complete original imagination request. Preserve its requested scenario, "
+        "constraints, entities, and ambiguity. Record what this fragment contributes. "
+        "Keep the request hypothetical. Do not write the scenario yet.",
+        request, (shared_budget - evidence_reserve) / 2, trace);
+}
+
+static char *generate_with_context(const char *system, const char *request,
+                                   const char *request_heading, const char *context, char **archive)
+{
     const char *direct_heading =
         "RETRIEVED CONTEXT (use this to form the scenario, not merely compare afterward)";
-    const char *review_heading =
-        "REVIEW NOTES (model interpretations of the archived evidence; preserve uncertainty)";
     *archive = NULL;
-    int ctx = r2_ollama_context_tokens();
-    if (ctx <= 1212) return NULL;
-    size_t capacity = (size_t)(ctx - 512 - 700) * 32U / 10U;
+    size_t capacity = imagination_input_capacity();
     size_t system_length = strlen(system);
-    int direct_fixed = snprintf(NULL, 0, format, request, direct_heading, "");
+    int direct_fixed = snprintf(NULL, 0, imagination_prompt_format,
+                                request_heading, request, direct_heading, "");
     if (direct_fixed < 0 || system_length > capacity) return NULL;
     char *trace = NULL;
     char *reviewed = NULL;
@@ -257,16 +284,17 @@ static char *generate_with_context(const char *system, const char *request,
     const char *heading = direct_heading;
     if ((size_t)direct_fixed > capacity - system_length ||
         strlen(context) > capacity - system_length - (size_t)direct_fixed) {
-        int review_fixed = snprintf(NULL, 0, format, request, review_heading, "");
+        int review_fixed = snprintf(NULL, 0, imagination_prompt_format,
+                                    request_heading, request, reviewed_context_heading, "");
         if (review_fixed < 0 || (size_t)review_fixed >= capacity - system_length) return NULL;
         reviewed = r2_review_context(request, context,
             capacity - system_length - (size_t)review_fixed, &trace);
         if (!reviewed) return NULL;
         evidence = reviewed;
-        heading = review_heading;
+        heading = reviewed_context_heading;
     }
     char *prompt = NULL;
-    if (asprintf(&prompt, format, request, heading, evidence) < 0) {
+    if (asprintf(&prompt, imagination_prompt_format, request_heading, request, heading, evidence) < 0) {
         free(reviewed); free(trace);
         return NULL;
     }
@@ -311,16 +339,12 @@ void r2_imagination_shutdown(void)
 
 char *r2_imagination_create(const char *request)
 {
-    if (!request || !*request || strlen(request) > IMAGINE_REQUEST_MAX)
-        return NULL;
+    if (!request || !*request || r2_is_shutting_down()) return NULL;
 
     pthread_mutex_lock(&imagination_lock);
     int ready = imagination_ready;
     pthread_mutex_unlock(&imagination_lock);
     if (!ready) return NULL;
-
-    char *context = collect_context(request);
-    if (!context) return NULL;
 
     const char *system =
         "You are R2-3PO's imagination subsystem. Create a useful, specific "
@@ -342,14 +366,39 @@ char *r2_imagination_create(const char *request)
         "and what remains invented or uncertain. Never reproduce raw internal "
         "database dumps, labels, or full memory records as the answer.";
 
+    char *request_trace = NULL;
+    char *working_request = review_imagination_request(system, request, &request_trace);
+    char *context = working_request && !r2_is_shutting_down()
+        ? collect_context(working_request, request) : NULL;
+    if (!context) {
+        free(request_trace);
+        free(working_request);
+        return NULL;
+    }
+
     char *processing_archive = NULL;
-    char *generated = generate_with_context(system, request, context, &processing_archive);
+    char *generated = generate_with_context(system, working_request,
+        request_trace ? reviewed_request_heading : exact_request_heading, context, &processing_archive);
+    free(working_request);
     if (processing_archive) {
         free(context);
         context = processing_archive;
     }
 
-    if (!generated || !*generated) {
+    if (generated && request_trace) {
+        size_t length = strlen(context);
+        ImagineBuffer saved = { .data = context, .length = length, .capacity = length + 1 };
+        if (append_source(&saved, "IMAGINATION REQUEST REVIEW (model interpretations)",
+                          request_trace) != 0) {
+            free(generated);
+            generated = NULL;
+        }
+        context = saved.data;
+    } else {
+        free(request_trace);
+    }
+
+    if (!generated || !*generated || r2_is_shutting_down()) {
         free(generated);
         free(context);
         return NULL;

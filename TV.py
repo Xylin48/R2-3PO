@@ -290,30 +290,47 @@ class CRTDisplay:
     def _ensure_player(self) -> bool:
         if self._player is not None:
             return True
+        instance = None
+        player = None
         try:
             import vlc
-            self._vlc = vlc
-            self._vlc_instance = vlc.Instance("--no-video-title-show", "--quiet")
-            if self._vlc_instance is None:
+            instance = vlc.Instance("--no-video-title-show", "--quiet")
+            if instance is None:
                 raise RuntimeError("VLC could not initialize")
-            self._player = self._vlc_instance.media_player_new()
+            player = instance.media_player_new()
+            if player is None:
+                raise RuntimeError("VLC could not create a player")
             self.root.update_idletasks()
-            self._player.set_xwindow(self.video_surface.winfo_id())
-            return True
-        except (ImportError, OSError, RuntimeError) as exc:
+            player.set_xwindow(self.video_surface.winfo_id())
+        except (ImportError, OSError, RuntimeError, tk.TclError) as exc:
+            for resource in (player, instance):
+                if resource is not None:
+                    try:
+                        resource.release()
+                    except (OSError, RuntimeError):
+                        pass
             if not self._vlc_error_shown:
                 self.feedback.configure(
                     text=f"VCR playback needs VLC and python3-vlc: {exc}", fg="#e0b0a0"
                 )
                 self._vlc_error_shown = True
             return False
+        self._vlc, self._vlc_instance, self._player = vlc, instance, player
+        self._vlc_error_shown = False
+        return True
 
     def _prepare_media(self, path: str, position: float, transport: str,
                        audible: bool) -> None:
         if not self._ensure_player():
             return
         media = self._vlc_instance.media_new(path)
-        self._player.set_media(media)
+        if media is None:
+            raise RuntimeError("VLC could not open the selected tape")
+        try:
+            self._player.set_media(media)
+        finally:
+            # The player retains its own reference to the selected media.
+            media.release()
         # Apply the modeled TV's audio state before starting VLC. Pause immediately
         # while VLC initializes so a stopped/paused tape cannot briefly play from 0.
         self._player.audio_set_mute(not audible)
@@ -470,13 +487,26 @@ class CRTDisplay:
     def close(self) -> None:
         self._save_vcr_position(force=True)
         self._record_playback_state(None)
+        self._publish_renderer(None)
         try:
             send_control_command("display closed")
         except (OSError, RuntimeError, ValueError):
             # Closing the window must still work if R2 has already stopped.
             pass
-        if self._player:
-            self._player.stop()
+        self._pending_vcr_seek = None
+        player, instance = self._player, self._vlc_instance
+        self._player = self._vlc_instance = self._vlc = None
+        if player is not None:
+            try:
+                player.stop()
+            except (OSError, RuntimeError):
+                pass
+        for resource in (player, instance):
+            if resource is not None:
+                try:
+                    resource.release()
+                except (OSError, RuntimeError):
+                    pass
         self.root.destroy()
 
     def refresh(self, schedule: bool = True) -> None:

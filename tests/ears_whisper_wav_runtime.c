@@ -1,7 +1,7 @@
 /*
  * Runtime regression for the real local Ears -> whisper.cpp audio format.
  * The two raw continuous 48 kHz stereo sources remain untouched; only the
- * completed short listening clip becomes a 16 kHz mono 16-bit RIFF WAV.
+ * completed listening clip becomes a 16 kHz mono 16-bit RIFF WAV.
  */
 #define main r2_program_main
 #include "../r2.c"
@@ -44,10 +44,11 @@ static FILE *source_wav(uint32_t frames)
 }
 int main(void)
 {
-    FILE *raw = source_wav(48000U);
+    const uint32_t seconds = 30U;
+    FILE *raw = source_wav(48000U * seconds);
     FILE *whisper = tmpfile();
     assert(whisper);
-    assert(r2_ears_write_whisper_wav(raw, whisper, 48000U * 4U) == 0);
+    assert(r2_ears_write_whisper_wav(raw, whisper, 48000U * 4U * seconds, NULL, NULL) == 0);
     assert(fseek(whisper, 0, SEEK_SET) == 0);
 
     unsigned char header[44];
@@ -55,17 +56,17 @@ int main(void)
     assert(memcmp(header, "RIFF", 4) == 0);
     assert(memcmp(header + 8, "WAVEfmt ", 8) == 0);
     assert(memcmp(header + 36, "data", 4) == 0);
-    assert(read_u32(header + 4) == 36U + 16000U * 2U);
+    assert(read_u32(header + 4) == 36U + 16000U * 2U * seconds);
     assert(read_u16(header + 20) == 1U);
     assert(read_u16(header + 22) == 1U);
     assert(read_u32(header + 24) == 16000U);
     assert(read_u32(header + 28) == 32000U);
     assert(read_u16(header + 32) == 2U);
     assert(read_u16(header + 34) == 16U);
-    assert(read_u32(header + 40) == 16000U * 2U);
+    assert(read_u32(header + 40) == 16000U * 2U * seconds);
 
     unsigned char pcm[2];
-    for (int i = 0; i < 16000; ++i) {
+    for (uint32_t i = 0; i < 16000U * seconds; ++i) {
         assert(fread(pcm, 1, 2, whisper) == 2);
         int16_t sample = (int16_t)read_u16(pcm);
         assert(sample == -500);
@@ -75,7 +76,7 @@ int main(void)
     assert(fread(header, 1, sizeof(header), raw) == sizeof(header));
     assert(read_u32(header + 24) == 48000U &&
            read_u16(header + 22) == 2U &&
-           read_u32(header + 40) == 48000U * 4U);
+           read_u32(header + 40) == 48000U * 4U * seconds);
     fclose(raw);
     fclose(whisper);
 
@@ -84,7 +85,7 @@ int main(void)
     raw = source_wav(24000U);
     whisper = tmpfile();
     assert(whisper);
-    assert(r2_ears_write_whisper_wav(raw, whisper, 48000U * 4U) != 0);
+    assert(r2_ears_write_whisper_wav(raw, whisper, 48000U * 4U, NULL, NULL) != 0);
     fclose(raw);
     fclose(whisper);
 

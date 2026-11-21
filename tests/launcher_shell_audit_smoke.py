@@ -25,7 +25,7 @@ required_match = re.search(
     launcher,
     re.MULTILINE | re.DOTALL,
 )
-compile_start = launcher.find('sudo -n -u r2 -- gcc -std=c11 -Wall -Wextra -Werror -O2')
+compile_start = launcher.find('run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2')
 compile_end = launcher.find("\nstatus=$?", compile_start)
 require(sources_match is not None, "Makefile declares its complete production source list")
 require(headers_match is not None, "Makefile declares its complete public/internal header list")

@@ -49,6 +49,6 @@ require("capability_context=%d" in core and "audit_capability_context = 1" in co
 require("size_t category_remaining = reality_reserve > reality_used" in core
         and "reality_used += length;" in core,
         "provisional allocation still measures live Reality separately")
-require("The actual user" in body and "message is stored separately" in body,
+require("Keep the user's text byte-for-byte intact." in body and "copy[context_index].content = context_content;" in body,
         "retrieval preserves the user's actual message separately")
 print("Final retrieved-context budget regression passed.")

@@ -5,11 +5,13 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import socket
+import sys
 import tempfile
 import time
 import threading
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "TV.py"
@@ -54,6 +56,33 @@ class TVDisplaySmoke(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO r2_tv_devices VALUES(?,?,?,?)",
                        (name, 1, kind, port))
+
+    def test_vlc_initialization_releases_failed_handles_and_retries(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._vlc = display._vlc_instance = display._player = None
+        display._vlc_error_shown = False
+        display.root = Mock()
+        display.video_surface = Mock()
+        display.video_surface.winfo_id.return_value = 421
+        display.feedback = Mock()
+        empty, broken, recovered = Mock(), Mock(), Mock()
+        empty.media_player_new.return_value = None
+        broken.media_player_new.return_value.set_xwindow.side_effect = RuntimeError("No X11 surface")
+        vlc = SimpleNamespace(Instance=Mock(side_effect=(empty, broken, recovered)))
+
+        with patch.dict(sys.modules, {"vlc": vlc}):
+            self.assertFalse(display._ensure_player())
+            empty.release.assert_called_once_with()
+            self.assertFalse(display._ensure_player())
+            self.assertIsNone(display._player)
+            broken.media_player_new.return_value.release.assert_called_once_with()
+            broken.release.assert_called_once_with()
+            self.assertTrue(display._ensure_player())
+            self.assertTrue(display._ensure_player())
+
+        self.assertIs(display._player, recovered.media_player_new.return_value)
+        display._player.set_xwindow.assert_called_once_with(421)
+        self.assertEqual(vlc.Instance.call_count, 3)
 
     def test_empty_rf_channel_has_no_device(self) -> None:
         self.set_state(1, "rf", 3)
@@ -326,6 +355,48 @@ class TVDisplaySmoke(unittest.TestCase):
             self.assertEqual(received, [command + "\n"])
             TV.SOCKET_PATH.unlink(missing_ok=True)
 
+    def test_vcr_releases_its_media_reference_on_success_and_failure(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Mock()
+        display._vlc_instance = Mock()
+        display.root = Mock()
+        media = display._vlc_instance.media_new.return_value
+        display._prepare_media("/tmp/cassette.mp4", 0, "stop", False)
+        display._player.set_media.assert_called_once_with(media)
+        media.release.assert_called_once_with()
+        media.release.reset_mock()
+        display._player.set_media.side_effect = RuntimeError("VLC rejected media")
+        with self.assertRaisesRegex(RuntimeError, "VLC rejected media"):
+            display._prepare_media("/tmp/next.mp4", 0, "stop", False)
+        media.release.assert_called_once_with()
+
+    def test_close_unpublishes_renderer_and_releases_vlc_after_stop_error(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        lifecycle = Mock()
+        display._player = lifecycle.player
+        lifecycle.player.stop.side_effect = RuntimeError("VLC stop failed")
+        display._vlc_instance = lifecycle.instance
+        display._vlc = Mock()
+        display.root = lifecycle.root
+        display._renderer_published = True
+        display._pending_vcr_seek = object()
+        display._last_logged_vlc_state = None
+        display._save_vcr_position = lifecycle.save
+        with patch.object(TV, "send_control_command", lifecycle.command):
+            display.close()
+        self.assertEqual(lifecycle.mock_calls, [
+            call.save(force=True),
+            call.command("renderer 0"),
+            call.command("display closed"),
+            call.player.stop(),
+            call.player.release(),
+            call.instance.release(),
+            call.root.destroy(),
+        ])
+        self.assertIsNone(display._pending_vcr_seek)
+        self.assertIsNone(display._player)
+        self.assertIsNone(display._vlc_instance)
+
     def test_vcr_initialization_is_muted_and_paused_before_seek(self) -> None:
         events = []
 
@@ -337,7 +408,7 @@ class TVDisplaySmoke(unittest.TestCase):
             def set_time(self, milliseconds): events.append(("seek", milliseconds))
 
         class FakeInstance:
-            def media_new(self, path): return ("media", path)
+            def media_new(self, path): return SimpleNamespace(release=lambda: None)
 
         class FakeRoot:
             def after(self, delay, callback): callback()
@@ -368,7 +439,7 @@ class TVDisplaySmoke(unittest.TestCase):
             def set_time(self, milliseconds): events.append(("seek", milliseconds))
 
         class FakeInstance:
-            def media_new(self, path): return ("media", path)
+            def media_new(self, path): return SimpleNamespace(release=lambda: None)
 
         class FakeRoot:
             def after(self, delay, callback): callback()
@@ -399,7 +470,7 @@ class TVDisplaySmoke(unittest.TestCase):
             def set_time(self, milliseconds): events.append(("seek", milliseconds))
 
         class FakeInstance:
-            def media_new(self, path): return ("media", path)
+            def media_new(self, path): return SimpleNamespace(release=lambda: None)
 
         class FakeRoot:
             callback = None
@@ -435,7 +506,7 @@ class TVDisplaySmoke(unittest.TestCase):
 
         display = object.__new__(TV.CRTDisplay)
         display._player = Player()
-        display._vlc_instance = type("Instance", (), {"media_new": lambda self, path: path})()
+        display._vlc_instance = type("Instance", (), {"media_new": lambda self, path: SimpleNamespace(release=lambda: None)})()
         display._loaded_path = None
         display._last_transport = None
         display.root = type("Root", (), {"after": lambda self, delay, callback: callbacks.append(callback)})()

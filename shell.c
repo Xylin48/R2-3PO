@@ -191,7 +191,7 @@ static void *tv_control_server(void *unused)
             continue;
         }
 
-        int client = accept(server_fd, NULL, NULL);
+        int client = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             break;
@@ -222,7 +222,8 @@ static void *tv_control_server(void *unused)
 
             ssize_t received = recv(client, command + used,
                                     sizeof(command) - 1 - used, 0);
-            if (received < 0 && errno == EINTR) continue;
+            if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
             if (received <= 0) break;
             used += (size_t)received;
             idle_polls = 0;
@@ -350,7 +351,7 @@ static int tv_control_start(void)
     struct stat st;
     if (lstat(tv_control_path, &st) == 0) {
         if (!S_ISSOCK(st.st_mode)) return -1;
-        int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+        int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (probe < 0) return -1;
         struct sockaddr_un existing;
         memset(&existing, 0, sizeof(existing));
@@ -363,7 +364,7 @@ static int tv_control_start(void)
         if (unlink(tv_control_path) != 0) return -1; /* stale socket only */
     } else if (errno != ENOENT) return -1;
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     struct sockaddr_un address;
     memset(&address, 0, sizeof(address));
@@ -647,7 +648,7 @@ static void shell_help(void)
         "      Search the chronological Life Log.\n"
         "\n"
         "  give <item> <quantity> [| description | container]\n"
-        "      Creator command: create item stacks from nothing; give money <dollars> adds cash.\n"
+        "      Create tracked items. give money <quantity> creates separate items with unspecified value.\n"
         "\n"
         "  tv [status|on|off|input 1..4|tune <channel>|connect <name> | input/RF | <port>|disconnect <name>|vcr ...]\n"
         "      Operate the persistent CRT television and built-in VCR.\n"
@@ -824,7 +825,7 @@ static void shell_talk_inner(const char *message, int64_t speech_event_id)
         return;
     }
 
-    char *reply = speech_event_id > 0
+    char *reply = speech_event_id != 0
         ? r2_talk_with_speech_event(message, speech_event_id) : r2_talk(message);
 
     if (!reply || !*reply) {
@@ -856,13 +857,15 @@ static pthread_mutex_t shell_conversation_lock = PTHREAD_MUTEX_INITIALIZER;
 static void shell_talk_with_speech_event(const char *message, int64_t speech_event_id)
 {
     pthread_mutex_lock(&shell_conversation_lock);
-    shell_talk_inner(message, speech_event_id);
+    shell_talk_inner(message, speech_event_id > 0 ? speech_event_id : -1);
     pthread_mutex_unlock(&shell_conversation_lock);
 }
 
 static void shell_talk(const char *message)
 {
-    shell_talk_with_speech_event(message, 0);
+    pthread_mutex_lock(&shell_conversation_lock);
+    shell_talk_inner(message, 0);
+    pthread_mutex_unlock(&shell_conversation_lock);
 }
 
 /* ============================================================
@@ -1362,8 +1365,8 @@ static void shell_ears(const char *argument)
             errno = 0;
             unsigned long parsed = strtoul(duration, &end, 10);
             while (end && *end && isspace((unsigned char)*end)) ++end;
-            if (errno || !end || end == duration || *end || parsed < 1UL || parsed > 15UL) {
-                printf("Usage: ears listen [1-15 seconds]\n");
+            if (errno || !end || end == duration || *end || parsed < 1UL || parsed > R2_EARS_MAX_WAV_SECONDS) {
+                printf("Usage: ears listen [seconds]\n");
                 return;
             }
             seconds = (unsigned)parsed;
@@ -1443,7 +1446,7 @@ static void shell_ears(const char *argument)
     }
 
     printf(
-        "Usage: ears [start|listen [1-15 seconds]|stop|status]\n"
+        "Usage: ears [start|listen [seconds]|stop|status]\n"
     );
 }
 
@@ -2328,32 +2331,52 @@ static int shell_gameboy(const char *arg)
 
     /* execv avoids interpreting user-supplied subcommands through a shell. */
     char *argv[10] = {0};
-    int argc = 0;
+    argv[0] = (char *)device;
     char *save = NULL;
-    char *part = strtok_r(copy, " \t", &save);
-    while (part) {
-        if (argc >= 8) {
-            printf("[Game Boy Advance] Too many command arguments.\n");
-            free(copy);
-            return 1;
-        }
-        argv[++argc] = part;
-        part = strtok_r(NULL, " \t", &save);
-    }
-    if (argc == 0) {
-        argv[0] = (char *)device;
+    argv[1] = strtok_r(copy, " \t", &save);
+    int argc = 1;
+    if (!argv[1]) {
         argv[1] = "power";
-        argv[2] = "on";
-        argc = 2;
+        argv[++argc] = "on";
+    } else if (!strcmp(argv[1], "insert") || !strcmp(argv[1], "move")) {
+        /* A cartridge filename can contain spaces. For move, only the
+           final word is the separate destination argument. */
+        char *name = shell_trim(save);
+        if (*name) {
+            argv[++argc] = name;
+            if (!strcmp(argv[1], "move")) {
+                char *destination = name + strlen(name);
+                while (destination > name && !isspace((unsigned char)destination[-1]))
+                    --destination;
+                if (destination > name) {
+                    destination[-1] = '\0';
+                    shell_trim(name);
+                    argv[++argc] = destination;
+                }
+            }
+        }
     } else {
-        argv[0] = (char *)device;
+        char *part;
+        while ((part = strtok_r(NULL, " \t", &save)) != NULL) {
+            if (argc >= 8) {
+                printf("[Game Boy Advance] Too many command arguments.\n");
+                free(copy);
+                return 1;
+            }
+            argv[++argc] = part;
+        }
     }
-    argv[argc + 1] = NULL;
 
     int is_power_off = argc == 2 && !strcmp(argv[1], "power") && !strcmp(argv[2], "off");
     ShellGameboyStatus before = {0}, after = {0};
     int have_before = shell_gameboy_read_status(&before);
 
+    struct timespec deadline;
+    if (r2_gameboy_command_deadline(&deadline) != 0) {
+        perror("[Game Boy Advance] clock_gettime");
+        free(copy);
+        return 1;
+    }
     pid_t child = fork();
     if (child < 0) {
         perror("[Game Boy Advance] fork");
@@ -2361,17 +2384,23 @@ static int shell_gameboy(const char *arg)
         return 1;
     }
     if (child == 0) {
+        if (setpgid(0, 0) != 0) _exit(126);
         execv(device, argv);
         perror("[Game Boy Advance] execv");
         _exit(127);
     }
+    (void)setpgid(child, child);
     int status = 0;
     int cancelled = 0;
+    int timed_out = 0;
     const struct timespec wait_pause = {.tv_nsec = 100000000L};
     for (;;) {
-        if (!cancelled && (atomic_load(&shell_shutdown) || r2_is_shutting_down())) {
-            cancelled = 1;
-            (void)kill(child, SIGKILL);
+        if (!cancelled) {
+            timed_out = r2_gameboy_command_expired(&deadline);
+            if (timed_out || atomic_load(&shell_shutdown) || r2_is_shutting_down()) {
+                cancelled = 1;
+                if (kill(-child, SIGKILL) != 0) (void)kill(child, SIGKILL);
+            }
         }
         pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) break;
@@ -2384,7 +2413,9 @@ static int shell_gameboy(const char *arg)
         (void)nanosleep(&wait_pause, NULL);
     }
     int command_ok = !cancelled && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!command_ok) {
+    if (timed_out) {
+        printf("[Game Boy Advance] Command timed out. Check console status before retrying.\n");
+    } else if (!command_ok) {
         printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
     } else {
         /* The event-outbox read may reconcile an exited emulator, so sync it
@@ -2447,7 +2478,7 @@ static int shell_money(const char *arg)
         free(copy);
         return 1;
     }
-    printf("Usage: money [status|deposit <amount>|withdraw <amount>|buy <item> | <price> | <description> | <container>]\n");return 1;
+    printf("Usage: money [status|receive <amount>|deposit <amount>|withdraw <amount>|buy <item> | <price> | <description> | <container>]\n");return 1;
 }
 
 static long long shell_parse_id(const char *text)
@@ -3008,11 +3039,15 @@ int r2_shell_run(void)
         sigdelset(&wait_mask, SIGTERM);
     }
 
+    if (signal(SIGINT, shell_signal_handler) == SIG_ERR ||
+        signal(SIGTERM, shell_signal_handler) == SIG_ERR) {
+        fprintf(stderr, "[R2 Shell] Could not install termination handlers.\n");
+        if (service_signals_blocked)
+            (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        return -1;
+    }
     shell_shutdown = 0;
     shell_running = 1;
-
-    signal(SIGINT, shell_signal_handler);
-    signal(SIGTERM, shell_signal_handler);
 
     if (tv_control_start() != 0)
         fprintf(stderr, "[TV] GUI control socket unavailable; shell TV commands remain available.\n");
@@ -3022,6 +3057,16 @@ int r2_shell_run(void)
     /* Source discovery is enabled by default; an unplugged mic or camera is
        not a startup error. No feed starts until a real input is found. */
     shell_watch_start();
+
+    /* Publish readiness only after installing service signal handling and
+       starting the shell interfaces. Keep the marker used by the installer. */
+    sigset_t pending;
+    if (service_mode && !shell_shutdown && !r2_is_shutting_down() &&
+        sigpending(&pending) == 0 &&
+        !sigismember(&pending, SIGINT) && !sigismember(&pending, SIGTERM)) {
+        printf("[R2 READY] Core initialized; entering shell.\n");
+        fflush(stdout);
+    }
 
     while (
         shell_running &&

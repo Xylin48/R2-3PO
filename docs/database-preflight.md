@@ -19,13 +19,15 @@ Those device databases are optional for installations without the Game Boy subsy
 
 ## Audit a stopped R2 instance
 
-Pass the directory that contains the database files (normally `/home/x/R2_Home/R2`):
+Pass the directory that contains the core databases and the installed Game Boy directory:
 
 ```sh
-python3 tools/audit_r2_databases.py --root /home/x/R2_Home/R2
+python3 tools/audit_r2_databases.py \
+  --root /home/x/R2_Home/R2 \
+  --gameboy-root /home/x/R2_Home/Devices/GameBoyAdvance
 ```
 
-Add `--json` for machine-readable output.
+Add `--json` for machine-readable output. Omit `--gameboy-root` when auditing a detached snapshot. The snapshot already stores the optional databases under `Devices/GameBoyAdvance` relative to its root.
 
 ## Snapshot and audit
 
@@ -34,10 +36,11 @@ The script can use SQLite's backup API to create a per-database snapshot and aud
 ```sh
 python3 tools/audit_r2_databases.py \
   --root /home/x/R2_Home/R2 \
+  --gameboy-root /home/x/R2_Home/Devices/GameBoyAdvance \
   --snapshot-dir /home/x/R2_Home/database-preflight-snapshot
 ```
 
-Existing snapshot files are never overwritten. Choose a new or empty destination directory. If any expected snapshot filename already exists, the script refuses the whole snapshot set before copying anything, so it cannot silently mix stale and fresh database copies. New snapshot files are created with owner-only permissions (0600). Source database files are opened read-only; suspicious rows are reported, not altered.
+Existing snapshot files are never overwritten. Choose a new or empty destination directory. If any expected snapshot database or SQLite sidecar (`-wal`, `-shm`, or `-journal`) already exists, the script refuses the whole snapshot set before copying anything. Nonregular database files and sidecars without their parent database also block the audit and snapshot. A source that stays locked causes the snapshot to fail and the incomplete copies from that attempt are removed. New snapshot files are created with owner-only permissions (0600). Source database files are opened read-only; suspicious rows are reported, not altered.
 
 Snapshots are consistent individually, but the separate databases are not captured at one atomic instant. Stop R2 before running the audit when cross-database consistency matters. Keep the snapshot directory private because these databases may contain personal memories and activity records. Do not upload the database files to public issues or logs.
 
@@ -65,3 +68,33 @@ storage failure; startup publishes only when the complete owned file verifies.
 Missing or partial files remain pending. Withdrawn records are cancelled saves
 whose cleanup did not finish. Startup excludes them even if a matching JPEG is
 restored later. The read-only report does not delete either kind of record.
+
+### Migrating a memory-only installation
+
+For a known older installation whose only core store is `r2_memory.db`,
+add `--legacy-memory-only` to the snapshot command. The audit requires a
+successful snapshot and a recognized structured Reality or Fridge layout.
+It continues to reject partially missing multi-database sets and integrity
+or relationship errors. For that layout, pass `--legacy-memory-only` to the
+desktop launcher, or append it after `--activate-reviewed` when invoking the
+overnight bootstrap.
+For a regular update, the desktop launcher audits the existing five stores
+before building or starting the core.
+
+The core initializes the dedicated stores on startup. It imports structured
+stock from `r2_fridge_items` when creating its first dedicated Fridge table,
+understanding the old `qty` and `amount` names. The original stock remains in
+the legacy database. An existing dedicated Fridge table keeps authority,
+including when it is empty after a meal. Food mentioned in memories alone
+does not create inventory. Reality, Fridge, Reward, Addiction and Memory
+retain their own records and exchange evidence through their normal operations.
+
+After initializing all five stores, the core records that the database set
+exists in `R2/.r2-database-set-initialized`. Before writable opens, the
+core checks file access, distinct store identities, and SQLite sidecar paths,
+then opens existing
+stores read-only for a SQLite quick check. Established sets must also contain
+each store's expected table. A partially missing multi-store layout is
+refused even if the marker is absent. Fresh workspaces and historical
+memory-only layouts follow the existing provisioning path. Keep the marker
+with the data directory during backup and restoration.

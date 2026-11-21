@@ -66,10 +66,10 @@ require(
     "r2_associative_query_cache_clear();" in turn_impl
     and turn_impl.find("r2_associative_query_cache_clear();")
         < turn_impl.find("chat_with_relevant_memories(message)"),
-    "the associative plan cache is reset at the start of each turn, while live context is still rebuilt on retries",
+    "the associative plan cache resets before each new foreground turn",
 )
 require(
-    "get_relevant_memories(associative_query, memory_limit)" in builder
+    "get_relevant_memories(associative_query, memory_limit, SIZE_MAX," in builder
     and "extract_memory_keywords(associative_query, keywords)" in builder,
     "generated associations are used to search persistent memory and Life Log history",
 )

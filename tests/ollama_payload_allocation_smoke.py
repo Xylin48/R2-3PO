@@ -35,7 +35,7 @@ require("if (role_value) json_object_put(role_value);" in helper
         and "if (message) json_object_put(message);" in helper,
         "partial JSON objects are cleaned up on failure")
 
-call = source.find("int append_rc = ollama_json_append_message(")
+call = source.find("int append_rc = ollama_json_append_message_with_image_sources(")
 if call < 0:
     raise SystemExit("FAIL: serializer loop does not use checked message helper")
 loop_end = source.find("\n        }\n    }\n    free(message_order);", call)
@@ -48,7 +48,7 @@ require("if (append_rc != 0)" in loop
         and "json_object_put(root);" in loop
         and "continue;" not in loop,
         "a failed message aborts the request instead of silently skipping a turn")
-require("if (json_object_object_add(root, \"messages\", arr) != 0)" in source,
+require('if (ollama_json_object_add_checked(root, "messages", chat_messages) != 0)' in source,
         "attaching the complete message array is checked")
 override_add = source.find('json_object_object_add(override_message, "content"')
 if override_add < 0:

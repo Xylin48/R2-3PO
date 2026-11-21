@@ -221,6 +221,11 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_primary_history_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-primary-history -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_ears_get_event -Wl,--wrap=r2_ears_read -Wl,--wrap=r2_log_sensory
           /tmp/r2-ears-primary-history
 
+      - name: Stream exact live Ears intervals longer than the rolling history
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/ears_live_interval_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-ears-live-interval -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          timeout 20s /tmp/r2-ears-live-interval
+
       - name: Exercise visual request response encoder and library session boundaries
         run: |
           VISUAL_ROOT="$(mktemp -d /tmp/r2-visual-request-XXXXXX)"
@@ -233,7 +238,7 @@ jobs:
         run: |
           REQUEST_ROOT="$(mktemp -d /tmp/r2-inference-request-XXXXXX)"
           trap 'rm -rf "$REQUEST_ROOT"' EXIT
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$REQUEST_ROOT\"" tests/inference_request_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-inference-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=json_object_object_add
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$REQUEST_ROOT\"" tests/inference_request_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-inference-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=json_object_object_add -Wl,--wrap=strdup
           /tmp/r2-inference-request
 
       - name: Preserve complete diary visual and learning context across read failures
@@ -400,8 +405,6 @@ jobs:
       - name: Refuse silently truncated active user turns
         run: python3 tests/no_truncated_current_turn_smoke.py
 
-      - name: Retry obvious nonresponsive text misclassification once
-        run: python3 tests/nonresponsive_reply_retry_smoke.py
       - name: Guard task pipe and child waits against interrupted system calls
         run: |
           python3 -m py_compile tests/r2_task_wait_smoke.py
@@ -412,17 +415,17 @@ jobs:
           rm -rf "$ROOT" /tmp/r2-task-shutdown-smoke-test
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS tests/r2_task_shutdown_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-task-shutdown-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          cc $FLAGS tests/r2_task_shutdown_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-task-shutdown-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=asprintf -Wl,--wrap=__asprintf_chk -Wl,--wrap=realloc -Wl,--wrap=free
           /tmp/r2-task-shutdown-smoke-test
 
-      - name: Exercise the production reply-misclassification guard
+      - name: Exercise conversation context and completed-task evidence
         run: |
-          ROOT=/tmp/r2-reply-misclassification-smoke
+          ROOT=/tmp/r2-conversation-context-runtime
           rm -rf "$ROOT"
           mkdir -p "$ROOT/R2"
           FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
-          cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_reply_misclassification_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-reply-misclassification-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
-          /tmp/r2-reply-misclassification-smoke-test
+          cc $FLAGS -DR2_COMPLETED_FAILURE_TEST tests/r2_conversation_context_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-conversation-context-runtime-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
+          /tmp/r2-conversation-context-runtime-test
 
       - name: Reject workspace read and directory-list symlink swaps after path validation
         run: |
@@ -468,6 +471,7 @@ jobs:
         run: |
           python3 -m py_compile GameBoyAdvance.py tests/gameboy_console_smoke.py
           python3 tests/gameboy_console_smoke.py
+          python3 tests/gameboy_cli_lock_smoke.py
 
       - name: Exercise writes against legacy Game Boy database schemas
         run: |
@@ -523,11 +527,13 @@ jobs:
 
       - name: Exercise Alternate-Self Lab persistence
         run: |
+          ROOT="$(mktemp -d /tmp/r2-altself-smoke.XXXXXX)"
+          trap 'rm -rf "$ROOT"' EXIT
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. \
-            -DR2_DIARY_DATABASE='"/tmp/r2-altself-smoke/r2_memory.db"' \
+            -DR2_ALTSELF_TEST_ROOT="\"$ROOT\"" -DR2_DIARY_DATABASE="\"$ROOT/r2_memory.db\"" \
             tests/alternate_self_smoke.c AlternateSelf.c -lsqlite3 -lpthread \
-            -o /tmp/r2-altself-smoke-test
-          /tmp/r2-altself-smoke-test
+            -o "$ROOT/alternate-self-test"
+          "$ROOT/alternate-self-test"
 
       - name: Check Life Log structured declarations and schema
         run: python3 tests/life_log_linker_regression.py
@@ -598,7 +604,7 @@ jobs:
         run: |
           ROOT=/tmp/r2-needs-smoke
           rm -rf "$ROOT" /tmp/r2-needs-smoke-r2.o /tmp/r2-needs-smoke-test
-          FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_INVENTORY_TEST_FAILURE_INJECTION -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
+          FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_INVENTORY_TEST_FAILURE_INJECTION -DR2_MONEY_TEST_FAILURE_INJECTION -DR2_ROOT=\"$ROOT\" -DR2_HOME=\"$ROOT/R2\" -DR2_WORKSPACE=\"$ROOT\" -DR2_DIARY_DATABASE=\"$ROOT/R2/r2_memory.db\" -DR2_DIARY_DIR=\"$ROOT/R2_Diary\""
           cc $FLAGS -Dmain=r2_program_main -c r2.c -o /tmp/r2-needs-smoke-r2.o
           cc $FLAGS tests/reality_needs_smoke.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c /tmp/r2-needs-smoke-r2.o -o /tmp/r2-needs-smoke-test -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm
           /tmp/r2-needs-smoke-test
@@ -635,7 +641,7 @@ jobs:
       - name: Prevent private reasoning from leaking into user-facing replies
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/r2_reply_smoke.c R2Reply.c -o /tmp/r2-reply-smoke
-          /tmp/r2-reply-smoke
+          timeout 15s /tmp/r2-reply-smoke
 
       - name: Audit sound asset inventory without touching audio payloads
         run: |
@@ -690,6 +696,7 @@ jobs:
 
       - name: Validate deployment scripts and private model copier
         run: |
+          test -x R2_Launch_Code.sh
           bash -n R2_Launch_Code.sh
           bash -n tools/r2_service_runner.sh
           bash -n tools/r2_ollama_runner.sh

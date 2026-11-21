@@ -211,6 +211,10 @@ static void seed_legacy_reality_owned_tables(void)
     if (sqlite3_open(path, &db) != SQLITE_OK)
         fail("could not create legacy Reality-owned database fixture");
     const char *legacy =
+        "CREATE TABLE r2_reality_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
+        "INSERT INTO r2_reality_meta VALUES('current_location','home');"
+        "CREATE TABLE r2_reality_self(id INTEGER PRIMARY KEY,hunger REAL);"
+        "INSERT INTO r2_reality_self VALUES(1,0);"
         "CREATE TABLE r2_reality_item_memory("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,item_name TEXT NOT NULL,"
         "description TEXT,exact_quantity INTEGER,approximate_quantity INTEGER);"
@@ -358,13 +362,18 @@ static void seed_legacy_shared_reality_tables(void)
         fail("could not create legacy shared-memory database fixture");
     const char *sql =
         "CREATE TABLE r2_reality_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
-        "INSERT INTO r2_reality_meta(key,value) VALUES('current_location','home'),('initial_cash_seeded','1');"
+        "INSERT INTO r2_reality_meta(key,value) VALUES('current_location','outside'),('initial_cash_seeded','1');"
+        "CREATE TABLE r2_reality_self(id INTEGER PRIMARY KEY,hunger REAL);"
+        "INSERT INTO r2_reality_self VALUES(1,23);"
         "CREATE TABLE r2_reality_containers(name TEXT PRIMARY KEY,description TEXT,parent TEXT);"
         "INSERT INTO r2_reality_containers(name,description,parent) VALUES('legacy_container','Old container','room');"
-        "CREATE TABLE r2_reality_objects(name TEXT PRIMARY KEY,description TEXT,quantity INTEGER,container TEXT);"
-        "INSERT INTO r2_reality_objects(name,description,quantity,container) VALUES('legacy_stack','Old stack',2,'legacy_container');"
+        "CREATE TABLE r2_reality_objects(name TEXT PRIMARY KEY,description TEXT,quantity INTEGER,location TEXT);"
+        "INSERT INTO r2_reality_objects(name,description,quantity,location) VALUES"
+        "('legacy_stack','Old stack',2,'legacy_container'),"
+        "('legacy_unlisted_stack','Saved at an unlisted location',1,'legacy_unlisted_location');"
         "CREATE TABLE r2_reality_self_facts(key TEXT PRIMARY KEY,value TEXT);"
-        "INSERT INTO r2_reality_self_facts(key,value) VALUES('legacy_fact','preserve me');"
+        "INSERT INTO r2_reality_self_facts(key,value) "
+        "VALUES('legacy_fact','preserve me'),('invalid_legacy_fact',NULL);"
         "CREATE TABLE r2_reality_ticks(previous_tick INTEGER,current_tick INTEGER);"
         "INSERT INTO r2_reality_ticks(previous_tick,current_tick) VALUES(100,110);"
         "CREATE TABLE r2_reality_item_memory(item_name TEXT,description TEXT,exact_quantity INTEGER,collected_at INTEGER);"
@@ -380,15 +389,15 @@ static void seed_legacy_shared_reality_tables(void)
         "CREATE TABLE r2_food_experience_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
         "INSERT INTO r2_food_experience_meta(key,value) VALUES('legacy_test','preserved');"
         "CREATE TABLE r2_money_account(id INTEGER PRIMARY KEY,cash_cents INTEGER,bank_cents INTEGER);"
-        "INSERT INTO r2_money_account(id,cash_cents,bank_cents) VALUES(1,1234,5678);"
+        "INSERT INTO r2_money_account(id,cash_cents,bank_cents) VALUES(1,9999,8888);"
         "CREATE TABLE r2_tv_state(id INTEGER PRIMARY KEY,power INTEGER,source_kind TEXT,source_value INTEGER);"
-        "INSERT INTO r2_tv_state(id,power,source_kind,source_value) VALUES(1,1,'input',2);"
+        "INSERT INTO r2_tv_state(id,power,source_kind,source_value) VALUES(1,0,'input',4);"
         "CREATE TABLE r2_tv_devices(name TEXT PRIMARY KEY,connection_kind TEXT,port INTEGER);"
         "INSERT INTO r2_tv_devices(name,connection_kind,port) VALUES('legacy_vcr','input',4);"
         "CREATE TABLE r2_tv_vcr_tapes(media_path TEXT PRIMARY KEY);"
         "INSERT INTO r2_tv_vcr_tapes(media_path) VALUES('legacy_tape.mkv');"
         "CREATE TABLE r2_tv_vcr_state(id INTEGER PRIMARY KEY,cassette_path TEXT,transport TEXT);"
-        "INSERT INTO r2_tv_vcr_state(id,cassette_path,transport) VALUES(1,'legacy_tape.mkv','pause');";
+        "INSERT INTO r2_tv_vcr_state(id,cassette_path,transport) VALUES(1,NULL,'stop');";
     char *error = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &error);
     if (rc != SQLITE_OK) {
@@ -411,6 +420,14 @@ static void verify_legacy_shared_reality_migration(void)
         fail("could not open destination Reality DB after legacy migration");
 
     const struct { const char *sql; int expected; const char *message; } counts[] = {
+        {"SELECT COUNT(*) FROM r2_reality_meta WHERE key='current_location' AND value='home'", 1,
+         "shared migration overwrote the dedicated location"},
+        {"SELECT COUNT(*) FROM r2_money_transfer_journal", 0,
+         "startup left a completed wallet materialization journal pending"},
+        {"SELECT COUNT(*) FROM r2_reality_meta WHERE key='money_files_authoritative' AND value='1'", 1,
+         "complete wallet materialization did not publish its authority marker"},
+        {"SELECT COUNT(*) FROM r2_reality_self_facts WHERE key='invalid_legacy_fact' AND value='repaired'", 1,
+         "corrected legacy fact was not imported on retry"},
         {"SELECT COUNT(*) FROM r2_reality_item_memory WHERE item_name='native_old_item' AND exact_quantity=4", 1,
          "in-place legacy item memory was not preserved"},
         {"SELECT COUNT(*) FROM r2_food_experiences WHERE food_name='native_old_meal' AND fullness=22 AND energy_bonus=0", 1,
@@ -449,6 +466,9 @@ static void verify_legacy_shared_reality_migration(void)
          "legacy object stack/container was not migrated"},
         {"SELECT COUNT(*) FROM r2_reality_containers WHERE name='legacy_container' AND kind='container'", 1,
          "legacy container was not migrated with a safe default kind"},
+        {"SELECT COUNT(*) FROM r2_reality_objects AS o JOIN r2_reality_containers AS c ON c.name=o.container "
+         "WHERE o.name='legacy_unlisted_stack' AND c.name='legacy_unlisted_location' AND c.parent='room'", 1,
+         "legacy location-only inventory lost its saved container"},
         {"SELECT COUNT(*) FROM r2_reality_ticks WHERE previous_tick=100 AND current_tick=110 AND elapsed_seconds=10", 1,
          "legacy world tick was not migrated with elapsed-time fallback"},
         {"SELECT COUNT(*) FROM r2_tv_vcr_tapes WHERE media_path='legacy_tape.mkv'", 1,
@@ -840,6 +860,51 @@ int main(void)
     seed_legacy_fridge_schema();
     seed_legacy_reality_owned_tables();
     seed_legacy_shared_reality_tables();
+    if (r2_reality_init() == 0)
+        fail("invalid legacy fact was skipped instead of rolling back the migration");
+    sqlite3 *migration_db = NULL;
+    sqlite3_stmt *migration_st = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &migration_db) != SQLITE_OK ||
+        sqlite3_prepare_v2(migration_db,
+            "SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM r2_reality_meta WHERE key='legacy_reality_migrated') "
+            "AND NOT EXISTS(SELECT 1 FROM r2_reality_containers WHERE name='legacy_container')",
+            -1, &migration_st, NULL) != SQLITE_OK ||
+        sqlite3_step(migration_st) != SQLITE_ROW)
+        fail("failed legacy migration recorded a receipt or left a partial import");
+    sqlite3_finalize(migration_st);
+    sqlite3_close(migration_db);
+    migration_db = NULL;
+    migration_st = NULL;
+    if (sqlite3_open(R2_HOME "/r2_memory.db", &migration_db) != SQLITE_OK ||
+        sqlite3_exec(migration_db,
+            "UPDATE r2_reality_self_facts SET value='repaired' WHERE key='invalid_legacy_fact'",
+            NULL, NULL, NULL) != SQLITE_OK || sqlite3_changes(migration_db) != 1)
+        fail("could not repair the isolated legacy fixture for retry");
+    sqlite3_close(migration_db);
+    migration_db = NULL;
+#ifdef R2_MONEY_TEST_FAILURE_INJECTION
+    if (setenv("R2_TEST_MONEY_MIGRATION_INTERRUPT_AFTER_WALLET", "1", 1) != 0)
+        fail("could not configure wallet migration interruption");
+    if (r2_reality_init() == 0)
+        fail("wallet migration failure did not prevent startup");
+    if (unsetenv("R2_TEST_MONEY_MIGRATION_INTERRUPT_AFTER_WALLET") != 0)
+        fail("could not clear wallet migration interruption");
+    if (access(R2_ROOT "/Pockets/Wallet/change.txt", F_OK) != 0 ||
+        access(R2_ROOT "/room/piggybank/change.txt", F_OK) == 0)
+        fail("wallet interruption fixture did not stop between the two physical writes");
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &migration_db) != SQLITE_OK ||
+        sqlite3_prepare_v2(migration_db,
+            "SELECT new_cash_cents,new_bank_cents FROM r2_money_transfer_journal "
+            "WHERE operation='legacy_materialization' AND phase='pending' "
+            "AND NOT EXISTS(SELECT 1 FROM r2_reality_meta WHERE key='money_files_authoritative')",
+            -1, &migration_st, NULL) != SQLITE_OK ||
+        sqlite3_step(migration_st) != SQLITE_ROW ||
+        sqlite3_column_int64(migration_st, 0) != 1234 ||
+        sqlite3_column_int64(migration_st, 1) != 5678)
+        fail("interrupted wallet migration lost its original two balances");
+    sqlite3_finalize(migration_st);
+    sqlite3_close(migration_db);
+#endif
     if (r2_reality_init() != 0) fail("Reality initialization failed");
     verify_complete_legacy_inventory();
     char *initial_status = r2_reality_status();
@@ -870,7 +935,7 @@ int main(void)
     read_needs(&initial_hunger, &initial_sleepiness, &initial_energy,
                &initial_satisfaction, &initial_since_meal);
     if (initial_hunger < 99.9 || initial_hunger > 100.0)
-        fail("fresh R2 state should start at full modeled satiety after the one-time semantics migration");
+        fail("dedicated needs state should survive the conflicting shared row and convert to full satiety");
     if (r2_reality_add_item("invalid_quantity", "Invalid quantity test", "pockets", 0) == 0)
         fail("Reality API must reject non-positive quantities rather than converting them to one");
     if (r2_reality_add_item("overflow_stack", "Quantity boundary test", "pockets", INT_MAX) != 0)

@@ -10,6 +10,13 @@ PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 umask 077
 
+# Any invocation that can start the real core is a final deployment action.
+if [[ "${1:-}" != "--activate-reviewed" || "$#" -gt 2 ||
+      ( "$#" -eq 2 && "${2:-}" != "--legacy-memory-only" ) ]]; then
+    echo "[R2 installer] No action taken. Final activation requires --activate-reviewed after release signoff." >&2
+    exit 2
+fi
+
 [[ "$EUID" -eq 0 ]] || {
     echo "[R2 installer] ERROR: this trusted bootstrap must be invoked as root via sudo." >&2
     exit 1
@@ -56,10 +63,10 @@ run_as_r2() {
 BACKUP_EXEC=""
 INSTALL_SUCCEEDED=0
 NEW_EXEC_INSTALLED=0
+CORE_START_ATTEMPTED=0
 OLLAMA_STATE_CAPTURED=0
 OLLAMA_WAS_ACTIVE=0
 OLLAMA_WAS_ENABLED=0
-R2_ROLLBACK_RESTARTED=0
 UNIT_STAGING_DIR=""
 
 cleanup_unit_staging() {
@@ -69,15 +76,25 @@ cleanup_unit_staging() {
     fi
 }
 
+stop_failed_activation() {
+    [[ "$CORE_START_ATTEMPTED" == "1" ]] || return 0
+    if ! root_run systemctl disable --now r2-3po.service; then
+        log "ERROR: could not stop and disable R2; leaving the executable in place."
+        return 1
+    fi
+    CORE_START_ATTEMPTED=0
+}
+
 cleanup_on_exit() {
     local status=$?
     trap - EXIT
+    trap '' INT TERM
     cleanup_unit_staging
 
     # Cover failures after replacing R2 but before the explicit activation
     # rollback path (for example, chmod/date/systemd setup failures).
     if [[ "$status" -ne 0 && "$INSTALL_SUCCEEDED" != "1" &&
-          "$NEW_EXEC_INSTALLED" == "1" ]]; then
+          "$NEW_EXEC_INSTALLED" == "1" ]] && stop_failed_activation; then
         if [[ -n "$BACKUP_EXEC" && -f "$BACKUP_EXEC" ]]; then
             local restore_exec=""
             restore_exec="$(run_as_r2 mktemp "$R2_ROOT/r2.restore.XXXXXX" 2>/dev/null)" || true
@@ -108,11 +125,8 @@ cleanup_on_exit() {
     # The installer stops the private model server while repairing its model
     # store. If any pre-activation step fails, restore its original enabled and
     # active state instead of leaving a previously running service stranded.
-    # If rollback successfully restarted the previous R2 core, keep its model
-    # server running; that core depends on it.
     if [[ "$INSTALL_SUCCEEDED" != "1" &&
-          "$OLLAMA_STATE_CAPTURED" == "1" &&
-          "$R2_ROLLBACK_RESTARTED" != "1" ]]; then
+          "$OLLAMA_STATE_CAPTURED" == "1" && "$CORE_START_ATTEMPTED" == "0" ]]; then
         if [[ "$OLLAMA_WAS_ENABLED" == "1" ]]; then
             root_run systemctl enable r2-ollama.service >/dev/null 2>&1 || true
         else
@@ -128,6 +142,8 @@ cleanup_on_exit() {
     exit "$status"
 }
 trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_core_ready() {
     # The service runner allows two 180-second model requests per policy,
@@ -159,7 +175,7 @@ wait_for_core_ready() {
 
 rollback_previous_executable() {
     # Stop any failed/new instance before inspecting or restoring the prior binary.
-    root_run systemctl stop r2-3po.service >/dev/null 2>&1 || true
+    stop_failed_activation || return 1
     if [[ -z "$BACKUP_EXEC" || ! -f "$BACKUP_EXEC" ]]; then
         log "WARNING: no previous executable is available to roll back to; the failed service has been stopped."
         return 1
@@ -178,20 +194,7 @@ rollback_previous_executable() {
     fi
     NEW_EXEC_INSTALLED=0
     log "Restored previous executable from $BACKUP_EXEC"
-    root_run systemctl reset-failed r2-3po.service >/dev/null 2>&1 || true
-    if ! root_run systemctl start r2-3po.service; then
-        log "WARNING: previous executable is restored, but the service could not be started."
-        return 1
-    fi
-    if wait_for_core_ready; then
-        R2_ROLLBACK_RESTARTED=1
-        log "Previous executable restored and core readiness marker observed."
-    else
-        log "WARNING: previous executable is restored, but it did not reach core readiness."
-        root_run systemctl --no-pager --full status r2-3po.service || true
-        root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-        return 1
-    fi
+    log "R2 remains stopped for manual recovery; the previous executable will not be launched."
 }
 
 [[ -d "$R2_SOURCE" ]] || fail "expected source tree at $R2_SOURCE. Copy/clone this repository there first, then rerun."
@@ -268,13 +271,18 @@ for database in "$R2_SOURCE/r2_memory.db" "$R2_SOURCE/r2_reality.db" "$R2_SOURCE
     fi
 done
 
-# No R2 process is running, so take a consistent, private snapshot of all five
-# persistent databases and require a clean integrity audit before installing/starting code.
+# With R2 stopped, snapshot each existing store before activating the core.
+# The normal path expects all five; the explicit legacy path verifies its source.
 AUDIT_SCRIPT="$R2_SOURCE/tools/audit_r2_databases.py"
 [[ -f "$AUDIT_SCRIPT" ]] || fail "database audit tool is missing: $AUDIT_SCRIPT"
 SNAPSHOT_DIR="$R2_ROOT/audit-snapshot-$(date '+%Y%m%d-%H%M%S')"
 log "Creating a private SQLite snapshot and checking database integrity..."
-run_as_r2 python3 "$AUDIT_SCRIPT" --root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR" ||
+AUDIT_ARGS=(--root "$R2_SOURCE" --snapshot-dir "$SNAPSHOT_DIR"
+    --gameboy-root "$R2_ROOT/Devices/GameBoyAdvance")
+if [[ "${2:-}" == "--legacy-memory-only" ]]; then
+    AUDIT_ARGS+=(--legacy-memory-only)
+fi
+run_as_r2 python3 "$AUDIT_SCRIPT" "${AUDIT_ARGS[@]}" ||
     fail "database snapshot/integrity audit failed. R2 was not activated; inspect the report and preserve the snapshot/source databases."
 log "Database snapshot and integrity audit passed: $SNAPSHOT_DIR"
 
@@ -473,11 +481,14 @@ if [[ "$NVIDIA_PCI_PRESENT" == "1" || "$PREFLIGHT_GPU" != "0" ]]; then
     PREFLIGHT_GPU_ARGS=(--require-gpu-offload)
 fi
 log "Preflight GPU/context policy: R2_OLLAMA_NUM_GPU=$PREFLIGHT_GPU R2_OLLAMA_NUM_CTX=${PREFLIGHT_CTX:-adaptive}"
-if ! run_as_r2 env R2_MODEL="$R2_MODEL" R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
+if run_as_r2 env R2_MODEL="$R2_MODEL" R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
     R2_OLLAMA_NUM_GPU="$PREFLIGHT_GPU" R2_OLLAMA_NUM_CTX="$PREFLIGHT_CTX" \
     python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
-    if [[ "$PREFLIGHT_POLICY_DEFAULTED" == "1" ]]; then
-        log "Default GTX 1050 Ti preflight failed; retrying with 12 GPU layers and 4096 context tokens."
+    :
+else
+    PREFLIGHT_STATUS=$?
+    if [[ "$PREFLIGHT_STATUS" == "75" && "$PREFLIGHT_POLICY_DEFAULTED" == "1" ]]; then
+        log "Default GTX 1050 Ti preflight reported insufficient memory; retrying with 12 GPU layers and 4096 context tokens."
         PREFLIGHT_GPU=12
         PREFLIGHT_CTX=4096
         if ! run_as_r2 env R2_MODEL="$R2_MODEL" R2_OLLAMA_BASE_URL="$R2_OLLAMA_BASE_URL" \
@@ -515,11 +526,12 @@ run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"
 NEW_EXEC_INSTALLED=1
 run_as_r2 chmod 0755 "$R2_EXEC"
 
-log "Enabling R2 at boot and starting the overnight service..."
-if ! root_run systemctl enable --now r2-3po.service; then
+log "Starting the reviewed R2 release..."
+CORE_START_ATTEMPTED=1
+if ! root_run systemctl start r2-3po.service; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-    rollback_previous_executable || log "WARNING: automatic executable rollback/restart was incomplete."
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
     fail "systemd could not start R2. The previous executable was restored when available; fix the reported preflight/dependency issue before relying on overnight operation."
 fi
 
@@ -528,8 +540,13 @@ fi
 if ! wait_for_core_ready; then
     root_run systemctl --no-pager --full status r2-3po.service || true
     root_run journalctl -u r2-3po.service -n 100 --no-pager || true
-    rollback_previous_executable || log "WARNING: automatic executable rollback/restart was incomplete."
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
     fail "R2 did not reach active state. The previous executable was restored when available; inspect the service logs before retrying deployment."
+fi
+
+if ! root_run systemctl enable r2-3po.service; then
+    rollback_previous_executable || log "WARNING: automatic executable rollback was incomplete."
+    fail "R2 reached readiness, but could not be enabled at boot. Inspect service state before retrying."
 fi
 
 INSTALL_SUCCEEDED=1

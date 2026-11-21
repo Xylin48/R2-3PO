@@ -54,6 +54,7 @@ def main() -> int:
         env["R2_FX_DIR"] = str(base / "FX")
         env["R2_TV_SOCKET"] = str(home / "tv-control.sock")
 
+        ready_marker = "[R2 READY] Core initialized; entering shell."
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 [str(binary)], cwd=workspace, env=env,
@@ -66,7 +67,7 @@ def main() -> int:
                     if process.poll() is not None:
                         break
                     try:
-                        if "R2-3PO ONLINE" in log_path.read_text(
+                        if ready_marker in log_path.read_text(
                             encoding="utf-8", errors="replace"
                         ):
                             break
@@ -75,27 +76,20 @@ def main() -> int:
                     time.sleep(0.1)
 
                 startup_log = log_path.read_text(encoding="utf-8", errors="replace")
-                if "R2-3PO ONLINE" not in startup_log:
+                if ready_marker not in startup_log:
                     raise AssertionError(
-                        "R2 did not reach ONLINE in isolated service mode.\n"
+                        "R2 did not publish service readiness.\n"
                         + startup_log[-12000:]
                     )
 
-                # ONLINE is emitted before every optional device endpoint is
-                # necessarily ready. Wait for the actual control socket instead
-                # of racing initialization on a fast CI runner.
+                # Readiness follows the socket initialization attempt.
                 socket_path = home / "tv-control.sock"
-                socket_deadline = time.monotonic() + 10
-                while (not socket_path.exists()
-                       and process.poll() is None
-                       and time.monotonic() < socket_deadline):
-                    time.sleep(0.05)
                 if not socket_path.exists():
                     current_log = log_path.read_text(
                         encoding="utf-8", errors="replace"
                     )
                     raise AssertionError(
-                        "TV control socket did not become ready after ONLINE.\\n"
+                        "TV control socket was unavailable at service readiness.\n"
                         + current_log[-12000:]
                     )
 
@@ -181,12 +175,12 @@ def main() -> int:
                 while time.monotonic() < deadline:
                     if restarted.poll() is not None:
                         break
-                    if "R2-3PO ONLINE" in restart_log.read_text(
+                    if ready_marker in restart_log.read_text(
                         encoding="utf-8", errors="replace"
                     ):
                         break
                     time.sleep(0.1)
-                if "R2-3PO ONLINE" not in restart_log.read_text(
+                if ready_marker not in restart_log.read_text(
                     encoding="utf-8", errors="replace"
                 ):
                     raise AssertionError(
@@ -234,7 +228,7 @@ def main() -> int:
                 "R2 did not shut down cleanly after restart.\n"
                 + restart_log.read_text(encoding="utf-8", errors="replace")[-12000:]
             )
-        print("PASS: R2 reached ONLINE with no peripherals, persisted media facts, "
+        print("PASS: R2 reached service readiness with no peripherals, persisted media facts, "
               "restarted with exact state/history, and shut down cleanly twice.")
     return 0
 

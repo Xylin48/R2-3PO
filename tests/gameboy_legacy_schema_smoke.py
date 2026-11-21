@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 from pathlib import Path
+from contextlib import closing
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -201,6 +202,30 @@ def main() -> int:
             ).fetchone()[0] == 0
         finally:
             fresh_db.close()
+
+        # A combined event table with no numeric ID still has importable
+        # history. Use a WITHOUT ROWID table to exercise that exact schema.
+        with closing(sqlite3.connect(fresh_root / "gameboy.db")) as source:
+            source.executescript("""
+                CREATE TABLE console_events (
+                    timestamp TEXT PRIMARY KEY,
+                    context TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                ) WITHOUT ROWID;
+                INSERT INTO console_events VALUES
+                    ('2023-05-02T00:00:00', 'system', 'legacy_idless', 'second event'),
+                    ('2023-05-01T00:00:00', 'system', 'legacy_idless', 'first event');
+            """)
+        for _ in range(2):
+            with closing(fresh_module.connect()) as migrated:
+                rows = migrated.execute(
+                    "SELECT summary FROM console_events WHERE event_type='legacy_idless' ORDER BY id"
+                ).fetchall()
+                assert [row["summary"] for row in rows] == ["first event", "second event"]
+                assert migrated.execute(
+                    "SELECT count(*) FROM cartridge.console_events"
+                ).fetchone()[0] == 2
 
     print("Legacy Game Boy cartridge/state schemas preserve existing data and accept new writes.")
     return 0

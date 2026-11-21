@@ -8,7 +8,7 @@ R2 already has a headless shell mode, a supervised systemd unit, a local-model p
 - Local model copier: `tools/copy_ollama_model.py`
 - Trusted bootstrap source: `tools/r2_install_root_bootstrap.sh` (install once as `/usr/local/sbin/r2-3po-install`); `tools/install_r2_overnight.sh` is only a nonprivileged notice.
 
-The overnight core uses the same persistent R2 databases as the interactive launcher, but its inference server is separate: the installer copies the already-installed `qwen3.5:9b` model from the host Ollama service at `127.0.0.1:11434` into `/home/x/R2_Home/.ollama/models`, then runs an `r2`-owned Ollama server on `127.0.0.1:11435`. It does not download model weights or modify the host Ollama service. **Only one R2 core may run at a time.** Both launch paths keep `HOME` set to `/home/x/R2_Home`, while the process UID remains `r2`; `/home/r2` is not an alternate memory, diary, or workspace location. While the overnight core is active, its stricter UID-scoped firewall chain permits only `127.0.0.1:11435`; IPv6 and all other egress for UID `r2` are rejected. The private Ollama service has its own chain, which also permits local port 11434 so the interactive launcher can use the host Ollama after the overnight core is stopped. The core chain is inserted first while the service is active, so port 11434 is not available to `r2` during overnight operation. The separate chains are cleaned up independently so stopping one service does not remove the other's rules. The installer refuses to rebuild while an R2 process is already running, checks database paths and permissions, takes a private SQLite snapshot, requires a clean integrity audit, copies only an already-installed model, builds to a process-specific temporary executable, preserves the previous binary, and starts the private model server only after installation checks. If the private model preflight fails, R2 is not started; if R2 activation fails, it attempts to restore and restart the previous executable.
+The overnight core uses the same persistent R2 databases as the interactive launcher, but its inference server is separate: the installer copies the already-installed `qwen3.5:9b` model from the host Ollama service at `127.0.0.1:11434` into `/home/x/R2_Home/.ollama/models`, then runs an `r2`-owned Ollama server on `127.0.0.1:11435`. It does not download model weights or modify the host Ollama service. **Only one R2 core may run at a time.** Both launch paths keep `HOME` set to `/home/x/R2_Home`, while the process UID remains `r2`; `/home/r2` is not an alternate memory, diary, or workspace location. While the overnight core is active, its stricter UID-scoped firewall chain permits only `127.0.0.1:11435`; IPv6 and all other egress for UID `r2` are rejected. The private Ollama service has its own chain, which also permits local port 11434 so the interactive launcher can use the host Ollama after the overnight core is stopped. The core chain is inserted first while the service is active, so port 11434 is not available to `r2` during overnight operation. The separate chains are cleaned up independently so stopping one service does not remove the other's rules. The installer refuses to rebuild while an R2 process is already running, checks database paths and permissions, takes a private SQLite snapshot, requires a clean integrity audit, copies only an already-installed model, builds to a process-specific temporary executable, preserves the previous binary, and starts the private model server only after installation checks. A failed model preflight prevents R2 startup. If final activation fails, the bootstrap attempts to stop and disable R2 and restores the previous executable when available. That executable stays stopped for manual recovery.
 
 ## One-time host preparation
 
@@ -20,7 +20,7 @@ Before installing or starting the service, run the non-destructive hardware pref
 bash /home/x/R2_Home/R2/tools/preflight_r2_hardware.sh
 ```
 
-It checks the source/deployment files, the local Ollama API and `qwen3.5:9b`, read-only SQLite integrity, the separate FX folder, and available audio/camera/TV/emulator dependencies. `[FAIL]` items block readiness; `[WARN]` items identify optional hardware or GUI features that need attention. The report does not install packages, change databases, rebuild R2, or start/stop the service. It distinguishes the desktop account's audio session from the `r2` account's default PulseAudio/PipeWire connection and checks whether `r2` can access detected camera and ALSA device nodes when non-interactive `sudo` permits verification. A warning means access was unavailable or could not be proven; it does not itself repair permissions. The interactive launcher adds the host's `audio` group only to the R2 process's supplementary groups when that group exists, preserving the account's existing groups and avoiding a permanent account-membership change. The overnight systemd unit uses the same service-scoped audio group. This allows direct ALSA access where available, but it does not grant access to the desktop user's PulseAudio/PipeWire socket. The final speaker, microphone, and camera test must still be performed from the actual R2 launch environment.
+It checks the source/deployment files, the local Ollama API and `qwen3.5:9b`, SQLite path permissions, the separate FX folder, and available audio/camera/TV/emulator dependencies. `[FAIL]` items block readiness; `[WARN]` items identify optional hardware or GUI features that need attention. The report does not install packages, change databases, rebuild R2, or start/stop the service. It distinguishes the desktop account's audio session from the `r2` account's default PulseAudio/PipeWire connection and checks whether `r2` can access detected camera and ALSA device nodes when non-interactive `sudo` permits verification. A warning means access was unavailable or could not be proven; it does not itself repair permissions. The interactive launcher adds the host's `audio` group only to the R2 process's supplementary groups when that group exists, preserving the account's existing groups and avoiding a permanent account-membership change. The overnight systemd unit uses the same service-scoped audio group. This allows direct ALSA access where available, but it does not grant access to the desktop user's PulseAudio/PipeWire socket. Verify the speaker, microphone, and camera with standalone host tools before installation. The interactive launcher checks existing SQLite integrity after final activation is authorized. The overnight installer audits a private SQLite snapshot before launch.
 
 1. Confirm the repository is deployed at `/home/x/R2_Home/R2`. The sound assets remain a separate local directory at `/home/x/R2_Home/R2_sounds/FX`; that directory is not supposed to exist in GitHub.
 2. Confirm the dedicated Linux account exists: `id r2`.
@@ -53,9 +53,43 @@ It checks the source/deployment files, the local Ollama API and `qwen3.5:9b`, re
 
    If a check fails, correct the existing owner/group/ACL deliberately before continuing. The core stores its five SQLite databases under `R2/` (`r2_memory.db`, `r2_reality.db`, `r2_fridge.db`, `r2_rewards.db`, and `r2_addictions.db`), so account `r2` needs read/write access to that directory and its existing database files.
 
+## Update the interactive launcher
+
+The desktop launcher lives beside the `R2/` checkout. After updating that
+checkout to the reviewed revision, refresh the desktop copy from the same revision.
+This keeps a numbered backup if a launcher is already installed.
+
+```sh
+install --backup=numbered -m 0755 \
+  /home/x/R2_Home/R2/R2_Launch_Code.sh /home/x/R2_Home/R2_Launch_Code.sh
+```
+
 ## Local inference timeout
 
-Foreground chat and its corrective retry allow up to six hours per request by default to accommodate slow mixed CPU/GPU inference and Qwen's reasoning channel. Override the setting before starting the interactive launcher if needed:
+The desktop launcher runs its audits, model probes, compiler, device setup,
+Observer, and core through the dedicated `r2` account. For an interactive
+diagnostic run, set `R2_LIVE_DIAGNOSTICS=1` before starting the launcher.
+Core diagnostics then appear in the terminal and continue to be appended to
+`/home/x/R2_Home/R2_Log/Debug.txt` by `r2`.
+
+From your desktop account, read the existing log under R2's identity, even
+with R2 and its model stopped.
+
+```sh
+sudo -u r2 -- tail -n 100 /home/x/R2_Home/R2_Log/Debug.txt
+```
+
+When Ollama completes a foreground chat with only private reasoning or stops
+at the generation limit, R2 can replay that request once with thinking off.
+The replay keeps the same current turn, context, images and generation budget.
+The diagnostics identify the reason, context size and output budget. Only a
+complete assistant response can proceed to the normal reply and action checks.
+
+The desktop launcher sends these requests as `r2` to the existing localhost
+Ollama service on port 11434. The overnight installation has its own
+`r2`-owned Ollama service on port 11435.
+
+Foreground chat allows up to six hours per request by default to accommodate slow mixed CPU/GPU inference. Override the setting before starting the interactive launcher if needed:
 
 ```sh
 export R2_OLLAMA_TIMEOUT_SECONDS=14400
@@ -104,7 +138,9 @@ unset R2_OLLAMA_TRACE_PROMPTS
 
 Tracing is off by default. When enabled, each serialized request is saved to a new file with owner-only permissions (`0600`); existing files are never overwritten and symlinks are not followed. The trace contains private conversation history, retrieved memories, and your exact message. **Review and redact it before sharing**; do not post it publicly or leave tracing enabled during ordinary use. Once the trace is available, compare the actual current user message and preceding context against the generated reply to determine whether the distortion came from prompt assembly/context, the model itself, or response handling. Do not treat a successful build as proof that this semantic failure is resolved.
 
-## Build, audit, and activate
+## Final activation after release signoff
+
+Complete the [rollout-readiness checklist](rollout-readiness.md) before installing the bootstrap or starting either R2 launch path. The command below is the final launch on the live workspace.
 
 First exit any interactive R2 session. The service and interactive launcher share persistent SQLite databases.
 
@@ -115,8 +151,8 @@ Do **not** run a source-tree script with `sudo`. The checkout under `/home/x/R2_
 Do **not** copy the bootstrap directly from `/home/x/R2_Home/R2`: that tree is writable by `r2`, so checking it and then running `sudo install` from the same path leaves a time-of-check/time-of-use gap. Fetch the reviewed bootstrap from an immutable commit into the desktop user's home (outside the R2-writable tree), verify its Git blob ID, then install that exact file:
 
 ```sh
-BOOTSTRAP_COMMIT=6bc5217ae07d7b7cd3927fb045a71482d11affa5
-BOOTSTRAP_BLOB_SHA=10489001918f3155fbb28a00aec0f14534268c94
+BOOTSTRAP_COMMIT=b24a9f31e43371f5ce1028e2d5b6e33584c01750
+BOOTSTRAP_BLOB_SHA=daab1b83c1e54f2e71c01e3cf5eaf58caeec7820
 umask 077
 curl -fsSL \
   "https://raw.githubusercontent.com/Xylin48/R2-3PO/${BOOTSTRAP_COMMIT}/tools/r2_install_root_bootstrap.sh" \
@@ -148,8 +184,13 @@ The commit URL is immutable, and the Git blob hash must match exactly. Do not re
 From then on, use only the protected entrypoint:
 
 ```sh
-sudo /usr/local/sbin/r2-3po-install
+sudo /usr/local/sbin/r2-3po-install --activate-reviewed
 ```
+
+For a verified older installation with only `r2_memory.db` and structured
+legacy state, append `--legacy-memory-only`. See the
+[database preflight](database-preflight.md#migrating-a-memory-only-installation)
+for the snapshot and migration behavior.
 
 The trusted bootstrap compiles the current checkout and runs the model copier, database audit, and preflight as the unprivileged `r2` account. Its systemd unit definitions are embedded in the root-owned bootstrap; it does not install unit contents read from the runtime-writable checkout. The repository's `tools/install_r2_overnight.sh` is now only a nonprivileged notice and must not be invoked with `sudo`. If the trusted bootstrap itself is intentionally changed in a future release, review that change and reinstall the root-owned copy deliberately.
 
@@ -159,7 +200,7 @@ The bootstrap will:
 - check permissions and refuse symlinked database paths;
 - create a private snapshot of the memory, Reality, fridge, reward, and addiction databases and require the integrity audit to pass;
 - compile the full C runtime as `r2` and keep the previous executable until the private Ollama server passes a real generation preflight;
-- install the trusted embedded systemd units, reload systemd, and enable/start the overnight service.
+- install the trusted embedded systemd units, reload systemd, start the reviewed release, and enable it at boot after readiness.
 
 The bootstrap intentionally stops if the database audit or model preflight fails. Preserve the report and snapshot and investigate the issue rather than deleting or replacing the database files.
 
@@ -191,15 +232,14 @@ The runner attempts to acquire a system sleep inhibitor before doing startup che
 
 The service intentionally runs without an interactive `R2>` prompt. Stop the service before launching `R2_Launch_Code.sh`; the desktop launcher checks whether the service is active to help prevent concurrent database writers.
 
-After future source changes, stop R2 and rerun the installer so the executable is rebuilt, the database audit is repeated, and the service is restarted safely. The installer does not create or rename the local FX assets.
+For future releases, complete signoff and take a fresh snapshot before the next authorized activation. The installer does not create or rename the local FX assets.
 
 ## Verification boundary
 
-CI can compile the source and statically check the supervisor wiring, but it cannot verify the host's Linux permissions, installed Ollama model, actual SQLite contents, speaker/audio routing, camera access, or desktop power settings. After activation, verify `systemctl is-enabled r2-3po.service` and `systemctl is-active r2-3po.service`, inspect the journal for model/preflight/audio warnings, and test one real conversation with the local model. Separately, launch the interactive desktop session and verify speaker playback, explicit microphone listening, camera/Eyes input, the Observer window, and TV/VCR playback; the overnight systemd service is intentionally headless and is not proof that desktop GUI/audio devices work. Confirm shutdown/restart once and inspect the logs for clean lifecycle messages. The FX collection is a local runtime asset, not a repository folder.
-
+Verify host permissions, installed Ollama generation, audio and camera operation, and desktop power settings before final deployment using the standalone tools in the [rollout-readiness gate](rollout-readiness.md). Use isolated data for SQLite and conversation checks. After final activation, monitor the service status, its journal, and routine operation on the normal overnight schedule. The systemd service runs headless. Use the interactive launcher for normal desktop operation only after stopping the service.
 
 ### CPU/GPU placement policy
 
-On the target 4 GiB GTX 1050 Ti, both launch paths default to 20 GPU layers and an 8192-token context. Before activation, preflight must demonstrate real generation and mixed placement from Ollama's `/api/ps` report: positive `size_vram` and total model size greater than VRAM. With both settings selected automatically, the interactive launcher and overnight runner try 4096 and 2048 tokens at 20 layers, followed by 12, 8, and 4 layers at 8192, 4096, and 2048 tokens per layer setting. An explicit context is used for every eligible retry. An explicit GPU layer setting disables the automatic retries. The privileged installer's earlier private-server check uses a single default-only fallback at 12 layers and 4096 tokens. Startup stops if the applicable candidates fail.
+On the target 4 GiB GTX 1050 Ti, both launch paths default to 20 GPU layers and an 8192-token context. Before activation, preflight must demonstrate real generation and mixed placement from Ollama's `/api/ps` report: positive `size_vram` and total model size greater than VRAM. When Ollama explicitly reports insufficient inference memory and both settings are automatic, the interactive launcher and overnight runner try 4096 and 2048 tokens at 20 layers, followed by 12, 8, and 4 layers at 8192, 4096, and 2048 tokens per layer setting. An explicit context is used for every eligible retry. An explicit GPU layer setting disables the automatic retries. The privileged installer's earlier private-server check uses one default-only retry at 12 layers and 4096 tokens for the same failure. A different preflight failure stops probing and reports its cause.
 
 On a host with no NVIDIA PCI device, `R2_OLLAMA_NUM_GPU=0` omits an explicit `num_gpu` option and lets Ollama choose an available backend automatically. If an NVIDIA PCI device is present but `nvidia-smi` cannot query it, startup fails rather than silently downgrading to CPU-only inference. A successfully queried non-1050-Ti NVIDIA GPU uses automatic layer placement but must still prove mixed placement. Explicit operator overrides are respected rather than silently changed; `R2_OLLAMA_NUM_GPU=0` means automatic placement, not permission to ignore an installed NVIDIA GPU. `-1` is an explicit all-layers request, not a safe universal default, and it is incompatible with the target's required mixed-placement check if Ollama reports the whole model in VRAM.

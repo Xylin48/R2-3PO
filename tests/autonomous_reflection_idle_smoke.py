@@ -19,7 +19,7 @@ activity_store = talk.find(activity_call)
 turn_lock = talk.find("pthread_mutex_lock(&conversation_turn_lock)")
 if activity_store < 0 or turn_lock < 0 or activity_store > turn_lock:
     raise SystemExit("A queued user turn must reset reflection idleness before waiting on the turn lock.")
-if not turn_lock < talk.rfind(activity_call) < talk.find("atomic_fetch_sub(&foreground_conversation_waiting, 1)"):
+if not turn_lock < talk.rfind(activity_call) < talk.rfind("atomic_fetch_sub(&foreground_conversation_waiting, 1)"):
     raise SystemExit("The idle interval must restart after foreground processing finishes.")
 
 start = core.find("static void *autonomous_thinking(void *arg)")

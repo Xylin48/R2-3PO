@@ -1,65 +1,73 @@
-/*
- * Runtime regression: a deliberate media view is the second image of the
- * same model message, never a replacement for R2's primary camera Eyes.
- */
+/* Source labels and image order must match the actual encoded inputs. */
 #define main r2_program_main
 #include "../r2.c"
 #undef main
 
 #include <assert.h>
-#include <limits.h>
-#include <stdio.h>
-#include <string.h>
 
-static struct json_object *message_images(struct json_object *arr, int index)
+static const char *message_field(json_object *message, const char *key)
 {
-    struct json_object *message = json_object_array_get_idx(arr, index);
-    struct json_object *images = NULL;
-    assert(message != NULL);
-    if (!json_object_object_get_ex(message, "images", &images))
-        return NULL;
-    return images;
+    json_object *value = NULL;
+    assert(message && json_object_object_get_ex(message, key, &value));
+    return json_object_get_string(value);
+}
+
+static void verify_images(const char *camera, const char *media,
+                          const char *expected_map)
+{
+    const char *identity = "You are R2-3PO.";
+    const char *turn = "  What is happening around me? é\n";
+    json_object *sections = json_object_new_array();
+    assert(sections && ollama_json_append_message(
+        sections, "system", identity, strlen(identity), NULL, NULL) == 0);
+    assert(ollama_json_append_message_with_image_sources(
+        sections, "user", turn, strlen(turn), camera, media) == 0);
+    json_object *request = ollama_json_chat_messages(sections);
+    json_object_put(sections);
+    assert(request && json_object_array_length(request) == 2);
+
+    json_object *system = json_object_array_get_idx(request, 0);
+    assert(!strcmp(message_field(system, "role"), "system"));
+    const char *content = message_field(system, "content");
+    assert(!strncmp(content, identity, strlen(identity)));
+    content += strlen(identity);
+    if (expected_map) {
+        assert(!strncmp(content, "\n\n", 2));
+        assert(!strcmp(content + 2, expected_map));
+    } else {
+        assert(!*content);
+    }
+    json_object *message = json_object_array_get_idx(request, 1);
+    assert(!strcmp(message_field(message, "role"), "user"));
+    assert(!strcmp(message_field(message, "content"), turn));
+    json_object *images = NULL;
+    if (!expected_map) {
+        assert(!json_object_object_get_ex(message, "images", &images));
+    } else {
+        assert(json_object_object_get_ex(message, "images", &images));
+        assert(json_object_array_length(images) == (camera && media ? 2U : 1U));
+        if (camera)
+            assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, 0)), camera));
+        if (media)
+            assert(!strcmp(json_object_get_string(json_object_array_get_idx(images, camera ? 1 : 0)), media));
+    }
+    json_object_put(request);
 }
 
 int main(void)
 {
-    struct json_object *messages = json_object_new_array();
-    assert(messages);
+    verify_images(NULL, NULL, NULL);
+    verify_images("CAMERA", NULL,
+        "CURRENT IMAGE SOURCE MAP: Image 1 is camera Eyes.");
+    verify_images("CAMERA", "MEDIA",
+        "CURRENT IMAGE SOURCE MAP: Image 1 is camera Eyes. Image 2 is the chosen media display.");
+    verify_images(NULL, "MEDIA",
+        "CURRENT IMAGE SOURCE MAP: Image 1 is the chosen media display. No camera frame is attached.");
 
-    /* Ordinary conversation: the camera is the only image. */
-    assert(ollama_json_append_message(messages, "user", "Hello", 5,
-                                      "CAMERA_FRAME", NULL) == 0);
-    struct json_object *images = message_images(messages, 0);
-    assert(images && json_object_array_length(images) == 1);
-    assert(strcmp(json_object_get_string(json_object_array_get_idx(images, 0)),
-                  "CAMERA_FRAME") == 0);
-
-    /* R2 chose to watch a separate display. Both frames reach one turn in
-       camera-first order with the exact original user message preserved. */
-    const char *turn = "What is happening around me?";
-    assert(ollama_json_append_message(messages, "user", turn, strlen(turn),
-                                      "LIVE_CAMERA", "LIVE_MEDIA") == 0);
-    struct json_object *message = json_object_array_get_idx(messages, 1);
-    struct json_object *content = NULL;
-    assert(json_object_object_get_ex(message, "content", &content));
-    assert(strcmp(json_object_get_string(content), turn) == 0);
-    images = message_images(messages, 1);
-    assert(images && json_object_array_length(images) == 2);
-    assert(strcmp(json_object_get_string(json_object_array_get_idx(images, 0)),
-                  "LIVE_CAMERA") == 0);
-    assert(strcmp(json_object_get_string(json_object_array_get_idx(images, 1)),
-                  "LIVE_MEDIA") == 0);
-
-    /* Without physical Eyes, a media-only image is not mislabeled as camera. */
-    assert(ollama_json_append_message(messages, "user", "No eyes", 7,
-                                      NULL, "UNATTACHED_MEDIA") == 0);
-    assert(message_images(messages, 2) == NULL);
-
-    /* Incomplete records must never be appended to the model request. */
-    assert(ollama_json_append_message(messages, NULL, "bad", 3,
-                                      "CAMERA", "MEDIA") != 0);
-    assert(json_object_array_length(messages) == 3);
-    json_object_put(messages);
-    puts("Media focus dual-image payload runtime regression passed.");
+    json_object *request = json_object_new_array();
+    assert(request && ollama_json_append_message(request, NULL, "invalid", 7, "CAMERA", "MEDIA") != 0);
+    assert(json_object_array_length(request) == 0);
+    json_object_put(request);
+    puts("Media focus labels camera-only, display-only and dual-source input and preserves exact user text.");
     return 0;
 }

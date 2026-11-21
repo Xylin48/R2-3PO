@@ -41,9 +41,12 @@ require("json_object_object_add(root, \"model\", json_object_new_string(MODEL))"
         and "if (options) {" not in function,
         "old unchecked metadata/options paths are absent")
 
-require("CURLcode setup_rc = curl_easy_setopt(curl, (option), (value));" in function
-        and "if (setup_rc != CURLE_OK)" in function
-        and "R2_OLLAMA_SETOPT(CURLOPT_WRITEFUNCTION, curl_write)" in function,
+submit_start = source.index("static char *ollama_submit_chat(", end)
+submit_end = source.index("static char *ollama_chat(", submit_start)
+submit = source[submit_start:submit_end]
+require("CURLcode setup_rc = curl_easy_setopt(curl, (option), (value));" in submit
+        and "if (setup_rc != CURLE_OK)" in submit
+        and "R2_OLLAMA_SETOPT(CURLOPT_WRITEFUNCTION, curl_write)" in submit,
         "transport setup fails before performing a partially configured request")
 require("r2_fit_complete_input(required_context_chars, num_ctx, &num_predict)" in function
         and 'ollama_json_object_add_checked(request_options, "num_predict"' in function,
@@ -58,10 +61,10 @@ require("CLOCK_MONOTONIC" in progress
         and "Still waiting for local Ollama response; stage=%s" in progress
         and "since_notice >= 15" in progress
         and "!ollama_background_mode" in progress
-        and "ollama_progress_clock_valid = 0;" in function,
+        and "ollama_progress_clock_valid = 0;" in submit,
         "long foreground inference reports bounded progress while background requests remain quiet")
 
-response_start = source.find("struct json_object *resp = r2_parse_complete_json_object(b.data, b.size);")
+response_start = source.find("struct json_object *resp = r2_parse_complete_json_object(b.data, b.size, &json_problem, &json_offset);")
 response_end = source.find("static char *ollama_chat(", response_start)
 if response_start < 0 or response_end <= response_start:
     raise SystemExit("FAIL: could not isolate Ollama response contract validation")

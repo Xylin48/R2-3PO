@@ -121,8 +121,8 @@ for marker in (
         raise SystemExit(f"Startup memory read does not correctly handle {marker!r}.")
 if "Persistent memory database could not be loaded into startup context" in core:
     raise SystemExit("Startup memory failure is still being masked with placeholder context.")
-if 'R2_INIT_FAIL("could not load startup persistent memories")' not in core:
-    raise SystemExit("R2 can start without its startup persistent-memory query succeeding.")
+if "Startup snapshot unavailable; current-turn retrieval remains active." not in core:
+    raise SystemExit("A failed startup snapshot must be reported while current-turn retrieval stays available.")
 
 # Dynamic retrieval distinguishes a genuinely empty result from a failed
 # database query. Failure must not be cached as an empty-memory success.
@@ -140,9 +140,7 @@ for marker in (
 ):
     if marker not in retrieval:
         raise SystemExit(f"Current-turn retrieval does not handle {marker!r}.")
-if 'memory_context = xstrdup("");' in core[core.find("char *memory_context = context_cache_get"):core.find("R2HistorySelection life_history")]:
-    raise SystemExit("Current-turn retrieval failure is still being cached as an empty context.")
-if "Persistent-memory retrieval failed; refusing to continue with silently missing evidence." not in core:
+if "CURRENT TURN RETRIEVAL STATUS:" not in core or "memory_unavailable = 1;" not in core:
     raise SystemExit("Conversation does not surface current-turn memory retrieval failure.")
 
 # Every real request should report whether the exact current user text and

@@ -1,4 +1,5 @@
 /* Execute the real serializer, CURL setup and response handler without a server. */
+#define R2_GAMEBOY_COMMAND_TIMEOUT_SECONDS 2
 #define main r2_program_main
 #include "../r2.c"
 #undef main
@@ -21,8 +22,26 @@ static char *reviewed_bytes;
 static size_t reviewed_size;
 static int staged_calls;
 static int fail_transport_at;
+static const char burst_user[] = "Queued during active post-turn processing.";
+static int burst_learning_requests;
+static int invalid_body_at;
+static CURLcode invalid_body_result = CURLE_OK;
+static char *isolated_retry_payload;
 static int foreground_after_response;
 static int completed_turn_after_response;
+static const char retry_copy_user[] = "Replay this evidence after an allocation failure.";
+static atomic_int fail_replay_copy = ATOMIC_VAR_INIT(0);
+
+char *__real_strdup(const char *value);
+char *__wrap_strdup(const char *value)
+{
+    if (!strcmp(value, retry_copy_user) && atomic_exchange(&fail_replay_copy, 0)) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_strdup(value);
+}
+
 static int defer_post_turn_request;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
@@ -62,6 +81,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     if (perform_count == fail_transport_at) return CURLE_COULDNT_CONNECT;
     assert(posted && posted_size == (curl_off_t)strlen(posted));
     assert(write_response && write_data && response_body);
+    if (strstr(posted, burst_user)) ++burst_learning_requests;
     if (captured) json_object_put(captured);
     captured = json_tokener_parse(posted); assert(captured);
     struct json_object *flag = NULL;
@@ -104,6 +124,16 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
     char *body = defer_post_turn_request == 1 ? structured : response_body;
+    if (perform_count == invalid_body_at) {
+        static char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
+        body = truncated_body;
+        isolated_retry_payload = strdup(posted);
+        assert(isolated_retry_payload);
+    } else if (isolated_retry_payload) {
+        assert(!strcmp(posted, isolated_retry_payload));
+        free(isolated_retry_payload);
+        isolated_retry_payload = NULL;
+    }
     size_t n = strlen(body), split = n / 3;
     assert(write_response(body, 1, split, write_data) == split);
     assert(write_response(body + split, 1, n - split, write_data) == n - split);
@@ -115,7 +145,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         completed_turn_after_response = 0;
         atomic_fetch_add(&last_conversation_activity_ms, 1);
     }
-    return CURLE_OK;
+    return perform_count == invalid_body_at ? invalid_body_result : CURLE_OK;
 }
 CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
 {
@@ -177,30 +207,62 @@ static void check_request(Message *messages, size_t count, const char *override,
     assert(!expect_reallocation || predict < requested);
     assert(required <= (size_t)(ctx - predict - 512) * 32U / 10U);
     assert(json_object_object_get_ex(captured, "messages", &array));
-    assert(json_object_array_length(array) == count + (override != NULL));
-    size_t matches = 0;
-    for (size_t i = 0; i < json_object_array_length(array); ++i) {
-        struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
+    size_t system_sections = override != NULL;
+    for (size_t i = 0; i < count; ++i)
+        system_sections += !strcmp(messages[i].role, "system");
+    size_t wire_index = 0;
+    if (system_sections) {
+        struct json_object *entry = json_object_array_get_idx(array, wire_index++);
+        struct json_object *content = NULL, *role = NULL;
+        assert(json_object_object_get_ex(entry, "role", &role));
+        assert(!strcmp(json_object_get_string(role), "system"));
+        assert(json_object_object_get_ex(entry, "content", &content));
+        const char *actual = json_object_get_string(content);
+        size_t seen = 0;
+        if (override) {
+            size_t length = strlen(override);
+            assert(!strncmp(actual, override, length));
+            actual += length;
+            ++seen;
+        }
+        for (int priority = 0; priority < 8; ++priority) {
+            for (size_t j = 0; j < count; ++j) {
+                if (strcmp(messages[j].role, "system") ||
+                    r2_is_current_input_source(&messages[j]) ||
+                    r2_inference_system_priority(messages[j].content, query) != priority)
+                    continue;
+                if (seen++) {
+                    assert(!strncmp(actual, "\n\n", 2));
+                    actual += 2;
+                }
+                size_t length = strlen(messages[j].content);
+                assert(!strncmp(actual, messages[j].content, length));
+                actual += length;
+            }
+        }
+        for (size_t j = 0; j < count; ++j) {
+            if (!r2_is_current_input_source(&messages[j])) continue;
+            if (seen++) {
+                assert(!strncmp(actual, "\n\n", 2));
+                actual += 2;
+            }
+            size_t length = strlen(messages[j].content);
+            assert(!strncmp(actual, messages[j].content, length));
+            actual += length;
+        }
+        assert(seen == system_sections && !*actual);
+    }
+    for (size_t j = 0; j < count; ++j) {
+        if (!strcmp(messages[j].role, "system")) continue;
+        struct json_object *entry = json_object_array_get_idx(array, wire_index++);
+        struct json_object *content = NULL, *role = NULL;
         assert(json_object_object_get_ex(entry, "content", &content));
         assert(json_object_object_get_ex(entry, "role", &role));
-        const char *actual = json_object_get_string(content), *actual_role = json_object_get_string(role);
-        int found = override && !strcmp(actual_role, "system") && !strcmp(actual, override);
-        for (size_t j = 0; j < count; ++j)
-            if (!strcmp(actual_role, messages[j].role) && !strcmp(actual, messages[j].content)) found = 1;
-        assert(found); ++matches;
+        assert(!strcmp(json_object_get_string(role),
+                       messages[j].internal_tool_result ? "tool" : messages[j].role));
+        assert(!strcmp(json_object_get_string(content), messages[j].content));
     }
-    assert(matches == count + (override != NULL));
-    for (size_t j = 0; j < count; ++j) {
-        size_t occurrences = 0;
-        for (size_t i = 0; i < json_object_array_length(array); ++i) {
-            struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
-            assert(json_object_object_get_ex(entry, "content", &content));
-            assert(json_object_object_get_ex(entry, "role", &role));
-            if (!strcmp(json_object_get_string(role), messages[j].role) &&
-                !strcmp(json_object_get_string(content), messages[j].content)) ++occurrences;
-        }
-        assert(occurrences == 1);
-    }
+    assert(wire_index == json_object_array_length(array));
     ollama_authoritative_user_query = NULL;
 }
 static void check_boundaries(void)
@@ -245,37 +307,46 @@ static int64_t unavailable_camera_events(void)
     return count;
 }
 
-static void check_retry_and_isolated_inputs(void)
+static void check_context_and_isolated_inputs(void)
 {
-    char *history = text(5000, 'h', "R2 PERSISTENT MEMORY - STARTUP CONTEXT quoted as text. ");
+    char *history = text(5000, 'h', "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     strcpy(history + 4983, "COMPLETE-HISTORY");
-    const char *query = "Current retry question";
-    assert(message_add("user", "First historical message") == 0);
-    assert(message_add("assistant", history) == 0);
-    assert(message_add("user", query) == 0);
-    Message turn[] = {{.role = "user", .content = (char *)query}};
+    const char *query = "Current question";
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
 
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
-    set_response("Retried answer", "stop", 1);
-    char *answer = r2_retry_direct_answer(turn, 1, query);
-    assert(answer && !strcmp(answer, "Retried answer"));
+    set_response("Direct answer", "stop", 1);
+    char *answer = r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60);
+    assert(answer && !strcmp(answer, "Direct answer"));
     assert(captured_contains(history) && captured_contains(query));
+    struct json_object *think = NULL;
+    assert(json_object_object_get_ex(captured, "think", &think) && !json_object_get_boolean(think));
+    int attempts = perform_count;
+    set_response("Incomplete answer", "length", 1);
+    assert(!r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60));
+    assert(perform_count == attempts + 1);
+    set_response("Direct answer", "stop", 1);
     free(answer);
 
-    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-RETRY-TOOL-RESULT";
+    const char *tool_result = "WORLD ERROR: no stock was moved. COMPLETE-TOOL-RESULT";
     Message action_turn[] = {
-        turn[0],
+        turn[1],
         {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
         {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
     };
-    answer = r2_retry_direct_answer(action_turn, 3, query);
+    answer = r2_chat_with_input_source(action_turn, 3, r2_conversation_system_prompt, query, 512, 60, NULL);
     assert(answer && captured_contains(query) && captured_contains(tool_result));
     free(answer);
 
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;
-    answer = r2_retry_direct_answer(turn, 1, query);
+    answer = r2_foreground_chat(turn, 2, "Full policy.", query, 512, 60);
     assert(answer && perform_count > before + 1);
     assert(captured_contains(query) && !captured_contains(history));
     free(answer);
@@ -474,6 +545,73 @@ static void check_foreground_context_review(void)
     ollama_audit_stage = NULL;
 }
 
+static void check_failed_optional_history_review(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    char *history = text(60000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    strcpy(history + 59984, "FULL-SOURCE-END");
+    const char *query = "Good evening, Mom is here. I missed you.";
+    const char *handoff = "[R2_INTERNAL_TOOL_RESULT]\nOne action already completed.";
+    const char *state = "PERSISTENT REALITY CONTEXT\nThe room is unchanged.";
+    const char *fitting = "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n"
+                          "The user previously identified herself as Mom.";
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = (char *)state},
+        {.role = "system", .content = (char *)fitting},
+        {.role = "user", .content = (char *)query},
+        {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST]\nCompleted"},
+        {.role = "user", .content = (char *)handoff, .internal_tool_result = 1},
+    };
+    R2TurnContextReviews scope = {0};
+    r2_turn_context_reviews = &scope;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    ollama_foreground_turn_mode = 1;
+    set_response("It's good to see you again, Mom.", "stop", 1);
+    int before = perform_count;
+    fail_transport_at = before + 1;
+    char *answer = r2_foreground_chat(turn, 6, r2_conversation_system_prompt, query, 1024, 60);
+    fail_transport_at = 0;
+    assert(answer && !strcmp(answer, "It's good to see you again, Mom."));
+    assert(perform_count == before + 2);
+    assert(captured_contains(query) && captured_contains(state) && captured_contains(handoff) &&
+           captured_contains(fitting) && captured_contains(R2_CONVERSATION_IDENTITY) &&
+           captured_contains("Earlier evidence review was unavailable") && !captured_contains(history));
+    assert(scope.count == 1);
+    char *stored = r2_log_read_context_review(scope.archives[0]);
+    assert(stored && strstr(stored, history) && strstr(stored, "Historical review failed"));
+    free(stored);
+    free(answer);
+
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER reject_optional_context_archive BEFORE INSERT ON r2_log_context_reviews "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    for (int fail_review = 0; fail_review < 2; ++fail_review) {
+        before = perform_count;
+        if (fail_review) fail_transport_at = before + 1;
+        answer = r2_foreground_chat(turn, 6, r2_conversation_system_prompt, query, 1024, 60);
+        fail_transport_at = 0;
+        assert(answer && !strcmp(answer, "It's good to see you again, Mom."));
+        assert(fail_review ? perform_count == before + 2 : perform_count > before + 1);
+        assert(captured_contains(query) && captured_contains(handoff) && captured_contains(fitting));
+        assert(captured_contains("lacks a confirmed archive link") && !captured_contains("source was archived"));
+        assert(!captured_contains("historical evidence review; model interpretations") && scope.count == 1);
+        free(answer);
+    }
+    assert(sqlite3_exec(fixture, "DROP TRIGGER reject_optional_context_archive;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+    free(scope.archives);
+    free(history);
+    r2_turn_context_reviews = NULL;
+    ollama_foreground_turn_mode = 0;
+    ollama_audit_stage = NULL;
+    ollama_authoritative_user_query = NULL;
+    puts("An unavailable historical review did not silence a current greeting or lose its source evidence.");
+}
+
 static int memory_fixture_count(const char *query)
 {
     sqlite3_stmt *statement = NULL;
@@ -506,15 +644,24 @@ static void check_post_turn_retry(void)
     int64_t source = r2_log_conversation_turn_for_learning(
         "What do you remember?", "I remember the blue door.", NULL, 0, NULL, 0, NULL);
     assert(source > 0);
+    assert(!atomic_load(&post_turn_replay_requested));
     pthread_mutex_lock(&conversation_turn_lock);
     resume_post_turn_learning();
-    assert(post_turn_active == 0);
+    assert(post_turn_active == 0 && atomic_load(&post_turn_replay_requested));
     pthread_mutex_unlock(&conversation_turn_lock);
 
+    pthread_mutex_lock(&db_lock);
+    resume_post_turn_learning();
+    assert(post_turn_active == 0 && atomic_load(&post_turn_replay_requested));
+    pthread_mutex_unlock(&db_lock);
+
+    /* The staged job below tests processing directly, without a poll. */
+    atomic_store(&post_turn_replay_requested, 0);
     begin_post_turn_work();
     resume_post_turn_learning();
-    assert(post_turn_active == 1);
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
     finish_post_turn_worker();
+    atomic_store(&post_turn_replay_requested, 0);
 
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     assert(job);
@@ -535,6 +682,74 @@ static void check_post_turn_retry(void)
     assert(memory_fixture_count("SELECT count(*) FROM memories WHERE memory='The door was blue.';") == 1);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_inner_states WHERE description='Recall of the blue door';") == 1);
     assert(memory_fixture_count(failures) == initial_failures);
+    before = perform_count;
+    const char *burst_reply = "The exact reply is already durable.";
+    begin_post_turn_work();
+    for (int i = 0; i < 3; ++i) {
+        int64_t event = r2_log_conversation_turn_for_learning(
+            burst_user, burst_reply, NULL, 0, NULL, 0, "Recorded result.");
+        assert(event > source && r2_log_ack_self_report(event) == 0);
+        schedule_post_turn_processing(burst_user, burst_reply, event, strdup("Recorded result."));
+    }
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
+    assert(perform_count == before);
+    resume_post_turn_learning();
+    assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Queued during active post-turn processing.' "
+                                "AND tool_result='Recorded result.'") == 3);
+    finish_post_turn_worker();
+    set_response("NONE", "stop", 1);
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(!atomic_load(&post_turn_replay_requested) && burst_learning_requests == 3);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Queued during active post-turn processing.'") == 0);
+
+    int64_t orphan = r2_log_event(R2_LOG_MEMORY, "legacy_queue_fixture", "Legacy queue fixture.", NULL, "fixture");
+    assert(orphan > source);
+    sqlite3 *legacy = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &legacy) == SQLITE_OK);
+    char *legacy_sql = sqlite3_mprintf(
+        "PRAGMA foreign_keys=OFF;"
+        "INSERT INTO r2_log_pending_learning(event_id,user_text,assistant_text) "
+        "VALUES(%lld,'Orphaned learning fixture','No associated source.');"
+        "DELETE FROM r2_log_events WHERE id=%lld;", (long long)orphan, (long long)orphan);
+    assert(legacy_sql && sqlite3_exec(legacy, legacy_sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(legacy_sql);
+
+    int64_t retry_event = r2_log_conversation_turn_for_learning(
+        retry_copy_user, "Accepted reply for replay.", NULL, 0, NULL, 0, NULL);
+    int64_t next_event = r2_log_conversation_turn_for_learning(
+        "Process the valid evidence behind the failed row.", "Accepted reply.", NULL, 0, NULL, 0, NULL);
+    assert(retry_event > orphan && next_event > retry_event);
+    assert(r2_log_ack_self_report(retry_event) == 0 && r2_log_ack_self_report(next_event) == 0);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 3);
+    atomic_store(&fail_replay_copy, 1);
+    set_response("NONE", "stop", 1);
+    before = perform_count;
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(perform_count == before + 1 && !atomic_load(&fail_replay_copy));
+    assert(atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 2);
+
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(perform_count == before + 2 && !atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                               "WHERE user_text='Orphaned learning fixture';") == 1);
+    assert(sqlite3_exec(legacy, "DELETE FROM r2_log_pending_learning WHERE user_text='Orphaned learning fixture';",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy) == SQLITE_OK);
+
     int64_t late = r2_log_conversation_turn_for_learning(
         "Earlier log", "I still need to finish.", NULL, 0, NULL, 0, NULL);
     int64_t newer = r2_log_conversation_turn_for_learning(
@@ -661,6 +876,7 @@ static void check_gameboy_delivery(void)
                  "cd \"$(dirname \"$0\")\" || exit 1\n"
                  "case \"$2\" in\n"
                  "events) cat events.json ;;\n"
+                 "stall) printf '%s' '{\"incomplete\":'; sleep 20 & wait ;;\n"
                  "ack_event)\n"
                  "  [ \"$3\" = 350001 ] || exit 1\n"
                  "  if [ -e ack-attempted ]; then printf '%s\\n' '{\"ok\":true}';\n"
@@ -668,6 +884,10 @@ static void check_gameboy_delivery(void)
                  "*) exit 1 ;;\n"
                  "esac\n", script) >= 0);
     assert(fclose(script) == 0 && chmod(executable, 0700) == 0);
+
+    char *abandoned = NULL;
+    assert(run_gameboy_console(executable, "stall", NULL, NULL, &abandoned) == -1);
+    assert(abandoned == NULL);
 
     char *details = text(70000, 'd', "Complete adapter evidence ");
     memcpy(details + 70000 - sizeof("VERIFIED-TAIL") + 1, "VERIFIED-TAIL", sizeof("VERIFIED-TAIL"));
@@ -807,6 +1027,387 @@ static void check_structured_report_evidence(void)
     r2_altself_shutdown();
 }
 
+static void check_action_result_under_history_pressure(void)
+{
+    const char *filename = "turn-result-fixture.txt";
+    const char *path = R2_WORKSPACE "/turn-result-fixture.txt";
+    char *user = text(512, 'u', "Please read the result fixture. ");
+    char *file_text = text(650, 'r', "complete action result from the fixture ");
+    memcpy(file_text + 640, "EXACT-TAIL", 10);
+
+    FILE *file = fopen(path, "w");
+    assert(file && fputs(file_text, file) >= 0 && fclose(file) == 0);
+    assert(init_db() == 0 && r2_diary_init() == 0);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    message_free_all();
+    /* The tool pair can fit only by evicting the active turn. The complete
+       direct result still fits beside the user message, without that pair. */
+    char *fixed_history = text(MAX_LIVE_MESSAGE_BYTES - 1350U, 'p', "Old fixture answer.");
+    assert(message_add_pinned("assistant", fixed_history) == 0);
+    free(fixed_history);
+    set_response("I will read the saved document.\n[READ] turn-result-fixture.txt", "stop", 1);
+
+    core_initialized = 1;
+    char *reply = r2_talk(user);
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    char *expected = NULL;
+    assert(asprintf(&expected, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n",
+                    filename, file_text) >= 0);
+    assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
+                            strlen("I processed the action request. Here is the recorded result:\n")));
+    assert(strstr(reply, expected));
+    assert(messages.count == 2 && !strcmp(messages.items[1].role, "user") &&
+           !strcmp(messages.items[1].content, user) && !messages.items[1].pinned);
+    assert(!active_turn_history.user && !active_turn_history.action_request &&
+           !active_turn_history.action_result);
+
+    sqlite3_stmt *statement = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT l.user_text,l.assistant_text,l.tool_result,c.assistant_text,"
+        "EXISTS(SELECT 1 FROM r2_log_pending_self_reports s WHERE s.event_id=l.event_id) "
+        "FROM r2_log_pending_learning l JOIN r2_log_conversations c USING(event_id) "
+        "WHERE l.user_text=?;", -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(statement, 1, user, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 0), user));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 1), ""));
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 3), reply));
+    assert(sqlite3_column_int(statement, 4) == 0);
+    assert(!strcmp((const char *)sqlite3_column_text(statement, 2), expected));
+    assert(sqlite3_step(statement) == SQLITE_DONE);
+    sqlite3_finalize(statement);
+
+    free(reply);
+    free(expected);
+    free(file_text);
+    free(user);
+    message_free_all();
+    const char *unsaved = "This exchange must not produce unsourced learning.";
+    assert(sqlite3_exec(db, "CREATE TRIGGER block_fixture_archive "
+                        "BEFORE INSERT ON r2_log_pending_conversations "
+                        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    const char *decision_failures = "SELECT count(*) FROM r2_log_events "
+                                    "WHERE event_type='post_turn_memory_decision_failed';";
+    int failures_before = memory_fixture_count(decision_failures);
+    set_response("I received your words.", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk(unsaved);
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(reply && !strcmp(reply, "I received your words.\n\n"
+                                  "I couldn't save this exchange to my Life Log."));
+    assert(memory_fixture_count(decision_failures) == failures_before);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='This exchange must not produce unsourced learning.'") == 0);
+    assert(sqlite3_exec(db, "DROP TRIGGER block_fixture_archive;", NULL, NULL, NULL) == SQLITE_OK);
+    free(reply);
+    message_free_all();
+    puts("Failed archive commit left the reply visible with a storage warning and queued no learning.");
+    r2_diary_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+    assert(unlink(path) == 0);
+    puts("Active user turn and exact action result survived live-history admission pressure.");
+}
+
+static void check_compact_ranked_memory(void)
+{
+    assert(!db && sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY, memory TEXT, category TEXT, updated_at TEXT);",
+        NULL, NULL, NULL) == SQLITE_OK);
+    char *large = text(35000, 'x', "orchard orchard orchard oversized ");
+    char *first = text(8700, 'a', "orchard first complete memory ");
+    char *second = text(6900, 'b', "orchard second complete memory ");
+    char *third = text(3000, 'c', "orchard third complete memory ");
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO memories VALUES (1,%Q,'self','2026-11-19'),"
+        "(2,%Q,'self','2026-11-18'),(3,%Q,'self','2026-11-17'),(4,%Q,'self','2026-11-16');",
+        large, first, second, third);
+    assert(sql && sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(sql);
+
+    char *history = text(62000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    char *world = text(30000, 'w', "PERSISTENT REALITY CONTEXT\n");
+    const char *identity = "============================================================\n"
+                           "IDENTITY AND PERSISTENT MEMORY\n"
+                           "Complete identity contract for R2-3PO.";
+    const char *query = "Good evening, darling. This is your mother speaking to you.";
+    Message turn[] = {
+        {.role = "system", .content = (char *)identity},
+        {.role = "system", .content = world},
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_stage = ollama_audit_stage;
+    const char *old_query = ollama_authoritative_user_query;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    r2_associative_query_cache_store(query, "orchard");
+    set_response("Good evening, Mom.", "stop", 1);
+    int before = perform_count;
+    char *answer = r2_foreground_chat(turn, 4, r2_conversation_system_prompt, query, 1024, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(identity) && captured_contains(query) &&
+           captured_contains(first) && captured_contains(second) && captured_contains(third));
+    assert(!captured_contains("orchard orchard orchard oversized") &&
+           !captured_contains(history) && !captured_contains(world));
+    struct json_object *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_ctx", &value) &&
+           json_object_get_int(value) == 8192);
+    assert(json_object_object_get_ex(options, "num_predict", &value) &&
+           json_object_get_int(value) == 1024);
+    char *full = get_relevant_memories("orchard", 10, SIZE_MAX, NULL);
+    assert(full && strstr(full, large) && strstr(full, first) && strstr(full, second) &&
+           strstr(full, third));
+    free(full);
+    free(answer);
+
+    free(history);
+    free(world);
+    free(large);
+    free(first);
+    free(second);
+    free(third);
+    r2_associative_query_cache_clear();
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
+static void check_isolated_response_replay(void)
+{
+    const char *policy = "Read the complete evidence.";
+    const char *fragment = "Evidence fragment stays exact across the replay.";
+    const char *note = "The complete fragment was reviewed.";
+    int old_mode = ollama_foreground_turn_mode;
+    ollama_foreground_turn_mode = 1;
+    set_response(note, "stop", 1);
+    int before = perform_count;
+    invalid_body_at = before + 1;
+    char *reply = r2_model_generate(policy, fragment, 512);
+    assert(reply && !strcmp(reply, note) && perform_count == before + 2);
+    assert(!isolated_retry_payload);
+    free(reply);
+    invalid_body_at = 0;
+
+    const CURLcode receive_failures[] = {CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
+    for (size_t i = 0; i < sizeof(receive_failures) / sizeof(receive_failures[0]); ++i) {
+        before = perform_count;
+        invalid_body_result = receive_failures[i];
+        invalid_body_at = before + 1;
+        reply = r2_model_generate(policy, fragment, 512);
+        assert(reply && !strcmp(reply, note) && perform_count == before + 2);
+        assert(!isolated_retry_payload);
+        free(reply);
+        invalid_body_at = 0;
+    }
+    invalid_body_result = CURLE_OK;
+
+    before = perform_count;
+    free(response_body);
+    response_body = strdup("{\"done\":");
+    assert(response_body);
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 2);
+
+    fixture_http_status = 503;
+    before = perform_count;
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
+    fixture_http_status = 200;
+
+    ollama_foreground_turn_mode = 0;
+    set_response(note, "stop", 1);
+    before = perform_count;
+    invalid_body_at = before + 1;
+    foreground_after_response = 1;
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
+    assert(isolated_retry_payload);
+    free(isolated_retry_payload);
+    isolated_retry_payload = NULL;
+    invalid_body_at = 0;
+    atomic_store(&foreground_conversation_waiting, 0);
+    ollama_foreground_turn_mode = old_mode;
+
+    const char *problem = NULL;
+    size_t offset = 0;
+    static const char embedded_nul[] = "{}\0{}";
+    assert(!r2_parse_complete_json_object(embedded_nul, sizeof(embedded_nul) - 1,
+                                          &problem, &offset));
+    assert(problem && !strcmp(problem, "embedded NUL byte") && offset == 2);
+}
+
+static int deny_memory_reads(void *data, int action, const char *table,
+                             const char *column, const char *schema, const char *origin)
+{
+    (void)data; (void)column; (void)schema; (void)origin;
+    return action == SQLITE_READ && table && !strcmp(table, "memories") ? SQLITE_DENY : SQLITE_OK;
+}
+
+static void check_context_cache_write_overlap(void)
+{
+    const char *key = "concurrent memory fixture";
+    uint64_t before, after;
+    assert(!context_cache_get(key, 10, &before));
+    context_cache_invalidate();
+    assert(!context_cache_get(key, 10, &after) && before != after);
+    context_cache_store(key, 10, "fresh after write", after);
+    context_cache_store(key, 10, "stale pre-write result", before);
+    char *cached = context_cache_get(key, 10, NULL);
+    assert(cached && !strcmp(cached, "fresh after write"));
+    free(cached);
+    context_cache_invalidate();
+}
+
+static void check_first_answer_with_unavailable_source(void)
+{
+    const char *query = "Do you remember the azurite fixture?";
+    const char *life = "The azurite fixture links to a complete Life Log record.";
+    const char *memory = "The azurite fixture has this exact recovered memory.";
+    assert(db == NULL && sqlite3_open(":memory:", &db) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY, memory TEXT, category TEXT, updated_at TEXT);"
+        "INSERT INTO memories VALUES(1,'The azurite fixture has this exact recovered memory.','fact','now');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(message_add("user", query) == 0);
+    assert(r2_log_event(R2_LOG_MEMORY, "retrieval_source_fixture", life, life, "fixture") > 0);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    r2_associative_query_cache_store(query, "azurite");
+    assert(sqlite3_set_authorizer(db, deny_memory_reads, NULL) == SQLITE_OK);
+    set_response("I can use what the Life Log recorded.", "stop", 1);
+    int requests = perform_count;
+    int64_t camera_before = unavailable_camera_events();
+    char *reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 1);
+    assert(captured_contains(query) && captured_contains(life));
+    assert(captured_contains("CURRENT TURN RETRIEVAL STATUS:") &&
+           captured_contains("could not be read fully: persistent memory"));
+    assert(!captured_contains(memory) && unavailable_camera_events() == camera_before);
+    free(reply);
+
+    assert(sqlite3_set_authorizer(db, NULL, NULL) == SQLITE_OK);
+    assert(db_exec("INSERT INTO memories VALUES(2,'azurite invalid'||char(0)||'tail','fact','now');") == 0);
+    reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 2 && captured_contains(memory));
+    assert(captured_contains("could not be read fully: persistent memory"));
+    assert(!captured_contains("azurite invalid"));
+    free(reply);
+
+    assert(db_exec("UPDATE memories SET memory='azurite recovered sibling' WHERE id=2;") == 0);
+    reply = chat_with_relevant_memories(query);
+    assert(reply && perform_count == requests + 3 && captured_contains(memory));
+    assert(captured_contains("azurite recovered sibling"));
+    assert(!captured_contains("could not be read fully: persistent memory"));
+    free(reply);
+    context_cache_invalidate();
+    r2_associative_query_cache_clear();
+    message_free_all();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
+static void check_foreground_input_provenance(void)
+{
+    const char *query = "Hi, I missed you.";
+    Message turn = {.role = "user", .content = (char *)query};
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("I missed you too.", "stop", 1);
+    for (int i = 0; i < 2; ++i) {
+        /* Transcribed input remains speech even if logging its event failed. */
+        r2_input_speech_event = i ? -1 : 0;
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60, NULL);
+        assert(reply && captured_contains(query));
+        assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
+                                     "CURRENT USER INPUT: typed keyboard text."));
+        assert(captured_contains(i ? "The transcript supplies words" :
+                                     "It contains no recording, voice, or microphone transcript."));
+        assert(captured_contains("Keep simple greetings brief and personal"));
+        assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
+        free(reply);
+    }
+    r2_input_speech_event = 0;
+    ollama_audit_stage = NULL;
+    ollama_authoritative_user_query = NULL;
+}
+
+static void check_memory_response_replay(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
+    set_response("knowledge | The user reported a blue key.", "stop", 1);
+    int before = perform_count;
+    invalid_body_at = before + 1;
+    invalid_body_result = CURLE_PARTIAL_FILE;
+    char *result = memory_decision("The spare key is blue.", "", NULL, 0, NULL);
+    invalid_body_at = 0;
+    invalid_body_result = CURLE_OK;
+    assert(result && !strcmp(result, "knowledge | The user reported a blue key."));
+    assert(perform_count == before + 2 && !isolated_retry_payload && !ollama_isolated_request);
+    assert(captured_contains("The spare key is blue.") && captured_contains("NO GENERATED R2 RESPONSE"));
+    free(result);
+    puts("A partial memory response was replayed against the same saved evidence.");
+}
+
+static void *shutdown_fixture_worker(void *unused)
+{
+    (void)unused;
+    r2_shutdown();
+    return NULL;
+}
+
+static void check_shutdown_drain_and_rollback(void)
+{
+    assert(init_db() == 0);
+    core_initialized = 1;
+    uint64_t cache_generation;
+    assert(context_cache_get("previous session", 3, &cache_generation) == NULL);
+    context_cache_store("previous session", 3, "stale context", cache_generation);
+    r2_associative_query_cache_store("previous session", "stale plan");
+    assert(sqlite3_exec(db, "BEGIN IMMEDIATE;"
+                        "INSERT INTO memories(memory,category) VALUES"
+                        "('Incomplete shutdown fixture','knowledge');",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    /* Treat the held turn lock as an inference which is finishing delivery. */
+    pthread_mutex_lock(&conversation_turn_lock);
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, shutdown_fixture_worker, NULL) == 0);
+    const struct timespec pause = {.tv_nsec = 10000000L};
+    for (int i = 0; i < 200 && !shutting_down; ++i) nanosleep(&pause, NULL);
+    assert(shutting_down);
+    assert(pthread_tryjoin_np(thread, NULL) == EBUSY);
+    assert(r2_log_is_initialized());
+    pthread_mutex_unlock(&conversation_turn_lock);
+    assert(pthread_join(thread, NULL) == 0);
+    assert(!r2_log_is_initialized() && db == NULL);
+    assert(context_cache_get("previous session", 3, NULL) == NULL);
+    assert(r2_associative_query_cache_lookup("previous session") == NULL);
+
+    char *reply = r2_talk("A turn arrived after shutdown.");
+    assert(reply && strstr(reply, "couldn't start this turn"));
+    free(reply);
+
+    sqlite3 *reader = NULL;
+    assert(sqlite3_open_v2(R2_DIARY_DATABASE, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(reader, "SELECT memory FROM memories WHERE memory='Incomplete shutdown fixture';",
+                              -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(reader, "SELECT 1 FROM r2_log_events WHERE event_type='shutdown_begin';",
+                              -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    sqlite3_close(reader);
+    puts("Shutdown waited for the active turn and rolled back an unfinished memory write.");
+}
+
 int main(void)
 {
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
@@ -815,8 +1416,12 @@ int main(void)
     check_structured_report_evidence();
     check_boundaries();
     check_reflection_stop_and_long_visual_query();
-    check_retry_and_isolated_inputs();
+    check_context_and_isolated_inputs();
     check_foreground_context_review();
+    check_failed_optional_history_review();
+    check_compact_ranked_memory();
+    check_context_cache_write_overlap();
+    check_first_answer_with_unavailable_source();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
@@ -892,6 +1497,9 @@ int main(void)
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
+    check_isolated_response_replay();
+    check_memory_response_replay();
+    check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
     assert(asprintf(&malformed, "%s trailing non-JSON", response_body) >= 0);
@@ -962,7 +1570,8 @@ int main(void)
     check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();
-    r2_log_shutdown();
+    check_action_result_under_history_pressure();
+    check_shutdown_drain_and_rollback();
     free(identity); free(retrieval); free(query); free(result); free(override);
     free(large_contract); free(large_user); free(oversized); free(partial); free(response_body);
     if (captured) json_object_put(captured);

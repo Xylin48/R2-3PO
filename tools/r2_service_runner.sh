@@ -169,10 +169,14 @@ fi
 [[ -r "$R2_SOURCE/tools/preflight_ollama_model.py" ]] ||
     fail "shared Ollama inference preflight is missing: $R2_SOURCE/tools/preflight_ollama_model.py"
 log "Waiting for local Qwen 3.5 model availability and a real chat completion..."
-if ! python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
+if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
+    :
+else
+    R2_OLLAMA_PREFLIGHT_STATUS=$?
     # Keep overnight recovery aligned with the interactive launcher. Retry only
     # when GPU placement was selected by R2, and never alter an explicit context.
-    if [[ "$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&
+    if [[ "$R2_OLLAMA_PREFLIGHT_STATUS" == "75" &&
+          "$R2_OLLAMA_NUM_GPU_DEFAULTED" == "1" &&
           "$R2_NVIDIA_QUERY_OK" == "1" ]] &&
        printf '%s\\n' "$R2_NVIDIA_GPU_NAMES" | grep -qi 'GTX 1050 Ti'; then
         R2_OLLAMA_PREFLIGHT_OK=0
@@ -196,6 +200,8 @@ if ! python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --ti
                     if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 30 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
                         R2_OLLAMA_PREFLIGHT_OK=1
                         break 2
+                    elif [[ "$?" != "75" ]]; then
+                        break 2
                     fi
                 done
             else
@@ -203,13 +209,15 @@ if ! python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --ti
                 if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 30 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
                     R2_OLLAMA_PREFLIGHT_OK=1
                     break
+                elif [[ "$?" != "75" ]]; then
+                    break
                 fi
             fi
         done
         [[ "$R2_OLLAMA_PREFLIGHT_OK" == "1" ]] ||
-            fail "Ollama preflight failed for every permitted GPU/context combination. Check model/server logs; systemd will retry automatically."
+            fail "Ollama did not pass preflight. See the last reported failure above; systemd will retry automatically."
     else
-        fail "Ollama did not complete a real qwen3.5:9b chat preflight with the explicitly configured GPU/context policy. Check the local model/server; systemd will retry automatically."
+        fail "Ollama did not complete a real qwen3.5:9b chat preflight under the active model policy. Check the local model/server; systemd will retry automatically."
     fi
 fi
 
