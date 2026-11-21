@@ -114,5 +114,5 @@ assert "atomic_store(&ears->open, 0);" in read_impl
 assert "r2_audio_file_close(ears->file_stream);" in ears
 assert "r2_audio_file_cancel(ears->file_stream);" in ears
 assert "r2_ears_close(ears);" not in read_impl
-assert "Qwen 3.5 9B accepts text and images, not raw microphone PCM" in ears_header
+assert "Llama 3.1 handles text and Qwen3-VL handles images, not raw microphone PCM" in ears_header
 print("Local microphone capture, Whisper transcription, and normal chat handoff smoke checks passed.")
