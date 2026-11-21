@@ -124,8 +124,8 @@ require(
 require(
     "r2_vision_encode_snapshot(&frame, &origin)" in core
     and 'r2_visual_describe_encoded_frame(' in core
-    and 'ollama_append_visual_observation(arr, "CAMERA", owned_image)' in core
-    and 'ollama_append_visual_observation(arr, "MEDIA DISPLAY", owned_media_image)' in core
+    and '"CAMERA", owned_image, &eyes_source_revision, camera_revision' in core
+    and '"MEDIA DISPLAY", owned_media_image, &media_source_revision, media_revision' in core
     and "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request." in core
     and "if (visual_requested && !r2_vision_watch_active())" not in core
     and "r2_visual_analyze_frame(" not in core[
