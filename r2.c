@@ -4540,6 +4540,7 @@ static char *ollama_chat_with_limit(
     }
     size_t ordered_count = r2_order_inference_messages(
         msgs, include, count, message_order, count);
+    int translated_visual_inputs = 0;
     for (size_t pos = 0; pos < ordered_count; ++pos) {
         size_t i = message_order[pos];
         const char *role = msgs[i].internal_tool_result ? "tool" :
@@ -4562,6 +4563,8 @@ static char *ollama_chat_with_limit(
         }
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
+        if (owned_image || owned_media_image)
+            translated_visual_inputs = 1;
         int append_rc = ollama_append_visual_observation(
             arr, "CAMERA", owned_image, &eyes_source_revision, camera_revision);
         if (append_rc == 0)
@@ -4602,6 +4605,7 @@ static char *ollama_chat_with_limit(
      * Never silently clip the authoritative user turn, memory or visual
      * evidence to make an overflowing request appear successful.
      */
+    if (translated_visual_inputs) {
     size_t final_input_bytes = 0;
     for (size_t i = 0; i < json_object_array_length(chat_messages); ++i) {
         struct json_object *message = json_object_array_get_idx(chat_messages, i);
@@ -4639,6 +4643,8 @@ static char *ollama_chat_with_limit(
             json_object_put(root);
             return NULL;
         }
+    }
+
     }
 
     const char *payload = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
