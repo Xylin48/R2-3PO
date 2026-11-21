@@ -20,7 +20,8 @@ Environment=R2_SOURCE=/home/x/R2_Home/R2
 Environment=R2_EXEC=/home/x/R2_Home/r2
 Environment=R2_FX_DIR=/home/x/R2_Home/R2_sounds/FX
 Environment=R2_SERVICE_MODE=1
-Environment=R2_MODEL=qwen3.5:9b
+Environment=R2_MODEL=llama3.1:8b
+Environment=R2_VISION_MODEL=qwen3-vl:4b-instruct-q4_K_M
 Environment=R2_OLLAMA_BASE_URL=http://127.0.0.1:11435
 # Per-UID egress isolation: only local Ollama TCP port 11435 is allowed for r2.
 # These inline root commands avoid executing a mutable script from R2's
