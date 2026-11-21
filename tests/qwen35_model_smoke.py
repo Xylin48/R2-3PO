@@ -46,7 +46,7 @@ require(
     "user-facing chat failure fallbacks do not hardcode the user relationship",
 )
 require(
-    "Speak in first person as the same R2-3PO robot companion" in core
+    "Speak in first person as R2-3PO across turns" in core
     and "Describe physical and software capabilities using your actual device and world state." in core,
     "identity guidance grounds R2 in his own environment",
 )

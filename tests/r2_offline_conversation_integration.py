@@ -80,7 +80,7 @@ IDENTITY_RECALL_REQUEST = "Hi R2, do you remember the brass compass I told you a
 IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
 IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
 IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
-IDENTITY_ANCHOR = "Speak in first person as the same R2-3PO robot companion across turns."
+IDENTITY_ANCHOR = "Speak in first person as R2-3PO across turns."
 
 
 FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
