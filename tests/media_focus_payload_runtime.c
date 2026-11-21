@@ -15,18 +15,29 @@ static const char *message_field(json_object *message, const char *key)
 static void verify_images(const char *camera, const char *media,
                           const char *expected_map)
 {
+    const char *identity = "You are R2-3PO.";
     const char *turn = "  What is happening around me? é\n";
-    json_object *request = json_object_new_array();
-    assert(request && ollama_json_append_message_with_image_sources(
-        request, "user", turn, strlen(turn), camera, media) == 0);
-    assert(json_object_array_length(request) == (expected_map ? 2U : 1U));
+    json_object *sections = json_object_new_array();
+    assert(sections && ollama_json_append_message(
+        sections, "system", identity, strlen(identity), NULL, NULL) == 0);
+    assert(ollama_json_append_message_with_image_sources(
+        sections, "user", turn, strlen(turn), camera, media) == 0);
+    json_object *request = ollama_json_chat_messages(sections);
+    json_object_put(sections);
+    assert(request && json_object_array_length(request) == 2);
 
+    json_object *system = json_object_array_get_idx(request, 0);
+    assert(!strcmp(message_field(system, "role"), "system"));
+    const char *content = message_field(system, "content");
+    assert(!strncmp(content, identity, strlen(identity)));
+    content += strlen(identity);
     if (expected_map) {
-        json_object *map = json_object_array_get_idx(request, 0);
-        assert(!strcmp(message_field(map, "role"), "system"));
-        assert(!strcmp(message_field(map, "content"), expected_map));
+        assert(!strncmp(content, "\n\n", 2));
+        assert(!strcmp(content + 2, expected_map));
+    } else {
+        assert(!*content);
     }
-    json_object *message = json_object_array_get_idx(request, expected_map ? 1 : 0);
+    json_object *message = json_object_array_get_idx(request, 1);
     assert(!strcmp(message_field(message, "role"), "user"));
     assert(!strcmp(message_field(message, "content"), turn));
     json_object *images = NULL;

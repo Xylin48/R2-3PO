@@ -207,30 +207,51 @@ static void check_request(Message *messages, size_t count, const char *override,
     assert(!expect_reallocation || predict < requested);
     assert(required <= (size_t)(ctx - predict - 512) * 32U / 10U);
     assert(json_object_object_get_ex(captured, "messages", &array));
-    assert(json_object_array_length(array) == count + (override != NULL));
-    size_t matches = 0;
-    for (size_t i = 0; i < json_object_array_length(array); ++i) {
-        struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
+    size_t system_sections = override != NULL;
+    for (size_t i = 0; i < count; ++i)
+        system_sections += !strcmp(messages[i].role, "system");
+    size_t wire_index = 0;
+    if (system_sections) {
+        struct json_object *entry = json_object_array_get_idx(array, wire_index++);
+        struct json_object *content = NULL, *role = NULL;
+        assert(json_object_object_get_ex(entry, "role", &role));
+        assert(!strcmp(json_object_get_string(role), "system"));
+        assert(json_object_object_get_ex(entry, "content", &content));
+        const char *actual = json_object_get_string(content);
+        size_t seen = 0;
+        if (override) {
+            size_t length = strlen(override);
+            assert(!strncmp(actual, override, length));
+            actual += length;
+            ++seen;
+        }
+        for (int priority = 0; priority < 8; ++priority) {
+            for (size_t j = 0; j < count; ++j) {
+                if (strcmp(messages[j].role, "system") ||
+                    r2_inference_system_priority(messages[j].content, query) != priority)
+                    continue;
+                if (seen++) {
+                    assert(!strncmp(actual, "\n\n", 2));
+                    actual += 2;
+                }
+                size_t length = strlen(messages[j].content);
+                assert(!strncmp(actual, messages[j].content, length));
+                actual += length;
+            }
+        }
+        assert(seen == system_sections && !*actual);
+    }
+    for (size_t j = 0; j < count; ++j) {
+        if (!strcmp(messages[j].role, "system")) continue;
+        struct json_object *entry = json_object_array_get_idx(array, wire_index++);
+        struct json_object *content = NULL, *role = NULL;
         assert(json_object_object_get_ex(entry, "content", &content));
         assert(json_object_object_get_ex(entry, "role", &role));
-        const char *actual = json_object_get_string(content), *actual_role = json_object_get_string(role);
-        int found = override && !strcmp(actual_role, "system") && !strcmp(actual, override);
-        for (size_t j = 0; j < count; ++j)
-            if (!strcmp(actual_role, messages[j].internal_tool_result ? "tool" : messages[j].role) && !strcmp(actual, messages[j].content)) found = 1;
-        assert(found); ++matches;
+        assert(!strcmp(json_object_get_string(role),
+                       messages[j].internal_tool_result ? "tool" : messages[j].role));
+        assert(!strcmp(json_object_get_string(content), messages[j].content));
     }
-    assert(matches == count + (override != NULL));
-    for (size_t j = 0; j < count; ++j) {
-        size_t occurrences = 0;
-        for (size_t i = 0; i < json_object_array_length(array); ++i) {
-            struct json_object *entry = json_object_array_get_idx(array, i), *content = NULL, *role = NULL;
-            assert(json_object_object_get_ex(entry, "content", &content));
-            assert(json_object_object_get_ex(entry, "role", &role));
-            if (!strcmp(json_object_get_string(role), messages[j].internal_tool_result ? "tool" : messages[j].role) &&
-                !strcmp(json_object_get_string(content), messages[j].content)) ++occurrences;
-        }
-        assert(occurrences == 1);
-    }
+    assert(wire_index == json_object_array_length(array));
     ollama_authoritative_user_query = NULL;
 }
 static void check_boundaries(void)
@@ -1297,7 +1318,8 @@ static void check_foreground_input_provenance(void)
                                      "CURRENT USER INPUT: typed keyboard text."));
         assert(captured_contains(i ? "The transcript supplies words" :
                                      "It contains no recording, voice, or microphone transcript."));
-        assert(captured_contains("In ordinary conversation, speak in everyday language"));
+        assert(captured_contains("Keep simple greetings brief and personal"));
+        assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
         free(reply);
     }
     r2_input_speech_event = 0;

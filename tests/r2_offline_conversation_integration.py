@@ -394,10 +394,12 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         assert len(requests) == 1, requests
         assert requests[0]["options"]["num_ctx"] == context
         system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
-        provenance = next(item for item in system if item.startswith("CURRENT USER INPUT: typed keyboard text."))
-        assert "supplies written words only" in provenance
-        assert "no recording, voice, or microphone transcript" in provenance
-        assert "speak in everyday language" in system[0]
+        assert len(system) == 1 and requests[0]["messages"][0]["role"] == "system"
+        assert "\n\nCURRENT USER INPUT: typed keyboard text." in system[0]
+        assert "supplies written words only" in system[0]
+        assert "no recording, voice, or microphone transcript" in system[0]
+        assert "Keep simple greetings brief and personal" in system[0]
+        assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
         assert IDENTITY_ANCHOR in system[0]
         assert "The current user message is spoken by the user" not in system[0]
         assert "RESPONSE CORRECTION:" not in system[0]
@@ -452,7 +454,7 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
             payload for payload in LocalOllama.requests
             if any(item["role"] == "user" and item["content"] == request
                    for item in payload["messages"])
-            and any(item["role"] == "system" and item["content"].startswith("CURRENT TURN PHASE:")
+            and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
                     for item in payload["messages"])
         ]
         assert len(followups) == 1
@@ -896,7 +898,7 @@ def compact_age_continuity(binary: Path, workspace: Path, url: str) -> None:
             request.get("options", {}).get("num_ctx") == 2048
             and any(item.get("role") == "user" and item.get("content") == marker
                     for item in request.get("messages", []))
-            and any(item.get("role") == "system" and item.get("content", "").startswith("PERSISTENT REALITY CONTEXT")
+            and any(item.get("role") == "system" and "\n\nPERSISTENT REALITY CONTEXT" in item["content"]
                     and evidence in item["content"] for item in request.get("messages", []))
             for request in LocalOllama.requests
         ), marker
@@ -1679,7 +1681,7 @@ def main() -> int:
             if not requests:
                 raise AssertionError(f"Exact turn {marker} never reached an answer request at {context}")
             if marker.startswith(FOLLOWUP) and not any(
-                item.get("role") == "system" and item["content"].startswith("PERSISTENT REALITY CONTEXT")
+                item.get("role") == "system" and "\n\nPERSISTENT REALITY CONTEXT" in item["content"]
                 and "POCKETS" in item["content"].upper()
                 for request in requests for item in request.get("messages", [])
                 if isinstance(item, dict) and isinstance(item.get("content"), str)

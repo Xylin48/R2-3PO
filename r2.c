@@ -480,8 +480,8 @@ static void autonomous_needs_check(void);
     "is the other speaker. Use established relationships naturally and let them grow. "
 
 #define R2_CONVERSATION_STYLE \
-    "In ordinary conversation, speak in everyday language. Answer a greeting or affection personally. " \
-    "Mention hardware and software when relevant. Ground perceptions in this turn's actual input sources. "
+    "Speak in everyday language. Keep simple greetings brief and personal. Mention hardware when relevant. " \
+    "Use evidence for any experiences, activities, or perceptions you describe. "
 
 static const char *SYSTEM_PROMPT =
 "============================================================\n"
@@ -3655,6 +3655,56 @@ static int ollama_json_append_message_with_image_sources(struct json_object *arr
     return ollama_json_append_message(array, role, content, length, camera, media);
 }
 
+/* Qwen's chat format expects one leading system turn. Keep the selected
+ * sections in priority order, then preserve every conversational role,
+ * tool result and image exactly as serialized. */
+static struct json_object *ollama_json_chat_messages(struct json_object *sections)
+{
+    struct json_object *messages = json_object_new_array();
+    struct printbuf *system = printbuf_new();
+    if (!messages || !system)
+        goto fail;
+
+    size_t count = json_object_array_length(sections);
+    size_t system_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        struct json_object *entry = json_object_array_get_idx(sections, i);
+        struct json_object *role = NULL, *content = NULL;
+        json_object_object_get_ex(entry, "role", &role);
+        if (strcmp(json_object_get_string(role), "system"))
+            continue;
+        json_object_object_get_ex(entry, "content", &content);
+        if ((system_count && printbuf_memappend(system, "\n\n", 2) < 0) ||
+            printbuf_memappend(system, json_object_get_string(content),
+                               json_object_get_string_len(content)) < 0)
+            goto fail;
+        ++system_count;
+    }
+    if (system_count && ollama_json_append_message(messages, "system", system->buf,
+                                                    (size_t)system->bpos, NULL, NULL) != 0)
+        goto fail;
+
+    for (size_t i = 0; i < count; ++i) {
+        struct json_object *entry = json_object_array_get_idx(sections, i);
+        struct json_object *role = NULL;
+        json_object_object_get_ex(entry, "role", &role);
+        if (!strcmp(json_object_get_string(role), "system"))
+            continue;
+        json_object_get(entry);
+        if (json_object_array_add(messages, entry) != 0) {
+            json_object_put(entry);
+            goto fail;
+        }
+    }
+    printbuf_free(system);
+    return messages;
+
+fail:
+    if (system) printbuf_free(system);
+    if (messages) json_object_put(messages);
+    return NULL;
+}
+
 typedef struct {
     size_t override_budget;
     size_t identity_budget;
@@ -4468,28 +4518,26 @@ static char *ollama_chat_with_limit(
     free(message_order);
     free(include);
     free(limits);
-    if (json_object_object_add(root, "messages", arr) != 0) {
+    struct json_object *chat_messages = ollama_json_chat_messages(arr);
+    if (ollama_json_object_add_checked(root, "messages", chat_messages) != 0) {
         json_object_put(arr);
         json_object_put(root);
         return NULL;
     }
-    arr = NULL; /* root owns the completed message array */
 
     const char *payload = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
     if (!payload) {
+        json_object_put(arr);
         json_object_put(root);
         return NULL;
     }
 
     /*
-     * Audit the serialized request without logging private prompt text. This
-     * distinguishes a model interpretation failure from a missing/truncated
-     * current user turn or a context block that never reached Ollama.
+     * Count wire messages and audit the original serialized section boundaries
+     * before freeing them. This keeps a heading quoted in history from being
+     * counted as its own context section. No prompt text is logged.
      */
-    struct json_object *audit_messages = NULL;
-    json_object_object_get_ex(root, "messages", &audit_messages);
-    size_t audit_message_count = audit_messages
-        ? json_object_array_length(audit_messages) : 0;
+    size_t audit_message_count = json_object_array_length(chat_messages);
     size_t audit_user_messages = 0;
     size_t audit_system_chars = 0;
     int audit_exact_user_turn = 0;
@@ -4502,8 +4550,8 @@ static char *ollama_chat_with_limit(
     int audit_learning_context = 0;
     const char *audit_query = ollama_authoritative_user_query;
     size_t audit_query_chars = audit_query ? strlen(audit_query) : 0;
-    for (size_t i = 0; i < audit_message_count; ++i) {
-        struct json_object *entry = json_object_array_get_idx(audit_messages, i);
+    for (size_t i = 0; i < json_object_array_length(arr); ++i) {
+        struct json_object *entry = json_object_array_get_idx(arr, i);
         struct json_object *role_obj = NULL, *content_obj = NULL;
         if (!entry ||
             !json_object_object_get_ex(entry, "role", &role_obj) ||
@@ -4523,7 +4571,6 @@ static char *ollama_chat_with_limit(
                     audit_user_turn_contained = 1;
             }
         } else if (!strcmp(role, "system")) {
-            audit_system_chars += strlen(content);
             if (i == 0 && strstr(content, R2_CONVERSATION_IDENTITY))
                 audit_robot_identity = 1;
             if (strstr(content, "R2 PERSISTENT MEMORY - STARTUP CONTEXT"))
@@ -4541,6 +4588,13 @@ static char *ollama_chat_with_limit(
                 audit_learning_context = 1;
         }
     }
+    json_object_put(arr);
+    struct json_object *first = json_object_array_get_idx(chat_messages, 0);
+    struct json_object *first_role = NULL, *first_content = NULL;
+    if (first && json_object_object_get_ex(first, "role", &first_role) &&
+        !strcmp(json_object_get_string(first_role), "system") &&
+        json_object_object_get_ex(first, "content", &first_content))
+        audit_system_chars = (size_t)json_object_get_string_len(first_content);
     fprintf(stderr,
             "[R2 Prompt Audit] stage=%s payload_chars=%zu messages=%zu user_messages=%zu "
             "current_query_chars=%zu exact_user_turn=%d query_in_user_turn=%d "
