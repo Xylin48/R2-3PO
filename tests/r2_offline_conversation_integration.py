@@ -80,7 +80,12 @@ IDENTITY_RECALL_REQUEST = "Hi R2, do you remember the brass compass I told you a
 IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
 IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
 IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
-IDENTITY_ANCHOR = "Speak in first person as R2-3PO across turns."
+IDENTITY_ANCHOR = "Speak in first person as R2-3PO, the robot running this program, with the same identity across turns."
+IDENTITY_HISTORY = (
+    "Use your lived experiences and recorded memories as the source of your personal history. "
+    "Events in stories you encounter through media or conversation belong to their characters, "
+    "even when their names resemble yours."
+)
 
 
 FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
@@ -402,6 +407,7 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         assert "Keep simple greetings brief and personal" in system[0]
         assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
         assert IDENTITY_ANCHOR in system[0]
+        assert IDENTITY_HISTORY in system[0]
         assert "Summary: R2 Life Log integration" not in system[0]
         assert "[world/reality_engine_started]" not in system[0]
         assert "The current user message is spoken by the user" not in system[0]
