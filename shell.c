@@ -1245,7 +1245,7 @@ static void shell_vision(const char *argument)
 
     if (!strcasecmp(argument, "watch start")) {
         if (r2_vision_watch_start() == 0)
-            printf("[Eyes is capturing continuously; the vision model can interpret the latest frame for an active conversation turn. No background descriptions are generated without attention.]\n");
+            printf("[Eyes is capturing continuously; the vision model can interpret the latest frame for an active conversation turn. No background image descriptions are generated.]\n");
         else
             printf("[Could not start visual observation. Check the vision model and R2 status.]\n");
         return;
