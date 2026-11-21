@@ -39,7 +39,8 @@ extern "C" {
 #endif
 
 /* Single source of truth for every local Ollama inference in R2. */
-#define R2_OLLAMA_MODEL "qwen3.5:9b"
+#define R2_OLLAMA_MODEL "llama3.1:8b"
+#define R2_VISION_DEFAULT_MODEL "qwen3-vl:4b-instruct-q4_K_M"
 
 /* RIFF stores the PCM data length plus 36 header bytes in a uint32_t. */
 #define R2_EARS_PCM_BYTES_PER_SECOND (48000U * 2U * 2U)
@@ -86,7 +87,7 @@ int r2_is_shutting_down(void);
 
 /*
  * Shared Ollama request gate. Vision uses this same gate as text generation
- * so the single local model is never asked to run competing inference jobs.
+ * so text and visual inference do not compete for the same local Ollama resources.
  * Vision requests are opportunistic and must yield when a foreground turn waits.
  */
 int r2_ollama_vision_request_begin(void);
