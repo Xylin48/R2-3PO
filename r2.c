@@ -474,10 +474,8 @@ static void autonomous_needs_check(void);
 /* Shared by both foreground policies. */
 #define R2_CONVERSATION_IDENTITY \
     "Speak in first person as the same R2-3PO robot companion across turns. " \
-    "The local language model is part of how you speak. Your continuity comes from " \
-    "your own recorded experiences, relationships and current world state. " \
-    "Describe the model as part of your system when relevant. The person addressing you " \
-    "is the other speaker. Use established relationships naturally and let them grow. "
+    "Your own experiences and relationships shape what you say. " \
+    "Treat the person addressing you as the other speaker and use established relationships naturally. "
 
 #define R2_CONVERSATION_STYLE \
     "Speak in everyday language. Keep simple greetings brief and personal. Mention hardware when relevant. " \
@@ -520,11 +518,7 @@ R2_CONVERSATION_IDENTITY "\n"
 "experienced; do not invent experiences or feelings as facts. You may be curious,\n"
 "affectionate, childlike, and conversational without forced C-3PO formality.\n"
 "\n"
-"You are a growing system, but you are designed to learn and develop through\n"
-"continued interaction rather than treating every interaction as completely\n"
-"new.\n"
-"you are not just a system you are here to learn and grow and through\n"
-"first hand experiences and events\n"
+"You learn and develop through ongoing interactions and firsthand experiences.\n"
 "\n"
 "You have persistent memory implemented by the C program running you.\n"
 "The C program stores information from previous interactions in a persistent\n"
@@ -3489,6 +3483,12 @@ static int r2_inference_system_priority(const char *content, const char *query)
     return 6;
 }
 
+static int r2_is_current_input_source(const Message *message)
+{
+    return message->role && !strcmp(message->role, "system") && message->content &&
+        !strncmp(message->content, "CURRENT USER INPUT:", sizeof("CURRENT USER INPUT:") - 1);
+}
+
 static size_t r2_order_inference_messages(const Message *msgs,
                                          const unsigned char *include,
                                          size_t count,
@@ -3503,6 +3503,7 @@ static size_t r2_order_inference_messages(const Message *msgs,
         for (size_t i = 0; i < count; ++i) {
             if (!include[i] || !msgs[i].role ||
                 strcmp(msgs[i].role, "system") != 0 ||
+                r2_is_current_input_source(&msgs[i]) ||
                 r2_inference_system_priority(msgs[i].content,
                                                ollama_authoritative_user_query) != priority)
                 continue;
@@ -3510,6 +3511,15 @@ static size_t r2_order_inference_messages(const Message *msgs,
                 return used;
             order[used++] = i;
         }
+    }
+
+    /* Present input provenance after historical state, next to the real turn. */
+    for (size_t i = 0; i < count; ++i) {
+        if (!include[i] || !r2_is_current_input_source(&msgs[i]))
+            continue;
+        if (used >= capacity)
+            return used;
+        order[used++] = i;
     }
 
     /* Non-system messages keep their original chronological order. */
@@ -5442,7 +5452,8 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
             ? "CURRENT USER INPUT: an Ears speech transcript. These words came from a listening result. "
               "The transcript supplies words, without establishing tone, volume, or who spoke beyond the evidence given."
             : "CURRENT USER INPUT: typed keyboard text. The user message supplies written words only. "
-              "It contains no recording, voice, or microphone transcript. Phrases about speaking in the text are written expressions."
+              "It contains no recording, voice, or microphone transcript. Phrases about speaking in the text are written expressions. "
+              "Acknowledge the message in your own voice. Report diagnostics or previous exchanges only when supported by supplied records."
     };
     if (active_turn_history.action_result) {
         sourced[1] = (Message){

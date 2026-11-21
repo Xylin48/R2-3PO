@@ -228,6 +228,7 @@ static void check_request(Message *messages, size_t count, const char *override,
         for (int priority = 0; priority < 8; ++priority) {
             for (size_t j = 0; j < count; ++j) {
                 if (strcmp(messages[j].role, "system") ||
+                    r2_is_current_input_source(&messages[j]) ||
                     r2_inference_system_priority(messages[j].content, query) != priority)
                     continue;
                 if (seen++) {
@@ -238,6 +239,16 @@ static void check_request(Message *messages, size_t count, const char *override,
                 assert(!strncmp(actual, messages[j].content, length));
                 actual += length;
             }
+        }
+        for (size_t j = 0; j < count; ++j) {
+            if (!r2_is_current_input_source(&messages[j])) continue;
+            if (seen++) {
+                assert(!strncmp(actual, "\n\n", 2));
+                actual += 2;
+            }
+            size_t length = strlen(messages[j].content);
+            assert(!strncmp(actual, messages[j].content, length));
+            actual += length;
         }
         assert(seen == system_sections && !*actual);
     }
