@@ -349,7 +349,9 @@ def runtime_environment(workspace: Path, url: str, context: int) -> dict[str, st
     env["R2_TV_SOCKET"] = str(workspace / "R2" / "tv-offline-test.sock")
     env["DISPLAY"] = ""
     if env.get("R2_TEST_VIRTUAL_CLOCK") == "1":
-        library = next(Path("/usr/lib").glob("*/faketime/libfaketime.so.1"), None)
+        configured_library = env.get("R2_TEST_FAKETIME_LIBRARY")
+        library = (Path(configured_library) if configured_library
+                   else next(Path("/usr/lib").glob("*/faketime/libfaketime.so.1"), None))
         assert library is not None and library.is_file(), "libfaketime test dependency is missing"
         env.update(LD_PRELOAD=str(library), FAKETIME="-852076800",
                    FAKETIME_DONT_RESET="1", FAKETIME_DONT_FAKE_MONOTONIC="1")

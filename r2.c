@@ -14321,8 +14321,9 @@ static void *replay_pending_learning(void *opaque)
             "SELECT MIN(event_id) AS event_id FROM r2_log_pending_learning WHERE event_id>?1 AND event_id<=?2 "
             "UNION ALL SELECT MIN(event_id) FROM r2_log_pending_self_reports WHERE event_id>?1 AND event_id<=?2)) "
             "SELECT n.event_id,m.user_text,COALESCE(s.assistant_text,m.assistant_text),m.tool_result,"
-            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL,e.event_type='reflection_completed' "
-            "FROM next n JOIN r2_log_events e ON e.id=n.event_id "
+            "s.extraction,s.event_id IS NOT NULL,m.event_id IS NOT NULL,e.event_type='reflection_completed',"
+            "e.id IS NOT NULL "
+            "FROM next n LEFT JOIN r2_log_events e ON e.id=n.event_id "
             "LEFT JOIN r2_log_pending_learning m USING(event_id) "
             "LEFT JOIN r2_log_pending_self_reports s USING(event_id) "
             "WHERE n.event_id IS NOT NULL;", -1, &st, NULL);
@@ -14330,13 +14331,21 @@ static void *replay_pending_learning(void *opaque)
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, through);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
         int copied = 0;
+        int source_missing = 0;
+        int retry_copy = 0;
         if (rc == SQLITE_ROW) {
             after = job.event_id = sqlite3_column_int64(st, 0);
+            source_missing = !sqlite3_column_int(st, 8);
             job.self_report_pending = sqlite3_column_int(st, 5);
             job.memory_pending = sqlite3_column_int(st, 6);
             job.private_reflection = sqlite3_column_int(st, 7);
             const char *fields[4];
-            if (memory_read_fields(st, 1, 4, fields) == 0 && fields[1]) {
+            int field_status = source_missing ? MEMORY_FIELD_ERROR : memory_read_fields(st, 1, 4, fields);
+            if (!source_missing && field_status == MEMORY_FIELD_ERROR &&
+                sqlite3_errcode(db) == SQLITE_NOMEM)
+                retry_copy = 1;
+            if (field_status == MEMORY_FIELD_OK && fields[1] &&
+                (!job.memory_pending || (job.private_reflection ? fields[2] != NULL : fields[0] != NULL))) {
                 job.user = fields[0] && !job.private_reflection ? strdup(fields[0]) : NULL;
                 job.reply = strdup(fields[1]);
                 job.tool_result = fields[2] ? strdup(fields[2]) : NULL;
@@ -14344,6 +14353,7 @@ static void *replay_pending_learning(void *opaque)
                 copied = job.reply && (!job.memory_pending ||
                          (job.private_reflection ? job.tool_result != NULL : job.user != NULL)) &&
                          (!fields[2] || job.tool_result) && (!fields[3] || job.extraction);
+                retry_copy = !copied;
             }
         }
         sqlite3_finalize(st);
@@ -14351,7 +14361,15 @@ static void *replay_pending_learning(void *opaque)
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW || !copied) {
             free(job.user); free(job.reply); free(job.tool_result); free(job.extraction);
-            fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay.\n");
+            if (source_missing) {
+                fprintf(stderr, "[R2 Post-turn] Pending learning event #%lld has no source event; leaving it intact.\n",
+                        (long long)job.event_id);
+                continue;
+            }
+            if (retry_copy)
+                atomic_store(&post_turn_replay_requested, 1);
+            fprintf(stderr, "[R2 Post-turn] Could not read pending learning for replay (event #%lld).\n",
+                    (long long)job.event_id);
             if (rc != SQLITE_ROW) {
                 int result = rc & 0xff; /* Extended SQLite codes share the base result. */
                 if (result == SQLITE_BUSY || result == SQLITE_LOCKED || result == SQLITE_NOMEM)

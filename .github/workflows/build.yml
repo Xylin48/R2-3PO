@@ -238,7 +238,7 @@ jobs:
         run: |
           REQUEST_ROOT="$(mktemp -d /tmp/r2-inference-request-XXXXXX)"
           trap 'rm -rf "$REQUEST_ROOT"' EXIT
-          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$REQUEST_ROOT\"" tests/inference_request_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-inference-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=json_object_object_add
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. -DR2_ROOT="\"$REQUEST_ROOT\"" tests/inference_request_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-inference-request -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=curl_easy_setopt -Wl,--wrap=curl_easy_perform -Wl,--wrap=curl_easy_getinfo -Wl,--wrap=curl_easy_cleanup -Wl,--wrap=json_object_object_add -Wl,--wrap=strdup
           /tmp/r2-inference-request
 
       - name: Preserve complete diary visual and learning context across read failures
@@ -527,11 +527,13 @@ jobs:
 
       - name: Exercise Alternate-Self Lab persistence
         run: |
+          ROOT="$(mktemp -d /tmp/r2-altself-smoke.XXXXXX)"
+          trap 'rm -rf "$ROOT"' EXIT
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. \
-            -DR2_DIARY_DATABASE='"/tmp/r2-altself-smoke/r2_memory.db"' \
+            -DR2_ALTSELF_TEST_ROOT="\"$ROOT\"" -DR2_DIARY_DATABASE="\"$ROOT/r2_memory.db\"" \
             tests/alternate_self_smoke.c AlternateSelf.c -lsqlite3 -lpthread \
-            -o /tmp/r2-altself-smoke-test
-          /tmp/r2-altself-smoke-test
+            -o "$ROOT/alternate-self-test"
+          "$ROOT/alternate-self-test"
 
       - name: Check Life Log structured declarations and schema
         run: python3 tests/life_log_linker_regression.py

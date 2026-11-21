@@ -29,6 +29,19 @@ static CURLcode invalid_body_result = CURLE_OK;
 static char *isolated_retry_payload;
 static int foreground_after_response;
 static int completed_turn_after_response;
+static const char retry_copy_user[] = "Replay this evidence after an allocation failure.";
+static atomic_int fail_replay_copy = ATOMIC_VAR_INIT(0);
+
+char *__real_strdup(const char *value);
+char *__wrap_strdup(const char *value)
+{
+    if (!strcmp(value, retry_copy_user) && atomic_exchange(&fail_replay_copy, 0)) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    return __real_strdup(value);
+}
+
 static int defer_post_turn_request;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
@@ -662,6 +675,48 @@ static void check_post_turn_retry(void)
     assert(!atomic_load(&post_turn_replay_requested) && burst_learning_requests == 3);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
                                 "WHERE user_text='Queued during active post-turn processing.'") == 0);
+
+    int64_t orphan = r2_log_event(R2_LOG_MEMORY, "legacy_queue_fixture", "Legacy queue fixture.", NULL, "fixture");
+    assert(orphan > source);
+    sqlite3 *legacy = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &legacy) == SQLITE_OK);
+    char *legacy_sql = sqlite3_mprintf(
+        "PRAGMA foreign_keys=OFF;"
+        "INSERT INTO r2_log_pending_learning(event_id,user_text,assistant_text) "
+        "VALUES(%lld,'Orphaned learning fixture','No associated source.');"
+        "DELETE FROM r2_log_events WHERE id=%lld;", (long long)orphan, (long long)orphan);
+    assert(legacy_sql && sqlite3_exec(legacy, legacy_sql, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(legacy_sql);
+
+    int64_t retry_event = r2_log_conversation_turn_for_learning(
+        retry_copy_user, "Accepted reply for replay.", NULL, 0, NULL, 0, NULL);
+    int64_t next_event = r2_log_conversation_turn_for_learning(
+        "Process the valid evidence behind the failed row.", "Accepted reply.", NULL, 0, NULL, 0, NULL);
+    assert(retry_event > orphan && next_event > retry_event);
+    assert(r2_log_ack_self_report(retry_event) == 0 && r2_log_ack_self_report(next_event) == 0);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 3);
+    atomic_store(&fail_replay_copy, 1);
+    set_response("NONE", "stop", 1);
+    before = perform_count;
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(perform_count == before + 1 && !atomic_load(&fail_replay_copy));
+    assert(atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 2);
+
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(perform_count == before + 2 && !atomic_load(&post_turn_replay_requested));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning;") == 1);
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                               "WHERE user_text='Orphaned learning fixture';") == 1);
+    assert(sqlite3_exec(legacy, "DELETE FROM r2_log_pending_learning WHERE user_text='Orphaned learning fixture';",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy) == SQLITE_OK);
 
     int64_t late = r2_log_conversation_turn_for_learning(
         "Earlier log", "I still need to finish.", NULL, 0, NULL, 0, NULL);

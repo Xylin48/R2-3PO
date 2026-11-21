@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#if !defined(R2_ALTSELF_TEST_ROOT) || !defined(R2_DIARY_DATABASE)
+#error "Supply a disposable Alternate-Self test root and database."
+#endif
 #include "AlternateSelf.h"
 #include "Log.h"
 #include "r2_diary.h"
@@ -155,7 +158,7 @@ static int check(int condition, const char *message)
 
 int main(void)
 {
-    const char *directory = "/tmp/r2-altself-smoke";
+    const char *directory = R2_ALTSELF_TEST_ROOT;
     const char *database = R2_DIARY_DATABASE;
     (void)mkdir(directory, 0700);
     unlink(database);
