@@ -4608,12 +4608,14 @@ static char *ollama_chat_with_limit(
         struct json_object *content_value = NULL;
         if (!message || !json_object_object_get_ex(message, "content", &content_value) ||
             !json_object_is_type(content_value, json_type_string)) {
+            json_object_put(arr);
             json_object_put(root);
             return NULL;
         }
         size_t content_bytes = (size_t)json_object_get_string_len(content_value);
         if (final_input_bytes > SIZE_MAX - 64U ||
             content_bytes > SIZE_MAX - final_input_bytes - 64U) {
+            json_object_put(arr);
             json_object_put(root);
             return NULL;
         }
@@ -4622,8 +4624,9 @@ static char *ollama_chat_with_limit(
     int original_predict = num_predict;
     if (r2_fit_complete_input(final_input_bytes, num_ctx, &num_predict) != 0) {
         fprintf(stderr, "[R2 Ollama] Full translated input exceeds context "
-                        "(input_bytes=%zu, context_tokens=%d); no partial payload sent.\\n",
+                        "(input_bytes=%zu, context_tokens=%d); no partial payload sent.\n",
                 final_input_bytes, num_ctx);
+        json_object_put(arr);
         json_object_put(root);
         return NULL;
     }
@@ -4632,6 +4635,7 @@ static char *ollama_chat_with_limit(
         if (!json_object_object_get_ex(root, "options", &request_options) ||
             ollama_json_object_add_checked(request_options, "num_predict",
                                            json_object_new_int(num_predict)) != 0) {
+            json_object_put(arr);
             json_object_put(root);
             return NULL;
         }
