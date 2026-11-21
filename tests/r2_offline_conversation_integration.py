@@ -394,7 +394,10 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         assert len(requests) == 1, requests
         assert requests[0]["options"]["num_ctx"] == context
         system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
-        assert "CURRENT USER INPUT: typed keyboard text." in system
+        provenance = next(item for item in system if item.startswith("CURRENT USER INPUT: typed keyboard text."))
+        assert "supplies written words only" in provenance
+        assert "no recording, voice, or microphone transcript" in provenance
+        assert "speak in everyday language" in system[0]
         assert IDENTITY_ANCHOR in system[0]
         assert "The current user message is spoken by the user" not in system[0]
         assert "RESPONSE CORRECTION:" not in system[0]

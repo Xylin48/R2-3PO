@@ -1295,6 +1295,9 @@ static void check_foreground_input_provenance(void)
         assert(reply && captured_contains(query));
         assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
                                      "CURRENT USER INPUT: typed keyboard text."));
+        assert(captured_contains(i ? "The transcript supplies words" :
+                                     "It contains no recording, voice, or microphone transcript."));
+        assert(captured_contains("In ordinary conversation, speak in everyday language"));
         free(reply);
     }
     r2_input_speech_event = 0;
