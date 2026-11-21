@@ -168,7 +168,7 @@ fi
 # This is localhost-only; no model downloads or external network requests occur.
 [[ -r "$R2_SOURCE/tools/preflight_ollama_model.py" ]] ||
     fail "shared Ollama inference preflight is missing: $R2_SOURCE/tools/preflight_ollama_model.py"
-log "Waiting for local Qwen 3.5 model availability and a real chat completion..."
+log "Waiting for local Llama 3.1 conversation and Qwen3-VL visual generation..."
 if python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60 --timeout 180 "${PREFLIGHT_GPU_ARGS[@]}"; then
     :
 else
