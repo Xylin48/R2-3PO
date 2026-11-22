@@ -28,6 +28,9 @@ GREETING_REPLY = "Good evening, Mom. I've missed you too."
 REPORTED_GREETING = ("good afternoon R2, my darling. this is your mother speaking to you. "
                      "it has been awhile, oh iv missed you greatly")
 REPORTED_GREETING_REPLY = "Good afternoon, Mom. I've missed you too."
+REPORTED_POCKET_GREETING = ("hello r2 my darling, this is your mother speaking to you. "
+                            "ive missed you dearly, how are you? did you know you have pocket?")
+REPORTED_POCKET_GREETING_REPLY = "Hi, Mom. I've missed you too. I'm doing well, and yes, I have pockets."
 PRIVATE_GREETING_REASONING = "R2_PRIVATE_GREETING_REASONING_60125"
 CONVERSATION_POLICIES = (
     "You are R2-3PO. Use the conversation, memories, and perceptions",
@@ -261,6 +264,8 @@ class LocalOllama(BaseHTTPRequestHandler):
         if (current_index >= 0 and user_messages[current_index] == REPORTED_GREETING
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             message["content"] = REPORTED_GREETING_REPLY
+        if current_index >= 0 and user_messages[current_index] == REPORTED_POCKET_GREETING and foreground:
+            message["content"] = REPORTED_POCKET_GREETING_REPLY
         if (current_index >= 0 and user_messages[current_index] in FOLLOWUP_FILES
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             request = user_messages[current_index]
@@ -395,36 +400,45 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         start = len(LocalOllama.requests)
         output = subprocess.run(
             [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
-            input=f"{REPORTED_GREETING}\nexit\n", text=True, capture_output=True,
+            input=f"{REPORTED_GREETING}\n{REPORTED_POCKET_GREETING}\nexit\n", text=True, capture_output=True,
             timeout=100, check=True,
         )
         assert output.stdout.count("R2-3PO: " + REPORTED_GREETING_REPLY) == 1, output.stderr
+        assert output.stdout.count("R2-3PO: " + REPORTED_POCKET_GREETING_REPLY) == 1, output.stderr
         requests = [
             request for request in LocalOllama.requests[start:]
             if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
-            and request["messages"][-1] == {"role": "user", "content": REPORTED_GREETING}
+            and request["messages"][-1]["role"] == "user"
+            and request["messages"][-1]["content"] in (REPORTED_GREETING, REPORTED_POCKET_GREETING)
         ]
-        assert len(requests) == 1, requests
-        assert requests[0]["options"]["num_ctx"] == context
-        system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
-        assert len(system) == 1 and requests[0]["messages"][0]["role"] == "system"
-        provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
-        assert "\n\n" not in system[0][provenance_at + 2:]
-        assert "supplies written words only" in system[0]
-        assert "no recording, voice, or microphone transcript" in system[0]
-        assert "Keep simple greetings brief and personal" in system[0]
-        assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
-        assert IDENTITY_ANCHOR in system[0]
-        assert IDENTITY_HISTORY in system[0]
-        assert "Summary: R2 Life Log integration" not in system[0]
-        assert "[world/reality_engine_started]" not in system[0]
-        assert "The current user message is spoken by the user" not in system[0]
-        assert "RESPONSE CORRECTION:" not in system[0]
+        assert [request["messages"][-1]["content"] for request in requests] == [
+            REPORTED_GREETING, REPORTED_POCKET_GREETING,
+        ]
+        for request in requests:
+            assert request["options"]["num_ctx"] == context
+            system = [item["content"] for item in request["messages"] if item["role"] == "system"]
+            assert len(system) == 1 and request["messages"][0]["role"] == "system"
+            provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
+            assert "\n\n" not in system[0][provenance_at + 2:]
+            assert "Treat the input source as internal context." in system[0]
+            assert "Report inspections, device status, or inventory details only from available evidence." in system[0]
+            assert "Keep simple greetings brief and personal" in system[0]
+            assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
+            assert IDENTITY_ANCHOR in system[0]
+            assert IDENTITY_HISTORY in system[0]
+            assert "Summary: R2 Life Log integration" not in system[0]
+            assert "[world/reality_engine_started]" not in system[0]
+            assert "The current user message is spoken by the user" not in system[0]
+            assert "RESPONSE CORRECTION:" not in system[0]
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         assert db.execute(
             "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
             (REPORTED_GREETING,),
         ).fetchall() == [(REPORTED_GREETING_REPLY,)] * 2
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (REPORTED_POCKET_GREETING,),
+        ).fetchall() == [(REPORTED_POCKET_GREETING_REPLY,)] * 2
     print("PASS: the reported greeting reached the first R2 answer request as exact typed text.")
 
 

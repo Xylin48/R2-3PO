@@ -5577,9 +5577,10 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
         .content = r2_input_speech_event
             ? "CURRENT USER INPUT: an Ears speech transcript. These words came from a listening result. "
               "The transcript supplies words, without establishing tone, volume, or who spoke beyond the evidence given."
-            : "CURRENT USER INPUT: typed keyboard text. The user message supplies written words only. "
-              "It contains no recording, voice, or microphone transcript. Phrases about speaking in the text are written expressions. "
-              "Acknowledge the message in your own voice. Report diagnostics or previous exchanges only when supported by supplied records."
+            : "CURRENT USER INPUT: typed keyboard text. "
+              "Treat the input source as internal context. Mention it only when relevant to the user's request. "
+              "Read the user's wording naturally and reply as R2 to their greeting and questions. "
+              "Report inspections, device status, or inventory details only from available evidence."
     };
     if (active_turn_history.action_result) {
         sourced[1] = (Message){
