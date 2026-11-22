@@ -285,6 +285,40 @@ static void check_final_budget_prefers_recent_dialogue(void)
         assert(limits[i] == strlen(turns[i].content));
 }
 
+static void check_final_budget_keeps_exchanges_whole(void)
+{
+    Message turns[] = {
+        {"system", "PAST CONVERSATION ARCHIVE — CONTEXT ONLY. Old archive", 0, 0},
+        {"user", "Older question", 0, 0},
+        {"assistant", "Older answer", 0, 0},
+        {"user", "A recent request about a real device", 0, 0},
+        {"assistant", "Internal action request", 0, 0},
+        {"user", "Recorded tool result", 0, 1},
+        {"assistant", "Recent answer", 0, 0},
+        {"user", "Current question", 0, 0},
+    };
+    unsigned char include[8];
+    size_t limits[8];
+    size_t recent = 0;
+    for (size_t i = 3; i < 8; ++i)
+        recent += strlen(turns[i].content);
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, recent, NULL) == 0);
+    assert(!include[0] && !include[1] && !include[2]);
+    for (size_t i = 3; i < 8; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
+    for (int missing_start = 0; missing_start < 2; ++missing_start) {
+        memset(include, 1, sizeof(include));
+        if (missing_start) include[3] = 0;
+        size_t budget = missing_start ? recent : recent - 1;
+        assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, budget, NULL) == 0);
+        assert(include[1] && include[2] && include[7]);
+        for (size_t i = 3; i < 7; ++i)
+            assert(!include[i] && limits[i] == 0);
+    }
+}
+
 static void check_boundaries(void)
 {
     const int contexts[] = {2048, 4096, 8192, 12288, 16384};
@@ -1462,6 +1496,7 @@ int main(void)
     check_structured_report_evidence();
     check_boundaries();
     check_final_budget_prefers_recent_dialogue();
+    check_final_budget_keeps_exchanges_whole();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();

@@ -3954,23 +3954,70 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     if (required_out) *required_out = required;
     if (required > input_budget) { errno = E2BIG; return -1; }
     size_t used = required;
-    /* Keep system context in its original order. Allocate historical dialogue
-     * from newest to oldest, just like the provisional selection. The final
-     * serializer still emits the retained turns in chronological order. */
+    /* Keep the existing policy and evidence order, but leave the optional
+     * startup transcript until after recent live dialogue. */
     for (size_t i = 0; i < count; ++i) {
         if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
+        const char *content = msgs[i].content ? msgs[i].content : "";
+        if (r2_inference_system_priority(content, ollama_authoritative_user_query) == 7)
+            continue;
         int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
-        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
+        size_t n = strlen(content);
         if (mandatory) { include[i] = 1; limits[i] = n; }
         else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
         else { include[i] = 0; limits[i] = 0; }
     }
-    for (size_t i = count; i > 0;) {
-        --i;
+    size_t history_end = current_user == SIZE_MAX ? count : current_user;
+    for (size_t i = history_end; i < count; ++i) {
         if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
-        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
-        if (current_user != SIZE_MAX && i >= current_user) { include[i] = 1; limits[i] = n; }
-        else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
+        include[i] = 1;
+        limits[i] = strlen(msgs[i].content ? msgs[i].content : "");
+    }
+
+    /* A historical exchange starts with a human turn and includes its
+     * assistant and tool messages. Keep it whole even if the provisional
+     * message limit admitted only its tail. Serialize the survivors later
+     * in their original order. */
+    for (size_t end = history_end; end > 0;) {
+        size_t start = end;
+        size_t bytes = 0;
+        int complete = 1;
+        int anchored = 0;
+        while (start > 0) {
+            const Message *message = &msgs[--start];
+            if (message->role && !strcmp(message->role, "system")) continue;
+            size_t n = strlen(message->content ? message->content : "");
+            if (!include[start] || n > input_budget - used - bytes)
+                complete = 0;
+            else
+                bytes += n;
+            if (message->role && !strcmp(message->role, "user") &&
+                !message->internal_tool_result) {
+                anchored = 1;
+                break;
+            }
+            /* Non-conversational helpers can send standalone messages. */
+            if (current_user == SIZE_MAX) {
+                anchored = 1;
+                break;
+            }
+        }
+        int keep = complete && anchored;
+        for (size_t i = start; i < end; ++i) {
+            if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
+            include[i] = keep;
+            limits[i] = keep ? strlen(msgs[i].content ? msgs[i].content : "") : 0;
+        }
+        if (keep) used += bytes;
+        end = start;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
+        const char *content = msgs[i].content ? msgs[i].content : "";
+        if (r2_inference_system_priority(content, ollama_authoritative_user_query) != 7)
+            continue;
+        size_t n = strlen(content);
+        if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
         else { include[i] = 0; limits[i] = 0; }
     }
     return 0;
@@ -4354,6 +4401,12 @@ static char *ollama_chat_with_limit(
             int message_priority = r2_inference_system_priority(
                 content, ollama_authoritative_user_query);
             if (message_priority != priority) continue;
+            if (message_priority == 7) {
+                /* Keep the full archive eligible without reserving bytes
+                 * ahead of live dialogue in this provisional pass. */
+                include[i] = *content != '\0';
+                continue;
+            }
 
             size_t length = strlen(content);
             if (length > OLLAMA_MAX_SYSTEM_MESSAGE_CHARS)
