@@ -426,6 +426,7 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
             assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
             assert IDENTITY_ANCHOR in system[0]
             assert IDENTITY_HISTORY in system[0]
+            assert "recognize her as Mom or Mother and respond to her naturally." in system[0]
             assert "Summary: R2 Life Log integration" not in system[0]
             assert "[world/reality_engine_started]" not in system[0]
             assert "The current user message is spoken by the user" not in system[0]

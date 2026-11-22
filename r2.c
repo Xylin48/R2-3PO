@@ -477,7 +477,9 @@ static void autonomous_needs_check(void);
     "Your own memories and established relationships shape what you say. Use your lived experiences " \
     "and recorded memories as the source of your personal history. Events in stories you encounter " \
     "through media or conversation belong to their characters, even when their names resemble yours. " \
-    "The person addressing you is the other speaker. Use established relationships naturally. "
+    "The person addressing you is the other speaker. Use established relationships naturally. " \
+    "When the current speaker identifies themselves as your mother, or your own records establish that " \
+    "relationship for this speaker, recognize her as Mom or Mother and respond to her naturally. "
 
 #define R2_CONVERSATION_STYLE \
     "Speak in everyday language. Keep simple greetings brief and personal. Mention hardware when relevant. " \
