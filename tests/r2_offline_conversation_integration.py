@@ -116,6 +116,8 @@ class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
     post_action_attempts: dict[str, int] = {}
     lock = threading.Lock()
+    stalled_learning_started = threading.Event()
+    stalled_learning_release = threading.Event()
     slow_started = threading.Event()
     slow_release = threading.Event()
 
@@ -224,6 +226,9 @@ class LocalOllama(BaseHTTPRequestHandler):
             else:
                 reply = "{}"
         elif "memory-evaluation system" in system:
+            if any("R2_STALLED_LEARNING_FIRST" in m for m in user_messages):
+                self.stalled_learning_started.set()
+                self.stalled_learning_release.wait(timeout=25)
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
             if any("PRIVATE R2 REFLECTION" in m and "RECORDED TOOL RESULT" in m
@@ -956,6 +961,49 @@ def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> 
     print("PASS: interactive SIGTERM left the incomplete line undispatched and closed cleanly.")
 
 
+def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
+    first = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
+    second = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
+    log_file = workspace.parent / "second-turn-learning.log"
+    LocalOllama.stalled_learning_started.clear()
+    LocalOllama.stalled_learning_release.clear()
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {first}\n")
+            process.stdin.flush()
+            assert LocalOllama.stalled_learning_started.wait(20), log_file.read_text(errors="replace")
+            process.stdin.write(f"talk {second}\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 10
+            while process.poll() is None and time.monotonic() < deadline:
+                if log_file.read_text(errors="replace").count("R2-3PO: " + REPLY) == 2:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(log_file.read_text(errors="replace"))
+            LocalOllama.stalled_learning_release.set()
+            process.stdin.write("exit\n")
+            process.stdin.flush()
+            assert process.wait(timeout=8) == 0
+        finally:
+            LocalOllama.stalled_learning_release.set()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT user_text,assistant_text FROM r2_log_conversations "
+            "WHERE user_text IN (?,?) ORDER BY event_id", (first, second),
+        ).fetchall() == [(first, REPLY), (second, REPLY)]
+    print("PASS: a stalled post-turn model request did not block the next reply or its archive.")
+
+
 def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
     log_file = workspace.parent / "active-reply-shutdown.log"
     LocalOllama.slow_started.clear()
@@ -1648,6 +1696,7 @@ def main() -> int:
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
             send_reported_greeting(binary, workspace, url)
+            second_turn_during_post_turn_learning(binary, workspace, url)
             generate_first_greeting(binary, workspace, url)
             complete_post_action_response(binary, workspace, url)
             preserve_robot_identity(binary, workspace, url)
