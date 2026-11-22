@@ -226,9 +226,6 @@ class LocalOllama(BaseHTTPRequestHandler):
             else:
                 reply = "{}"
         elif "memory-evaluation system" in system:
-            if any("R2_STALLED_LEARNING_FIRST" in m for m in user_messages):
-                self.stalled_learning_started.set()
-                self.stalled_learning_release.wait(timeout=25)
             reply = ("knowledge | " + BLUE_MEMORY if any(BLUE_MEMORY in message for message in user_messages)
                      else "NONE")
             if any("PRIVATE R2 REFLECTION" in m and "RECORDED TOOL RESULT" in m
@@ -236,6 +233,12 @@ class LocalOllama(BaseHTTPRequestHandler):
                 reply = "experience | " + PRIVATE_TOOL_MEMORY
             if any(LEARNING_RESTART_REQUEST in message for message in user_messages):
                 reply = "knowledge | " + RESTART_MEMORY
+            if any("R2_STALLED_LEARNING_FIRST" in m for m in user_messages):
+                if not self.stalled_learning_started.is_set():
+                    self.stalled_learning_started.set()
+                    self.stalled_learning_release.wait(timeout=25)
+                    return
+                reply = "knowledge | " + INTERRUPTED_LEARNING_MEMORY
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -961,6 +964,9 @@ def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> 
     print("PASS: interactive SIGTERM left the incomplete line undispatched and closed cleanly.")
 
 
+INTERRUPTED_LEARNING_MEMORY = "The user reported seeing a blue notebook during the stalled-learning test."
+
+
 def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
     first = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
     second = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
@@ -987,6 +993,20 @@ def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: st
             else:
                 raise AssertionError(log_file.read_text(errors="replace"))
             LocalOllama.stalled_learning_release.set()
+            deadline = time.monotonic() + 10
+            with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+                while process.poll() is None and time.monotonic() < deadline:
+                    saved = db.execute(
+                        "SELECT count(*) FROM memories WHERE memory=?", (INTERRUPTED_LEARNING_MEMORY,),
+                    ).fetchone()
+                    pending = db.execute(
+                        "SELECT 1 FROM r2_log_pending_learning WHERE user_text IN (?,?)", (first, second),
+                    ).fetchone()
+                    if saved == (1,) and pending is None:
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError(log_file.read_text(errors="replace"))
             process.stdin.write("exit\n")
             process.stdin.flush()
             assert process.wait(timeout=8) == 0
@@ -1001,7 +1021,8 @@ def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: st
             "SELECT user_text,assistant_text FROM r2_log_conversations "
             "WHERE user_text IN (?,?) ORDER BY event_id", (first, second),
         ).fetchall() == [(first, REPLY), (second, REPLY)]
-    print("PASS: a stalled post-turn model request did not block the next reply or its archive.")
+    print("PASS: a stalled post-turn model request yielded, resumed learning exactly once, "
+          "and preserved both replies.")
 
 
 def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
