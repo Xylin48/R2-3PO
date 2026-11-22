@@ -238,14 +238,14 @@ fi
 # interactive preflight sees an empty ollama ps on 11434.
 if have systemctl && systemctl is-active --quiet r2-ollama.service 2>/dev/null; then
   fail "r2-ollama.service is active on 127.0.0.1:11435 and may be occupying the shared GPU; stop that service manually before interactive launch."
-elif curl --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
+elif curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
   fail "a separate Ollama API is responding on 127.0.0.1:11435; it may be using the shared GPU. Stop that server before interactive launch, then retry."
 else
   pass "no competing R2 Ollama server detected on 127.0.0.1:11435"
 fi
 
 section "Ollama Llama conversation and Qwen3-VL vision models"
-if TAGS="$(curl --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
+if TAGS="$(curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
   if printf '%s' "$TAGS" | python3 -c '
 import json
 import sys

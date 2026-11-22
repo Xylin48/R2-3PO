@@ -17,6 +17,8 @@ required = (
     'R2_ROOT="${R2_ROOT:-/home/x/R2_Home}"',
     'R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"',
     'http://127.0.0.1:11434/api/tags',
+    'curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags',
+    'curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 4 "$OLLAMA_URL"',
     'llama3.1:8b', 'qwen3-vl:4b-instruct-q4_K_M',
     'r2_memory.db', 'r2_reality.db', 'r2_fridge.db',
     'r2_rewards.db', 'r2_addictions.db',
