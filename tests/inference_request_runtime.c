@@ -265,6 +265,26 @@ static void check_request(Message *messages, size_t count, const char *override,
     assert(wire_index == json_object_array_length(array));
     ollama_authoritative_user_query = NULL;
 }
+static void check_final_budget_prefers_recent_dialogue(void)
+{
+    Message turns[] = {
+        {"user", "Old question", 0, 0},
+        {"assistant", "Old generic answer", 0, 0},
+        {"user", "Recent question", 0, 0},
+        {"assistant", "Recent R2 answer", 0, 0},
+        {"user", "Current question", 0, 0},
+    };
+    unsigned char include[] = {1, 1, 1, 1, 0};
+    size_t limits[5] = {0};
+    size_t required = 0;
+    size_t budget = strlen(turns[2].content) + strlen(turns[3].content) + strlen(turns[4].content);
+    assert(r2_preserve_inference_units(turns, 5, include, limits, 4, 0, budget, &required) == 0);
+    assert(required == strlen(turns[4].content));
+    assert(!include[0] && !include[1] && include[2] && include[3] && include[4]);
+    for (size_t i = 2; i < 5; ++i)
+        assert(limits[i] == strlen(turns[i].content));
+}
+
 static void check_boundaries(void)
 {
     const int contexts[] = {2048, 4096, 8192, 12288, 16384};
@@ -1441,6 +1461,7 @@ int main(void)
     assert(r2_log_init() == 0);
     check_structured_report_evidence();
     check_boundaries();
+    check_final_budget_prefers_recent_dialogue();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();

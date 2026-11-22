@@ -3954,10 +3954,22 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     if (required_out) *required_out = required;
     if (required > input_budget) { errno = E2BIG; return -1; }
     size_t used = required;
+    /* Keep system context in its original order. Allocate historical dialogue
+     * from newest to oldest, just like the provisional selection. The final
+     * serializer still emits the retained turns in chronological order. */
     for (size_t i = 0; i < count; ++i) {
+        if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
         int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
         size_t n = strlen(msgs[i].content ? msgs[i].content : "");
         if (mandatory) { include[i] = 1; limits[i] = n; }
+        else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
+        else { include[i] = 0; limits[i] = 0; }
+    }
+    for (size_t i = count; i > 0;) {
+        --i;
+        if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
+        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
+        if (current_user != SIZE_MAX && i >= current_user) { include[i] = 1; limits[i] = n; }
         else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
         else { include[i] = 0; limits[i] = 0; }
     }
