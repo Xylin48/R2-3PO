@@ -6315,8 +6315,8 @@ static char *r2_build_associative_search_query(const char *query)
 
     size_t query_length = strlen(query);
     size_t concepts_length = strlen(clean);
-    /* The next consumers tokenize every word in this string. A descriptive
-     * label becomes a search cue even when the user never used those words. */
+    /* Search consumers use a bounded prefix of the keyword list. Give the
+     * user's own words those slots first, then add model-derived synonyms. */
     const char separator[] = "\n\n";
     if (query_length > SIZE_MAX - sizeof(separator) ||
         concepts_length > SIZE_MAX - sizeof(separator) - query_length) {
@@ -6334,7 +6334,7 @@ static char *r2_build_associative_search_query(const char *query)
         return fallback;
     }
 
-    snprintf(combined, total, "%s%s%s", clean, separator, query);
+    snprintf(combined, total, "%s%s%s", query, separator, clean);
     fprintf(stderr,
             "[R2 Association] Generated associative retrieval cues (%zu chars); original user text remains unchanged.\n",
             concepts_length);

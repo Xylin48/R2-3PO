@@ -1338,6 +1338,32 @@ static void check_foreground_input_provenance(void)
     ollama_authoritative_user_query = NULL;
 }
 
+static void check_literal_retrieval_cues_precede_generated_cues(void)
+{
+    const char *query = "hello r2 my darling, this is your mother speaking to you. "
+                        "ive missed you dearly, how are you? did you know you have pocket?";
+    const char *generated = "conversation dialogue greeting sentiments interpersonal "
+                            "association identity diagnostic capability visual technology "
+                            "inspection context interpretation";
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    r2_associative_query_cache_clear();
+    set_response(generated, "stop", 1);
+    char *plan = r2_build_associative_search_query(query);
+    assert(plan && captured_contains(query));
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t count = extract_memory_keywords(plan, keywords);
+    assert(count > R2_TURN_HISTORY_SEARCHES);
+    int mother_found = 0, pocket_found = 0, generated_found = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (i < 6 && !strcmp(keywords[i], "mother")) mother_found = 1;
+        if (i < 6 && !strcmp(keywords[i], "pocket")) pocket_found = 1;
+        if (!strcmp(keywords[i], "interpersonal")) generated_found = 1;
+    }
+    assert(mother_found && pocket_found && generated_found);
+    free(plan);
+    r2_associative_query_cache_clear();
+}
+
 static void check_memory_response_replay(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
@@ -1422,6 +1448,7 @@ int main(void)
     check_compact_ranked_memory();
     check_context_cache_write_overlap();
     check_first_answer_with_unavailable_source();
+    check_literal_retrieval_cues_precede_generated_cues();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
