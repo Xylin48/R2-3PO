@@ -1328,7 +1328,7 @@ static void check_foreground_input_provenance(void)
         assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
                                      "CURRENT USER INPUT: typed keyboard text."));
         assert(captured_contains(i ? "The transcript supplies words" :
-                                     "It contains no recording, voice, or microphone transcript."));
+                                     "Treat the input source as internal context."));
         assert(captured_contains("Keep simple greetings brief and personal"));
         assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
         free(reply);
