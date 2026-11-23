@@ -1011,17 +1011,16 @@ static void check_reflection_stop_and_long_visual_query(void)
     memset(query, 'x', 3000);
     strcpy(query + 3000, " WHAT DO YOU SEE");
     assert(query_requests_visual_context(query));
-    assert(query_requests_live_vision(query, 1));
+    assert(query_requested_live_sources(query) == R2_LIVE_CAMERA);
     assert(query_requests_visual_context("What did we watch yesterday?"));
-    assert(!query_requests_live_vision("What did we watch yesterday?", 0));
-    assert(query_requests_live_vision("What's on the screen?", 0));
-    assert(!query_requests_live_vision("What's on the screen?", 1));
+    assert(!query_requested_live_sources("What did we watch yesterday?"));
+    assert(query_requested_live_sources("What's on the screen?") == R2_LIVE_DISPLAY);
 
     r2_associative_query_cache_clear();
     set_response("present visual view", "stop", 1);
     char *plan = r2_build_associative_search_query("What can you see?");
     assert(plan && captured_contains("What can you see?"));
-    assert(!captured_contains("CURRENT VISUAL INPUT: unavailable."));
+    assert(!captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable."));
     assert(!ollama_isolated_request);
     free(plan);
     r2_associative_query_cache_clear();
@@ -1434,7 +1433,7 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
 
 static void check_missing_live_frame_is_current_evidence(void)
 {
-    const char *queries[] = {"What can you see?", "What did we watch yesterday?",
+    const char *queries[] = {"What can you see?", "What's on the screen?", "What did we watch yesterday?",
                              "Good afternoon, R2."};
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
@@ -1445,12 +1444,23 @@ static void check_missing_live_frame_is_current_evidence(void)
         char *answer = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
                                                  query, 512, 60, NULL);
         assert(answer && captured_contains(query));
-        assert(captured_contains("CURRENT VISUAL INPUT: unavailable.") == (i == 0));
+        assert(captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable.") == (i == 0));
+        assert(captured_contains("CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable.") == (i == 1));
         assert(!captured_contains("CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL"));
         assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
         free(answer);
     }
     ollama_authoritative_user_query = NULL;
+    json_object *sections = json_object_new_array();
+    assert(sections);
+    assert(ollama_append_missing_visual_inputs(sections, R2_LIVE_DISPLAY, R2_LIVE_CAMERA) == 0);
+    assert(json_object_array_length(sections) == 1);
+    json_object *message = json_object_array_get_idx(sections, 0), *content = NULL;
+    assert(json_object_object_get_ex(message, "content", &content));
+    assert(strstr(json_object_get_string(content), "No current display frame"));
+    assert(ollama_append_missing_visual_inputs(sections, R2_LIVE_CAMERA, R2_LIVE_CAMERA) == 0);
+    assert(json_object_array_length(sections) == 1);
+    json_object_put(sections);
 }
 
 static void check_failed_reality_refresh_keeps_action_evidence(void)

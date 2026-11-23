@@ -199,7 +199,8 @@ static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
 static atomic_uint_fast64_t vision_watch_owner_token = ATOMIC_VAR_INIT(0); /* protected by vision_watch_lock */
 static int query_requests_visual_context(const char *query);
-static int query_requests_live_vision(const char *query, int camera_only);
+enum { R2_LIVE_CAMERA = 1, R2_LIVE_DISPLAY = 2 };
+static int query_requested_live_sources(const char *query);
 static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
@@ -3726,6 +3727,22 @@ static int ollama_append_visual_observation(struct json_object *array,
     return appended;
 }
 
+static int ollama_append_missing_visual_inputs(struct json_object *array,
+                                               int requested, int available)
+{
+    static const char camera[] =
+        "CURRENT CAMERA VISUAL INPUT: unavailable. No current camera frame is available for this reply.";
+    static const char display[] =
+        "CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable. No current display frame is available for this reply.";
+    int missing = requested & ~available;
+    if ((missing & R2_LIVE_CAMERA) &&
+        ollama_json_append_message(array, "system", camera, sizeof(camera) - 1, NULL, NULL) != 0)
+        return -1;
+    if (missing & R2_LIVE_DISPLAY)
+        return ollama_json_append_message(array, "system", display, sizeof(display) - 1, NULL, NULL);
+    return 0;
+}
+
 /* Keep one leading system turn for Llama, with ordered context sections. Keep the selected
  * sections in priority order, then preserve every conversational role,
  * tool result and translated visual evidence exactly as serialized. */
@@ -4640,24 +4657,24 @@ static char *ollama_chat_with_limit(
         }
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
-        const char *question = i == current_user_index && active_foreground_turn &&
-            !ollama_isolated_request && query_requests_live_vision(ollama_authoritative_user_query, 0)
-            ? ollama_authoritative_user_query : NULL;
+        const char *query = ollama_authoritative_user_query;
+        int requested = i == current_user_index && active_foreground_turn && !ollama_isolated_request
+            ? query_requested_live_sources(query) : 0;
         size_t before_visual_evidence = json_object_array_length(arr);
-        char *camera_description = ollama_describe_visual_source(owned_image, &camera, question);
-        char *media_description = ollama_describe_visual_source(owned_media_image, &media, NULL);
+        char *camera_description = ollama_describe_visual_source(owned_image, &camera,
+            (requested & R2_LIVE_CAMERA) ? query : NULL);
+        char *media_description = ollama_describe_visual_source(owned_media_image, &media,
+            (requested & R2_LIVE_DISPLAY) ? query : NULL);
         int append_rc = ollama_append_visual_observation(
             arr, "CAMERA", owned_image, camera_description, &camera);
+        size_t after_camera = json_object_array_length(arr);
         if (append_rc == 0)
             append_rc = ollama_append_visual_observation(
                 arr, "MEDIA DISPLAY", owned_media_image, media_description, &media);
-        if (append_rc == 0 && question && json_object_array_length(arr) == before_visual_evidence) {
-            static const char unavailable[] =
-                "CURRENT VISUAL INPUT: unavailable. No current camera or display frame "
-                "is available for this reply. Treat any retrieved visual memories as past observations.";
-            append_rc = ollama_json_append_message(arr, "system", unavailable,
-                                                  sizeof(unavailable) - 1, NULL, NULL);
-        }
+        int available = (after_camera > before_visual_evidence ? R2_LIVE_CAMERA : 0) |
+            (json_object_array_length(arr) > after_camera ? R2_LIVE_DISPLAY : 0);
+        if (append_rc == 0)
+            append_rc = ollama_append_missing_visual_inputs(arr, requested, available);
         if (json_object_array_length(arr) != before_visual_evidence)
             translated_visual_inputs = 1;
         free(media_description);
@@ -6711,7 +6728,7 @@ static char *chat_with_relevant_memories(
      * brain. A background watcher does not force attention. Ordinary conversation
      * never opens a camera silently.
      */
-    if (query_requests_live_vision(query, 1) && atomic_load(&eyes_auto_allowed) &&
+    if ((query_requested_live_sources(query) & R2_LIVE_CAMERA) && atomic_load(&eyes_auto_allowed) &&
         r2_eyes_status() <= 0) {
         /* An explicit request to see permits opening Eyes; ordinary turns do not. */
         if (r2_eyes_start_impl(NULL, 0) != 0) {
@@ -11213,7 +11230,7 @@ void r2_stop_thinking(void)
 /* Historical visual search has a broader vocabulary than live perception.
  * A display question can use the already selected media source without
  * opening the independent physical camera. */
-static int query_requests_live_vision(const char *query, int camera_only)
+static int query_requested_live_sources(const char *query)
 {
     if (!query) return 0;
     static const char *const camera_terms[] = {
@@ -11226,12 +11243,18 @@ static int query_requests_live_vision(const char *query, int camera_only)
         "what are we watching", "what is on the screen", "what's on the screen",
         "what is playing", "what's playing", "describe the video"
     };
+    int sources = 0;
     for (size_t i = 0; i < sizeof(camera_terms) / sizeof(camera_terms[0]); ++i)
-        if (strcasestr(query, camera_terms[i])) return 1;
-    if (!camera_only)
-        for (size_t i = 0; i < sizeof(display_terms) / sizeof(display_terms[0]); ++i)
-            if (strcasestr(query, display_terms[i])) return 1;
-    return 0;
+        if (strcasestr(query, camera_terms[i])) {
+            sources |= R2_LIVE_CAMERA;
+            break;
+        }
+    for (size_t i = 0; i < sizeof(display_terms) / sizeof(display_terms[0]); ++i)
+        if (strcasestr(query, display_terms[i])) {
+            sources |= R2_LIVE_DISPLAY;
+            break;
+        }
+    return sources;
 }
 
 static int query_requests_visual_context(const char *query)
