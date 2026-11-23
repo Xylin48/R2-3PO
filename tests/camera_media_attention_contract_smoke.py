@@ -53,7 +53,7 @@ assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen clo
 assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_sense_auto_allowed(desktop ? 3 : 2)" in worker
 # A visual question cannot undo R2's explicit decision to close Eyes.
-assert "visual_requested && atomic_load(&eyes_auto_allowed)" in core
+assert "query_requests_live_vision(query, 1) && atomic_load(&eyes_auto_allowed)" in core
 camera_analysis = core[core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\n{"):
                        core.index("char *r2_vision_see(const char *question)")]
 assert "!atomic_load(&eyes_auto_allowed)" in camera_analysis
