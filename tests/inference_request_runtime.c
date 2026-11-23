@@ -1117,7 +1117,7 @@ static void check_action_result_under_history_pressure(void)
     char *fixed_history = text(MAX_LIVE_MESSAGE_BYTES - 1350U, 'p', "Old fixture answer.");
     assert(message_add_pinned("assistant", fixed_history) == 0);
     free(fixed_history);
-    set_response("I will read the saved document.\n[READ] turn-result-fixture.txt", "stop", 1);
+    set_response("[READ] turn-result-fixture.txt", "stop", 1);
 
     core_initialized = 1;
     char *reply = r2_talk(user);
@@ -1157,6 +1157,22 @@ static void check_action_result_under_history_pressure(void)
     free(file_text);
     free(user);
     message_free_all();
+
+    assert(!r2_vision_media_status());
+    set_response("[MEDIA_SEE] What is on the screen?", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk("What is on the screen right now?");
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    /* The model repeats the control marker on follow-up. Surface the actual
+       tool result without showing the marker or executing another action. */
+    assert(reply && strstr(reply, "MEDIA OBSERVATION ERROR: no visible media frame"));
+    assert(!strstr(reply, "[MEDIA_SEE]"));
+    free(reply);
+    message_free_all();
+
     const char *unsaved = "This exchange must not produce unsourced learning.";
     assert(sqlite3_exec(db, "CREATE TRIGGER block_fixture_archive "
                         "BEFORE INSERT ON r2_log_pending_conversations "

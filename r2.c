@@ -15062,7 +15062,9 @@ static char *r2_talk_impl(const char *message)
        cleanup allocation failure cannot occur after a tool side effect. Keep
        the original separately in case this is a final reply and should play. */
     char *stripped_reply = r2_sounds_strip_markers_with_literals(reply, literal_tool_span);
-    if (!reply_has_visible_text(stripped_reply)) {
+    /* An action-only reply is valid input to process_tools. Check for visible
+       text only when preparing the outward reply, after routing the action. */
+    if (!stripped_reply || !stripped_reply[strspn(stripped_reply, " \t\n\r\v\f")]) {
         free(reply);
         free(stripped_reply);
         reply = xstrdup("I couldn't produce a reply to this turn. Your message is still here.");
