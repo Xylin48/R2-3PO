@@ -127,6 +127,7 @@ static R2Eyes *media_eyes = NULL;
 static pthread_mutex_t media_capture_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t media_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t media_frame_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t media_capture_thread;
 static atomic_int media_capture_running = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t media_source_revision = ATOMIC_VAR_INIT(1);
@@ -11441,6 +11442,7 @@ static void r2_vision_media_end_capture(void)
     atomic_store(&media_capture_running, 0);
     int had_attention = atomic_exchange(&media_attention_selected, 0);
     if (had_attention) atomic_fetch_add(&media_attention_revision, 1);
+    pthread_cond_broadcast(&media_frame_cond);
     pthread_mutex_unlock(&media_frame_lock);
     if (had_attention)
         r2_log_sensory("media_attention_source_lost",
@@ -11481,11 +11483,13 @@ static void *r2_media_capture_worker(void *unused)
                 }
             }
             if (available) {
+                int first_frame = !media_latest_source;
                 memcpy(media_latest_data, frame.data, frame.size);
                 media_latest_frame = frame;
                 media_latest_frame.data = media_latest_data;
                 free(media_latest_source);
                 media_latest_source = source;
+                if (first_frame) pthread_cond_broadcast(&media_frame_cond);
             }
             pthread_mutex_unlock(&media_frame_lock);
         }
@@ -11699,12 +11703,28 @@ char *r2_vision_media_see(const char *question)
 {
     if (!r2_vision_media_status() || !question || !*question ||
         !atomic_load(&eyes_auto_allowed)) return NULL;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return NULL;
+    deadline.tv_sec += 5; /* Same first-frame budget as deliberate camera observation. */
+
     pthread_mutex_lock(&media_frame_lock);
+    R2VisionRequestSource origin = {
+        .revision = &media_source_revision,
+        .expected = atomic_load(&media_source_revision),
+    };
+    /* A deliberate inspection can arrive before the decoder publishes. Keep it
+     * bound to that source generation, even if Watch opens a replacement. */
+    int wait_result = 0;
+    while (!shutting_down && atomic_load(&media_capture_running) &&
+           !r2_vision_source_changed(&origin) && !media_latest_source) {
+        wait_result = pthread_cond_clockwait(&media_frame_cond, &media_frame_lock,
+                                              CLOCK_MONOTONIC, &deadline);
+        if (wait_result != 0) break;
+    }
     R2VisionFrame frame = media_latest_frame;
-    R2VisionRequestSource origin = {.revision = &media_source_revision, .expected = atomic_load(&media_source_revision)};
     char *source = NULL;
-    if (atomic_load(&media_capture_running) && frame.data && frame.size &&
-        media_latest_source)
+    if (wait_result == 0 && !shutting_down && atomic_load(&media_capture_running) &&
+        !r2_vision_source_changed(&origin) && frame.data && frame.size && media_latest_source)
         source = strdup(media_latest_source);
     unsigned char *copy = source ? malloc(frame.size) : NULL;
     if (copy) {
@@ -12431,6 +12451,7 @@ void r2_sense_set_auto_allowed(int which, int allowed)
                 atomic_fetch_add(&eyes_source_revision, 1);
                 pthread_mutex_lock(&media_frame_lock);
                 atomic_fetch_add(&media_source_revision, 1);
+                pthread_cond_broadcast(&media_frame_cond);
                 pthread_mutex_unlock(&media_frame_lock);
                 pthread_mutex_lock(&vision_watch_frame_lock);
                 pthread_cond_broadcast(&vision_watch_frame_cond);
@@ -14171,6 +14192,9 @@ void r2_request_shutdown(void)
     shutting_down = 1;
     pthread_cond_broadcast(&task_queue_cond);
     pthread_mutex_unlock(&task_queue_lock);
+    pthread_mutex_lock(&media_frame_lock);
+    pthread_cond_broadcast(&media_frame_cond);
+    pthread_mutex_unlock(&media_frame_lock);
     pthread_mutex_lock(&vision_watch_frame_lock);
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
