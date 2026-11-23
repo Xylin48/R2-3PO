@@ -136,6 +136,41 @@ static void verify_display_source_end(void)
     assert(atomic_load(&media_source_revision) == ended);
 }
 
+static void verify_camera_watch_stop(void)
+{
+    R2VisionRequestSource camera = {
+        .revision = &eyes_source_revision,
+        .expected = atomic_load(&eyes_source_revision),
+    };
+    R2VisionRequestSource display = {
+        .revision = &media_source_revision,
+        .expected = atomic_load(&media_source_revision),
+    };
+    atomic_store(&eyes_auto_allowed, 1);
+    assert(!r2_vision_source_changed(&camera));
+    atomic_store(&eyes_source_changing, 1);
+    assert(r2_vision_source_changed(&camera));
+    assert(!r2_vision_source_changed(&display));
+    atomic_store(&eyes_source_changing, 0);
+
+    atomic_store(&vision_watch_running, 1);
+    assert(r2_vision_watch_stop() == 0);
+    assert(r2_vision_source_changed(&camera));
+    assert(!r2_vision_source_changed(&display));
+    camera.expected = atomic_load(&eyes_source_revision);
+    assert(r2_vision_watch_stop() == 0);
+    assert(!r2_vision_source_changed(&camera));
+
+    atomic_store(&vision_watch_running, 1);
+    /* With no Eyes receiver, the production capture worker ends on its own. */
+    assert(vision_watch_capture_worker(NULL) == NULL);
+    assert(vision_watch_capture_done && r2_vision_source_changed(&camera));
+    assert(!r2_vision_source_changed(&display));
+    camera.expected = atomic_load(&eyes_source_revision);
+    assert(r2_vision_watch_stop() == 0);
+    assert(!r2_vision_source_changed(&camera));
+}
+
 int main(void)
 {
     verify_images(NULL, NULL, NULL);
@@ -147,6 +182,7 @@ int main(void)
         "CURRENT IMAGE SOURCE MAP: Image 1 is the chosen media display. No camera frame is attached.");
     verify_current_observations();
     verify_display_source_end();
+    verify_camera_watch_stop();
 
     json_object *request = json_object_new_array();
     assert(request && ollama_json_append_message(request, NULL, "invalid", 7, "CAMERA", "MEDIA") != 0);

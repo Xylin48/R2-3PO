@@ -1530,6 +1530,7 @@ char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *ques
         return NULL;
     char model[sizeof(visual_model)];
     pthread_mutex_lock(&visual_lock);
+    uint64_t generation = visual_generation;
     int available = visual_initialized && visual_db;
     if (available)
         snprintf(model, sizeof(model), "%s", visual_model);
@@ -1544,6 +1545,14 @@ char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *ques
         r2_log_sensory("vision_invalid_description",
                       "Visual perception returned no valid description.", json, model);
     free(json);
+
+    pthread_mutex_lock(&visual_lock);
+    int still_current = visual_initialized && visual_db && visual_generation == generation;
+    pthread_mutex_unlock(&visual_lock);
+    if (!still_current || r2_ollama_vision_request_should_abort()) {
+        free(description);
+        return NULL;
+    }
     return description;
 }
 

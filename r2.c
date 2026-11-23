@@ -3122,6 +3122,7 @@ void r2_ollama_vision_request_end(void)
 static int r2_vision_source_changed(const R2VisionRequestSource *origin)
 {
     return !atomic_load(&eyes_auto_allowed) ||
+        (origin->revision == &eyes_source_revision && atomic_load(&eyes_source_changing)) ||
         atomic_load(origin->revision) != origin->expected ||
         (origin->expected_attention &&
          (!atomic_load(&media_attention_selected) ||
@@ -11949,6 +11950,8 @@ static void *vision_watch_capture_worker(void *unused)
     }
 
     pthread_mutex_lock(&vision_watch_frame_lock);
+    if (atomic_load(&vision_watch_running))
+        atomic_fetch_add(&eyes_source_revision, 1);
     vision_watch_capture_done = 1;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);
@@ -12162,8 +12165,10 @@ uint64_t r2_vision_watch_start_for_watch(void)
 static int r2_vision_watch_stop_locked(void)
 {
     vision_watch_owner_token = 0;
-    atomic_store(&vision_watch_running, 0);
     pthread_mutex_lock(&vision_watch_frame_lock);
+    if (atomic_load(&vision_watch_running) && !vision_watch_capture_done)
+        atomic_fetch_add(&eyes_source_revision, 1);
+    atomic_store(&vision_watch_running, 0);
     ++vision_watch_session;
     pthread_cond_broadcast(&vision_watch_frame_cond);
     pthread_mutex_unlock(&vision_watch_frame_lock);

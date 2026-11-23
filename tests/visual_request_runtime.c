@@ -593,6 +593,16 @@ int main(void)
 
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
+    response("{\"description\":\"stale conversation view\",\"focus\":null}", "stop");
+    restart_library = 1;
+    assert(!r2_visual_describe_encoded_frame("fixture-image", "What do you see?"));
+    assert(!restart_library);
+    response("{\"description\":\"current conversation view\",\"focus\":null}", "stop");
+    actual = r2_visual_describe_encoded_frame("fixture-image", "What do you see?");
+    assert(actual && !strcmp(actual, "current conversation view"));
+    free(actual);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 0);
+
     assert(sqlite3_exec(visual_db, "CREATE TRIGGER fail_after_detached_insert "
         "AFTER INSERT ON r2_visual_experiences BEGIN SELECT RAISE(FAIL, 'fixture'); END",
         NULL, NULL, NULL) == SQLITE_OK);
