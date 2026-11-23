@@ -1011,6 +1011,20 @@ static void check_reflection_stop_and_long_visual_query(void)
     memset(query, 'x', 3000);
     strcpy(query + 3000, " WHAT DO YOU SEE");
     assert(query_requests_visual_context(query));
+    assert(query_requests_live_vision(query, 1));
+    assert(query_requests_visual_context("What did we watch yesterday?"));
+    assert(!query_requests_live_vision("What did we watch yesterday?", 0));
+    assert(query_requests_live_vision("What's on the screen?", 0));
+    assert(!query_requests_live_vision("What's on the screen?", 1));
+
+    r2_associative_query_cache_clear();
+    set_response("present visual view", "stop", 1);
+    char *plan = r2_build_associative_search_query("What can you see?");
+    assert(plan && captured_contains("What can you see?"));
+    assert(!captured_contains("CURRENT VISUAL INPUT: unavailable."));
+    assert(!ollama_isolated_request);
+    free(plan);
+    r2_associative_query_cache_clear();
 }
 
 static void check_structured_report_evidence(void)
@@ -1420,7 +1434,8 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
 
 static void check_missing_live_frame_is_current_evidence(void)
 {
-    const char *queries[] = {"What can you see?", "Good afternoon, R2."};
+    const char *queries[] = {"What can you see?", "What did we watch yesterday?",
+                             "Good afternoon, R2."};
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
         const char *query = queries[i];

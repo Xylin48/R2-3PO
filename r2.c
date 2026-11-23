@@ -199,6 +199,7 @@ static _Thread_local int vision_watch_worker_context = 0;
 static int vision_watch_thread_started = 0;
 static atomic_uint_fast64_t vision_watch_owner_token = ATOMIC_VAR_INIT(0); /* protected by vision_watch_lock */
 static int query_requests_visual_context(const char *query);
+static int query_requests_live_vision(const char *query, int camera_only);
 static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
 static char *r2_vision_current_frame_base64(void);
@@ -4640,7 +4641,7 @@ static char *ollama_chat_with_limit(
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
         const char *question = i == current_user_index && active_foreground_turn &&
-            !ollama_isolated_request && query_requests_visual_context(ollama_authoritative_user_query)
+            !ollama_isolated_request && query_requests_live_vision(ollama_authoritative_user_query, 0)
             ? ollama_authoritative_user_query : NULL;
         size_t before_visual_evidence = json_object_array_length(arr);
         char *camera_description = ollama_describe_visual_source(owned_image, &camera, question);
@@ -6376,8 +6377,11 @@ static char *r2_build_associative_search_query(const char *query)
     const char *previous_stage = ollama_audit_stage;
     ollama_authoritative_user_query = query;
     ollama_audit_stage = "association-planner";
+    int previous_isolated = ollama_isolated_request;
+    ollama_isolated_request = 1;
     char *generated = ollama_chat_with_limit(
         &probe, 1, retrieval_prompt, 128, 90L);
+    ollama_isolated_request = previous_isolated;
     ollama_authoritative_user_query = previous_query;
     ollama_audit_stage = previous_stage;
 
@@ -6707,7 +6711,7 @@ static char *chat_with_relevant_memories(
      * brain. A background watcher does not force attention. Ordinary conversation
      * never opens a camera silently.
      */
-    if (visual_requested && atomic_load(&eyes_auto_allowed) &&
+    if (query_requests_live_vision(query, 1) && atomic_load(&eyes_auto_allowed) &&
         r2_eyes_status() <= 0) {
         /* An explicit request to see permits opening Eyes; ordinary turns do not. */
         if (r2_eyes_start_impl(NULL, 0) != 0) {
@@ -11205,6 +11209,30 @@ void r2_stop_thinking(void)
 /* ============================================================
    VISUAL PERCEPTION BRIDGE
    ============================================================ */
+
+/* Historical visual search has a broader vocabulary than live perception.
+ * A display question can use the already selected media source without
+ * opening the independent physical camera. */
+static int query_requests_live_vision(const char *query, int camera_only)
+{
+    if (!query) return 0;
+    static const char *const camera_terms[] = {
+        "what do you see", "what can you see", "look at", "look on",
+        "what am i showing you", "what am i looking at",
+        "what is this", "what's this", "describe this",
+        "describe the image", "in this picture", "in this image"
+    };
+    static const char *const display_terms[] = {
+        "what are we watching", "what is on the screen", "what's on the screen",
+        "what is playing", "what's playing", "describe the video"
+    };
+    for (size_t i = 0; i < sizeof(camera_terms) / sizeof(camera_terms[0]); ++i)
+        if (strcasestr(query, camera_terms[i])) return 1;
+    if (!camera_only)
+        for (size_t i = 0; i < sizeof(display_terms) / sizeof(display_terms[0]); ++i)
+            if (strcasestr(query, display_terms[i])) return 1;
+    return 0;
+}
 
 static int query_requests_visual_context(const char *query)
 {
