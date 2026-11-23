@@ -1418,6 +1418,26 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
     r2_associative_query_cache_clear();
 }
 
+static void check_missing_live_frame_is_current_evidence(void)
+{
+    const char *queries[] = {"What can you see?", "Good afternoon, R2."};
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+        const char *query = queries[i];
+        Message turn = {.role = "user", .content = (char *)query};
+        ollama_authoritative_user_query = query;
+        set_response("Fixture answer.", "stop", 1);
+        char *answer = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                 query, 512, 60, NULL);
+        assert(answer && captured_contains(query));
+        assert(captured_contains("CURRENT VISUAL INPUT: unavailable.") == (i == 0));
+        assert(!captured_contains("CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL"));
+        assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
+        free(answer);
+    }
+    ollama_authoritative_user_query = NULL;
+}
+
 static void check_failed_reality_refresh_keeps_action_evidence(void)
 {
     const char *query = "Did you move the notebook out of your pockets?";
@@ -1527,6 +1547,7 @@ int main(void)
     check_structured_report_evidence();
     check_boundaries();
     check_failed_reality_refresh_keeps_action_evidence();
+    check_missing_live_frame_is_current_evidence();
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
     check_reflection_stop_and_long_visual_query();

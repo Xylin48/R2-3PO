@@ -4639,11 +4639,10 @@ static char *ollama_chat_with_limit(
         }
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
-        if (owned_image || owned_media_image)
-            translated_visual_inputs = 1;
-        const char *question = active_foreground_turn &&
-            query_requests_visual_context(ollama_authoritative_user_query)
+        const char *question = i == current_user_index && active_foreground_turn &&
+            !ollama_isolated_request && query_requests_visual_context(ollama_authoritative_user_query)
             ? ollama_authoritative_user_query : NULL;
+        size_t before_visual_evidence = json_object_array_length(arr);
         char *camera_description = ollama_describe_visual_source(owned_image, &camera, question);
         char *media_description = ollama_describe_visual_source(owned_media_image, &media, NULL);
         int append_rc = ollama_append_visual_observation(
@@ -4651,6 +4650,15 @@ static char *ollama_chat_with_limit(
         if (append_rc == 0)
             append_rc = ollama_append_visual_observation(
                 arr, "MEDIA DISPLAY", owned_media_image, media_description, &media);
+        if (append_rc == 0 && question && json_object_array_length(arr) == before_visual_evidence) {
+            static const char unavailable[] =
+                "CURRENT VISUAL INPUT: unavailable. No current camera or display frame "
+                "is available for this reply. Treat any retrieved visual memories as past observations.";
+            append_rc = ollama_json_append_message(arr, "system", unavailable,
+                                                  sizeof(unavailable) - 1, NULL, NULL);
+        }
+        if (json_object_array_length(arr) != before_visual_evidence)
+            translated_visual_inputs = 1;
         free(media_description);
         free(camera_description);
         free(owned_media_image);
@@ -6707,12 +6715,6 @@ static char *chat_with_relevant_memories(
                            "R2 could not open continuous Eyes input for an explicit visual request.",
                            "The camera could not be opened or the continuous raw-frame capture worker could not start.",
                            "Eyes");
-            const char unavailable[] =
-                "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request. "
-                "Do not claim to see the current scene from historical memories.";
-            if (r2_append_association_section(&memory_context, "", unavailable) != 0) {
-                free(memory_context); r2_history_release(&life_history); return NULL;
-            }
         }
     }
 
