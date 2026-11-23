@@ -133,7 +133,8 @@ require(
     and 'r2_visual_describe_encoded_frame(' in core
     and '"CAMERA", owned_image, camera_description, &camera' in core
     and '"MEDIA DISPLAY", owned_media_image, media_description, &media' in core
-    and "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request." in core
+    and "CURRENT VISUAL INPUT: unavailable. No current camera or display frame " in core
+    and "question && json_object_array_length(arr) == before_visual_evidence" in core
     and "if (visual_requested && !r2_vision_watch_active())" not in core
     and "r2_visual_analyze_frame(" not in core[
         core.index("static void *vision_watch_worker(void *unused)"):
