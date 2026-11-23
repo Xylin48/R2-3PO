@@ -1643,7 +1643,9 @@ static void *shell_watch_worker(void *unused)
             (void)r2_vision_watch_stop_if_watch_owned(attached_visual);
             attached_visual = 0;
         }
-        if (eyes_permitted && !managed_camera && r2_eyes_status() > 0 &&
+        /* A camera can stay open after its capture worker exits. Reattach
+         * to either a Watch-owned or a manually opened camera in that case. */
+        if (eyes_permitted && r2_eyes_status() > 0 &&
             !r2_vision_watch_active() && r2_vision_available())
             attached_visual = r2_vision_watch_start_for_watch();
 
