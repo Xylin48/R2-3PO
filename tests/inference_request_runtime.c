@@ -1117,7 +1117,7 @@ static void check_action_result_under_history_pressure(void)
     char *fixed_history = text(MAX_LIVE_MESSAGE_BYTES - 1350U, 'p', "Old fixture answer.");
     assert(message_add_pinned("assistant", fixed_history) == 0);
     free(fixed_history);
-    set_response("[READ] turn-result-fixture.txt", "stop", 1);
+    set_response("I will read the saved document.\n[READ] turn-result-fixture.txt", "stop", 1);
 
     core_initialized = 1;
     char *reply = r2_talk(user);
@@ -1170,6 +1170,17 @@ static void check_action_result_under_history_pressure(void)
        tool result without showing the marker or executing another action. */
     assert(reply && strstr(reply, "MEDIA OBSERVATION ERROR: no visible media frame"));
     assert(!strstr(reply, "[MEDIA_SEE]"));
+    free(reply);
+    message_free_all();
+
+    set_response("[MEDIA_SEE] What is on the screen?\n[READ] turn-result-fixture.txt", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk("Inspect the screen again.");
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(reply && !strcmp(reply, "I couldn't produce a reply to this turn. Your message is still here."));
     free(reply);
     message_free_all();
 

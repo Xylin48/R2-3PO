@@ -14972,6 +14972,17 @@ static int reply_has_visible_text(const char *text)
     return 0;
 }
 
+/* A display inspection may stand alone so the answer can follow its result. */
+static int reply_is_standalone_media_inspection(const char *reply)
+{
+    static const char marker[] = "[MEDIA_SEE]";
+    const char *command = find_control_marker_line(reply, marker, 0);
+    if (!command || reply + strspn(reply, " \t\r\n") != command) return 0;
+    /* Other control lines must pass the regular visible-reply gate. */
+    const char *newline = strchr(command, '\n');
+    return !newline || !newline[strspn(newline, " \t\r\n")];
+}
+
 static char *clean_final_reply(const char *reply)
 {
     size_t length = strlen(reply);
@@ -15062,9 +15073,8 @@ static char *r2_talk_impl(const char *message)
        cleanup allocation failure cannot occur after a tool side effect. Keep
        the original separately in case this is a final reply and should play. */
     char *stripped_reply = r2_sounds_strip_markers_with_literals(reply, literal_tool_span);
-    /* An action-only reply is valid input to process_tools. Check for visible
-       text only when preparing the outward reply, after routing the action. */
-    if (!stripped_reply || !stripped_reply[strspn(stripped_reply, " \t\n\r\v\f")]) {
+    if (!reply_has_visible_text(stripped_reply) &&
+        !reply_is_standalone_media_inspection(stripped_reply)) {
         free(reply);
         free(stripped_reply);
         reply = xstrdup("I couldn't produce a reply to this turn. Your message is still here.");

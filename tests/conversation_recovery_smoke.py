@@ -67,7 +67,7 @@ require(
     "the answer and the action follow-up each have one generation path",
 )
 
-# A model response containing only internal markers must not trigger an action.
+# A single display inspection may run before producing outward text.
 visible_start = core.index("static size_t reply_control_span(")
 visible_end = core.index("static char *r2_talk_impl(", visible_start)
 visible_helper = core[visible_start:visible_end]
@@ -80,12 +80,13 @@ require(
     and "reply_control_span(reply, reply + offset)" in visible_helper,
     "action-control blocks and lines do not count as visible user-facing text",
 )
-visible_gate = impl.find("if (!reply_has_visible_text(stripped_reply))")
+visible_gate = impl.find("if (!reply_has_visible_text(stripped_reply) &&")
 tool_execution = impl.find("char *tools = process_tools(stripped_reply)")
 require(
     visible_gate >= 0 and tool_execution > visible_gate
-    and "I couldn't produce a reply to this turn." in impl,
-    "marker-only or empty model output reports the failed turn before tool execution",
+    and "!reply_is_standalone_media_inspection(stripped_reply)" in impl[visible_gate:tool_execution]
+    and "I couldn't produce a reply to this turn." in impl[visible_gate:tool_execution],
+    "empty replies and other command-only replies fail before tool execution",
 )
 require(
     "if (!tools)" in impl
