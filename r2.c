@@ -205,8 +205,8 @@ enum { R2_LIVE_CAMERA = 1, R2_LIVE_DISPLAY = 2 };
 static int query_requested_live_sources(const char *query);
 static int r2_eyes_start_impl(uint64_t *watch_token_out, int replace);
 static char *vision_analyze_current_frame(const char *question, int open_camera);
-static char *r2_vision_current_frame_base64(void);
-static char *r2_vision_media_current_frame_base64(void);
+static char *r2_vision_current_frame_base64(R2VisionRequestSource *captured_origin);
+static char *r2_vision_media_current_frame_base64(R2VisionRequestSource *captured_origin);
 static int r2_vision_copy_watched_frame(R2VisionFrame *frame,
                                         char **source_out,
                                         unsigned char **owned_data);
@@ -4650,12 +4650,7 @@ static char *ollama_chat_with_limit(
         const char *content = msgs[i].content ? msgs[i].content : "";
         char *owned_image = NULL;
         char *owned_media_image = NULL;
-        R2VisionRequestSource camera = {.revision = &eyes_source_revision, .expected = atomic_load(&eyes_source_revision)};
-        R2VisionRequestSource media = {
-            .revision = &media_source_revision,
-            .expected = atomic_load(&media_source_revision),
-            .expected_attention = atomic_load(&media_attention_revision),
-        };
+        R2VisionRequestSource camera = {0}, media = {0};
         int active_foreground_turn = ollama_authoritative_user_query &&
             *ollama_authoritative_user_query &&
             strstr(content, ollama_authoritative_user_query);
@@ -4663,9 +4658,9 @@ static char *ollama_chat_with_limit(
             !ollama_isolated_request &&
             (active_foreground_turn || ollama_autonomous_sensory_input)) {
             /* Each source may provide a frame independently. */
-            owned_image = r2_vision_current_frame_base64();
+            owned_image = r2_vision_current_frame_base64(&camera);
             if (atomic_load(&media_attention_selected))
-                owned_media_image = r2_vision_media_current_frame_base64();
+                owned_media_image = r2_vision_media_current_frame_base64(&media);
         }
         /* Describe the two independent sensory sources through Qwen3-VL.
          * Never attach JPEG data to the text-only Llama conversation model. */
@@ -11246,14 +11241,15 @@ static int query_requested_live_sources(const char *query)
 {
     if (!query) return 0;
     static const char *const camera_terms[] = {
-        "what do you see", "what can you see", "look at", "look on",
+        "what do you see", "what can you see", "look at me",
         "what am i showing you", "what am i looking at",
-        "what is this", "what's this", "describe this",
         "describe the image", "in this picture", "in this image"
     };
     static const char *const display_terms[] = {
         "what are we watching", "what is on the screen", "what's on the screen",
-        "what is playing", "what's playing", "describe the video"
+        "what is playing", "what's playing", "describe the video", "look at the screen",
+        "look at the display", "look at the tv", "look on the screen",
+        "what is this on the screen", "what's this on the screen"
     };
     int sources = 0;
     for (size_t i = 0; i < sizeof(camera_terms) / sizeof(camera_terms[0]); ++i)
@@ -11266,6 +11262,14 @@ static int query_requested_live_sources(const char *query)
             sources |= R2_LIVE_DISPLAY;
             break;
         }
+    /* An unqualified look request can use Eyes. Display-directed requests
+     * should not open Eyes just because they contain the same verb. */
+    static const char *const unqualified_terms[] = {
+        "look at", "look on", "what is this", "what's this", "describe this"
+    };
+    if (!sources)
+        for (size_t i = 0; i < sizeof(unqualified_terms) / sizeof(unqualified_terms[0]); ++i)
+            if (strcasestr(query, unqualified_terms[i])) return R2_LIVE_CAMERA;
     return sources;
 }
 
@@ -11428,10 +11432,11 @@ char *r2_vision_search(const char *query, int limit)
 
 /* Serialize the end of a media generation with attention and frame readers.
  * The worker can end on its own while a lifecycle caller is joining it. */
-static void r2_vision_media_end_capture(int replaced)
+static void r2_vision_media_end_capture(void)
 {
     pthread_mutex_lock(&media_frame_lock);
-    if (replaced) atomic_fetch_add(&media_source_revision, 1);
+    if (atomic_load(&media_capture_running))
+        atomic_fetch_add(&media_source_revision, 1);
     atomic_store(&media_capture_running, 0);
     int had_attention = atomic_exchange(&media_attention_selected, 0);
     if (had_attention) atomic_fetch_add(&media_attention_revision, 1);
@@ -11515,14 +11520,14 @@ static void *r2_media_capture_worker(void *unused)
         }
         have_previous = 1;
     }
-    r2_vision_media_end_capture(0);
+    r2_vision_media_end_capture();
     return NULL;
 }
 
 /* Caller holds media_lifecycle_lock. Join before closing or replacing Eyes. */
 static int r2_vision_media_stop_locked(void)
 {
-    r2_vision_media_end_capture(1);
+    r2_vision_media_end_capture();
     if (media_capture_thread_started) {
         pthread_join(media_capture_thread, NULL);
         media_capture_thread_started = 0;
@@ -11621,7 +11626,7 @@ static int r2_vision_media_open(int kind, unsigned long window,
     atomic_store(&media_capture_running, 1);
     if (pthread_create(&media_capture_thread, NULL,
                        r2_media_capture_worker, NULL) != 0) {
-        r2_vision_media_end_capture(1);
+        r2_vision_media_end_capture();
         pthread_mutex_lock(&media_capture_lock);
         r2_eyes_close(media_eyes);
         pthread_mutex_unlock(&media_capture_lock);
@@ -11752,7 +11757,7 @@ int r2_vision_media_set_attention(int watching)
 
 /* Encoding is separate from capture and recognition. No frame summaries
    are generated just because R2 chose to keep looking at a display. */
-static char *r2_vision_media_current_frame_base64(void)
+static char *r2_vision_media_current_frame_base64(R2VisionRequestSource *captured_origin)
 {
     pthread_mutex_lock(&media_frame_lock);
     if (!r2_vision_media_attention_status() || !atomic_load(&eyes_auto_allowed)) {
@@ -11778,6 +11783,7 @@ static char *r2_vision_media_current_frame_base64(void)
         encoded = NULL;
     }
     free(copy);
+    if (encoded) *captured_origin = origin;
     return encoded;
 }
 
@@ -11948,7 +11954,7 @@ static void *vision_watch_capture_worker(void *unused)
     pthread_mutex_unlock(&vision_watch_frame_lock);
     return NULL;
 }
-static char *r2_vision_current_frame_base64(void)
+static char *r2_vision_current_frame_base64(R2VisionRequestSource *captured_origin)
 {
     uint_fast64_t revision = atomic_load(&eyes_source_revision);
     if (r2_vision_direct_cancelled(&revision) || r2_eyes_status() <= 0) return NULL;
@@ -11992,6 +11998,7 @@ static char *r2_vision_current_frame_base64(void)
                        "Frame-to-JPEG/base64 encoding failed; no visual interpretation was substituted.",
                        source ? source : "Eyes");
     free(source);
+    if (encoded) *captured_origin = origin;
     return encoded;
 }
 

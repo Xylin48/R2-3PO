@@ -58,7 +58,7 @@ assert review.index("r2_review_context(") < review.index(
 
 # The live image comes from the latest owned frame snapshot (or a fresh frame
 # from an explicitly open Eyes source), then undergoes encoding only.
-helper_start = core.index("static char *r2_vision_current_frame_base64(void)\n{")
+helper_start = core.index("static char *r2_vision_current_frame_base64(R2VisionRequestSource *captured_origin)\n{")
 helper_end = core.index("\nstatic void *vision_watch_worker(void *unused)", helper_start)
 helper = core[helper_start:helper_end]
 assert "r2_vision_copy_watched_frame(&frame, &source, &frame_copy)" in helper

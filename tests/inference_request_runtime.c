@@ -1015,6 +1015,11 @@ static void check_reflection_stop_and_long_visual_query(void)
     assert(query_requests_visual_context("What did we watch yesterday?"));
     assert(!query_requested_live_sources("What did we watch yesterday?"));
     assert(query_requested_live_sources("What's on the screen?") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("Look at the screen, please.") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("What is this on the screen?") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("Look at me, then look at the screen.") ==
+           (R2_LIVE_CAMERA | R2_LIVE_DISPLAY));
+    assert(query_requested_live_sources("Look at my notebook.") == R2_LIVE_CAMERA);
 
     r2_associative_query_cache_clear();
     set_response("present visual view", "stop", 1);

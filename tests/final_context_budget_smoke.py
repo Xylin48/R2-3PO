@@ -22,8 +22,8 @@ require("r2_bound_context_records" not in body and "final_context_limit" not in 
         "selected evidence is not clipped by intermediate character caps")
 require("r2_append_association_section(&memory_context" in body,
         "diary and visual sections use checked complete allocations")
-require("r2_vision_current_frame_base64()" in core
-        and "r2_vision_media_current_frame_base64()" in core
+require("r2_vision_current_frame_base64(&camera)" in core
+        and "r2_vision_media_current_frame_base64(&media)" in core
         and "r2_visual_describe_encoded_frame(" in core,
         "camera and media frames are translated into evidence independently from historical records")
 # Qwen generates its descriptions only after the provisional prompt allocation.

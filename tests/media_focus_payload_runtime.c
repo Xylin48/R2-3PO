@@ -120,6 +120,22 @@ static void verify_current_observations(void)
     json_object_put(sections);
 }
 
+static void verify_display_source_end(void)
+{
+    R2VisionRequestSource origin = {
+        .revision = &media_source_revision,
+        .expected = atomic_load(&media_source_revision),
+    };
+    atomic_store(&media_capture_running, 1);
+    assert(!r2_vision_source_changed(&origin));
+    r2_vision_media_end_capture();
+    assert(!atomic_load(&media_capture_running));
+    assert(r2_vision_source_changed(&origin));
+    uint_fast64_t ended = atomic_load(&media_source_revision);
+    r2_vision_media_end_capture();
+    assert(atomic_load(&media_source_revision) == ended);
+}
+
 int main(void)
 {
     verify_images(NULL, NULL, NULL);
@@ -130,6 +146,7 @@ int main(void)
     verify_images(NULL, "MEDIA",
         "CURRENT IMAGE SOURCE MAP: Image 1 is the chosen media display. No camera frame is attached.");
     verify_current_observations();
+    verify_display_source_end();
 
     json_object *request = json_object_new_array();
     assert(request && ollama_json_append_message(request, NULL, "invalid", 7, "CAMERA", "MEDIA") != 0);

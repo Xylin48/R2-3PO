@@ -24,7 +24,7 @@ assert "r2_log_sensory(\"media_attention_released\"" in focus
 assert "r2_vision_media_status() ? 1 : 0;" in focus
 media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
                   core.index("int r2_vision_media_stop(void)")]
-assert "r2_vision_media_end_capture(1);" in media_stop
+assert "r2_vision_media_end_capture();" in media_stop
 assert "media_attention_source_lost" in core
 assert "r2_eyes_close(media_eyes)" in media_stop
 assert "r2_eyes_close(eyes)" not in media_stop
@@ -45,7 +45,7 @@ assert 'extract_marker(reply, "[MEDIA_FOCUS]"' in tool
 assert "r2_process_media_focus_request(trim(request))" in tool
 assert 'extract_marker(reply, "[MEDIA_SEE]"' in tool
 
-media = core[core.index("static char *r2_vision_media_current_frame_base64(void)\n{"):
+media = core[core.index("static char *r2_vision_media_current_frame_base64(R2VisionRequestSource *captured_origin)\n{"):
              core.index("/* Capture and inference are separate workers.")]
 assert "pthread_mutex_lock(&media_frame_lock)" in media
 assert "memcpy(copy, frame.data, frame.size)" in media
@@ -64,9 +64,9 @@ assert "No camera frame is attached." in serializer
 
 turn = core[core.index("size_t ordered_count = r2_order_inference_messages("):
             core.index("free(message_order);", core.index("size_t ordered_count = r2_order_inference_messages("))]
-assert "owned_image = r2_vision_current_frame_base64()" in turn
+assert "owned_image = r2_vision_current_frame_base64(&camera)" in turn
 assert "if (atomic_load(&media_attention_selected))" in turn
-assert "owned_media_image = r2_vision_media_current_frame_base64()" in turn
+assert "owned_media_image = r2_vision_media_current_frame_base64(&media)" in turn
 assert '"CAMERA", owned_image, camera_description, &camera' in turn
 assert '"MEDIA DISPLAY", owned_media_image, media_description, &media' in turn
 assert "limits[i], NULL, NULL)" in turn
