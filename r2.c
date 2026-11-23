@@ -141,6 +141,7 @@ static R2VisionFrame media_latest_frame;
 static char *media_latest_source;
 /* Chosen display attention never changes camera capture or playback. */
 static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t media_attention_revision = ATOMIC_VAR_INIT(1);
 static atomic_int eyes_auto_allowed = ATOMIC_VAR_INIT(1);
 static atomic_int eyes_source_changing = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t eyes_source_revision = ATOMIC_VAR_INIT(1);
@@ -148,6 +149,7 @@ static atomic_uint_fast64_t eyes_source_revision = ATOMIC_VAR_INIT(1);
 typedef struct {
     const atomic_uint_fast64_t *revision;
     uint_fast64_t expected;
+    uint_fast64_t expected_attention; /* zero for requests independent of display attention */
 } R2VisionRequestSource;
 static _Thread_local const R2VisionRequestSource *vision_request_source;
 static atomic_int microphone_auto_allowed = ATOMIC_VAR_INIT(1);
@@ -3117,11 +3119,18 @@ void r2_ollama_vision_request_end(void)
     pthread_mutex_unlock(&ollama_request_lock);
 }
 
+static int r2_vision_source_changed(const R2VisionRequestSource *origin)
+{
+    return !atomic_load(&eyes_auto_allowed) ||
+        atomic_load(origin->revision) != origin->expected ||
+        (origin->expected_attention &&
+         (!atomic_load(&media_attention_selected) ||
+          atomic_load(&media_attention_revision) != origin->expected_attention));
+}
+
 static int r2_vision_request_source_changed(void)
 {
-    return vision_request_source &&
-        (!atomic_load(&eyes_auto_allowed) ||
-         atomic_load(vision_request_source->revision) != vision_request_source->expected);
+    return vision_request_source && r2_vision_source_changed(vision_request_source);
 }
 
 int r2_ollama_vision_request_should_abort(void)
@@ -3704,8 +3713,7 @@ static int ollama_append_visual_observation(struct json_object *array,
     if (!frame || !*frame) return 0;
     /* Revalidate both snapshots after all inference, since the other source's
        generation may have taken long enough for this one to close or change. */
-    if (!atomic_load(&eyes_auto_allowed) ||
-        atomic_load(origin->revision) != origin->expected ||
+    if (r2_vision_source_changed(origin) ||
         (!strcmp(source, "MEDIA DISPLAY") && !atomic_load(&media_attention_selected)))
         return 0;
     char *evidence = NULL;
@@ -4642,8 +4650,12 @@ static char *ollama_chat_with_limit(
         const char *content = msgs[i].content ? msgs[i].content : "";
         char *owned_image = NULL;
         char *owned_media_image = NULL;
-        R2VisionRequestSource camera = {&eyes_source_revision, atomic_load(&eyes_source_revision)};
-        R2VisionRequestSource media = {&media_source_revision, atomic_load(&media_source_revision)};
+        R2VisionRequestSource camera = {.revision = &eyes_source_revision, .expected = atomic_load(&eyes_source_revision)};
+        R2VisionRequestSource media = {
+            .revision = &media_source_revision,
+            .expected = atomic_load(&media_source_revision),
+            .expected_attention = atomic_load(&media_attention_revision),
+        };
         int active_foreground_turn = ollama_authoritative_user_query &&
             *ollama_authoritative_user_query &&
             strstr(content, ollama_authoritative_user_query);
@@ -11384,7 +11396,7 @@ static char *vision_analyze_current_frame(const char *question, int open_camera)
         pthread_mutex_unlock(&visual_capture_lock);
     }
 
-    R2VisionRequestSource origin = {&eyes_source_revision, revision};
+    R2VisionRequestSource origin = {.revision = &eyes_source_revision, .expected = revision};
     char *description = r2_vision_direct_cancelled(&revision) ? NULL
         : r2_vision_analyze_snapshot(&frame, source, question, &origin);
     free(source);
@@ -11422,6 +11434,7 @@ static void r2_vision_media_end_capture(int replaced)
     if (replaced) atomic_fetch_add(&media_source_revision, 1);
     atomic_store(&media_capture_running, 0);
     int had_attention = atomic_exchange(&media_attention_selected, 0);
+    if (had_attention) atomic_fetch_add(&media_attention_revision, 1);
     pthread_mutex_unlock(&media_frame_lock);
     if (had_attention)
         r2_log_sensory("media_attention_source_lost",
@@ -11682,7 +11695,7 @@ char *r2_vision_media_see(const char *question)
         !atomic_load(&eyes_auto_allowed)) return NULL;
     pthread_mutex_lock(&media_frame_lock);
     R2VisionFrame frame = media_latest_frame;
-    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
+    R2VisionRequestSource origin = {.revision = &media_source_revision, .expected = atomic_load(&media_source_revision)};
     char *source = NULL;
     if (atomic_load(&media_capture_running) && frame.data && frame.size &&
         media_latest_source)
@@ -11716,11 +11729,12 @@ int r2_vision_media_set_attention(int watching)
         pthread_mutex_unlock(&media_lifecycle_lock);
         return -1;
     }
-    int changed;
-    if (watching)
-        changed = !atomic_exchange(&media_attention_selected, 1);
-    else
-        changed = atomic_exchange(&media_attention_selected, 0);
+    int selected = watching != 0;
+    int changed = atomic_load(&media_attention_selected) != selected;
+    if (changed) {
+        atomic_fetch_add(&media_attention_revision, 1);
+        atomic_store(&media_attention_selected, selected);
+    }
     pthread_mutex_unlock(&media_frame_lock);
     if (changed && watching)
         r2_log_sensory("media_attention_selected",
@@ -11746,7 +11760,11 @@ static char *r2_vision_media_current_frame_base64(void)
         return NULL;
     }
     R2VisionFrame frame = media_latest_frame;
-    R2VisionRequestSource origin = {&media_source_revision, atomic_load(&media_source_revision)};
+    R2VisionRequestSource origin = {
+        .revision = &media_source_revision,
+        .expected = atomic_load(&media_source_revision),
+        .expected_attention = atomic_load(&media_attention_revision),
+    };
     unsigned char *copy = frame.data && frame.size ? malloc(frame.size) : NULL;
     if (copy) {
         memcpy(copy, frame.data, frame.size);
@@ -11964,7 +11982,7 @@ static char *r2_vision_current_frame_base64(void)
         return NULL;
     }
 
-    R2VisionRequestSource origin = {&eyes_source_revision, revision};
+    R2VisionRequestSource origin = {.revision = &eyes_source_revision, .expected = revision};
     char *encoded = r2_vision_direct_cancelled(&revision) ? NULL
         : r2_vision_encode_snapshot(&frame, &origin);
     free(frame_copy);

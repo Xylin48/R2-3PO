@@ -58,10 +58,11 @@ static void verify_current_observations(void)
 {
     atomic_uint_fast64_t camera_revision = ATOMIC_VAR_INIT(3);
     atomic_uint_fast64_t media_revision = ATOMIC_VAR_INIT(5);
-    R2VisionRequestSource camera = {&camera_revision, 3};
-    R2VisionRequestSource media = {&media_revision, 5};
+    R2VisionRequestSource camera = {.revision = &camera_revision, .expected = 3};
+    R2VisionRequestSource media = {.revision = &media_revision, .expected = 5};
     atomic_store(&eyes_auto_allowed, 1);
     atomic_store(&media_attention_selected, 1);
+    media.expected_attention = atomic_load(&media_attention_revision);
     const char *turn = "What is visible?  é";
 
     json_object *sections = json_object_new_array();
@@ -97,6 +98,25 @@ static void verify_current_observations(void)
     assert(json_object_array_length(sections) == 1);
     const char *unavailable = message_field(json_object_array_get_idx(sections, 0), "content");
     assert(strstr(unavailable, "visual interpretation was unavailable"));
+    json_object_put(sections);
+
+    sections = json_object_new_array();
+    assert(sections);
+    atomic_store(&media_attention_selected, 1);
+    media.expected_attention = atomic_load(&media_attention_revision);
+    atomic_store(&media_capture_running, 1);
+    assert(r2_vision_media_set_attention(0) == 0);
+    assert(r2_vision_media_set_attention(1) == 0);
+    assert(atomic_load(&media_revision) == media.expected);
+    assert(r2_vision_source_changed(&media));
+    assert(!r2_vision_source_changed(&camera));
+    assert(ollama_append_visual_observation(sections, "MEDIA DISPLAY", "jpeg", "Before looking away", &media) == 0);
+    assert(json_object_array_length(sections) == 0);
+    media.expected_attention = atomic_load(&media_attention_revision);
+    assert(ollama_append_visual_observation(sections, "MEDIA DISPLAY", "jpeg", "After looking back", &media) == 0);
+    assert(json_object_array_length(sections) == 1);
+    assert(r2_vision_media_set_attention(0) == 0);
+    atomic_store(&media_capture_running, 0);
     json_object_put(sections);
 }
 
