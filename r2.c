@@ -420,6 +420,7 @@ typedef struct {
 static _Thread_local R2AudioTurnEvidence *r2_audio_turn_evidence = NULL;
 /* Zero identifies typed input. A negative value means a transcript whose Life Log event could not be saved. */
 static _Thread_local int64_t r2_input_speech_event = 0;
+static _Thread_local int r2_turn_reality_stale;
 
 static void r2_audio_turn_record(int64_t event_id)
 {
@@ -5287,14 +5288,15 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     static const char *const age_terms[] = {"age", "born", "birth"};
     static const char *const money_terms[] = {"wallet", "money", "cash", "piggybank", "buy", "purchase"};
     static const char *const tv_terms[] = {"tv", "television", "vcr", "cassette", "crt", "channel"};
-    int room = r2_query_matches_any_term(query, room_terms, sizeof(room_terms) / sizeof(room_terms[0]));
-    int pockets = r2_query_matches_any_term(query, pocket_terms, sizeof(pocket_terms) / sizeof(pocket_terms[0]));
-    int fridge = r2_query_matches_any_term(query, fridge_terms, sizeof(fridge_terms) / sizeof(fridge_terms[0]));
-    int self = r2_query_matches_any_term(query, self_terms, sizeof(self_terms) / sizeof(self_terms[0]));
-    int age = r2_query_matches_any_term(query, age_terms, sizeof(age_terms) / sizeof(age_terms[0])) ||
-        query_has_phrase(query, "how old");
-    int money = r2_query_matches_any_term(query, money_terms, sizeof(money_terms) / sizeof(money_terms[0]));
-    int tv = r2_query_matches_any_term(query, tv_terms, sizeof(tv_terms) / sizeof(tv_terms[0]));
+    const char *state_query = r2_turn_reality_stale ? NULL : query;
+    int room = r2_query_matches_any_term(state_query, room_terms, sizeof(room_terms) / sizeof(room_terms[0]));
+    int pockets = r2_query_matches_any_term(state_query, pocket_terms, sizeof(pocket_terms) / sizeof(pocket_terms[0]));
+    int fridge = r2_query_matches_any_term(state_query, fridge_terms, sizeof(fridge_terms) / sizeof(fridge_terms[0]));
+    int self = r2_query_matches_any_term(state_query, self_terms, sizeof(self_terms) / sizeof(self_terms[0]));
+    int age = r2_query_matches_any_term(state_query, age_terms, sizeof(age_terms) / sizeof(age_terms[0])) ||
+        query_has_phrase(state_query, "how old");
+    int money = r2_query_matches_any_term(state_query, money_terms, sizeof(money_terms) / sizeof(money_terms[0]));
+    int tv = r2_query_matches_any_term(state_query, tv_terms, sizeof(tv_terms) / sizeof(tv_terms[0]));
     int recalled = r2_query_explicitly_requests_recall(query);
     if (count > SIZE_MAX / sizeof(Message) - 3) return NULL;
     Message *selected = calloc(count + 3, sizeof(*selected));
@@ -5632,7 +5634,7 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
                                        const char *retrieval_status)
 {
     size_t context_count = 1 + (active_turn_history.action_result != NULL) +
-        (retrieval_status != NULL);
+        (retrieval_status != NULL) + (r2_turn_reality_stale != 0);
     if (count > SIZE_MAX / sizeof(*messages) - context_count) {
         errno = EOVERFLOW;
         return NULL;
@@ -5656,10 +5658,21 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
                        "in visible prose using the recorded tool result. Finish this turn without action markers."
         };
     }
+    size_t used = 1 + (active_turn_history.action_result != NULL);
     if (retrieval_status)
-        sourced[context_count - 1] = (Message){.role = "system", .content = (char *)retrieval_status};
-    if (count) memcpy(sourced + context_count, messages, count * sizeof(*messages));
-    char *answer = r2_foreground_chat(sourced, count + context_count, system, query,
+        sourced[used++] = (Message){.role = "system", .content = (char *)retrieval_status};
+    if (r2_turn_reality_stale)
+        sourced[used++] = (Message){.role = "system",
+            .content = "CURRENT REALITY STATUS: The live world snapshot could not be refreshed for this reply. "
+                       "Use any recorded action result and say when current state cannot be verified."};
+    for (size_t i = 0; i < count; ++i) {
+        if (r2_turn_reality_stale && messages[i].role && !strcmp(messages[i].role, "system") &&
+            messages[i].content && !strncmp(messages[i].content, "PERSISTENT REALITY CONTEXT",
+                                            sizeof("PERSISTENT REALITY CONTEXT") - 1))
+            continue;
+        sourced[used++] = messages[i];
+    }
+    char *answer = r2_foreground_chat(sourced, used, system, query,
                                      num_predict, timeout);
     free(sourced);
     return answer;
@@ -14924,7 +14937,8 @@ static char *r2_talk_impl(const char *message)
     handle_completed_messages();
 
     /* Replace the previous snapshot so every turn sees current Reality state. */
-    if (refresh_reality_context_message() != 0)
+    r2_turn_reality_stale = refresh_reality_context_message() != 0;
+    if (r2_turn_reality_stale)
         fprintf(stderr, "[R2 Reality] Could not refresh current reality context.\n");
 
     pthread_mutex_lock(&messages_lock);
@@ -15071,8 +15085,11 @@ static char *r2_talk_impl(const char *message)
 
         /* The action can change R2's current inventory or needs. Build the
            first follow-up with that state and the recorded outcome. */
-        if (!shutting_down && refresh_reality_context_message() != 0)
-            fprintf(stderr, "[R2 Reality] Could not refresh state after the completed action.\n");
+        if (!shutting_down) {
+            r2_turn_reality_stale = refresh_reality_context_message() != 0;
+            if (r2_turn_reality_stale)
+                fprintf(stderr, "[R2 Reality] Could not refresh state after the completed action.\n");
+        }
         reply = shutting_down ? NULL : chat_with_relevant_memories(message);
         char *sound_clean_reply = reply && !shutting_down ? clean_final_reply(reply) : NULL;
         free(reply);
@@ -15319,6 +15336,7 @@ char *r2_talk(const char *message)
     r2_audio_turn_evidence = &speech_evidence;
     r2_audio_turn_record(r2_input_speech_event);
     char *reply = r2_talk_impl(message);
+    r2_turn_reality_stale = 0;
     pthread_mutex_lock(&messages_lock);
     active_turn_history = (ActiveTurnHistory){0};
     pthread_mutex_unlock(&messages_lock);

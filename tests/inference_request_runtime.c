@@ -1418,6 +1418,37 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
     r2_associative_query_cache_clear();
 }
 
+static void check_failed_reality_refresh_keeps_action_evidence(void)
+{
+    const char *query = "Did you move the notebook out of your pockets?";
+    char snapshot[] = "PERSISTENT REALITY CONTEXT\nThe notebook was in the pocket.";
+    Message turn[] = {
+        {"system", snapshot, 0, 0},
+        {"user", (char *)query, 0, 0},
+        {"assistant", "[R2_INTERNAL_TOOL_REQUEST]\nMove the notebook.", 0, 0},
+        {"user", "[R2_INTERNAL_TOOL_RESULT]\nMoved the notebook to the shelf.", 0, 1},
+    };
+    const char *contexts[] = {"8192", "2048"};
+    ollama_authoritative_user_query = query;
+    active_turn_history.action_result = turn[3].content;
+    r2_turn_reality_stale = 1;
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        assert(setenv("R2_OLLAMA_NUM_CTX", contexts[i], 1) == 0);
+        set_response("Yes, I moved it to the shelf.", "stop", 1);
+        char *reply = r2_chat_with_input_source(turn, 4, r2_conversation_system_prompt, query, 512, 60, NULL);
+        assert(reply && captured_contains(query));
+        assert(captured_contains("CURRENT REALITY STATUS: The live world snapshot could not be refreshed"));
+        assert(captured_contains("Moved the notebook to the shelf."));
+        assert(!captured_contains("The notebook was in the pocket."));
+        assert(!captured_contains("selected current views"));
+        free(reply);
+    }
+    assert(!strcmp(turn[0].content, snapshot));
+    r2_turn_reality_stale = 0;
+    active_turn_history.action_result = NULL;
+    ollama_authoritative_user_query = NULL;
+}
+
 static void check_memory_response_replay(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
@@ -1495,6 +1526,7 @@ int main(void)
     assert(r2_log_init() == 0);
     check_structured_report_evidence();
     check_boundaries();
+    check_failed_reality_refresh_keeps_action_evidence();
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
     check_reflection_stop_and_long_visual_query();
