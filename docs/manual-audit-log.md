@@ -2439,3 +2439,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced the original user text and the reviewed text through compact foreground chat, capability ordering, live-source routing and request diagnostics. The reviewed text must still be used to match the user-role wire message. The original text now supplies capability relevance and the explicit camera or display request. Isolated requests retain their own query.
 - The native regression checks both directions: a review that introduces a screen request cannot add display routing, and a review that omits an explicit camera request cannot hide the current camera availability notice.
 - [Run 45314048678](https://github.com/Xylin48/R2-3PO/actions/runs/45314048678) passed all 128 steps on `783f37985648396a99935347e5f50dcd382e6d37`, including the focused request test, offline conversation and restart, sanitizers and shutdown. Live model behavior remains outside this check.
+
+### R2-AUD-2026-11-23-277 — Carry visible fallback replies into the next turn
+
+- Traced `r2_talk_impl` from failed generation and recorded tool fallback through live history, Life Log staging, and post-turn learning. Replies synthesized by the runtime were shown and archived but omitted from live history, so the next prompt could omit the answer the user had just seen.
+- Live history now retains the visible fallback when the turn ends normally. The existing generation flag still controls learning and self-reports. Regressions verify exact file-read fallback under history pressure and the outgoing follow-up request after a display inspection fallback.
+- [Run 45322904913](https://github.com/Xylin48/R2-3PO/actions/runs/45322904913) passed all 128 steps at `b6dd8b125ecf5d37e8cbdade86f42dfe776e75ad`, including offline restart, sanitizers and shutdown. Follow-up behavior was checked with simulated Ollama.
