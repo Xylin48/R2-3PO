@@ -361,6 +361,30 @@ static int64_t unavailable_camera_events(void)
     return count;
 }
 
+static void check_oversized_history_leaves_room_for_complete_exchange(void)
+{
+    char *long_answer = text(14000, 'x', "Oversized reply from the previous exchange. ");
+    const char *query = "Which shelf did we pick?";
+    Message turns[] = {
+        {"user", "Where should the blue book go?", 0, 0},
+        {"assistant", "Let's put the blue book on the top shelf.", 0, 0},
+        {"user", "Write a detailed description of the room.", 0, 0},
+        {"assistant", long_answer, 0, 0},
+        {"user", (char *)query, 0, 0},
+    };
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("The top shelf.", "stop", 1);
+    ollama_authoritative_user_query = query;
+    char *reply = ollama_chat_with_limit(turns, 5, "Answer the current question.", 512, 60);
+    assert(reply && captured_contains(query));
+    assert(captured_contains(turns[0].content) && captured_contains(turns[1].content));
+    assert(!captured_contains(turns[2].content));
+    assert(!captured_contains("Oversized reply from the previous exchange."));
+    ollama_authoritative_user_query = NULL;
+    free(reply);
+    free(long_answer);
+}
+
 static void check_context_and_isolated_inputs(void)
 {
     char *history = text(5000, 'h', "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
@@ -1701,6 +1725,7 @@ int main(void)
     check_missing_live_frame_is_current_evidence();
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
+    check_oversized_history_leaves_room_for_complete_exchange();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();

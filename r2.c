@@ -4512,28 +4512,19 @@ static char *ollama_chat_with_limit(
         if (length > 0) {
             include[current_user_index] = 1;
             limits[current_user_index] = length;
-            total_chars += length;
             recent_count = 1;
         }
     }
 
+    /* Mark recent dialogue candidates by count. The whole-exchange pass
+       budgets their bytes after reserving the active turn and its evidence.
+       An exchange that cannot fit must leave room for the next candidate. */
     for (size_t i = count; i > 0 && recent_count < OLLAMA_MAX_RECENT_MESSAGES; --i) {
         size_t index = i - 1;
         if (include[index]) continue;
-        /* System messages were already handled under the explicit priority budget. */
         if (msgs[index].role && !strcmp(msgs[index].role, "system")) continue;
-        const char *content = msgs[index].content ? msgs[index].content : "";
-        size_t length = strlen(content);
-        if (length > OLLAMA_MAX_MESSAGE_CHARS)
-            length = r2_utf8_safe_prefix_length(
-                content, OLLAMA_MAX_MESSAGE_CHARS);
-        if (total_chars >= input_budget) break;
-        size_t remaining = input_budget - total_chars;
-        if (length > remaining) length = r2_utf8_safe_prefix_length(content, remaining);
-        if (length == 0) continue;
+        if (!msgs[index].content || !*msgs[index].content) continue;
         include[index] = 1;
-        limits[index] = length;
-        total_chars += length;
         ++recent_count;
     }
 
