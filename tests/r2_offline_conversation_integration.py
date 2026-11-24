@@ -278,10 +278,13 @@ class LocalOllama(BaseHTTPRequestHandler):
                 with self.lock:
                     attempts = self.post_action_attempts.get(request, 0) + 1
                     self.post_action_attempts[request] = attempts
-                message["content"] = (
-                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST
-                    else "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
-                )
+                if request == FOLLOWUP_RECOVERY_REQUEST:
+                    if attempts == 1:
+                        message.update(content="", thinking=PRIVATE_GREETING_REASONING)
+                    else:
+                        message["content"] = FOLLOWUP_RECOVERY_ANSWER
+                else:
+                    message["content"] = "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
             else:
                 message["content"] = (
                     f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
@@ -496,7 +499,9 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
     assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
     assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
     assert sentinel.read_bytes() == b"private planned action must remain inert"
-    assert all(LocalOllama.post_action_attempts.get(request) == 1 for request in FOLLOWUP_FILES)
+    assert PRIVATE_GREETING_REASONING not in output.stdout
+    assert LocalOllama.post_action_attempts.get(FOLLOWUP_RECOVERY_REQUEST) == 2
+    assert LocalOllama.post_action_attempts.get(FOLLOWUP_FALLBACK_REQUEST) == 1
     for request in FOLLOWUP_FILES:
         followups = [
             payload for payload in LocalOllama.requests
@@ -505,8 +510,10 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
             and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
                     for item in payload["messages"])
         ]
-        assert len(followups) == 1
+        expected_count = 2 if request == FOLLOWUP_RECOVERY_REQUEST else 1
+        assert len(followups) == expected_count
         assert followups[0]["messages"][-1]["role"] == "tool"
+        assert all(payload == followups[0] for payload in followups)
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         for request, name in FOLLOWUP_FILES.items():
             assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
@@ -523,7 +530,7 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
                 "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
                 (f"%/{name} (success)",),
             ).fetchone() == (1,)
-    print("PASS: each completed action produced one follow-up call with a tool-role result.")
+    print("PASS: a blank post-action answer replayed the same tool result without repeating the action.")
 
 
 def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) -> None:
@@ -567,8 +574,8 @@ def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) 
         if payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
         and payload["messages"][-1] == {"role": "user", "content": UNANSWERED_LEARNING_REQUEST}
     ]
-    assert len(requests) == 1
-    print("PASS: an empty model answer sent no second request and the exact user report remained available for learning.")
+    assert len(requests) == 2 and requests[0] == requests[1]
+    print("PASS: two blank model answers exhausted one replay and preserved the exact user report for learning.")
 
 
 def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
