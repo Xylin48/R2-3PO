@@ -1656,9 +1656,9 @@ static void check_compact_reserves_current_instructions_before_history(void)
     char *history = text(history_size, 'h',
         "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     Message turn[] = {
+        {.role = "system", .content = history},
         {.role = "system", .content = (char *)source},
         {.role = "system", .content = (char *)stale},
-        {.role = "system", .content = history},
         {.role = "user", .content = (char *)previous_question},
         {.role = "assistant", .content = (char *)previous_answer},
         {.role = "user", .content = (char *)query},
