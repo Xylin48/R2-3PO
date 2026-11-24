@@ -5190,6 +5190,9 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
     }
 
     if (!result) {
+        /* Retry empty output, but another request cannot fix a failed copy. */
+        if (!final_has_nonspace)
+            *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         /*
          * Do not print the model's private thinking text. Its presence/length,
          * final-channel length, and Ollama completion metadata distinguish an

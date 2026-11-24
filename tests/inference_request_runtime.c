@@ -25,6 +25,11 @@ static int fail_transport_at;
 static const char burst_user[] = "Queued during active post-turn processing.";
 static int burst_learning_requests;
 static int invalid_body_at;
+static const char *invalid_body_override;
+static const char blank_answer_body[] =
+    "{\"done\":true,\"done_reason\":\"stop\","
+    "\"message\":{\"role\":\"assistant\",\"content\":\" \\t\\n\","
+    "\"thinking\":\"PRIVATE-THINKING-NEVER-ARCHIVE\"}}";
 static CURLcode invalid_body_result = CURLE_OK;
 static char *isolated_retry_payload;
 static int foreground_after_response;
@@ -123,10 +128,10 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     char structured[] = "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
-    char *body = defer_post_turn_request == 1 ? structured : response_body;
+    const char *body = defer_post_turn_request == 1 ? structured : response_body;
     if (perform_count == invalid_body_at) {
-        static char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
-        body = truncated_body;
+        static const char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
+        body = invalid_body_override ? invalid_body_override : truncated_body;
         isolated_retry_payload = strdup(posted);
         assert(isolated_retry_payload);
     } else if (isolated_retry_payload) {
@@ -135,8 +140,8 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         isolated_retry_payload = NULL;
     }
     size_t n = strlen(body), split = n / 3;
-    assert(write_response(body, 1, split, write_data) == split);
-    assert(write_response(body + split, 1, n - split, write_data) == n - split);
+    assert(write_response((char *)body, 1, split, write_data) == split);
+    assert(write_response((char *)body + split, 1, n - split, write_data) == n - split);
     if (foreground_after_response) {
         foreground_after_response = 0;
         atomic_store(&foreground_conversation_waiting, 1);
@@ -1408,10 +1413,28 @@ static void check_foreground_answer_replay(void)
         assert(captured_contains(query));
         free(reply);
     }
-    invalid_body_at = 0;
     invalid_body_result = CURLE_OK;
+    const char *empty_answers[] = {
+        blank_answer_body,
+        "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+        "\"thinking\":\"PRIVATE-THINKING-NEVER-ARCHIVE\"}}"
+    };
+    for (size_t i = 0; i < sizeof(empty_answers) / sizeof(empty_answers[0]); ++i) {
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_override = empty_answers[i];
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                query, 512, 60, NULL);
+        assert(reply && !strcmp(reply, "We put the blue book there."));
+        assert(perform_count == before + 2 && !isolated_retry_payload);
+        assert(captured_contains(query));
+        free(reply);
+    }
+    invalid_body_at = 0;
+    invalid_body_override = NULL;
+
     free(response_body);
-    response_body = strdup("{\"done\":");
+    response_body = strdup(blank_answer_body);
     assert(response_body);
     int before = perform_count;
     assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
@@ -1718,13 +1741,21 @@ static void check_failed_reality_refresh_keeps_action_evidence(void)
         {"user", "[R2_INTERNAL_TOOL_RESULT]\nMoved the notebook to the shelf.", 0, 1},
     };
     const char *contexts[] = {"8192", "2048"};
+    ollama_foreground_turn_mode = 1;
+    ollama_audit_stage = "conversation-answer";
     ollama_authoritative_user_query = query;
     active_turn_history.action_result = turn[3].content;
     r2_turn_reality_stale = 1;
     for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
         assert(setenv("R2_OLLAMA_NUM_CTX", contexts[i], 1) == 0);
         set_response("Yes, I moved it to the shelf.", "stop", 1);
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_override = blank_answer_body;
         char *reply = r2_chat_with_input_source(turn, 4, r2_conversation_system_prompt, query, 512, 60, NULL);
+        invalid_body_at = 0;
+        invalid_body_override = NULL;
+        assert(perform_count == before + 2 && !isolated_retry_payload);
         assert(reply && captured_contains(query));
         assert(captured_contains("CURRENT REALITY STATUS: The live world snapshot could not be refreshed"));
         assert(captured_contains("Moved the notebook to the shelf."));
@@ -1736,6 +1767,8 @@ static void check_failed_reality_refresh_keeps_action_evidence(void)
     r2_turn_reality_stale = 0;
     active_turn_history.action_result = NULL;
     ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+    ollama_foreground_turn_mode = 0;
 }
 
 static void check_memory_response_replay(void)
