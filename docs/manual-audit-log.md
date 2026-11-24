@@ -2445,3 +2445,9 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Traced `r2_talk_impl` from failed generation and recorded tool fallback through live history, Life Log staging, and post-turn learning. Replies synthesized by the runtime were shown and archived but omitted from live history, so the next prompt could omit the answer the user had just seen.
 - Live history now retains the visible fallback when the turn ends normally. The existing generation flag still controls learning and self-reports. Regressions verify exact file-read fallback under history pressure and the outgoing follow-up request after a display inspection fallback.
 - [Run 45322904913](https://github.com/Xylin48/R2-3PO/actions/runs/45322904913) passed all 128 steps at `b6dd8b125ecf5d37e8cbdade86f42dfe776e75ad`, including offline restart, sanitizers and shutdown. Follow-up behavior was checked with simulated Ollama.
+
+### R2-AUD-2026-11-23-278 — Preserve smaller exchanges under history pressure
+
+- Traced both selection passes in `ollama_chat_with_limit` and `r2_preserve_inference_units`. A large recent reply could consume the preliminary byte allowance and exclude shorter candidates. The whole-exchange pass would then reject that large exchange after losing the ability to consider the shorter exchanges.
+- The recent-message pass now selects candidates by count and leaves their byte allocation to the whole-exchange pass. The new native regression checks that the outgoing 2,048-token request retains a smaller complete exchange and the current question after skipping an oversized exchange. The static check verifies the boundary between these passes.
+- [Run 45325318291](https://github.com/Xylin48/R2-3PO/actions/runs/45325318291) passed all 128 steps at `5b29a9b9269b49bc33bf85bbda7df3db7a865831`, including the request regression, offline restart, sanitizers and shutdown. The regression verifies the request using a simulated endpoint.
