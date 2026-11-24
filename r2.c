@@ -15296,7 +15296,9 @@ interrupted_reply:
 finalize_reply:
     pthread_mutex_lock(&messages_lock);
 
-    int assistant_context_rc = generated_reply ? message_add("assistant", reply) : 0;
+    /* Keep the reply the user saw available to the next turn. Whether
+       the model generated it controls learning, not dialogue history. */
+    int assistant_context_rc = shutting_down ? 0 : message_add("assistant", reply);
     if (assistant_context_rc != 0)
         fprintf(stderr,
                 "[R2] Failed to add assistant response "

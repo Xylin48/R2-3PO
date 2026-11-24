@@ -1151,8 +1151,10 @@ static void check_action_result_under_history_pressure(void)
     assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
                             strlen("I processed the action request. Here is the recorded result:\n")));
     assert(strstr(reply, expected));
-    assert(messages.count == 2 && !strcmp(messages.items[1].role, "user") &&
+    assert(messages.count == 3 && !strcmp(messages.items[1].role, "user") &&
            !strcmp(messages.items[1].content, user) && !messages.items[1].pinned);
+    assert(!strcmp(messages.items[2].role, "assistant") &&
+           !strcmp(messages.items[2].content, reply));
     assert(!active_turn_history.user && !active_turn_history.action_request &&
            !active_turn_history.action_result);
 
@@ -1190,6 +1192,15 @@ static void check_action_result_under_history_pressure(void)
        tool result without showing the marker or executing another action. */
     assert(reply && strstr(reply, "MEDIA OBSERVATION ERROR: no visible media frame"));
     assert(!strstr(reply, "[MEDIA_SEE]"));
+    assert(messages.count > 0 &&
+           !strcmp(messages.items[messages.count - 1].role, "assistant") &&
+           !strcmp(messages.items[messages.count - 1].content, reply));
+    const char *followup = "Why wasn't a frame available?";
+    assert(message_add("user", followup) == 0);
+    set_response("The display had no visible frame.", "stop", 1);
+    char *answer = chat_with_relevant_memories(followup);
+    assert(answer && captured_contains(followup) && captured_contains(reply));
+    free(answer);
     free(reply);
     message_free_all();
 
