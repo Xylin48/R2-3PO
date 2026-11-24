@@ -16,9 +16,8 @@ required = (
     'if (!msgs[index].role || strcmp(msgs[index].role, "user") != 0)',
     '"----- BEGIN CURRENT USER MESSAGE -----\\n"',
     '"----- END CURRENT USER MESSAGE -----"',
-    "include[current_user_index] = 1;",
-    "limits[current_user_index] = length;",
-    "size_t remaining = input_budget - total_chars;",
+    "r2_preserve_inference_units(msgs, count, include, limits, current_user_index,",
+    "query_length <= serialized_length - query_offset",
     "const char *authoritative_query = ollama_authoritative_user_query;",
     "strcmp(content, authoritative_query) == 0",
     "memcmp(begin, authoritative_query, wrapped_length) == 0",
@@ -31,18 +30,6 @@ required = (
 for needle in required:
     if needle not in builder:
         raise SystemExit(f"Current-turn retention safeguard missing: {needle}")
-
-explicit_turn = builder.find("include[current_user_index] = 1;")
-history_loop = builder.find("for (size_t i = count; i > 0 && recent_count < OLLAMA_MAX_RECENT_MESSAGES; --i)")
-if explicit_turn < 0 or history_loop < 0 or explicit_turn > history_loop:
-    raise SystemExit("The current user turn must be budgeted before recent-history selection.")
-
-if "recent_count = 1;" not in builder:
-    raise SystemExit("The explicitly included user turn must count against the recent-message limit.")
-if "if (include[index]) continue;" not in builder:
-    raise SystemExit("Recent-history selection must not duplicate the explicitly included user turn.")
-if "if (length > OLLAMA_MAX_MESSAGE_CHARS)" not in builder:
-    raise SystemExit("The explicit current turn must retain the per-message safety cap.")
 
 if "static _Thread_local const char *ollama_authoritative_user_query = NULL;" not in core:
     raise SystemExit("The active user query must be tracked per thread, not in shared global state.")

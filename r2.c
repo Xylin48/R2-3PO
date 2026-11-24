@@ -4002,24 +4002,27 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
         limits[i] = strlen(msgs[i].content ? msgs[i].content : "");
     }
     size_t history_end = current_user == SIZE_MAX ? count : current_user;
+    size_t message_slots = OLLAMA_MAX_RECENT_MESSAGES;
     for (size_t i = history_end; i < count; ++i) {
         if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
         include[i] = 1;
         limits[i] = strlen(msgs[i].content ? msgs[i].content : "");
+        if (message_slots) --message_slots;
     }
 
-    /* A historical exchange starts with a human turn and includes its
-     * assistant and tool messages. Keep it whole even if the provisional
-     * message limit admitted only its tail. Serialize the survivors later
-     * in their original order. */
+    /* Reserve one slot for each message in a retained exchange. An exchange
+     * that cannot fit the byte budget leaves its slots available to the next
+     * candidate. Serialize the survivors later in their original order. */
     for (size_t end = history_end; end > 0;) {
         size_t start = end;
         size_t bytes = 0;
+        size_t exchange_messages = 0;
         int complete = 1;
         int anchored = 0;
         while (start > 0) {
             const Message *message = &msgs[--start];
             if (message->role && !strcmp(message->role, "system")) continue;
+            ++exchange_messages;
             size_t n = strlen(message->content ? message->content : "");
             if (!include[start] || n > input_budget - used - bytes)
                 complete = 0;
@@ -4036,13 +4039,16 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
                 break;
             }
         }
-        int keep = complete && anchored;
+        int keep = complete && anchored && exchange_messages <= message_slots;
         for (size_t i = start; i < end; ++i) {
             if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
             include[i] = keep;
             limits[i] = keep ? strlen(msgs[i].content ? msgs[i].content : "") : 0;
         }
-        if (keep) used += bytes;
+        if (keep) {
+            used += bytes;
+            message_slots -= exchange_messages;
+        }
         end = start;
     }
     /* Keep startup and learning snapshots ahead of the optional archive. */
@@ -4494,39 +4500,12 @@ static char *ollama_chat_with_limit(
         }
     }
 
-    size_t recent_count = 0;
-    /*
-     * Include the current user turn first, even if later tool-result messages
-     * would otherwise push it outside the newest-message count. Its content
-     * is capped exactly like every other message and remains inside the same
-     * serialized input budget.
-     */
-    if (current_user_index != SIZE_MAX && total_chars < input_budget) {
-        const char *content = msgs[current_user_index].content
-            ? msgs[current_user_index].content : "";
-        size_t length = strlen(content);
-        if (length > OLLAMA_MAX_MESSAGE_CHARS)
-            length = r2_utf8_safe_prefix_length(
-                content, OLLAMA_MAX_MESSAGE_CHARS);
-        size_t remaining = input_budget - total_chars;
-        if (length > remaining) length = r2_utf8_safe_prefix_length(content, remaining);
-        if (length > 0) {
-            include[current_user_index] = 1;
-            limits[current_user_index] = length;
-            recent_count = 1;
-        }
-    }
-
-    /* Mark recent dialogue candidates by count. The whole-exchange pass
-       budgets their bytes after reserving the active turn and its evidence.
-       An exchange that cannot fit must leave room for the next candidate. */
-    for (size_t i = count; i > 0 && recent_count < OLLAMA_MAX_RECENT_MESSAGES; --i) {
-        size_t index = i - 1;
-        if (include[index]) continue;
-        if (msgs[index].role && !strcmp(msgs[index].role, "system")) continue;
-        if (!msgs[index].content || !*msgs[index].content) continue;
-        include[index] = 1;
-        ++recent_count;
+    /* Mark historical candidates only. The final allocator reserves the
+       entire active turn and applies both limits to complete exchanges. */
+    size_t history_end = current_user_index == SIZE_MAX ? count : current_user_index;
+    for (size_t i = 0; i < history_end; ++i) {
+        if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
+        if (msgs[i].content && *msgs[i].content) include[i] = 1;
     }
 
     size_t complete_override_length = system_override ? strlen(system_override) : 0;
