@@ -397,6 +397,26 @@ static void check_context_and_isolated_inputs(void)
     assert(answer && captured_contains(query) && captured_contains(tool_result));
     free(answer);
 
+    const char *followup = "Wait, which pocket did you mean?";
+    Message later_turn[] = {
+        turn[1],
+        {.role = "assistant", .content = "I meant my left pocket."},
+        {.role = "user", .content = (char *)followup},
+        {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
+        {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
+    };
+    /* The expected text still exists in old dialogue, but it cannot
+       authorize a request whose newest human message is different. */
+    attempts = perform_count;
+    assert(!r2_foreground_chat(later_turn, 5, "Full policy.", query, 512, 60));
+    assert(perform_count == attempts);
+    ollama_authoritative_user_query = followup;
+    answer = r2_foreground_chat(later_turn, 5, "Full policy.", followup, 512, 60);
+    assert(answer && perform_count == attempts + 1);
+    assert(captured_contains(followup) && captured_contains(tool_result));
+    free(answer);
+    ollama_authoritative_user_query = query;
+
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
     int before = perform_count;

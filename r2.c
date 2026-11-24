@@ -4251,8 +4251,7 @@ static char *ollama_chat_with_limit(
            handoff; never let one become the fallback "current human turn". */
         if (r2_is_internal_tool_result(&msgs[index]))
             continue;
-        if (fallback_user_index == SIZE_MAX)
-            fallback_user_index = index;
+        fallback_user_index = index;
         if (authoritative_query && strcmp(content, authoritative_query) == 0) {
             current_user_index = index;
             break;
@@ -4278,6 +4277,8 @@ static char *ollama_chat_with_limit(
                 }
             }
         }
+        /* A matching historical message cannot stand in for the newest turn. */
+        break;
     }
     if (current_user_index == SIZE_MAX && authoritative_query && *authoritative_query) {
         /*
@@ -4648,6 +4649,7 @@ static char *ollama_chat_with_limit(
     int translated_visual_inputs = 0;
     int has_input_provenance = 0;
     int current_visual_frames = 0, current_visual_observations = 0;
+    size_t serialized_current_user = SIZE_MAX;
     for (size_t pos = 0; pos < ordered_count; ++pos) {
         size_t i = message_order[pos];
         if (r2_is_current_input_source(&msgs[i]))
@@ -4701,9 +4703,12 @@ static char *ollama_chat_with_limit(
         free(camera_description);
         free(owned_media_image);
         free(owned_image);
-        if (append_rc == 0)
+        if (append_rc == 0) {
+            if (i == current_user_index)
+                serialized_current_user = json_object_array_length(arr);
             append_rc = ollama_json_append_message_with_image_sources(
                 arr, role, content, limits[i], NULL, NULL);
+        }
         if (append_rc != 0) {
             fprintf(stderr,
                     "[R2 Ollama] refusing inference: could not serialize message %zu/%zu; no partial payload will be sent.\n",
@@ -4816,7 +4821,7 @@ static char *ollama_chat_with_limit(
             continue;
         if (!strcmp(role, "user")) {
             ++audit_user_messages;
-            if (audit_query && *audit_query) {
+            if (i == serialized_current_user && audit_query && *audit_query) {
                 if (!strcmp(content, audit_query))
                     audit_exact_user_turn = 1;
                 if (strstr(content, audit_query))
@@ -5575,11 +5580,11 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     size_t user = SIZE_MAX;
     for (size_t i = count; i > 0; --i) {
         const Message *m = &messages[i - 1];
-        if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result &&
-            m->content && !strcmp(m->content, query)) {
+        if (!m->role || strcmp(m->role, "user") || m->internal_tool_result)
+            continue;
+        if (m->content && !strcmp(m->content, query))
             user = i - 1;
-            break;
-        }
+        break;
     }
     int ctx = r2_ollama_context_tokens();
     if (ctx <= 576 || user == SIZE_MAX)
