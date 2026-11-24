@@ -3992,18 +3992,14 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     if (required_out) *required_out = required;
     if (required > input_budget) { errno = E2BIG; return -1; }
     size_t used = required;
-    /* Keep the existing policy and evidence order, but leave the optional
-     * startup transcript until after recent live dialogue. */
+    /* Reserve required system sections now. Startup memory, learning
+     * snapshots and the original archive can use space after live dialogue. */
     for (size_t i = 0; i < count; ++i) {
-        if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
-        const char *content = msgs[i].content ? msgs[i].content : "";
-        if (r2_inference_system_priority(content, r2_inference_user_intent()) == 7)
+        if (!msgs[i].role || strcmp(msgs[i].role, "system") ||
+            !r2_inference_unit_required(&msgs[i], i, current_user))
             continue;
-        int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
-        size_t n = strlen(content);
-        if (mandatory) { include[i] = 1; limits[i] = n; }
-        else if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
-        else { include[i] = 0; limits[i] = 0; }
+        include[i] = 1;
+        limits[i] = strlen(msgs[i].content ? msgs[i].content : "");
     }
     size_t history_end = current_user == SIZE_MAX ? count : current_user;
     for (size_t i = history_end; i < count; ++i) {
@@ -4050,11 +4046,10 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
         end = start;
     }
     for (size_t i = 0; i < count; ++i) {
-        if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
-        const char *content = msgs[i].content ? msgs[i].content : "";
-        if (r2_inference_system_priority(content, r2_inference_user_intent()) != 7)
+        if (!msgs[i].role || strcmp(msgs[i].role, "system") ||
+            r2_inference_unit_required(&msgs[i], i, current_user))
             continue;
-        size_t n = strlen(content);
+        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
         if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
         else { include[i] = 0; limits[i] = 0; }
     }

@@ -285,6 +285,36 @@ static void check_final_budget_prefers_recent_dialogue(void)
         assert(limits[i] == strlen(turns[i].content));
 }
 
+static void check_optional_snapshots_yield_to_dialogue(void)
+{
+    Message turns[] = {
+        {"system", "R2 PERSISTENT MEMORY - STARTUP CONTEXT: Unrelated old memory.", 0, 0},
+        {"system", "PERSISTENT LEARNING CONTEXT: Unrelated old learning.", 0, 0},
+        {"system", "Current instructions.", 0, 0},
+        {"user", "Where did we put the blue book?", 0, 0},
+        {"assistant", "The blue book is on the top shelf.", 0, 0},
+        {"user", "Can I reach it?", 0, 0},
+    };
+    unsigned char include[6];
+    size_t limits[6];
+    size_t dialogue_budget = 0, all_budget = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        size_t length = strlen(turns[i].content);
+        all_budget += length;
+        if (i >= 2) dialogue_budget += length;
+    }
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, dialogue_budget, NULL) == 0);
+    assert(!include[0] && !include[1] && !limits[0] && !limits[1]);
+    for (size_t i = 2; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget, NULL) == 0);
+    for (size_t i = 0; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+}
+
 static void check_final_budget_keeps_exchanges_whole(void)
 {
     Message turns[] = {
@@ -1725,6 +1755,7 @@ int main(void)
     check_missing_live_frame_is_current_evidence();
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
+    check_optional_snapshots_yield_to_dialogue();
     check_oversized_history_leaves_room_for_complete_exchange();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
