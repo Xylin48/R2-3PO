@@ -4693,13 +4693,6 @@ static char *ollama_chat_with_limit(
             current_visual_observations = available &
                 ((camera_description ? R2_LIVE_CAMERA : 0) |
                  (media_description ? R2_LIVE_DISPLAY : 0));
-            if (append_rc == 0 && has_input_provenance && !requested &&
-                !current_visual_observations) {
-                static const char no_visual_observation[] =
-                    "CURRENT TURN SENSORY EVIDENCE: No current camera or display observation is supplied.";
-                append_rc = ollama_json_append_message(arr, "system", no_visual_observation,
-                    sizeof(no_visual_observation) - 1, NULL, NULL);
-            }
         }
         if (json_object_array_length(arr) != before_visual_evidence)
             translated_visual_inputs = 1;
@@ -5706,8 +5699,8 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
               "The transcript supplies words, without establishing tone, volume, or who spoke beyond the evidence given."
             : "CURRENT USER INPUT: typed keyboard text. "
               "Treat the input source as internal context. Mention it only when relevant to the user's request. "
-              "The user entered these words directly. Interpret the current words on their own terms even when an earlier reply misunderstood. "
-              "Reply as R2 to the greeting and questions. "
+              "The user entered these words directly. Reply as R2 to their current meaning. "
+              "Watch status alone supplies no observation. "
               "Report inspections, device status, or inventory details only from available evidence."
     };
     if (active_turn_history.action_result) {

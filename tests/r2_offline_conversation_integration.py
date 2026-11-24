@@ -428,10 +428,10 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
             system = [item["content"] for item in request["messages"] if item["role"] == "system"]
             assert len(system) == 1 and request["messages"][0]["role"] == "system"
             provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
-            evidence_at = system[0].rindex("\n\nCURRENT TURN SENSORY EVIDENCE:")
-            assert provenance_at < evidence_at
-            assert "No current camera or display observation is supplied" in system[0][evidence_at:]
-            assert "\n\n" not in system[0][evidence_at + 2:]
+            assert "\n\n" not in system[0][provenance_at + 2:]
+            assert "Watch status alone supplies no observation." in system[0][provenance_at:]
+            assert "CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL" not in system[0]
+            assert "CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL" not in system[0]
             assert "Treat the input source as internal context." in system[0]
             assert "Report inspections, device status, or inventory details only from available evidence." in system[0]
             assert "Keep simple greetings brief and personal" in system[0]

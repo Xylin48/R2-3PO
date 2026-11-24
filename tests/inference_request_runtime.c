@@ -1445,7 +1445,9 @@ static void check_foreground_input_provenance(void)
                                               "CURRENT USER INPUT: typed keyboard text."));
             assert(captured_contains(speech ? "The transcript supplies words" :
                                               "The user entered these words directly."));
-            assert(captured_contains("No current camera or display observation is supplied"));
+            if (!speech) assert(captured_contains("Watch status alone supplies no observation."));
+            assert(!captured_contains("CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL"));
+            assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
             assert(captured_contains("Keep simple greetings brief and personal"));
             assert(captured_contains("recognize her as Mom or Mother"));
             assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
