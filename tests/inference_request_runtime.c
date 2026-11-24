@@ -1646,6 +1646,8 @@ static void check_first_answer_with_unavailable_source(void)
 
 static void check_compact_reserves_current_instructions_before_history(void)
 {
+    assert(conversation_reply_token_budget("I got you up and running and fixed.") == 1024);
+    assert(conversation_reply_token_budget("Please fix this.") == 4096);
     const char *query = "Which one did we decide on?";
     const char *source = "CURRENT USER INPUT: typed keyboard text. Use the user's exact words.";
     const char *stale = "CURRENT REALITY STATUS: The live world snapshot could not be refreshed.";
@@ -1672,6 +1674,22 @@ static void check_compact_reserves_current_instructions_before_history(void)
     assert(captured_contains(query) && captured_contains(source) && captured_contains(stale));
     assert(captured_contains(previous_question) && captured_contains(previous_answer));
     assert(!captured_contains("RECENT CONVERSATION CONTEXT"));
+    free(reply);
+    free(history);
+
+    /* This older block fits alongside current instructions by itself.
+       It must yield to the immediately preceding complete exchange. */
+    history_size -= strlen(source) + strlen(stale);
+    history = text(history_size, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    turn[0].content = history;
+    before = perform_count;
+    reply = r2_compact_foreground_chat(turn, sizeof(turn) / sizeof(turn[0]),
+                                       5, query, 64, 60, capacity);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(previous_question) &&
+           captured_contains(previous_answer));
+    assert(!captured_contains(history));
     free(reply);
     free(history);
 }

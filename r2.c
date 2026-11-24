@@ -5448,6 +5448,31 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
         goto cleanup;
     }
 
+    /* A direct follow-up needs the preceding exchange before older
+       evidence. Preserve the requested reply budget when history is optional. */
+    int ctx = r2_ollama_context_tokens();
+    size_t history_budget = capacity;
+    if (!recalled && num_predict >= 64 && num_predict < ctx - 512)
+        history_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+    size_t recent_reserve = 0;
+    if (!recalled && total < history_budget) {
+        size_t bytes = 0;
+        size_t slots = 0;
+        for (size_t i = user; i > 0;) {
+            const Message *m = &messages[--i];
+            if (m->role && !strcmp(m->role, "system")) continue;
+            size_t length = m->content ? strlen(m->content) : 0;
+            if (!length || length > history_budget - total - bytes ||
+                ++slots >= OLLAMA_MAX_RECENT_MESSAGES) break;
+            bytes += length;
+            if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
+                recent_reserve = bytes;
+                break;
+            }
+        }
+    }
+    history_budget -= recent_reserve;
+
     size_t selected_count = 0;
     size_t oversized_retrieval_bytes = 0;
     if (state)
@@ -5462,7 +5487,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
         }
         if (r2_context_can_be_reviewed(&m)) {
             size_t length = strlen(m.content ? m.content : "");
-            if (recalled || length <= capacity - total) {
+            if (recalled || (total <= history_budget && length <= history_budget - total)) {
                 selected[selected_count++] = m;
                 if (length <= capacity - total) total += length;
             } else if (!strncmp(m.content, "CURRENT TURN RETRIEVED CONTEXT",
@@ -5497,6 +5522,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
            The full allocation is available for the exact turn and live state. */
         if (num_predict >= 64 && num_predict < ctx - 512)
             input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+        if (recent_reserve <= input_bytes) input_bytes -= recent_reserve;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
             char *plan = r2_associative_query_cache_lookup(query);
             static char notice[] =
@@ -5944,8 +5970,10 @@ static int conversation_reply_token_budget(const char *query)
     static const char *const code_terms[] = {
         "write", "rewrite", "create", "implement", "code", "script",
         "program", "file", "debug", "diagnos", "generate", "build",
-        "modify", "fix"
+        "modify"
     };
+    if (query_has_phrase(query, "fix"))
+        return 4096;
     for (size_t i = 0; i < sizeof(code_terms) / sizeof(code_terms[0]); ++i) {
         if (query_has_word_prefix(query, code_terms[i]))
             return 4096;
