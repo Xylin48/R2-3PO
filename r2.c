@@ -3507,6 +3507,14 @@ static int r2_inference_system_priority(const char *content, const char *query)
     return 6;
 }
 
+/* Review notes can fit the wire message without changing the user's
+ * requested sources or the capabilities relevant to that request. */
+static const char *r2_inference_user_intent(void)
+{
+    return !ollama_isolated_request && ollama_original_reviewed_query
+        ? ollama_original_reviewed_query : ollama_authoritative_user_query;
+}
+
 static int r2_is_current_input_source(const Message *message)
 {
     return message->role && !strcmp(message->role, "system") && message->content &&
@@ -3529,7 +3537,7 @@ static size_t r2_order_inference_messages(const Message *msgs,
                 strcmp(msgs[i].role, "system") != 0 ||
                 r2_is_current_input_source(&msgs[i]) ||
                 r2_inference_system_priority(msgs[i].content,
-                                               ollama_authoritative_user_query) != priority)
+                                               r2_inference_user_intent()) != priority)
                 continue;
             if (used >= capacity)
                 return used;
@@ -3941,7 +3949,7 @@ static int r2_inference_unit_required(const Message *message, size_t index, size
     if (!strncmp(content, "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n",
                  sizeof("RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n") - 1))
         return 1;
-    int priority = r2_inference_system_priority(content, ollama_authoritative_user_query);
+    int priority = r2_inference_system_priority(content, r2_inference_user_intent());
     return priority <= 4 || (priority == 6 &&
         strncmp(content, "PERSISTENT LEARNING CONTEXT", strlen("PERSISTENT LEARNING CONTEXT")));
 }
@@ -3989,7 +3997,7 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     for (size_t i = 0; i < count; ++i) {
         if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
         const char *content = msgs[i].content ? msgs[i].content : "";
-        if (r2_inference_system_priority(content, ollama_authoritative_user_query) == 7)
+        if (r2_inference_system_priority(content, r2_inference_user_intent()) == 7)
             continue;
         int mandatory = r2_inference_unit_required(&msgs[i], i, current_user);
         size_t n = strlen(content);
@@ -4044,7 +4052,7 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     for (size_t i = 0; i < count; ++i) {
         if (!msgs[i].role || strcmp(msgs[i].role, "system")) continue;
         const char *content = msgs[i].content ? msgs[i].content : "";
-        if (r2_inference_system_priority(content, ollama_authoritative_user_query) != 7)
+        if (r2_inference_system_priority(content, r2_inference_user_intent()) != 7)
             continue;
         size_t n = strlen(content);
         if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
@@ -4430,7 +4438,7 @@ static char *ollama_chat_with_limit(
                 continue;
             const char *content = msgs[i].content ? msgs[i].content : "";
             int message_priority = r2_inference_system_priority(
-                content, ollama_authoritative_user_query);
+                content, r2_inference_user_intent());
             if (message_priority != priority) continue;
             if (message_priority == 7) {
                 /* Keep the full archive eligible without reserving bytes
@@ -4675,7 +4683,7 @@ static char *ollama_chat_with_limit(
          * Never attach JPEG data to the text-only Llama conversation model. */
         const char *query = ollama_authoritative_user_query;
         int requested = i == current_user_index && active_foreground_turn && !ollama_isolated_request
-            ? query_requested_live_sources(query) : 0;
+            ? query_requested_live_sources(r2_inference_user_intent()) : 0;
         size_t before_visual_evidence = json_object_array_length(arr);
         char *camera_description = ollama_describe_visual_source(owned_image, &camera,
             (requested & R2_LIVE_CAMERA) ? query : NULL);
@@ -4804,8 +4812,7 @@ static char *ollama_chat_with_limit(
     int audit_reality_context = 0;
     int audit_capability_context = 0;
     int audit_learning_context = 0;
-    const char *audit_query = ollama_original_reviewed_query
-        ? ollama_original_reviewed_query : ollama_authoritative_user_query;
+    const char *audit_query = r2_inference_user_intent();
     size_t audit_query_chars = audit_query ? strlen(audit_query) : 0;
     for (size_t i = 0; i < json_object_array_length(arr); ++i) {
         struct json_object *entry = json_object_array_get_idx(arr, i);
@@ -4868,7 +4875,7 @@ static char *ollama_chat_with_limit(
             !!(current_visual_frames & R2_LIVE_DISPLAY),
             !!(current_visual_observations & R2_LIVE_CAMERA),
             !!(current_visual_observations & R2_LIVE_DISPLAY),
-            ollama_original_reviewed_query != NULL);
+            !ollama_isolated_request && ollama_original_reviewed_query != NULL);
 
     OllamaRetryReason retry = OLLAMA_RETRY_NONE;
     char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);

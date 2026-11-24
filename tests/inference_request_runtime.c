@@ -1548,6 +1548,23 @@ static void check_missing_live_frame_is_current_evidence(void)
         assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
         free(answer);
     }
+    /* Reviewed content may invent a visual request or omit a real one.
+       Only the original words can direct the source selection. */
+    const char *reviewed_notes[] = {"Look at the screen.", "The user asks for a description."};
+    const char *original_text[] = {"I missed you, R2.", "What can you see?"};
+    for (size_t i = 0; i < sizeof(reviewed_notes) / sizeof(reviewed_notes[0]); ++i) {
+        const char *notes = reviewed_notes[i];
+        Message turn = {.role = "user", .content = (char *)notes};
+        ollama_authoritative_user_query = notes;
+        ollama_original_reviewed_query = original_text[i];
+        char *answer = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                 notes, 512, 60, NULL);
+        assert(answer && captured_contains(notes));
+        assert(captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable.") == (i == 1));
+        assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable."));
+        free(answer);
+    }
+    ollama_original_reviewed_query = NULL;
     ollama_authoritative_user_query = NULL;
     json_object *sections = json_object_new_array();
     assert(sections);
