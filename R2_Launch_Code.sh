@@ -33,13 +33,12 @@ if [[ "$R2_OLLAMA_BASE_URL" != "http://127.0.0.1:11434" ]]; then
 fi
 export R2_OLLAMA_BASE_URL
 
-# Keep R2's Linux identity separate from the canonical data location. HOME is
-# set to the project root for every R2 process, never to /home/r2.
+# Use R2's Linux home for per-user libraries. Project paths use R2_ROOT.
 if ! id r2 >/dev/null 2>&1; then echo "ERROR: Dedicated Linux account r2 does not exist."; exit 1; fi
 R2_UID="$(id -u r2)"
 R2_GID="$(id -g r2)"
-R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
-if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
+R2_HOME_DIR="/home/r2"
+if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ ]]; then
     echo "ERROR: Could not resolve the dedicated r2 account identity."
     exit 1
 fi
@@ -60,7 +59,7 @@ done
 
 # Drop privileges before executing any project or runtime command.
 R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --
-    env HOME="$R2_ROOT" USER=r2 LOGNAME=r2)
+    env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2)
 run_as_r2() {
     "${R2_HANDOFF[@]}" "$@"
 }

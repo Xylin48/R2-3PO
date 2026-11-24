@@ -66,7 +66,9 @@ required = (
     'Hardware preflight identity: %s (uid=%s, groups=%s)',
     'for DEVICE_GROUP in audio video; do',
     'DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)',
-    'sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2',
+    'sudo -n "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2',
+    'R2_HOME_DIR="/home/r2"',
+    'Linux home $HOME must be owned, writable, and traversable by r2',
     'sudo -n setpriv --reuid="$uid" --regid="$gid" --groups="$groups" -- "$@"',
     'libfaketime.so.1 is missing',
     'sudo apt-get update && sudo apt-get install -y ffmpeg',
@@ -106,6 +108,10 @@ if 'R2_OLLAMA_URL:-http://127.0.0.1:11434/api/tags' not in script:
     raise SystemExit("Ollama endpoint must remain locally configurable")
 
 launch_required = (
+    'R2_ROOT="/home/x/R2_Home"',
+    'R2_SOURCE="$R2_ROOT/R2"',
+    'R2_HOME_DIR="/home/r2"',
+    'env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2',
     '"$R2_SOURCE/V-Webcam.py"',
     'R2_PREFLIGHT="$R2_SOURCE/tools/preflight_r2_hardware.sh"',
     'bash "$R2_PREFLIGHT"',

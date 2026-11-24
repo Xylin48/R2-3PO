@@ -17,7 +17,7 @@ if [[ "$(id -un)" != "r2" ]]; then
   fi
   R2_UID="$(id -u r2)"
   R2_GID="$(id -g r2)"
-  R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
+  R2_HOME_DIR="/home/r2"
   R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
   for DEVICE_GROUP in audio video; do
     if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
@@ -28,19 +28,19 @@ if [[ "$(id -un)" != "r2" ]]; then
       esac
     fi
   done
-  if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
+  if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ ]]; then
     printf '[FAIL] Could not resolve the r2 runtime identity.\n' >&2
     exit 1
   fi
   SCRIPT_PATH="$(readlink -f "$0")"
   DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)
   if [[ "$EUID" -eq 0 ]]; then
-    "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2 \
       R2_PREFLIGHT_AS_RUNTIME=1 R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
       R2_EXEC="$R2_EXEC" R2_FX_DIR="$R2_FX_DIR" R2_OLLAMA_URL="$OLLAMA_URL" \
       bash "$SCRIPT_PATH"
   else
-    sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    sudo -n "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2 \
       R2_PREFLIGHT_AS_RUNTIME=1 R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
       R2_EXEC="$R2_EXEC" R2_FX_DIR="$R2_FX_DIR" R2_OLLAMA_URL="$OLLAMA_URL" \
       bash "$SCRIPT_PATH"
@@ -284,6 +284,9 @@ else
 fi
 
 section "Audio, microphone, camera, TV, and emulator"
+if [[ ! -d "$HOME" || ! -O "$HOME" || ! -x "$HOME" || ! -w "$HOME" ]]; then
+  warn "Linux home $HOME must be owned, writable, and traversable by r2 for per-user audio configuration."
+fi
 if have mpg123 || have ffplay || have mpv; then pass "supported local MP3 playback process available"
 else
   warn "no mpg123/ffplay/mpv; sound effects will not play. On Ubuntu/Debian, install a decoder with: sudo apt-get update && sudo apt-get install -y ffmpeg"
