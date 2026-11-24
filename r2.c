@@ -4045,13 +4045,19 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
         if (keep) used += bytes;
         end = start;
     }
-    for (size_t i = 0; i < count; ++i) {
-        if (!msgs[i].role || strcmp(msgs[i].role, "system") ||
-            r2_inference_unit_required(&msgs[i], i, current_user))
-            continue;
-        size_t n = strlen(msgs[i].content ? msgs[i].content : "");
-        if (include[i] && n <= input_budget - used) { limits[i] = n; used += n; }
-        else { include[i] = 0; limits[i] = 0; }
+    /* Keep startup and learning snapshots ahead of the optional archive. */
+    for (int archive = 0; archive <= 1; ++archive) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!msgs[i].role || strcmp(msgs[i].role, "system") ||
+                !include[i] || r2_inference_unit_required(&msgs[i], i, current_user))
+                continue;
+            const char *content = msgs[i].content ? msgs[i].content : "";
+            int is_archive = r2_inference_system_priority(content, r2_inference_user_intent()) == 7;
+            if (is_archive != archive) continue;
+            size_t n = strlen(content);
+            if (n <= input_budget - used) { limits[i] = n; used += n; }
+            else { include[i] = 0; limits[i] = 0; }
+        }
     }
     return 0;
 }
