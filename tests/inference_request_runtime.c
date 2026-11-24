@@ -1414,24 +1414,45 @@ static void check_first_answer_with_unavailable_source(void)
 
 static void check_foreground_input_provenance(void)
 {
-    const char *query = "Hi, I missed you.";
-    Message turn = {.role = "user", .content = (char *)query};
+    const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
+                        "since we last spoke. with each passing moon i find myself wondering when we might converse once more";
+    Message turn[] = {
+        {.role = "user", .content = "Hello, R2."},
+        {.role = "assistant", .content = "I'm not sure what to make of that message."},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *contexts[] = {"2048", "4096", "8192"};
     ollama_authoritative_user_query = query;
     ollama_audit_stage = "conversation-answer";
     set_response("I missed you too.", "stop", 1);
-    for (int i = 0; i < 2; ++i) {
-        /* Transcribed input remains speech even if logging its event failed. */
-        r2_input_speech_event = i ? -1 : 0;
-        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60, NULL);
-        assert(reply && captured_contains(query));
-        assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
-                                     "CURRENT USER INPUT: typed keyboard text."));
-        assert(captured_contains(i ? "The transcript supplies words" :
-                                     "Treat the input source as internal context."));
-        assert(captured_contains("Keep simple greetings brief and personal"));
-        assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
-        free(reply);
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        assert(setenv("R2_OLLAMA_NUM_CTX", contexts[i], 1) == 0);
+        for (int speech = 0; speech < 2; ++speech) {
+            /* Transcribed input remains speech even if logging its event failed. */
+            r2_input_speech_event = speech ? -1 : 0;
+            char *reply = r2_chat_with_input_source(turn, 3, r2_conversation_system_prompt,
+                                                     query, 512, 60, NULL);
+            assert(reply);
+            struct json_object *messages = NULL, *role = NULL, *content = NULL;
+            assert(json_object_object_get_ex(captured, "messages", &messages));
+            struct json_object *current = json_object_array_get_idx(
+                messages, json_object_array_length(messages) - 1);
+            assert(json_object_object_get_ex(current, "role", &role) &&
+                   !strcmp(json_object_get_string(role), "user"));
+            assert(json_object_object_get_ex(current, "content", &content) &&
+                   !strcmp(json_object_get_string(content), query));
+            assert(captured_contains(speech ? "CURRENT USER INPUT: an Ears speech transcript." :
+                                              "CURRENT USER INPUT: typed keyboard text."));
+            assert(captured_contains(speech ? "The transcript supplies words" :
+                                              "The user entered these words directly."));
+            assert(captured_contains("No current camera or display observation is supplied"));
+            assert(captured_contains("Keep simple greetings brief and personal"));
+            assert(captured_contains("recognize her as Mom or Mother"));
+            assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
+            free(reply);
+        }
     }
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
     r2_input_speech_event = 0;
     ollama_audit_stage = NULL;
     ollama_authoritative_user_query = NULL;

@@ -4645,8 +4645,12 @@ static char *ollama_chat_with_limit(
     size_t ordered_count = r2_order_inference_messages(
         msgs, include, count, message_order, count);
     int translated_visual_inputs = 0;
+    int has_input_provenance = 0;
+    int current_visual_frames = 0, current_visual_observations = 0;
     for (size_t pos = 0; pos < ordered_count; ++pos) {
         size_t i = message_order[pos];
+        if (r2_is_current_input_source(&msgs[i]))
+            has_input_provenance = 1;
         const char *role = msgs[i].internal_tool_result ? "tool" :
             (msgs[i].role ? msgs[i].role : "user");
         const char *content = msgs[i].content ? msgs[i].content : "";
@@ -4684,6 +4688,19 @@ static char *ollama_chat_with_limit(
             (json_object_array_length(arr) > after_camera ? R2_LIVE_DISPLAY : 0);
         if (append_rc == 0)
             append_rc = ollama_append_missing_visual_inputs(arr, requested, available);
+        if (i == current_user_index) {
+            current_visual_frames = available;
+            current_visual_observations = available &
+                ((camera_description ? R2_LIVE_CAMERA : 0) |
+                 (media_description ? R2_LIVE_DISPLAY : 0));
+            if (append_rc == 0 && has_input_provenance && !requested &&
+                !current_visual_observations) {
+                static const char no_visual_observation[] =
+                    "CURRENT TURN SENSORY EVIDENCE: No current camera or display observation is supplied.";
+                append_rc = ollama_json_append_message(arr, "system", no_visual_observation,
+                    sizeof(no_visual_observation) - 1, NULL, NULL);
+            }
+        }
         if (json_object_array_length(arr) != before_visual_evidence)
             translated_visual_inputs = 1;
         free(media_description);
@@ -4839,12 +4856,18 @@ static char *ollama_chat_with_limit(
             "[R2 Prompt Audit] stage=%s payload_chars=%zu messages=%zu user_messages=%zu "
             "current_query_chars=%zu exact_user_turn=%d query_in_user_turn=%d "
             "robot_identity=%d startup_memory=%d retrieved_context=%d reality_context=%d capability_context=%d "
-            "learning_context=%d system_chars=%zu\n",
+            "learning_context=%d system_chars=%zu input_source=%s camera_frame=%d display_frame=%d "
+            "camera_observation=%d display_observation=%d\n",
             ollama_audit_stage ? ollama_audit_stage : "unspecified",
             strlen(payload), audit_message_count, audit_user_messages,
             audit_query_chars, audit_exact_user_turn, audit_user_turn_contained,
             audit_robot_identity, audit_startup_memory, audit_retrieved_context, audit_reality_context,
-            audit_capability_context, audit_learning_context, audit_system_chars);
+            audit_capability_context, audit_learning_context, audit_system_chars,
+            has_input_provenance ? (r2_input_speech_event ? "speech" : "typed") : "unspecified",
+            !!(current_visual_frames & R2_LIVE_CAMERA),
+            !!(current_visual_frames & R2_LIVE_DISPLAY),
+            !!(current_visual_observations & R2_LIVE_CAMERA),
+            !!(current_visual_observations & R2_LIVE_DISPLAY));
 
     OllamaRetryReason retry = OLLAMA_RETRY_NONE;
     char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
@@ -5683,7 +5706,8 @@ static char *r2_chat_with_input_source(Message *messages, size_t count,
               "The transcript supplies words, without establishing tone, volume, or who spoke beyond the evidence given."
             : "CURRENT USER INPUT: typed keyboard text. "
               "Treat the input source as internal context. Mention it only when relevant to the user's request. "
-              "Read the user's wording naturally and reply as R2 to their greeting and questions. "
+              "The user entered these words directly. Interpret the current words on their own terms even when an earlier reply misunderstood. "
+              "Reply as R2 to the greeting and questions. "
               "Report inspections, device status, or inventory details only from available evidence."
     };
     if (active_turn_history.action_result) {
