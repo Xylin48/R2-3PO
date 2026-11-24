@@ -51,10 +51,19 @@ require(
 require(
     "override_length = r2_utf8_safe_prefix_length(" in core
     and "content, OLLAMA_MAX_SYSTEM_MESSAGE_CHARS);" in core
-    and core.count("content, OLLAMA_MAX_MESSAGE_CHARS);") == 2
+    and "content, OLLAMA_MAX_MESSAGE_CHARS);" in core
     and not re.search(r"^\s+length = OLLAMA_MAX_MESSAGE_CHARS;$", core, re.MULTILINE)
     and not re.search(r"^\s+length = OLLAMA_MAX_SYSTEM_MESSAGE_CHARS;$", core, re.MULTILINE),
     "provisional Ollama byte budgets use UTF-8 boundaries before final whole-message reservation",
+)
+history_start = core.index("/* Mark recent dialogue candidates by count.")
+history_end = core.index("size_t complete_override_length", history_start)
+history_candidates = core[history_start:history_end]
+require(
+    "recent_count < OLLAMA_MAX_RECENT_MESSAGES" in history_candidates
+    and "include[index] = 1;" in history_candidates
+    and "input_budget" not in history_candidates,
+    "recent dialogue candidates reach whole-exchange selection without a provisional byte cutoff",
 )
 require(
     "r2_bound_context_records" not in core
