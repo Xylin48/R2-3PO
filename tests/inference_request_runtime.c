@@ -731,6 +731,26 @@ static void check_failed_optional_history_review(void)
     }
     assert(sqlite3_exec(fixture, "DROP TRIGGER reject_optional_context_archive;", NULL, NULL, NULL) == SQLITE_OK);
     assert(sqlite3_close(fixture) == SQLITE_OK);
+
+    /* Required input fills the compact window. There is no room for a
+       review heading or notice, but the exact request can still be sent. */
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    char *instructions = text(instructions_len, 'z', "Required fixture instructions. ");
+    Message tight[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = instructions},
+        {.role = "user", .content = (char *)query},
+    };
+    before = perform_count;
+    answer = r2_foreground_chat(tight, 3, r2_compact_conversation_policy, query, 64, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(instructions));
+    assert(!captured_contains(history) && !captured_contains("Earlier evidence review was unavailable"));
+    free(answer);
+    free(instructions);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
     free(scope.archives);
     free(history);
     r2_turn_context_reviews = NULL;

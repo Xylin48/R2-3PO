@@ -5550,13 +5550,16 @@ static char *r2_answer_after_failed_history_review(Message *messages, size_t cou
         : "Earlier evidence review was unavailable for this request and lacks a confirmed archive link. "
           "Answer from the current message and available evidence, acknowledging gaps where relevant.";
     size_t notice_length = strlen(notice);
-    if (remaining < notice_length || count >= SIZE_MAX / sizeof(Message))
-        return NULL;
+    if (count >= SIZE_MAX / sizeof(Message)) return NULL;
     Message *selected = calloc(count + 1, sizeof(*selected));
     if (!selected) return NULL;
     size_t used = 0;
-    selected[used++] = (Message){.role = "system", .content = (char *)notice};
-    remaining -= notice_length;
+    /* A notice is useful when it fits. Reserve the answer even when
+       the immutable turn already fills the window. */
+    if (notice_length <= remaining) {
+        selected[used++] = (Message){.role = "system", .content = (char *)notice};
+        remaining -= notice_length;
+    }
     for (size_t i = 0; i < count; ++i) {
         if (r2_context_can_be_reviewed(&messages[i])) {
             size_t length = strlen(messages[i].content);
@@ -5618,6 +5621,9 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     int heading_size = snprintf(NULL, 0, heading_format, (long long)INT64_MAX, "");
     if (heading_size < 0 || immutable >= capacity ||
         (size_t)heading_size >= capacity - immutable) {
+        if (optional_history && immutable <= capacity && !shutting_down)
+            return r2_answer_after_failed_history_review(messages, count, system,
+                                                          capacity - immutable, num_predict, timeout, 0);
         errno = E2BIG;
         return NULL;
     }
