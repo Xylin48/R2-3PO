@@ -347,19 +347,20 @@ class OllamaPreflightSmoke(unittest.TestCase):
         self.assertEqual(read.call_count, 3)
         self.assertIn("incomplete or invalid assistant turn", errors.getvalue())
 
-    def test_generation_limit_cannot_pass_either_probe(self) -> None:
+    def test_explicit_non_stop_completion_cannot_pass_either_probe(self) -> None:
         for vision in (False, True):
-            with self.subTest(vision=vision):
-                text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
-                image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
-                (image if vision else text)["done_reason"] = "length"
-                replies = [{"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]}, text]
-                if vision:
-                    replies.append(image)
-                with patch.object(probe, "_read_json", side_effect=replies) as read, \
-                     contextlib.redirect_stderr(io.StringIO()):
-                    self.assertFalse(probe.preflight(timeout=1))
-                self.assertEqual(read.call_count, 3 if vision else 2)
+            for reason in ("length", "cancelled", "load", "", None):
+                with self.subTest(vision=vision, reason=reason):
+                    text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
+                    image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
+                    (image if vision else text)["done_reason"] = reason
+                    replies = [{"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]}, text]
+                    if vision:
+                        replies.append(image)
+                    with patch.object(probe, "_read_json", side_effect=replies) as read, \
+                         contextlib.redirect_stderr(io.StringIO()):
+                        self.assertFalse(probe.preflight(timeout=1))
+                    self.assertEqual(read.call_count, 3 if vision else 2)
 
     def test_negated_blue_does_not_pass_the_vision_probe(self) -> None:
         with patch.object(probe, "_read_json", side_effect=[

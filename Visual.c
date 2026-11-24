@@ -793,6 +793,7 @@ payload_ready:
             strcmp(json_object_get_string(role), "assistant") == 0;
         int has_reason = parsed && json_object_object_get_ex(parsed, "done_reason", &reason);
         if (has_reason && (!json_object_is_type(reason, json_type_string) ||
+            json_object_get_string_len(reason) == 0 ||
             strlen(json_object_get_string(reason)) != (size_t)json_object_get_string_len(reason)))
             complete_assistant_turn = 0;
         if (complete_assistant_turn && json_object_object_get_ex(message, "content", &content) &&
@@ -804,6 +805,9 @@ payload_ready:
             } else if (has_reason && !strcmp(json_object_get_string(reason), "length")) {
                 r2_log_sensory("vision_output_limit_reached", "Vision generation stopped at its limit; partial evidence is not a visual observation.",
                                text && *text ? text : "No final-channel text was returned; private reasoning was not archived.", model);
+            } else if (has_reason && strcmp(json_object_get_string(reason), "stop") != 0) {
+                r2_log_sensory("vision_invalid_completion_contract",
+                               "R2 rejected vision output with a non-stop completion reason.", NULL, model);
             } else if (text && *text) answer = strdup(text);
         } else {
             r2_log_sensory("vision_invalid_completion_contract",

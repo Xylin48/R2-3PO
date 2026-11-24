@@ -1418,11 +1418,14 @@ static void check_foreground_answer_replay(void)
                                       query, 512, 60, NULL));
     assert(perform_count == before + 2);
 
-    set_response("Partial generated answer.", "length", 1);
-    before = perform_count;
-    assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
-                                      query, 512, 60, NULL));
-    assert(perform_count == before + 1);
+    const char *non_stop_reasons[] = {"length", "cancelled", "load", "missing"};
+    for (size_t i = 0; i < sizeof(non_stop_reasons) / sizeof(non_stop_reasons[0]); ++i) {
+        set_response("We put the blue book there.", non_stop_reasons[i], 1);
+        before = perform_count;
+        assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                          query, 512, 60, NULL));
+        assert(perform_count == before + 1);
+    }
     ollama_authoritative_user_query = NULL;
     ollama_audit_stage = NULL;
     ollama_foreground_turn_mode = 0;

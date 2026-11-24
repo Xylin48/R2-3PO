@@ -5175,6 +5175,20 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
         free(result); json_object_put(resp); return NULL;
     }
 
+    /* Older Ollama responses may omit the reason. An explicit reason must
+       confirm that generation stopped normally before the reply can be used. */
+    if (done_reason_obj && strcmp(done_reason, "stop") != 0) {
+        fprintf(stderr, "[R2 Ollama] Rejected a reply with a non-stop completion reason (stage=%s).\n",
+                ollama_audit_stage ? ollama_audit_stage : "unspecified");
+        if (r2_log_is_initialized())
+            r2_log_event(R2_LOG_ERROR, "ollama_invalid_completion_contract",
+                         "Ollama reported a completion reason other than a normal stop.",
+                         ollama_audit_stage, MODEL);
+        free(result);
+        json_object_put(resp);
+        return NULL;
+    }
+
     if (!result) {
         /*
          * Do not print the model's private thinking text. Its presence/length,

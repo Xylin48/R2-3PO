@@ -154,12 +154,11 @@ def _report_inference_http_error(exc: urllib.error.HTTPError, failure: str) -> N
 def _is_complete_assistant_turn(reply: dict[str, Any]) -> bool:
     """Match the core's non-streaming Ollama completion contract."""
     message = reply.get("message")
-    reason = reply.get("done_reason", "missing")
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and reply.get("done") is True
-        and isinstance(reason, str) and bool(reason) and "\x00" not in reason and reason != "length"
+        and reply.get("done_reason", "stop") == "stop"
     )
 
 
