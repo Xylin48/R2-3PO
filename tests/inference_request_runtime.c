@@ -1387,6 +1387,47 @@ static void check_compact_ranked_memory(void)
     db = NULL;
 }
 
+static void check_foreground_answer_replay(void)
+{
+    const char *query = "Which book did we put on the shelf?";
+    Message turn = {.role = "user", .content = (char *)query};
+    ollama_foreground_turn_mode = 1;
+    ollama_audit_stage = "conversation-answer";
+    ollama_authoritative_user_query = query;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    set_response("We put the blue book there.", "stop", 1);
+    const CURLcode results[] = {CURLE_OK, CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); ++i) {
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_result = results[i];
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                query, 512, 60, NULL);
+        assert(reply && !strcmp(reply, "We put the blue book there."));
+        assert(perform_count == before + 2 && !isolated_retry_payload);
+        assert(captured_contains(query));
+        free(reply);
+    }
+    invalid_body_at = 0;
+    invalid_body_result = CURLE_OK;
+    free(response_body);
+    response_body = strdup("{\"done\":");
+    assert(response_body);
+    int before = perform_count;
+    assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                      query, 512, 60, NULL));
+    assert(perform_count == before + 2);
+
+    set_response("Partial generated answer.", "length", 1);
+    before = perform_count;
+    assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                      query, 512, 60, NULL));
+    assert(perform_count == before + 1);
+    ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+    ollama_foreground_turn_mode = 0;
+}
+
 static void check_isolated_response_replay(void)
 {
     const char *policy = "Read the complete evidence.";
@@ -1861,6 +1902,7 @@ int main(void)
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
     check_isolated_response_replay();
+    check_foreground_answer_replay();
     check_memory_response_replay();
     check_context_pressure_does_not_rewrite_short_turn();
     check_foreground_input_provenance();

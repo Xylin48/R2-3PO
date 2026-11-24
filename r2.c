@@ -4871,11 +4871,14 @@ static char *ollama_chat_with_limit(
 
     OllamaRetryReason retry = OLLAMA_RETRY_NONE;
     char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
+    int foreground_answer = ollama_foreground_turn_mode && ollama_audit_stage &&
+        !strcmp(ollama_audit_stage, "conversation-answer");
     if (!result && retry == OLLAMA_RETRY_INCOMPLETE_RESPONSE &&
-        ollama_isolated_request && !shutting_down) {
-        /* A failed evidence fragment otherwise restarts the entire review.
-           Replay only the current request. The normal request gate can defer it. */
-        fprintf(stderr, "[R2 Ollama] Replaying one isolated request after an incomplete or invalid response.\n");
+        (ollama_isolated_request || foreground_answer) && !shutting_down) {
+        /* Replay the serialized request only. Keep the same evidence, and
+           return no action text until the response can be parsed. */
+        fprintf(stderr, "[R2 Ollama] Replaying one %s request after an incomplete or invalid response.\n",
+                ollama_isolated_request ? "isolated" : "foreground answer");
         result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
     }
     json_object_put(root);
