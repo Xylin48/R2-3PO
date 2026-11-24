@@ -184,6 +184,7 @@ static _Thread_local struct timespec ollama_progress_last_notice_at;
 static _Thread_local int ollama_progress_clock_valid = 0;
 /* Original user query for the active contextual conversation request. */
 static _Thread_local const char *ollama_authoritative_user_query = NULL;
+static _Thread_local const char *ollama_original_reviewed_query = NULL;
 /* Only explicit foreground turns and autonomous reflection may receive live raw imagery. */
 static _Thread_local int ollama_autonomous_sensory_input = 0;
 static _Thread_local int ollama_isolated_request = 0;
@@ -4798,7 +4799,8 @@ static char *ollama_chat_with_limit(
     int audit_reality_context = 0;
     int audit_capability_context = 0;
     int audit_learning_context = 0;
-    const char *audit_query = ollama_authoritative_user_query;
+    const char *audit_query = ollama_original_reviewed_query
+        ? ollama_original_reviewed_query : ollama_authoritative_user_query;
     size_t audit_query_chars = audit_query ? strlen(audit_query) : 0;
     for (size_t i = 0; i < json_object_array_length(arr); ++i) {
         struct json_object *entry = json_object_array_get_idx(arr, i);
@@ -4850,7 +4852,7 @@ static char *ollama_chat_with_limit(
             "current_query_chars=%zu exact_user_turn=%d query_in_user_turn=%d "
             "robot_identity=%d startup_memory=%d retrieved_context=%d reality_context=%d capability_context=%d "
             "learning_context=%d system_chars=%zu input_source=%s camera_frame=%d display_frame=%d "
-            "camera_observation=%d display_observation=%d\n",
+            "camera_observation=%d display_observation=%d reviewed_user_turn=%d\n",
             ollama_audit_stage ? ollama_audit_stage : "unspecified",
             strlen(payload), audit_message_count, audit_user_messages,
             audit_query_chars, audit_exact_user_turn, audit_user_turn_contained,
@@ -4860,7 +4862,8 @@ static char *ollama_chat_with_limit(
             !!(current_visual_frames & R2_LIVE_CAMERA),
             !!(current_visual_frames & R2_LIVE_DISPLAY),
             !!(current_visual_observations & R2_LIVE_CAMERA),
-            !!(current_visual_observations & R2_LIVE_DISPLAY));
+            !!(current_visual_observations & R2_LIVE_DISPLAY),
+            ollama_original_reviewed_query != NULL);
 
     OllamaRetryReason retry = OLLAMA_RETRY_NONE;
     char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
@@ -5514,9 +5517,12 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     fprintf(stderr, "[R2 Context] Using complete selected policies and state views in the smaller conversation window.\n");
     const char *previous_query = ollama_authoritative_user_query;
     const char *effective_query = reviewed_query ? reviewed_query : query;
+    const char *previous_original = ollama_original_reviewed_query;
     ollama_authoritative_user_query = effective_query;
+    if (reviewed_query) ollama_original_reviewed_query = query;
     answer = r2_foreground_chat(selected, selected_count, r2_compact_conversation_policy,
                                  effective_query, num_predict, timeout);
+    ollama_original_reviewed_query = previous_original;
     ollama_authoritative_user_query = previous_query;
 cleanup:
     free(focused_retrieval);
