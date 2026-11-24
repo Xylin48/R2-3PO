@@ -5377,7 +5377,8 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
                 tv ? "TV:\n" : "", tv_state ? tv_state : tv ? "Unavailable.\n" : "") < 0)
         goto cleanup;
 
-    size_t total = strlen(r2_compact_conversation_policy) + (state ? strlen(state) : 0);
+    size_t policy_length = strlen(r2_compact_conversation_policy);
+    size_t total = policy_length + (state ? strlen(state) : 0);
     size_t result_index = SIZE_MAX, result_length = 0;
     for (size_t i = user; i < count; ++i) {
         if (messages[i].role && strcmp(messages[i].role, "system")) {
@@ -5397,14 +5398,19 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             total = total - result_length + strlen(reviewed_result);
     }
     size_t query_length = strlen(query);
-    if (total > capacity && total - query_length < capacity) {
+    /* Context from a state view or tool result must never turn a normal
+       current message into a model paraphrase. Reserve review for input
+       that cannot fit alongside even the compact conversation policy. */
+    int query_requires_review = policy_length < capacity && query_length > capacity - policy_length;
+    if (query_requires_review && total > capacity && total - query_length < capacity) {
         reviewed_query = r2_review_current_turn(query, capacity - (total - query_length));
         if (reviewed_query)
             total = total - query_length + strlen(reviewed_query);
     }
     /* Both a long user message and a long result may need review on the same
        follow-up. Allocate their notes together while keeping both sources distinct. */
-    if (total > capacity && !reviewed_result && !reviewed_query && result_index != SIZE_MAX) {
+    if (query_requires_review && total > capacity && !reviewed_result &&
+        !reviewed_query && result_index != SIZE_MAX) {
         size_t other = total - query_length - result_length;
         if (other < capacity && capacity - other >= 1024) {
             size_t shared = (capacity - other) / 2;

@@ -1412,6 +1412,29 @@ static void check_first_answer_with_unavailable_source(void)
     db = NULL;
 }
 
+static void check_context_pressure_does_not_rewrite_short_turn(void)
+{
+    const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
+                        "since we last spoke. with each passing moon i find myself wondering when we might converse once more";
+    char *longer_query = text(720, 'q', query);
+    char *followup = text(4096, 'a', "[R2_INTERNAL_TOOL_REQUEST] ");
+    Message turn[] = {
+        {.role = "user", .content = longer_query},
+        {.role = "assistant", .content = followup},
+    };
+    /* The greeting and policy fit by themselves. The same-turn handoff
+       exhausts the remaining room. Even if the reviewer could generate
+       shorter wording, this case must never send the greeting for review. */
+    size_t capacity = strlen(r2_compact_conversation_policy) + strlen(followup) + strlen(longer_query) - 1;
+    set_response("Review fixture.", "stop", 1);
+    int requests_before = perform_count;
+    errno = 0;
+    assert(!r2_compact_foreground_chat(turn, 2, 0, longer_query, 64, 60, capacity));
+    assert(errno == E2BIG && perform_count == requests_before);
+    free(followup);
+    free(longer_query);
+}
+
 static void check_foreground_input_provenance(void)
 {
     const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
@@ -1715,6 +1738,7 @@ int main(void)
     assert(cleanup_count == perform_count + 2);
     check_isolated_response_replay();
     check_memory_response_replay();
+    check_context_pressure_does_not_rewrite_short_turn();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
