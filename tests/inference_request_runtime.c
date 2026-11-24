@@ -420,6 +420,27 @@ static void check_oversized_history_leaves_room_for_complete_exchange(void)
     free(long_answer);
 }
 
+static void check_malformed_conversation_input(void)
+{
+    const char *invalid[] = {
+        "Bad continuation: \x80",
+        "Overlong: \xC0\xAF",
+        "Surrogate: \xED\xA0\x80",
+        "Past Unicode range: \xF4\x90\x80\x80",
+        "Missing tail: \xF0\x9F",
+    };
+    int before = perform_count;
+    size_t history_count = messages.count;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        assert(!r2_input_is_utf8(invalid[i]));
+        char *reply = r2_talk(invalid[i]);
+        assert(reply && strstr(reply, "invalid UTF-8"));
+        free(reply);
+    }
+    assert(perform_count == before && messages.count == history_count);
+    assert(r2_input_is_utf8("ASCII; caf\xC3\xA9; \xE2\x98\x83; \xF0\x9F\x99\x82"));
+}
+
 static void check_history_slots_count_only_complete_exchanges(void)
 {
     char *oversized = text(14000, 'x', "Oversized reply that cannot fit. ");
@@ -1894,6 +1915,7 @@ int main(void)
     check_optional_snapshots_yield_to_dialogue();
     check_oversized_history_leaves_room_for_complete_exchange();
     check_history_slots_count_only_complete_exchanges();
+    check_malformed_conversation_input();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();

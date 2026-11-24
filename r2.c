@@ -15473,6 +15473,11 @@ finalize_reply:
  */
 char *r2_talk(const char *message)
 {
+    if (message && !r2_input_is_utf8(message)) {
+        fprintf(stderr, "[R2 Input Audit] Rejected a conversation turn with invalid UTF-8.\n");
+        return xstrdup("I couldn't read that message because it contains invalid UTF-8. "
+                       "Please resend it as text.");
+    }
     /* Reset autonomous-reflection idleness before waiting for the turn lock,
        so queued user turns also take priority over background thought. */
     /* Announce foreground intent before waiting for the turn lock. Background
