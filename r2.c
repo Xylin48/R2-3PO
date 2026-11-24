@@ -5385,6 +5385,20 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
 
     size_t policy_length = strlen(r2_compact_conversation_policy);
     size_t total = policy_length + (state ? strlen(state) : 0);
+    /* The compact path always retains unclassified required instructions,
+       including the input source, action phase, and unavailable-state notices.
+       Reserve them before sizing reviews or considering historical material. */
+    for (size_t i = 0; i < count; ++i) {
+        const Message *m = &messages[i];
+        if (!m->role || strcmp(m->role, "system") || !m->content ||
+            r2_inference_system_priority(m->content, query) < 5 ||
+            !r2_inference_unit_required(m, i, user) || r2_context_can_be_reviewed(m))
+            continue;
+        size_t length = strlen(m->content);
+        if (length > SIZE_MAX - total) goto cleanup;
+        total += length;
+        policy_length += length;
+    }
     size_t result_index = SIZE_MAX, result_length = 0;
     for (size_t i = user; i < count; ++i) {
         if (messages[i].role && strcmp(messages[i].role, "system")) {
@@ -5406,7 +5420,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     size_t query_length = strlen(query);
     /* Context from a state view or tool result must never turn a normal
        current message into a model paraphrase. Reserve review for input
-       that cannot fit alongside even the compact conversation policy. */
+       that cannot fit alongside the compact policy and required instructions. */
     int query_requires_review = policy_length < capacity && query_length > capacity - policy_length;
     if (query_requires_review && total > capacity && total - query_length < capacity) {
         reviewed_query = r2_review_current_turn(query, capacity - (total - query_length));
@@ -5464,11 +5478,9 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             !r2_capability_section_matches_query(m.content, query)) continue;
         size_t length = strlen(m.content);
         if (priority >= 5) {
-            /* Preserve complete optional history for the normal allocator.
-               Charge required system messages before adding focused memory. */
+            /* Required instructions are reserved above. The final allocator
+               budgets optional snapshots after recent dialogue. */
             selected[selected_count++] = m;
-            if (r2_inference_unit_required(&m, i, user))
-                total += length <= capacity - total ? length : capacity - total;
         } else if (length <= capacity - total) {
             selected[selected_count++] = m;
             total += length;

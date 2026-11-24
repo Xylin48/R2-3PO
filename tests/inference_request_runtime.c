@@ -1644,6 +1644,38 @@ static void check_first_answer_with_unavailable_source(void)
     db = NULL;
 }
 
+static void check_compact_reserves_current_instructions_before_history(void)
+{
+    const char *query = "Which one did we decide on?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text. Use the user's exact words.";
+    const char *stale = "CURRENT REALITY STATUS: The live world snapshot could not be refreshed.";
+    const char *previous_question = "Which shelf should hold the blue book?";
+    const char *previous_answer = "Let's use the top shelf.";
+    size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    char *history = text(history_size, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    Message turn[] = {
+        {.role = "system", .content = (char *)source},
+        {.role = "system", .content = (char *)stale},
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)previous_question},
+        {.role = "assistant", .content = (char *)previous_answer},
+        {.role = "user", .content = (char *)query},
+    };
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("The top shelf.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_compact_foreground_chat(turn, sizeof(turn) / sizeof(turn[0]),
+                                            5, query, 64, 60, capacity);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(source) && captured_contains(stale));
+    assert(captured_contains(previous_question) && captured_contains(previous_answer));
+    assert(!captured_contains("RECENT CONVERSATION CONTEXT"));
+    free(reply);
+    free(history);
+}
+
 static void check_context_pressure_does_not_rewrite_short_turn(void)
 {
     const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
@@ -2003,6 +2035,7 @@ int main(void)
     check_foreground_answer_replay();
     check_memory_response_replay();
     check_context_pressure_does_not_rewrite_short_turn();
+    check_compact_reserves_current_instructions_before_history();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
