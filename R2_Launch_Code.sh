@@ -235,6 +235,18 @@ if pgrep -x r2 >/dev/null 2>&1; then
     exit 1
 fi
 
+# Check from the desktop account before restricting r2 to port 11434.
+# Otherwise an independently started server on 11435 can escape detection
+# while still sharing the GPU with the desktop Ollama service.
+if { command -v systemctl >/dev/null 2>&1 &&
+     systemctl is-active --quiet r2-ollama.service 2>/dev/null; } ||
+   curl --noproxy 127.0.0.1 --silent --fail --max-time 2 \
+       http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
+    echo "ERROR: The separate R2 Ollama service or API on port 11435 is active."
+    echo "Stop that server before interactive launch so both Ollama servers do not compete for the GPU."
+    exit 1
+fi
+
 echo "[Network] Applying R2-only network isolation..."
 if ! r2_apply_network_lock; then
     r2_remove_network_lock

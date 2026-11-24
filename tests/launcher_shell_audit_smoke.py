@@ -87,3 +87,15 @@ require('TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"' in launcher
         and 'mv -f "$TEMP_EXEC" "$R2_EXEC"' in launcher,
         "launcher preserves the last known-good executable until a successful build")
 print("Launcher/core/module consistency smoke test passed.")
+
+conflict_start = launcher.index("# Check from the desktop account before restricting r2")
+isolation_start = launcher.index("if ! r2_apply_network_lock; then")
+conflict_check = launcher[conflict_start:isolation_start]
+require(
+    conflict_start < isolation_start
+    and "systemctl is-active --quiet r2-ollama.service" in conflict_check
+    and "http://127.0.0.1:11435/api/tags" in conflict_check
+    and "run_as_r2" not in conflict_check
+    and "exit 1" in conflict_check,
+    "launcher checks for an active service or second Ollama API before restricting the runtime account",
+)
