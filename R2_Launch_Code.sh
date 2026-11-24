@@ -67,6 +67,7 @@ run_as_r2() {
 R2_NETWORK_LOCK_ACTIVE=0
 OBSERVER_XHOST_GRANTED=0
 OBSERVER_PID=""
+R2_DIAGNOSTICS_DIR=""
 
 # Observer/display cleanup must run for every exit path, not only after R2
 # returns normally. In particular, an early launch failure after opening the
@@ -106,6 +107,10 @@ r2_network_cleanup() {
     local exit_status=$?
     trap - EXIT
     r2_observer_cleanup
+    if [[ -n "$R2_DIAGNOSTICS_DIR" ]]; then
+        rm -f -- "$R2_DIAGNOSTICS_DIR/Debug.txt"
+        rmdir -- "$R2_DIAGNOSTICS_DIR"
+    fi
     if [[ "$R2_NETWORK_LOCK_ACTIVE" -eq 1 ]]; then
         if r2_remove_network_lock; then
             echo "[Network] R2-only network lock removed."
@@ -824,6 +829,30 @@ echo "Launching R2..."
 printf 'R2 diagnostics are saved in %s.\n' "$R2_ROOT/R2_Log/Debug.txt"
 echo
 
+# The terminal runs as the desktop user. Mirror the live stream into a
+# private temporary file so the saved log can remain accessible only to r2.
+R2_DIAGNOSTICS_TERMINAL=()
+if command -v ptyxis >/dev/null 2>&1; then
+    R2_DIAGNOSTICS_TERMINAL=(ptyxis --new-window --title="R2 Diagnostics" --)
+elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    R2_DIAGNOSTICS_TERMINAL=(x-terminal-emulator -e)
+fi
+R2_MIRROR_DIAGNOSTICS=0
+exec {R2_CORE_STDERR}>&2
+if [[ "${R2_LIVE_DIAGNOSTICS:-0}" == 1 ]]; then
+    if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" && ${#R2_DIAGNOSTICS_TERMINAL[@]} -gt 0 ]] &&
+       R2_DIAGNOSTICS_DIR="$(mktemp -d -- /tmp/r2-diagnostics.XXXXXX)" &&
+       : >"$R2_DIAGNOSTICS_DIR/Debug.txt"; then
+        exec {R2_CORE_STDERR}>&-
+        exec {R2_CORE_STDERR}>>"$R2_DIAGNOSTICS_DIR/Debug.txt"
+        R2_MIRROR_DIAGNOSTICS=1
+        "${R2_DIAGNOSTICS_TERMINAL[@]}" tail --pid="$$" -n +1 -f -- \
+            "$R2_DIAGNOSTICS_DIR/Debug.txt" </dev/null >/dev/null 2>&1 &
+    else
+        echo "WARNING: Could not open the live diagnostics window. See the saved Debug.txt." >&2
+    fi
+fi
+
 # Apply the private clock only to the core and its children.
 run_as_r2 env \
     DISPLAY="${DISPLAY:-}" \
@@ -852,9 +881,10 @@ run_as_r2 env \
             exec "$1" 2> >(tee -a -- "$2" >&2)
         fi
         exec "$1" 2>>"$2"
-    ' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"
+    ' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt" "$R2_MIRROR_DIAGNOSTICS" 2>&"$R2_CORE_STDERR"
 
 status=$?
+exec {R2_CORE_STDERR}>&-
 
 # Also clean up immediately after a normal R2 exit; the EXIT trap is an
 # idempotent fallback for all early exits and signals.
