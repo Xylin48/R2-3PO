@@ -10682,16 +10682,18 @@ static char *memory_decision(
        uncertainty. A length-limited line is never submitted to the ledger. */
     int budget = 384;
     char *res;
+    /* Both direct and reviewed decisions belong to the saved exchange,
+       not to a live conversation or newly arriving sensory evidence. */
+    int previous_isolated = ollama_isolated_request;
+    int previous_sensory_input = ollama_autonomous_sensory_input;
+    const char *previous_stage = ollama_audit_stage;
+    const char *previous_query = ollama_authoritative_user_query;
+    ollama_isolated_request = 1;
+    ollama_autonomous_sensory_input = 0;
+    ollama_audit_stage = "post-turn-memory";
+    ollama_authoritative_user_query = NULL;
     if (r2_fit_complete_input(strlen(sys) + strlen(u), r2_ollama_context_tokens(), &budget) == 0) {
-        /* The saved exchange owns this decision. Retry a damaged response
-           without adding live sensor data or changing the original evidence. */
-        int previous_isolated = ollama_isolated_request;
-        const char *previous_stage = ollama_audit_stage;
-        ollama_isolated_request = 1;
-        ollama_audit_stage = "post-turn-memory";
         res = ollama_chat_with_limit(&m, 1, sys, budget, 90L);
-        ollama_audit_stage = previous_stage;
-        ollama_isolated_request = previous_isolated;
     } else {
         char task[320];
         snprintf(task, sizeof(task),
@@ -10701,6 +10703,10 @@ static char *memory_decision(
             (long long)source_event_id);
         res = generate_with_private_evidence(sys, task, u, NULL, archive_id);
     }
+    ollama_authoritative_user_query = previous_query;
+    ollama_audit_stage = previous_stage;
+    ollama_autonomous_sensory_input = previous_sensory_input;
+    ollama_isolated_request = previous_isolated;
 
     free(u);
 
