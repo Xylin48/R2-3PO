@@ -4848,34 +4848,31 @@ static char *ollama_chat_with_limit(
         return NULL;
     }
 
-    /*
-     * The provisional input budget precedes Qwen3-VL inference. Camera and
-     * display observations are newly generated text and may increase the
-     * final Llama input. Account for their real serialized contents (plus
-     * message-template overhead) before submitting any chat payload.
-     * Never silently clip the authoritative user turn, memory or visual
-     * evidence to make an overflowing request appear successful.
-     */
-    if (translated_visual_inputs) {
-        size_t final_input_bytes = 0;
-        for (size_t i = 0; i < json_object_array_length(chat_messages); ++i) {
-            struct json_object *message = json_object_array_get_idx(chat_messages, i);
-            struct json_object *content_value = NULL;
-            if (!message || !json_object_object_get_ex(message, "content", &content_value) ||
-                !json_object_is_type(content_value, json_type_string)) {
-                json_object_put(arr);
-                json_object_put(root);
-                return NULL;
-            }
-            size_t content_bytes = (size_t)json_object_get_string_len(content_value);
-            if (final_input_bytes > SIZE_MAX - 64U ||
-                content_bytes > SIZE_MAX - final_input_bytes - 64U) {
-                json_object_put(arr);
-                json_object_put(root);
-                return NULL;
-            }
-            final_input_bytes += content_bytes + 64U;
+    /* Measure the actual joined text on every request. Visual translation
+     * can add evidence after selection; retain its existing extra template
+     * allowance. For ordinary requests the final allocator already accounts
+     * for the complete content and inter-section delimiters. */
+    size_t final_input_bytes = 0;
+    for (size_t i = 0; i < json_object_array_length(chat_messages); ++i) {
+        struct json_object *message = json_object_array_get_idx(chat_messages, i);
+        struct json_object *content_value = NULL;
+        if (!message || !json_object_object_get_ex(message, "content", &content_value) ||
+            !json_object_is_type(content_value, json_type_string)) {
+            json_object_put(arr);
+            json_object_put(root);
+            return NULL;
         }
+        size_t content_bytes = (size_t)json_object_get_string_len(content_value);
+        size_t template_bytes = translated_visual_inputs ? 64U : 0U;
+        if (final_input_bytes > SIZE_MAX - template_bytes ||
+            content_bytes > SIZE_MAX - final_input_bytes - template_bytes) {
+            json_object_put(arr);
+            json_object_put(root);
+            return NULL;
+        }
+        final_input_bytes += content_bytes + template_bytes;
+    }
+    if (translated_visual_inputs) {
         int original_predict = num_predict;
         if (r2_fit_complete_input(final_input_bytes, num_ctx, &num_predict) != 0) {
             fprintf(stderr, "[R2 Ollama] Full translated input exceeds context "
@@ -4895,7 +4892,14 @@ static char *ollama_chat_with_limit(
                 return NULL;
             }
         }
-
+    } else if (final_input_bytes > actual_input_budget) {
+        fprintf(stderr, "[R2 Ollama] Final content allocation mismatch "
+                        "(serialized_bytes=%zu, allocated_bytes=%zu).\n",
+                final_input_bytes, actual_input_budget);
+        json_object_put(arr);
+        json_object_put(root);
+        errno = EOVERFLOW;
+        return NULL;
     }
 
     const char *payload = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
