@@ -120,35 +120,57 @@ int main(void)
     verify_complete_reads();
 
     const char *keywords[] = {"DIARY-END", "DIARY"};
-    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 1);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search, NULL), diary_text, 1);
     assert(r2_diary_write(diary_text) == 0);
-    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search), diary_text, 2);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search, NULL), diary_text, 2);
     keywords[0] = "VISUAL-END";
     keywords[1] = "visual-source";
-    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 1);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search, NULL), visual_text, 1);
     insert_visual(connection, visual_text, 3);
-    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search), visual_text, 2);
+    expect_copies(r2_collect_associated_records(keywords, 2, r2_visual_visit_search, NULL), visual_text, 2);
     char *visual_context = strdup("");
     assert(visual_context);
-    assert(r2_append_visual_associations(&visual_context, keywords, 1, 1) == 0);
+    assert(r2_append_visual_associations(&visual_context, keywords, 1, 1, NULL) == 0);
     assert(strstr(visual_context, "RELATED VISUAL EXPERIENCES"));
     assert(strstr(visual_context, "PRIOR VISUAL EXPERIENCES"));
+    assert(strstr(visual_context, "another visual row"));
+    expect_copies(visual_context, visual_text, 2);
+    /* Keep the same two full selected records and report the third match. */
+    int incomplete = 0;
+    assert(r2_diary_write(diary_text) == 0);
+    keywords[0] = "DIARY-END";
+    char *bounded = r2_collect_associated_records(keywords, 1,
+        r2_diary_visit_search, &incomplete);
+    assert(incomplete);
+    expect_copies(bounded, diary_text, 2);
+    insert_visual(connection, visual_text, 4);
+    keywords[0] = "VISUAL-END";
+    incomplete = 0;
+    bounded = r2_collect_associated_records(keywords, 1,
+        r2_visual_visit_search, &incomplete);
+    assert(incomplete);
+    expect_copies(bounded, visual_text, 2);
+    visual_context = strdup("");
+    assert(visual_context);
+    incomplete = 0;
+    assert(r2_append_visual_associations(&visual_context, keywords, 1, 1,
+        &incomplete) == 0 && incomplete);
     assert(strstr(visual_context, "another visual row"));
     expect_copies(visual_context, visual_text, 2);
     char *long_pattern = make_text('j', 55000, "%_literal-long-pattern");
     assert(r2_diary_write(long_pattern) == 0);
     const char *literal_keywords[] = {long_pattern};
-    expect_copies(r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search), long_pattern, 1);
+    expect_copies(r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search, NULL), long_pattern, 1);
     expect_copies(r2_diary_search("jj%_literal-long%pattern", 1), long_pattern, 1);
     literal_keywords[0] = "jj%_literal-long%pattern";
-    empty = r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search);
+    empty = r2_collect_associated_records(literal_keywords, 1, r2_diary_visit_search, NULL);
     assert(empty && !*empty);
     free(empty);
     assert(r2_log_conversation_turn(long_pattern, "This is its full receipt") > 0);
     expect_copies(r2_log_search(long_pattern, 1), long_pattern, 1);
     expect_copies(r2_sj_search(long_pattern, 1), long_pattern, 1);
     free(long_pattern);
-    expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel), "TAIL");
+    expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel, NULL), "TAIL");
     expect_copies(r2_visual_search("not-in-the-fixture", 2), "(No visual experiences found.)\n", 1);
     char *assembled = strdup(memory_text); assert(assembled);
     assert(r2_append_association_section(&assembled, "DIARY:\n", diary_text) == 0);
@@ -174,13 +196,13 @@ int main(void)
     allowed_rows = 1; assert(!r2_diary_search("DIARY-END", 20));
     allowed_rows = 1; assert(!r2_diary_build_reflection_context(20));
     keywords[0] = "DIARY-END";
-    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_diary_visit_search));
+    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_diary_visit_search, NULL));
     failed_sql = "SELECT e.id,e.local_time,e.category,e.event_type"; allowed_rows = 1;
     assert(!r2_diary_build_reflection_context(20));
     failed_sql = "SELECT created_utc,source,model,description"; allowed_rows = 1;
     assert(!r2_visual_recent(20));
     keywords[0] = "VISUAL-END";
-    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_visual_visit_search));
+    allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_visual_visit_search, NULL));
     failed_sql = NULL;
 
     /* A byte-exact old-size allocation is the historical off-by-one bug.
