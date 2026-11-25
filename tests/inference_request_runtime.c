@@ -2229,6 +2229,37 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
     r2_associative_query_cache_clear();
 }
 
+static int followup_subject_searches;
+static int record_followup_subject_search(const char *word, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    (void)limit;
+    (void)visit;
+    (void)context;
+    if (!strcmp(word, "meteorite")) ++followup_subject_searches;
+    return 0;
+}
+
+/* A generic request for more detail must not use every diary/visual search
+ * slot before reaching the subject named in the preceding visible answer. */
+static void check_followup_subject_reaches_associated_stores(void)
+{
+    const char *query = "Could you please explain and elaborate in more detail on that?";
+    char *plan = r2_associative_fallback_query(query, "What happened?",
+                                              "I saw a meteorite.");
+    assert(plan && strstr(plan, "I saw a meteorite."));
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t count = extract_memory_keywords(plan, keywords);
+    R2HistorySelection selection = {0};
+    followup_subject_searches = 0;
+    assert(r2_collect_associated_rows(keywords, count,
+                                      record_followup_subject_search, &selection) == 0);
+    assert(followup_subject_searches == 1);
+    r2_history_release(&selection);
+    free(plan);
+    r2_associative_query_cache_clear();
+}
+
 /* The second-turn planner must see the exact preceding visible exchange,
  * not just the latest pronoun or the internal action that produced a reply. */
 static void check_associative_planner_retains_previous_exchange(void)
@@ -2648,6 +2679,7 @@ int main(void)
     check_first_answer_with_unavailable_source();
     check_literal_retrieval_cues_precede_generated_cues();
     check_associative_planner_retains_previous_exchange();
+    check_followup_subject_reaches_associated_stores();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
