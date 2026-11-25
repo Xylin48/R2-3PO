@@ -116,7 +116,7 @@ static void test_world_and_welcome_replay(void)
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s hands|diary|locked|welcome\n", argv[0]);
+        fprintf(stderr, "usage: %s hands|diary|learning|locked|welcome\n", argv[0]);
         return 2;
     }
 
@@ -152,6 +152,8 @@ int main(int argc, char **argv)
         failure_env = "R2_TEST_FAIL_HANDS_THREAD_CREATE";
     } else if (strcmp(argv[1], "diary") == 0) {
         failure_env = "R2_TEST_FAIL_DIARY_THREAD_CREATE";
+    } else if (strcmp(argv[1], "learning") == 0) {
+        failure_env = "R2_TEST_FAIL_LEARNING_THREAD_CREATE";
     } else {
         fprintf(stderr, "unknown startup failure scenario: %s\n", argv[1]);
         return 2;
