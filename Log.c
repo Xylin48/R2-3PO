@@ -3463,7 +3463,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
             "WHERE (l.from_event_id = ?1 OR l.to_event_id = ?1) "
             "AND (?2=0 OR NOT (COALESCE(e.source,'')='r2_init' AND "
             "COALESCE(e.category,'') IN ('continuity','lifecycle','system'))) "
-            "ORDER BY l.id DESC LIMIT 4;";
+            "ORDER BY l.id DESC LIMIT 5;";
         rc = sqlite3_prepare_v2(log_db, sql_links, -1, &link_statement, NULL);
         if (rc != SQLITE_OK) {
             sqlite3_finalize(statement);
@@ -3542,7 +3542,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
         }
         }
 
-        if (query && link_statement && linked_total < 8) {
+        if (query && link_statement && (linked_total < 8 || batch)) {
             sqlite3_reset(link_statement);
             sqlite3_clear_bindings(link_statement);
             int link_bind_rc = sqlite3_bind_int64(link_statement, 1, id);
@@ -3556,12 +3556,20 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
 
             int link_rc = SQLITE_OK;
             int links_for_event = 0;
+            int examined_links = 0;
             while ((link_rc = sqlite3_step(link_statement)) == SQLITE_ROW) {
+                if (++examined_links > 4) {
+                    if (batch) batch->incomplete = 1;
+                    link_rc = SQLITE_DONE; /* Probe beyond the link scan bound. */
+                    break;
+                }
                 int64_t linked_id = sqlite3_column_int64(link_statement, 2);
                 if (linked_id == id || event_id_seen(seen_ids, seen_count, linked_id))
                     continue;
-                if (linked_total >= 8 || links_for_event >= 2)
+                if (linked_total >= 8 || links_for_event >= 2) {
+                    if (batch) batch->incomplete = 1;
                     continue;
+                }
                 if (seen_count < sizeof(seen_ids) / sizeof(seen_ids[0]))
                     seen_ids[seen_count++] = linked_id;
 
