@@ -1694,6 +1694,78 @@ static void check_compact_reserves_current_instructions_before_history(void)
     free(history);
 }
 
+/* Exercise the ordinary second turn through policy selection and actual JSON
+ * serialization, not only the compact allocator with a hand-picked quota. */
+static void check_second_turn_uses_actual_wire_budget(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *first = "Hello R2, I put the blue book on the top shelf.";
+    const char *query = "Which shelf did we just agree on?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text.";
+    const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
+                   strlen(first) + strlen(query);
+    assert(capacity > fixed + 512U);
+    char *answer_text = text(capacity - fixed - 128U, 'a',
+                            "The blue book is on the top shelf. ");
+    char *identity = text(512, 'i',
+        "============================================================\n"
+        "IDENTITY AND PERSISTENT MEMORY\n");
+    char *history = text(1000, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = identity},
+        {.role = "system", .content = (char *)source},
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = answer_text},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("The top shelf.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_foreground_chat(turn, 6, r2_conversation_system_prompt,
+                                      query, 1024, 60);
+    assert(reply && !strcmp(reply, "The top shelf."));
+    assert(perform_count == before + 1);
+    assert(captured_contains(source) && captured_contains(first) &&
+           captured_contains(answer_text) && captured_contains(query));
+    assert(!captured_contains(history) && !captured_contains(identity));
+    struct json_object *array = NULL, *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t count = json_object_array_length(array);
+    assert(count >= 3);
+    const char *expected_roles[] = {"user", "assistant", "user"};
+    const char *expected_contents[] = {first, answer_text, query};
+    for (size_t i = 0; i < 3; ++i) {
+        struct json_object *entry = json_object_array_get_idx(array, count - 3 + i);
+        assert(json_object_object_get_ex(entry, "role", &value));
+        assert(!strcmp(json_object_get_string(value), expected_roles[i]));
+        assert(json_object_object_get_ex(entry, "content", &value));
+        assert(!strcmp(json_object_get_string(value), expected_contents[i]));
+    }
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_predict", &value));
+    int predict = json_object_get_int(value);
+    assert(predict >= 64 && predict <= 512);
+    size_t input_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, i),
+                                         "content", &value));
+        input_bytes += (size_t)json_object_get_string_len(value);
+    }
+    assert(input_bytes <= (size_t)(2048 - 512 - predict) * 32U / 10U);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    free(reply);
+    free(answer_text);
+    free(identity);
+    free(history);
+}
+
 static void check_context_pressure_does_not_rewrite_short_turn(void)
 {
     const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
@@ -2054,6 +2126,7 @@ int main(void)
     check_memory_response_replay();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
+    check_second_turn_uses_actual_wire_budget();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
