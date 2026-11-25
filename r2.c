@@ -10507,6 +10507,57 @@ static void *autonomous_thinking(void *arg)
    MEMORY DECISION
    ============================================================ */
 
+static char *r2_parse_memory_decision(const char *raw, const char **failure)
+{
+    char *copy = strdup(raw);
+    if (!copy) return NULL;
+    char *text = trim(copy);
+    if (!strcasecmp(text, "NONE")) {
+        free(copy);
+        return strdup("NONE");
+    }
+    char *separator = strchr(text, '|');
+    if (!separator) {
+        *failure = "missing category separator";
+        free(copy);
+        return NULL;
+    }
+    *separator = '\0';
+    const char *category = trim(text);
+    const char *memory = trim(separator + 1);
+    static const char *const allowed_categories[] = {
+        "self", "person", "experience", "preference", "knowledge", "relationship", "other"
+    };
+    const char *canonical_category = NULL;
+    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
+        if (!strcasecmp(category, allowed_categories[i])) {
+            canonical_category = allowed_categories[i];
+            break;
+        }
+    }
+    if (!canonical_category || !*memory) {
+        *failure = "invalid category or empty memory";
+        free(copy);
+        return NULL;
+    }
+    if (!strcmp(canonical_category, "self")) {
+        static const char *const identity_patterns[] = {
+            "i am ", "i'm ", "my identity is ", "i was created as ", "i was made as "
+        };
+        for (size_t i = 0; i < sizeof(identity_patterns) / sizeof(identity_patterns[0]); ++i) {
+            if (strcasestr(memory, identity_patterns[i])) {
+                free(copy);
+                return strdup("NONE");
+            }
+        }
+    }
+    char *normalized = NULL;
+    if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
+        normalized = NULL;
+    free(copy);
+    return normalized;
+}
+
 static char *memory_decision(
     const char *user,
     const char *reply,
@@ -10625,66 +10676,54 @@ static char *memory_decision(
         res = generate_with_private_evidence(sys, task, u, NULL, archive_id);
     }
 
-    free(u);
-
-    if (!res)
-        return NULL;
-
-    char *text = trim(res);
-    if (!strcasecmp(text, "NONE")) return res;
-
-    char *separator = strchr(text, '|');
-    if (!separator) {
-        fprintf(stderr, "[R2 Post-turn] Memory decision rejected: missing category separator (event %lld).\n",
-                (long long)source_event_id);
+    if (!res) { free(u); return NULL; }
+    const char *failure = NULL;
+    char *normalized = r2_parse_memory_decision(res, &failure);
+    if (failure) {
+        char summary[192];
+        snprintf(summary, sizeof(summary),
+                 "Memory decision rejected: %s (event %lld).",
+                 failure, (long long)source_event_id);
+        fprintf(stderr, "[R2 Post-turn] %s\n", summary);
         (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
-                           "The model returned a memory decision without the required category separator.",
-                           res, "memory_decision");
-        free(res);
-        return NULL;
-    }
-    *separator = '\0';
-    const char *category = trim(text);
-    const char *memory = trim(separator + 1);
-
-    static const char *const allowed_categories[] = {
-        "self", "person", "experience", "preference", "knowledge", "relationship", "other"
-    };
-    const char *canonical_category = NULL;
-    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
-        if (strcasecmp(category, allowed_categories[i]) == 0) {
-            canonical_category = allowed_categories[i];
-            break;
-        }
-    }
-    if (!canonical_category || !*memory) {
-        /* Restore the exact model output before recording the parse failure. */
-        *separator = '|';
-        fprintf(stderr, "[R2 Post-turn] Memory decision rejected: invalid category or empty memory (event %lld).\n",
-                (long long)source_event_id);
-        (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
-                           "The model returned an invalid memory category or empty memory.",
-                           res, "memory_decision");
-        free(res);
-        return NULL;
-    }
-
-    if (!strcmp(canonical_category, "self")) {
-        static const char *const identity_patterns[] = {
-            "i am ", "i'm ", "my identity is ", "i was created as ", "i was made as "
-        };
-        for (size_t i = 0; i < sizeof(identity_patterns) / sizeof(identity_patterns[0]); ++i) {
-            if (strcasestr(memory, identity_patterns[i])) {
-                free(res);
-                return strdup("NONE");
+                           summary, res, "memory_decision");
+        /* Re-evaluate the same saved exchange once. The rejected answer is
+           diagnostic evidence, not a memory and not a user statement. */
+        static const char repair[] =
+            "The previous memory decision did not match the required format. "
+            "Re-evaluate only the supplied exchange. Return exactly NONE, or one "
+            "allowed category followed by | and a supported memory. No preface, "
+            "list, explanation, or invented event.";
+        char *repair_sys = NULL;
+        int repair_budget = 384;
+        if (!shutting_down &&
+            asprintf(&repair_sys, "%s\n\n%s", sys, repair) >= 0 &&
+            r2_fit_complete_input(strlen(repair_sys) + strlen(u),
+                                  r2_ollama_context_tokens(), &repair_budget) == 0) {
+            int previous_isolated = ollama_isolated_request;
+            const char *previous_stage = ollama_audit_stage;
+            ollama_isolated_request = 1;
+            ollama_audit_stage = "post-turn-memory-format-repair";
+            char *repaired = ollama_chat_with_limit(&m, 1, repair_sys, repair_budget, 90L);
+            ollama_audit_stage = previous_stage;
+            ollama_isolated_request = previous_isolated;
+            if (repaired) {
+                failure = NULL;
+                normalized = r2_parse_memory_decision(repaired, &failure);
+                if (failure) {
+                    snprintf(summary, sizeof(summary),
+                             "Memory format repair rejected: %s (event %lld).",
+                             failure, (long long)source_event_id);
+                    fprintf(stderr, "[R2 Post-turn] %s\n", summary);
+                    (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
+                                       summary, repaired, "memory_decision");
+                }
+                free(repaired);
             }
         }
+        free(repair_sys);
     }
-
-    /* Trimming the category can insert a terminator before the separator. */
-    char *normalized = NULL;
-    if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
-        normalized = NULL;
+    free(u);
     free(res);
     return normalized;
 }

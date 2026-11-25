@@ -16,6 +16,10 @@ static int fail_predict_update;
 static const char *failed_metadata;
 static long fixture_http_status = 200;
 static char *response_body;
+static int memory_format_first_at;
+static const char memory_format_first_body[] =
+    "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+    "\"content\":\"This could be remembered, but I did not pick a category.\"}}";
 static struct json_object *captured;
 static int capture_reviews;
 static char *reviewed_bytes;
@@ -129,6 +133,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
     const char *body = defer_post_turn_request == 1 ? structured : response_body;
+    if (perform_count == memory_format_first_at) body = memory_format_first_body;
     if (perform_count == invalid_body_at) {
         static const char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
         body = invalid_body_override ? invalid_body_override : truncated_body;
@@ -1929,6 +1934,19 @@ static void check_memory_response_replay(void)
     assert(perform_count == before + 2 && !isolated_retry_payload && !ollama_isolated_request);
     assert(captured_contains("The spare key is blue.") && captured_contains("NO GENERATED R2 RESPONSE"));
     free(result);
+    set_response("knowledge | The user reported a blue key.", "stop", 1);
+    before = perform_count;
+    memory_format_first_at = before + 1;
+    result = memory_decision("The spare key is blue.", "", NULL, 0, NULL);
+    memory_format_first_at = 0;
+    assert(result && !strcmp(result, "knowledge | The user reported a blue key."));
+    assert(perform_count == before + 2 && captured_contains("The spare key is blue."));
+    assert(captured_contains("The previous memory decision did not match the required format"));
+    free(result);
+    set_response("I could remember something, but I omitted the category.", "stop", 1);
+    before = perform_count;
+    assert(!memory_decision("The spare key is blue.", "", NULL, 0, NULL));
+    assert(perform_count == before + 2);
     puts("A partial memory response was replayed against the same saved evidence.");
 }
 
