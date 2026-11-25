@@ -2622,3 +2622,15 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Source inspection at code blob `abb2d1344f0812de69b7d4e45d980d66f1028824`: `ollama_json_chat_messages` joins system sections with exactly two newline bytes for every section after the first. Required-input measurement, final optional selection, full/compact preselection, focused records/notices and historical-review fallback currently omit these bytes. The nonvisual wire path also never measures the final joined content. For a 2048-token context and 64-token generation the estimated input allowance is 4710 bytes; two system sections and user text summing to 4710 produce 4712 actual content bytes. This is an arithmetic inconsistency independent of the tokenizer approximation or heap terminators.
 - Repair the selection and measurement contract consistently, charge the actual delimiters, and test exact and one-byte-short boundaries. Do not change model safety settings, storage limits or add model requests merely to solve the arithmetic discrepancy.
 - The startup memory row format has seven literal bytes; ordinary retrieved rows have four; their existing budget checks match those formats. The CURL buffer includes the terminating NUL, and live message storage includes both role and content terminators. These are distinct from inference content bytes. A fresh local Git checkout attempt failed with DNS resolution for github.com; source inspection is via the GitHub connection. Native runtime validation remains pending.
+
+
+### R2-AUD-2026-11-24-304 — Text bridge mismeasures workspace reads with embedded NUL bytes
+
+- Confirmed in `r2_diary.c` at blob `3631e5d744e08decabcba04e82cbca18c4400765`: the low-level chunk reader reports the actual length and next offset, but `r2_workspace_read_chunk_tool` uses strlen(result) to allocate and place metadata. Embedded NUL bytes therefore cause the returned text to omit subsequent bytes while the metadata advances across them. FILE_READ likewise passes an embedded-NUL buffer to a text-only interface.
+- Correct the text bridge using the returned byte count and exactly measured metadata length. Keep the binary-capable low-level APIs intact; explicitly report when bytes cannot be represented in this C-string interface rather than returning misleading content or offsets. Test raw binary reads, ordinary text, and EOF.
+- Status: confirmed before repair.
+
+### R2-AUD-2026-11-24-305 — Workspace listing/search output cap uses estimated rather than exact row sizes
+
+- The bounded listing and search builders use conservative fixed additions to estimate row sizes before formatting, rather than measuring the actual format. A final row that would fit can be omitted; near the output cap the omission notice may itself not fit. This is a completeness/accounting issue, not an established heap overflow.
+- Status: open. Measure actual formatted sizes and reserve/report the omission notice without changing the established output cap. Do not confuse the intentional cap with the arithmetic defect.
