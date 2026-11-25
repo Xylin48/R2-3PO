@@ -2571,12 +2571,16 @@ static void check_rejected_memory_output_retains_evidence(void)
     const char *invalid[] = {
         "  This response lacks its category.  \n",
         "  imagination | An unsupported category. \n",
-        "  knowledge |  \t\n"
+        "  knowledge |  \t\n",
+        "knowledge | The user reported a blue notebook.\n"
+        "relationship | An unverified second memory.\n"
     };
-    const char *reasons[] = {"missing category separator", "unknown category", "empty memory"};
+    const char *reasons[] = {
+        "missing category separator", "unknown category", "empty memory", "multiple decision lines"
+    };
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         set_response(invalid[i], "stop", 1);
         int before = perform_count;
         assert(!memory_decision("Memory parser fixture.", "This is the recorded response.",
@@ -2595,6 +2599,23 @@ static void check_rejected_memory_output_retains_evidence(void)
         assert(strstr((const char *)sqlite3_column_text(st, 1), reasons[i]));
         sqlite3_finalize(st);
     }
+    /* The real post-turn caller must not save either line or acknowledge the
+       source exchange after receiving this malformed decision. */
+    set_response(invalid[3], "stop", 1);
+    preserve_evidence_memory("Memory parser fixture.", "This is the recorded response.",
+                             NULL, event);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM memories WHERE memory LIKE '%unverified second memory%';",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM r2_log_pending_learning WHERE event_id=?;",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, event) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
     assert(sqlite3_close(connection) == SQLITE_OK);
     assert(r2_log_ack_learning(event) == 0);
 }
