@@ -5476,7 +5476,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     /* Reserve history before selecting optional retrieval. The serializer
        can lower num_predict to fit the complete selected input. */
     if (recent_reserve > history_budget - (total < history_budget ? total : history_budget))
-        history_budget = total + recent_reserve;
+        history_budget = total;
     else
         history_budget -= recent_reserve;
 
@@ -5530,7 +5530,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
         if (num_predict >= 64 && num_predict < ctx - 512)
             input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
         if (recent_reserve > input_bytes - (total < input_bytes ? total : input_bytes))
-            input_bytes = total + recent_reserve;
+            input_bytes = total;
         else
             input_bytes -= recent_reserve;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
