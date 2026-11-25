@@ -1422,6 +1422,9 @@ static void check_structured_report_evidence(void)
         assert(sqlite3_column_int(st, 6) == 4 * valid);
         sqlite3_finalize(st);
     }
+    /* This fixture exercises only structured extraction, not learning.
+       Acknowledge its unrelated pending learning before queue tests. */
+    assert(r2_log_ack_learning(parent) == 0);
     assert(sqlite3_close(fixture) == SQLITE_OK);
     r2_altself_shutdown();
 }
