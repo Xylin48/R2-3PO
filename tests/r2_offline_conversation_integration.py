@@ -883,6 +883,36 @@ def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
             assert heading + str(tail_offset) + ":\n" + tail + "\n" in snapshot
             assert "Old unrelated notes from the original recording." not in snapshot
 
+    # The archive scans all matching lines, but only four are selected. A fifth
+    # matching line must make that bounded retrieval explicit to the answer.
+    with original.open("a", encoding="utf-8") as stream:
+        stream.write("\n")
+        for i in range(5):
+            stream.write(f"User: rhodonite fixture archive marker {i}.\n")
+    bounded = "Which rhodonite fixture archive records were there?"
+    start = len(LocalOllama.requests)
+    conversation(binary, workspace, url, (bounded,), 2048)
+    assert any(
+        any(item.get("role") == "user" and item.get("content") == bounded
+            for item in request["messages"])
+        and any(item.get("role") == "system"
+            and "CURRENT TURN RETRIEVAL STATUS:" in item["content"]
+            and " original archive" in item["content"]
+            and "An incomplete search does not prove a memory is absent." in item["content"]
+            for item in request["messages"])
+        for request in LocalOllama.requests[start:]
+    )
+    with sqlite3.connect(home / "r2_memory.db") as db:
+        snapshots = db.execute(
+            "SELECT r.original_context FROM r2_log_context_reviews r "
+            "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
+            "WHERE c.user_text=?", (bounded,),
+        ).fetchall()
+        assert len(snapshots) == 1
+        assert snapshots[0][0].count(
+            "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte "
+        ) == 4
+
     # A malformed tail must not publish a matching prefix as verified history.
     with original.open("ab") as stream:
         stream.write(b"\x00")
