@@ -2647,43 +2647,37 @@ static char *r2_workspace_read_chunk_tool(
         return NULL;
     }
 
-    /*
-     * Return the actual chunk plus metadata so R2 knows whether
-     * another read is necessary.
-     */
+    /* The low-level reader returns bytes; this tool returns a C string.
+     * Never advance the reported text offset across unrepresentable bytes. */
+    if (memchr(result, '\0', bytes_read))
     {
-        size_t result_length =
-            strlen(result);
+        free(result);
+        return strdup("FILE READ CHUNK ERROR: Embedded NUL bytes cannot be represented as text.");
+    }
 
-        size_t metadata_size = 128;
+    const char *metadata_format =
+        "\n\n[CHUNK_BYTES_READ=%zu]\n[NEXT_OFFSET=%ld]\n";
+    int metadata_length = snprintf(NULL, 0, metadata_format, bytes_read, next_offset);
+    if (metadata_length < 0 ||
+        bytes_read > SIZE_MAX - (size_t)metadata_length - 1)
+    {
+        free(result);
+        return NULL;
+    }
 
-        char *expanded =
-            realloc(
-                result,
-                result_length
-                +
-                metadata_size
-            );
-
-        if (!expanded)
-        {
-            free(result);
-            return NULL;
-        }
-
-        result = expanded;
-
-        snprintf(
-            result + result_length,
-            metadata_size,
-
-            "\n\n"
-            "[CHUNK_BYTES_READ=%zu]\n"
-            "[NEXT_OFFSET=%ld]\n",
-
-            bytes_read,
-            next_offset
-        );
+    size_t metadata_size = (size_t)metadata_length + 1;
+    char *expanded = realloc(result, bytes_read + metadata_size);
+    if (!expanded)
+    {
+        free(result);
+        return NULL;
+    }
+    result = expanded;
+    if (snprintf(result + bytes_read, metadata_size, metadata_format,
+                 bytes_read, next_offset) != metadata_length)
+    {
+        free(result);
+        return NULL;
     }
 
     return result;
@@ -2912,6 +2906,12 @@ char *r2_diary_tool(
                 "is outside the workspace, or exceeds "
                 "the maximum full-read size."
             );
+        }
+
+        if (memchr(result, '\0', size))
+        {
+            free(result);
+            return strdup("FILE READ ERROR: Embedded NUL bytes cannot be represented as text.");
         }
 
         return result;
