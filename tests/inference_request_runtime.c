@@ -314,11 +314,17 @@ static void check_optional_snapshots_yield_to_dialogue(void)
     for (size_t i = 2; i < 6; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 
+    all_budget += 4U; /* Three joined system sections have two delimiters. */
     memset(include, 1, sizeof(include));
     /* The preliminary system pass may run out before these optional rows. */
     include[0] = include[1] = 0;
     assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget, NULL) == 0);
     for (size_t i = 0; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget - 1U, NULL) == 0);
+    assert(include[0] && !include[1]);
+    for (size_t i = 2; i < 6; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 }
 
@@ -418,6 +424,55 @@ static void check_optional_snapshot_survives_provisional_budget(void)
            captured_contains(query));
     free(reply);
     free(contract);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+}
+
+/* Compare the selection's arithmetic against actual JSON content at the
+ * maximum generation-floor boundary, including the joined system delimiter. */
+static void check_joined_system_exact_wire_boundary(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *policy = "Complete contract.";
+    const char *query = "Exact byte boundary?";
+    const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t n = capacity - strlen(policy) - strlen(query) - 2U;
+    char *instructions = text(n, 'z', "Required fixture instructions. ");
+    Message turn[] = {
+        {.role = "system", .content = instructions},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = NULL;
+    set_response("Complete.", "stop", 1);
+    size_t measured = 0;
+    assert(r2_required_inference_bytes(turn, 2, 1, strlen(policy), &measured) == 0);
+    assert(measured == capacity);
+    int before = perform_count;
+    char *reply = ollama_chat_with_limit(turn, 2, policy, 64, 60);
+    assert(reply && perform_count == before + 1 &&
+           captured_contains(instructions) && captured_contains(query));
+    struct json_object *array = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t wire = 0;
+    for (size_t i = 0; i < json_object_array_length(array); ++i) {
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, i), "content", &value));
+        wire += (size_t)json_object_get_string_len(value);
+    }
+    assert(wire == measured && wire == capacity);
+    assert(captured_contains("\n\nRequired fixture instructions."));
+    free(reply);
+    free(instructions);
+    instructions = text(n + 1U, 'z', "Required fixture instructions. ");
+    turn[0].content = instructions;
+    assert(r2_required_inference_bytes(turn, 2, 1, strlen(policy), &measured) == 0);
+    assert(measured == capacity + 1U);
+    before = perform_count;
+    assert(!ollama_chat_with_limit(turn, 2, policy, 64, 60));
+    assert(perform_count == before);
+    free(instructions);
     ollama_authoritative_user_query = old_query;
     ollama_audit_stage = old_stage;
 }
@@ -841,7 +896,7 @@ static void check_failed_optional_history_review(void)
        review heading or notice, but the exact request can still be sent. */
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
-    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query) - 2U;
     char *instructions = text(instructions_len, 'z', "Required fixture instructions. ");
     Message tight[] = {
         {.role = "system", .content = history},
@@ -1675,7 +1730,7 @@ static void check_compact_ranked_memory(void)
     for (int short_byte = 0; short_byte <= 1; ++short_byte) {
         before = perform_count;
         answer = r2_compact_foreground_chat(tight, 2, 1, query, 1024, 60,
-                                            fixed + strlen(notice) - (size_t)short_byte);
+                                            fixed + strlen(notice) + 2U - (size_t)short_byte);
         assert(answer && perform_count == before + 1 && captured_contains(query));
         assert(captured_contains(notice) == !short_byte);
         assert(!captured_contains(history));
@@ -1897,7 +1952,7 @@ static void check_compact_reserves_current_instructions_before_history(void)
     const char *previous_question = "Which shelf should hold the blue book?";
     const char *previous_answer = "Let's use the top shelf.";
     size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
-    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query) - 2U;
     char *history = text(history_size, 'h',
         "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     Message turn[] = {
@@ -1922,7 +1977,7 @@ static void check_compact_reserves_current_instructions_before_history(void)
 
     /* This older block fits alongside current instructions by itself.
        It must yield to the immediately preceding complete exchange. */
-    history_size -= strlen(source) + strlen(stale);
+    history_size -= strlen(source) + strlen(stale) + 4U;
     history = text(history_size, 'h',
         "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     turn[0].content = history;
@@ -1947,7 +2002,7 @@ static void check_second_turn_uses_actual_wire_budget(void)
     const char *source = "CURRENT USER INPUT: typed keyboard text.";
     const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
     size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
-                   strlen(first) + strlen(query);
+                   strlen(first) + strlen(query) + 2U;
     assert(capacity > fixed + 512U);
     char *answer_text = text(capacity - fixed - 128U, 'a',
                             "The blue book is on the top shelf. ");
@@ -2022,7 +2077,7 @@ static void check_second_turn_explicit_recall_retains_dialogue(void)
     size_t capacity = (4096U - 512U - 64U) * 32U / 10U;
     char *history = text(4000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
     size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
-                   strlen(first) + strlen(query) + strlen(history);
+                   strlen(first) + strlen(query) + strlen(history) + 4U;
     assert(capacity > fixed + 512U);
     char *previous = text(capacity - fixed - 128U, 'b',
                           "I liked the blue book. ");
@@ -2493,6 +2548,7 @@ int main(void)
     check_final_budget_keeps_exchanges_whole();
     check_optional_snapshots_yield_to_dialogue();
     check_optional_snapshot_survives_provisional_budget();
+    check_joined_system_exact_wire_boundary();
     check_oversized_history_leaves_room_for_complete_exchange();
     check_history_slots_count_only_complete_exchanges();
     check_malformed_conversation_input();
