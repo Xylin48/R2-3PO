@@ -17,7 +17,9 @@ required = (
     'R2_ROOT="${R2_ROOT:-/home/x/R2_Home}"',
     'R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"',
     'http://127.0.0.1:11434/api/tags',
-    'qwen3.5:9b',
+    'curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags',
+    'curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 4 "$OLLAMA_URL"',
+    'llama3.1:8b', 'qwen3-vl:4b-instruct-q4_K_M',
     'r2_memory.db', 'r2_reality.db', 'r2_fridge.db',
     'r2_rewards.db', 'r2_addictions.db',
     'pactl', 'R2 runtime account can connect to its default PulseAudio/PipeWire server',
@@ -64,7 +66,9 @@ required = (
     'Hardware preflight identity: %s (uid=%s, groups=%s)',
     'for DEVICE_GROUP in audio video; do',
     'DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)',
-    'sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2',
+    'sudo -n "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2',
+    'R2_HOME_DIR="/home/r2"',
+    'Linux home $HOME must be owned, writable, and traversable by r2',
     'sudo -n setpriv --reuid="$uid" --regid="$gid" --groups="$groups" -- "$@"',
     'libfaketime.so.1 is missing',
     'sudo apt-get update && sudo apt-get install -y ffmpeg',
@@ -104,6 +108,10 @@ if 'R2_OLLAMA_URL:-http://127.0.0.1:11434/api/tags' not in script:
     raise SystemExit("Ollama endpoint must remain locally configurable")
 
 launch_required = (
+    'R2_ROOT="/home/x/R2_Home"',
+    'R2_SOURCE="$R2_ROOT/R2"',
+    'R2_HOME_DIR="/home/r2"',
+    'env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2',
     '"$R2_SOURCE/V-Webcam.py"',
     'R2_PREFLIGHT="$R2_SOURCE/tools/preflight_r2_hardware.sh"',
     'bash "$R2_PREFLIGHT"',
@@ -152,7 +160,7 @@ empty_ps = subprocess.run(
 )
 loaded_ps = subprocess.run(
     ["awk", model_row_predicate],
-    input="NAME ID SIZE PROCESSOR CONTEXT UNTIL\nqwen3.5:9b abc 6.0 GiB 20%/80% 4096 5m\n",
+    input="NAME ID SIZE PROCESSOR CONTEXT UNTIL\nllama3.1:8b abc 6.0 GiB 20%/80% 4096 5m\n",
     text=True, capture_output=True, check=False,
 )
 if empty_ps.returncode != 1 or loaded_ps.returncode != 0:
@@ -182,10 +190,14 @@ for video, groups in (("yes", "311,29,44"), ("no", "311,29")):
 # Exercise the same model parser the hardware report runs against /api/tags.
 tags_parser = script.split("printf '%s' \"$TAGS\" | python3 -c '", 1)[1].split("\n'", 1)[0]
 for response, expected in (
-    ({"models": [None, {"name": "qwen3.5:9b"}]}, 0),
-    ({"models": [{"name": "qwen3.5:9b-other"}]}, 1),
-    ({"models": "qwen3.5:9b"}, 1),
-    (["qwen3.5:9b"], 1),
+    ({"models": [None, {"name": "llama3.1:8b"},
+                 {"name": "qwen3-vl:4b-instruct-q4_K_M"}]}, 0),
+    ({"models": [{"name": "llama3.1:8b"}]}, 1),
+    ({"models": [{"name": "qwen3-vl:4b-instruct-q4_K_M"}]}, 1),
+    ({"models": [{"name": "llama3.1:8b-other"},
+                 {"name": "qwen3-vl:4b-instruct-q4_K_M"}]}, 1),
+    ({"models": "llama3.1:8b"}, 1),
+    (["llama3.1:8b", "qwen3-vl:4b-instruct-q4_K_M"], 1),
 ):
     probe = subprocess.run([sys.executable, "-c", tags_parser],
                            input=json.dumps(response), text=True, capture_output=True)

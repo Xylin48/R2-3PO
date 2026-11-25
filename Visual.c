@@ -27,7 +27,6 @@
 #include <ctype.h>
 #include <signal.h>
 
-#define R2_VISION_DEFAULT_MODEL R2_OLLAMA_MODEL
 #define R2_VISION_MAX_IMAGE_BYTES (20U * 1024U * 1024U)
 #define R2_VISION_MAX_RESPONSE (1024U * 1024U)
 
@@ -750,6 +749,7 @@ payload_ready:
         } \
     } while (0)
     R2_VISION_SETOPT(CURLOPT_URL, ollama_url);
+    R2_VISION_SETOPT(CURLOPT_NOPROXY, "127.0.0.1");
     R2_VISION_SETOPT(CURLOPT_HTTPHEADER, headers);
     R2_VISION_SETOPT(CURLOPT_POST, 1L);
     R2_VISION_SETOPT(CURLOPT_POSTFIELDS, payload);
@@ -793,6 +793,7 @@ payload_ready:
             strcmp(json_object_get_string(role), "assistant") == 0;
         int has_reason = parsed && json_object_object_get_ex(parsed, "done_reason", &reason);
         if (has_reason && (!json_object_is_type(reason, json_type_string) ||
+            json_object_get_string_len(reason) == 0 ||
             strlen(json_object_get_string(reason)) != (size_t)json_object_get_string_len(reason)))
             complete_assistant_turn = 0;
         if (complete_assistant_turn && json_object_object_get_ex(message, "content", &content) &&
@@ -804,6 +805,9 @@ payload_ready:
             } else if (has_reason && !strcmp(json_object_get_string(reason), "length")) {
                 r2_log_sensory("vision_output_limit_reached", "Vision generation stopped at its limit; partial evidence is not a visual observation.",
                                text && *text ? text : "No final-channel text was returned; private reasoning was not archived.", model);
+            } else if (has_reason && strcmp(json_object_get_string(reason), "stop") != 0) {
+                r2_log_sensory("vision_invalid_completion_contract",
+                               "R2 rejected vision output with a non-stop completion reason.", NULL, model);
             } else if (text && *text) answer = strdup(text);
         } else {
             r2_log_sensory("vision_invalid_completion_contract",
@@ -1394,7 +1398,7 @@ int r2_visual_init(const char *database_path, const char *library_directory)
     if (configured && *configured &&
         strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0) {
         fprintf(stderr,
-                "[R2 Vision] Ignoring R2_VISION_MODEL=%s; this build uses the unified model %s.\n",
+                "[R2 Vision] Ignoring R2_VISION_MODEL=%s; this build requires the configured visual model %s.\n",
                 configured, R2_VISION_DEFAULT_MODEL);
     }
     snprintf(visual_model, sizeof(visual_model), "%s", R2_VISION_DEFAULT_MODEL);
@@ -1490,7 +1494,7 @@ int r2_visual_set_model(const char *model)
     }
     if (strcmp(model, R2_VISION_DEFAULT_MODEL) != 0) {
         fprintf(stderr,
-                "[R2 Vision] Rejected model %s; conversation and vision must share %s.\n",
+                "[R2 Vision] Rejected model %s; this build requires the configured visual model %s.\n",
                 model, R2_VISION_DEFAULT_MODEL);
         return -1;
     }
@@ -1519,6 +1523,41 @@ const char *r2_visual_model_name(void)
              visual_model[0] ? visual_model : R2_VISION_DEFAULT_MODEL);
     pthread_mutex_unlock(&visual_lock);
     return model_snapshot;
+}
+
+/* One-shot perception for text-only Llama conversation turns. The existing
+ * Ollama request gate serializes Qwen3-VL and Llama to avoid GPU contention.
+ * No raw image is ever handed to the text-only model. */
+char *r2_visual_describe_encoded_frame(const char *jpeg_base64, const char *question)
+{
+    if (!jpeg_base64 || !*jpeg_base64 || r2_ollama_vision_request_should_abort())
+        return NULL;
+    char model[sizeof(visual_model)];
+    pthread_mutex_lock(&visual_lock);
+    uint64_t generation = visual_generation;
+    int available = visual_initialized && visual_db;
+    if (available)
+        snprintf(model, sizeof(model), "%s", visual_model);
+    pthread_mutex_unlock(&visual_lock);
+    if (!available) return NULL;
+    char *json = call_vision_model(jpeg_base64, question, model);
+    if (!json) return NULL;
+    json_object *focus = NULL;
+    char *description = extract_visual_description(json, &focus);
+    if (focus) json_object_put(focus);
+    if (!description)
+        r2_log_sensory("vision_invalid_description",
+                      "Visual perception returned no valid description.", json, model);
+    free(json);
+
+    pthread_mutex_lock(&visual_lock);
+    int still_current = visual_initialized && visual_db && visual_generation == generation;
+    pthread_mutex_unlock(&visual_lock);
+    if (!still_current || r2_ollama_vision_request_should_abort()) {
+        free(description);
+        return NULL;
+    }
+    return description;
 }
 
 char *r2_visual_analyze_frame(const R2VisionFrame *frame,

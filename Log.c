@@ -1510,7 +1510,7 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     const char user_prefix[] = "USER SAID:\n";
     const char reply_prefix[] = "\nR2 REPLIED:\n";
     size_t tool_len = tool_result ? strlen(tool_result) : 0;
-    size_t overhead = sizeof(user_prefix) - 1 + sizeof(reply_prefix) +
+    size_t overhead = (sizeof(user_prefix) - 1) + (sizeof(reply_prefix) - 1) +
                       (tool_len ? sizeof(log_conversation_tool_prefix) - 1 : 0);
     if (user_len > SIZE_MAX - overhead ||
         assistant_len > SIZE_MAX - overhead - user_len ||
@@ -1519,7 +1519,13 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
         return -1;
     }
     size_t details_size = user_len + assistant_len + tool_len + overhead;
-    char *details = malloc(details_size);
+    if (details_size == SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    /* details_size counts text bytes, not the terminating NUL copied below.
+       Both the ordinary turn and the tool-result form need that final byte. */
+    char *details = malloc(details_size + 1);
     if (!details) return -1;
     memcpy(details, user_prefix, sizeof(user_prefix) - 1);
     memcpy(details + sizeof(user_prefix) - 1, user_text, user_len);

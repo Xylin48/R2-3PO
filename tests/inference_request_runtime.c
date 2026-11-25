@@ -25,6 +25,11 @@ static int fail_transport_at;
 static const char burst_user[] = "Queued during active post-turn processing.";
 static int burst_learning_requests;
 static int invalid_body_at;
+static const char *invalid_body_override;
+static const char blank_answer_body[] =
+    "{\"done\":true,\"done_reason\":\"stop\","
+    "\"message\":{\"role\":\"assistant\",\"content\":\" \\t\\n\","
+    "\"thinking\":\"PRIVATE-THINKING-NEVER-ARCHIVE\"}}";
 static CURLcode invalid_body_result = CURLE_OK;
 static char *isolated_retry_payload;
 static int foreground_after_response;
@@ -123,10 +128,10 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     char structured[] = "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
-    char *body = defer_post_turn_request == 1 ? structured : response_body;
+    const char *body = defer_post_turn_request == 1 ? structured : response_body;
     if (perform_count == invalid_body_at) {
-        static char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
-        body = truncated_body;
+        static const char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
+        body = invalid_body_override ? invalid_body_override : truncated_body;
         isolated_retry_payload = strdup(posted);
         assert(isolated_retry_payload);
     } else if (isolated_retry_payload) {
@@ -135,8 +140,8 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
         isolated_retry_payload = NULL;
     }
     size_t n = strlen(body), split = n / 3;
-    assert(write_response(body, 1, split, write_data) == split);
-    assert(write_response(body + split, 1, n - split, write_data) == n - split);
+    assert(write_response((char *)body, 1, split, write_data) == split);
+    assert(write_response((char *)body + split, 1, n - split, write_data) == n - split);
     if (foreground_after_response) {
         foreground_after_response = 0;
         atomic_store(&foreground_conversation_waiting, 1);
@@ -265,6 +270,90 @@ static void check_request(Message *messages, size_t count, const char *override,
     assert(wire_index == json_object_array_length(array));
     ollama_authoritative_user_query = NULL;
 }
+static void check_final_budget_prefers_recent_dialogue(void)
+{
+    Message turns[] = {
+        {"user", "Old question", 0, 0},
+        {"assistant", "Old generic answer", 0, 0},
+        {"user", "Recent question", 0, 0},
+        {"assistant", "Recent R2 answer", 0, 0},
+        {"user", "Current question", 0, 0},
+    };
+    unsigned char include[] = {1, 1, 1, 1, 0};
+    size_t limits[5] = {0};
+    size_t required = 0;
+    size_t budget = strlen(turns[2].content) + strlen(turns[3].content) + strlen(turns[4].content);
+    assert(r2_preserve_inference_units(turns, 5, include, limits, 4, 0, budget, &required) == 0);
+    assert(required == strlen(turns[4].content));
+    assert(!include[0] && !include[1] && include[2] && include[3] && include[4]);
+    for (size_t i = 2; i < 5; ++i)
+        assert(limits[i] == strlen(turns[i].content));
+}
+
+static void check_optional_snapshots_yield_to_dialogue(void)
+{
+    Message turns[] = {
+        {"system", "R2 PERSISTENT MEMORY - STARTUP CONTEXT: Unrelated old memory.", 0, 0},
+        {"system", "PERSISTENT LEARNING CONTEXT: Unrelated old learning.", 0, 0},
+        {"system", "Current instructions.", 0, 0},
+        {"user", "Where did we put the blue book?", 0, 0},
+        {"assistant", "The blue book is on the top shelf.", 0, 0},
+        {"user", "Can I reach it?", 0, 0},
+    };
+    unsigned char include[6];
+    size_t limits[6];
+    size_t dialogue_budget = 0, all_budget = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        size_t length = strlen(turns[i].content);
+        all_budget += length;
+        if (i >= 2) dialogue_budget += length;
+    }
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, dialogue_budget, NULL) == 0);
+    assert(!include[0] && !include[1] && !limits[0] && !limits[1]);
+    for (size_t i = 2; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget, NULL) == 0);
+    for (size_t i = 0; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+}
+
+static void check_final_budget_keeps_exchanges_whole(void)
+{
+    Message turns[] = {
+        {"system", "PAST CONVERSATION ARCHIVE — CONTEXT ONLY. Old archive", 0, 0},
+        {"user", "Older question", 0, 0},
+        {"assistant", "Older answer", 0, 0},
+        {"user", "A recent request about a real device", 0, 0},
+        {"assistant", "Internal action request", 0, 0},
+        {"user", "Recorded tool result", 0, 1},
+        {"assistant", "Recent answer", 0, 0},
+        {"user", "Current question", 0, 0},
+    };
+    unsigned char include[8];
+    size_t limits[8];
+    size_t recent = 0;
+    for (size_t i = 3; i < 8; ++i)
+        recent += strlen(turns[i].content);
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, recent, NULL) == 0);
+    assert(!include[0] && !include[1] && !include[2]);
+    for (size_t i = 3; i < 8; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
+    for (int missing_start = 0; missing_start < 2; ++missing_start) {
+        memset(include, 1, sizeof(include));
+        if (missing_start) include[3] = 0;
+        size_t budget = missing_start ? recent : recent - 1;
+        assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, budget, NULL) == 0);
+        assert(include[1] && include[2] && include[7]);
+        for (size_t i = 3; i < 7; ++i)
+            assert(!include[i] && limits[i] == 0);
+    }
+}
+
 static void check_boundaries(void)
 {
     const int contexts[] = {2048, 4096, 8192, 12288, 16384};
@@ -307,6 +396,90 @@ static int64_t unavailable_camera_events(void)
     return count;
 }
 
+static void check_oversized_history_leaves_room_for_complete_exchange(void)
+{
+    char *long_answer = text(14000, 'x', "Oversized reply from the previous exchange. ");
+    const char *query = "Which shelf did we pick?";
+    Message turns[] = {
+        {"user", "Where should the blue book go?", 0, 0},
+        {"assistant", "Let's put the blue book on the top shelf.", 0, 0},
+        {"user", "Write a detailed description of the room.", 0, 0},
+        {"assistant", long_answer, 0, 0},
+        {"user", (char *)query, 0, 0},
+    };
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("The top shelf.", "stop", 1);
+    ollama_authoritative_user_query = query;
+    char *reply = ollama_chat_with_limit(turns, 5, "Answer the current question.", 512, 60);
+    assert(reply && captured_contains(query));
+    assert(captured_contains(turns[0].content) && captured_contains(turns[1].content));
+    assert(!captured_contains(turns[2].content));
+    assert(!captured_contains("Oversized reply from the previous exchange."));
+    ollama_authoritative_user_query = NULL;
+    free(reply);
+    free(long_answer);
+}
+
+static void check_malformed_conversation_input(void)
+{
+    const char *invalid[] = {
+        "Bad continuation: \x80",
+        "Overlong: \xC0\xAF",
+        "Surrogate: \xED\xA0\x80",
+        "Past Unicode range: \xF4\x90\x80\x80",
+        "Missing tail: \xF0\x9F",
+    };
+    int before = perform_count;
+    size_t history_count = messages.count;
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        assert(!r2_input_is_utf8(invalid[i]));
+        char *reply = r2_talk(invalid[i]);
+        assert(reply && strstr(reply, "invalid UTF-8"));
+        free(reply);
+    }
+    assert(perform_count == before && messages.count == history_count);
+    assert(r2_input_is_utf8("ASCII; caf\xC3\xA9; \xE2\x98\x83; \xF0\x9F\x99\x82"));
+}
+
+static void check_history_slots_count_only_complete_exchanges(void)
+{
+    char *oversized = text(14000, 'x', "Oversized reply that cannot fit. ");
+    const char *query = "Which shelf did we pick?";
+    enum { EXCHANGES = OLLAMA_MAX_RECENT_MESSAGES / 2 + 1 };
+    Message turns[EXCHANGES * 2 + 1] = {0};
+    char questions[EXCHANGES][48];
+    char answers[EXCHANGES][48];
+    for (size_t i = 0; i < EXCHANGES; ++i) {
+        snprintf(questions[i], sizeof(questions[i]), "Shelf question %zu.", i);
+        snprintf(answers[i], sizeof(answers[i]), "Shelf answer %zu.", i);
+        turns[2 * i] = (Message){.role = "user", .content = questions[i]};
+        turns[2 * i + 1] = (Message){.role = "assistant", .content = i ? oversized : answers[i]};
+    }
+    turns[EXCHANGES * 2] = (Message){.role = "user", .content = (char *)query};
+
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("The top shelf.", "stop", 1);
+    ollama_authoritative_user_query = query;
+    char *reply = ollama_chat_with_limit(turns, EXCHANGES * 2 + 1, "Answer the current question.", 512, 60);
+    assert(reply && captured_contains(query));
+    assert(captured_contains(questions[0]) && captured_contains(answers[0]));
+    assert(!captured_contains(questions[1]) && !captured_contains("Oversized reply that cannot fit."));
+    free(reply);
+
+    for (size_t i = 0; i < EXCHANGES; ++i)
+        turns[2 * i + 1].content = answers[i];
+    reply = ollama_chat_with_limit(turns, EXCHANGES * 2 + 1, "Answer the current question.", 512, 60);
+    assert(reply && captured_contains(query));
+    for (size_t i = 0; i < EXCHANGES; ++i) {
+        int fits = i >= EXCHANGES - (OLLAMA_MAX_RECENT_MESSAGES - 1) / 2;
+        assert(captured_contains(questions[i]) == fits);
+        assert(captured_contains(answers[i]) == fits);
+    }
+    free(reply);
+    free(oversized);
+    ollama_authoritative_user_query = NULL;
+}
+
 static void check_context_and_isolated_inputs(void)
 {
     char *history = text(5000, 'h', "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
@@ -342,6 +515,26 @@ static void check_context_and_isolated_inputs(void)
     answer = r2_chat_with_input_source(action_turn, 3, r2_conversation_system_prompt, query, 512, 60, NULL);
     assert(answer && captured_contains(query) && captured_contains(tool_result));
     free(answer);
+
+    const char *followup = "Wait, which pocket did you mean?";
+    Message later_turn[] = {
+        turn[1],
+        {.role = "assistant", .content = "I meant my left pocket."},
+        {.role = "user", .content = (char *)followup},
+        {.role = "assistant", .content = "[R2_INTERNAL_TOOL_REQUEST] Already handled."},
+        {.role = "user", .content = (char *)tool_result, .internal_tool_result = 1}
+    };
+    /* The expected text still exists in old dialogue, but it cannot
+       authorize a request whose newest human message is different. */
+    attempts = perform_count;
+    assert(!r2_foreground_chat(later_turn, 5, "Full policy.", query, 512, 60));
+    assert(perform_count == attempts);
+    ollama_authoritative_user_query = followup;
+    answer = r2_foreground_chat(later_turn, 5, "Full policy.", followup, 512, 60);
+    assert(answer && perform_count == attempts + 1);
+    assert(captured_contains(followup) && captured_contains(tool_result));
+    free(answer);
+    ollama_authoritative_user_query = query;
 
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     set_response("must not send clipped history", "stop", 1);
@@ -603,6 +796,26 @@ static void check_failed_optional_history_review(void)
     }
     assert(sqlite3_exec(fixture, "DROP TRIGGER reject_optional_context_archive;", NULL, NULL, NULL) == SQLITE_OK);
     assert(sqlite3_close(fixture) == SQLITE_OK);
+
+    /* Required input fills the compact window. There is no room for a
+       review heading or notice, but the exact request can still be sent. */
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    char *instructions = text(instructions_len, 'z', "Required fixture instructions. ");
+    Message tight[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = instructions},
+        {.role = "user", .content = (char *)query},
+    };
+    before = perform_count;
+    answer = r2_foreground_chat(tight, 3, r2_compact_conversation_policy, query, 64, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(instructions));
+    assert(!captured_contains(history) && !captured_contains("Earlier evidence review was unavailable"));
+    free(answer);
+    free(instructions);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
     free(scope.archives);
     free(history);
     r2_turn_context_reviews = NULL;
@@ -622,6 +835,63 @@ static int memory_fixture_count(const char *query)
     return count;
 }
 
+/* Check both Life Log allocation shapes, including the exact last byte of
+ * the recorded tool result, and the learning evidence staged by that write. */
+static void check_conversation_learning_record_boundaries(void)
+{
+    assert(init_db() == 0);
+    char *user = text(4097, 'u', "Long user message: ");
+    char *reply = text(8193, 'r', "Long R2 response: ");
+    char *tool = text(2049, 't', "Recorded tool evidence: ");
+    const char tail[] = "END!";
+    memcpy(user + strlen(user) - sizeof(tail) + 1, tail, sizeof(tail));
+    memcpy(reply + strlen(reply) - sizeof(tail) + 1, tail, sizeof(tail));
+    memcpy(tool + strlen(tool) - sizeof(tail) + 1, tail, sizeof(tail));
+
+    for (int with_tool = 0; with_tool <= 1; ++with_tool) {
+        const char *recorded = with_tool ? tool : NULL;
+        int64_t event_id = r2_log_conversation_turn_for_learning(
+            user, reply, NULL, 0, NULL, 0, recorded);
+        assert(event_id > 0);
+        char *expected = NULL;
+        assert(asprintf(&expected, "USER SAID:\n%s\nR2 REPLIED:\n%s%s%s",
+                        user, reply,
+                        recorded ? R2_LOG_CONVERSATION_TOOL_PREFIX : "",
+                        recorded ? recorded : "") >= 0);
+        sqlite3_stmt *statement = NULL;
+        assert(sqlite3_prepare_v2(db,
+            "SELECT e.details,l.user_text,l.assistant_text,l.tool_result,s.assistant_text "
+            "FROM r2_log_events e JOIN r2_log_pending_learning l ON l.event_id=e.id "
+            "JOIN r2_log_pending_self_reports s ON s.event_id=e.id WHERE e.id=?;",
+            -1, &statement, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(statement, 1, event_id) == SQLITE_OK);
+        assert(sqlite3_step(statement) == SQLITE_ROW);
+        const char *values[] = {expected, user, reply, recorded, reply};
+        for (int col = 0; col < 5; ++col) {
+            if (!values[col]) {
+                assert(sqlite3_column_type(statement, col) == SQLITE_NULL);
+                continue;
+            }
+            assert(sqlite3_column_type(statement, col) == SQLITE_TEXT);
+            const unsigned char *actual = sqlite3_column_text(statement, col);
+            assert(actual && (size_t)sqlite3_column_bytes(statement, col) == strlen(values[col]));
+            assert(memcmp(actual, values[col], strlen(values[col])) == 0);
+            assert(actual[strlen(values[col])] == '\0');
+        }
+        assert(sqlite3_step(statement) == SQLITE_DONE);
+        sqlite3_finalize(statement);
+        assert(r2_log_ack_learning(event_id) == 0);
+        assert(r2_log_ack_self_report(event_id) == 0);
+        free(expected);
+    }
+
+    free(user);
+    free(reply);
+    free(tool);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_stale_needs_decision(void)
 {
     assert(init_db() == 0 && r2_reality_init() == 0);
@@ -634,6 +904,60 @@ static void check_stale_needs_decision(void)
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
                                 "WHERE event_type='autonomous_needs_yielded_to_conversation';") == before + 1);
     r2_reality_shutdown();
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
+/* Accepted learning must drain even when the diary is explicitly stopped.
+ * Exercise the production dispatcher and the real SQLite/model bridge. */
+static void check_learning_dispatch_without_diary(void)
+{
+    assert(init_db() == 0);
+    assert(!atomic_load(&diary_running) && !shutting_down);
+    const char *user = "Learning scheduler fixture: the spare card is green.";
+    int64_t event = r2_log_conversation_turn_for_learning(
+        user, "I understand.", NULL, 0, NULL, 0, NULL);
+    assert(event > 0 && r2_log_ack_self_report(event) == 0);
+    char *pending = sqlite3_mprintf(
+        "SELECT count(*) FROM r2_log_pending_learning WHERE event_id=%lld;",
+        (long long)event);
+    assert(pending && memory_fixture_count(pending) == 1);
+    assert(!atomic_load(&post_turn_replay_requested));
+    assert(!post_turn_active);
+    set_response("knowledge | The spare card is green.", "stop", 1);
+    int before = perform_count;
+    /* A live turn owns the scheduling boundary; the queue remains staged. */
+    pthread_mutex_lock(&conversation_turn_lock);
+    atomic_store(&foreground_conversation_waiting, 1);
+    atomic_store(&post_turn_replay_requested, 1);
+    pthread_t scheduler;
+    assert(pthread_create(&scheduler, NULL, post_turn_scheduler, NULL) == 0);
+    const struct timespec first_poll = {.tv_sec = 1, .tv_nsec = 200000000L};
+    nanosleep(&first_poll, NULL);
+    assert(memory_fixture_count(pending) == 1);
+    pthread_mutex_unlock(&conversation_turn_lock);
+    atomic_store(&foreground_conversation_waiting, 0);
+    const struct timespec poll = {.tv_sec = 0, .tv_nsec = 100000000L};
+    int remaining = 1;
+    for (int i = 0; i < 60 && remaining; ++i) {
+        nanosleep(&poll, NULL);
+        pthread_mutex_lock(&db_lock);
+        remaining = memory_fixture_count(pending);
+        pthread_mutex_unlock(&db_lock);
+    }
+    assert(!remaining);
+    shutting_down = 1;
+    assert(pthread_join(scheduler, NULL) == 0);
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    shutting_down = 0;
+    assert(!atomic_load(&diary_running));
+    assert(perform_count == before + 1);
+    assert(memory_fixture_count("SELECT count(*) FROM memories "
+                                "WHERE memory='The spare card is green.';") == 1);
+    assert(!atomic_load(&post_turn_replay_requested));
+    sqlite3_free(pending);
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;
 }
@@ -939,6 +1263,63 @@ static void check_gameboy_delivery(void)
     assert(rmdir(directory) == 0);
 }
 
+typedef struct {
+    atomic_int started;
+    int result;
+} ReflectionSlotFixture;
+
+static void *reflection_slot_fixture(void *opaque)
+{
+    ReflectionSlotFixture *fixture = opaque;
+    ollama_background_mode = 1;
+    ollama_reflection_worker = 1;
+    atomic_store(&fixture->started, 1);
+    fixture->result = r2_ollama_background_request_begin();
+    if (fixture->result == 0) pthread_mutex_unlock(&ollama_request_lock);
+    return NULL;
+}
+
+static void check_reflection_waits_for_existing_request(void)
+{
+    int old_diary = atomic_exchange(&diary_running, 1);
+    int old_background = ollama_background_mode;
+    int *old_deferred = post_turn_deferred;
+    int deferred = 0;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 150000000L};
+
+    /* Ordinary learning still defers without queuing another inference. */
+    pthread_mutex_lock(&ollama_request_lock);
+    ollama_background_mode = 1;
+    post_turn_deferred = &deferred;
+    assert(r2_ollama_background_request_begin() == EBUSY && deferred);
+    post_turn_deferred = old_deferred;
+    ollama_background_mode = old_background;
+    pthread_mutex_unlock(&ollama_request_lock);
+
+    for (int foreground_arrives = 0; foreground_arrives < 2; ++foreground_arrives) {
+        ReflectionSlotFixture fixture = {.started = ATOMIC_VAR_INIT(0), .result = -1};
+        pthread_t thread;
+        pthread_mutex_lock(&ollama_request_lock);
+        assert(pthread_create(&thread, NULL, reflection_slot_fixture, &fixture) == 0);
+        while (!atomic_load(&fixture.started)) nanosleep(&pause, NULL);
+        nanosleep(&pause, NULL);
+        if (foreground_arrives) {
+            /* Cancellation is observable while another request still owns
+               the slot, not only after that request finally completes. */
+            atomic_store(&foreground_conversation_waiting, 1);
+            assert(pthread_join(thread, NULL) == 0);
+            assert(fixture.result == ECANCELED);
+            atomic_store(&foreground_conversation_waiting, 0);
+            pthread_mutex_unlock(&ollama_request_lock);
+        } else {
+            pthread_mutex_unlock(&ollama_request_lock);
+            assert(pthread_join(thread, NULL) == 0);
+            assert(fixture.result == 0);
+        }
+    }
+    atomic_store(&diary_running, old_diary);
+}
+
 static void check_reflection_stop_and_long_visual_query(void)
 {
     ollama_reflection_worker = 1;
@@ -957,6 +1338,24 @@ static void check_reflection_stop_and_long_visual_query(void)
     memset(query, 'x', 3000);
     strcpy(query + 3000, " WHAT DO YOU SEE");
     assert(query_requests_visual_context(query));
+    assert(query_requested_live_sources(query) == R2_LIVE_CAMERA);
+    assert(query_requests_visual_context("What did we watch yesterday?"));
+    assert(!query_requested_live_sources("What did we watch yesterday?"));
+    assert(query_requested_live_sources("What's on the screen?") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("Look at the screen, please.") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("What is this on the screen?") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("Look at me, then look at the screen.") ==
+           (R2_LIVE_CAMERA | R2_LIVE_DISPLAY));
+    assert(query_requested_live_sources("Look at my notebook.") == R2_LIVE_CAMERA);
+
+    r2_associative_query_cache_clear();
+    set_response("present visual view", "stop", 1);
+    char *plan = r2_build_associative_search_query("What can you see?");
+    assert(plan && captured_contains("What can you see?"));
+    assert(!captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable."));
+    assert(!ollama_isolated_request);
+    free(plan);
+    r2_associative_query_cache_clear();
 }
 
 static void check_structured_report_evidence(void)
@@ -1023,6 +1422,9 @@ static void check_structured_report_evidence(void)
         assert(sqlite3_column_int(st, 6) == 4 * valid);
         sqlite3_finalize(st);
     }
+    /* This fixture exercises only structured extraction, not learning.
+       Acknowledge its unrelated pending learning before queue tests. */
+    assert(r2_log_ack_learning(parent) == 0);
     assert(sqlite3_close(fixture) == SQLITE_OK);
     r2_altself_shutdown();
 }
@@ -1059,8 +1461,10 @@ static void check_action_result_under_history_pressure(void)
     assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
                             strlen("I processed the action request. Here is the recorded result:\n")));
     assert(strstr(reply, expected));
-    assert(messages.count == 2 && !strcmp(messages.items[1].role, "user") &&
+    assert(messages.count == 3 && !strcmp(messages.items[1].role, "user") &&
            !strcmp(messages.items[1].content, user) && !messages.items[1].pinned);
+    assert(!strcmp(messages.items[2].role, "assistant") &&
+           !strcmp(messages.items[2].content, reply));
     assert(!active_turn_history.user && !active_turn_history.action_request &&
            !active_turn_history.action_result);
 
@@ -1085,6 +1489,42 @@ static void check_action_result_under_history_pressure(void)
     free(file_text);
     free(user);
     message_free_all();
+
+    assert(!r2_vision_media_status());
+    set_response("[MEDIA_SEE] What is on the screen?", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk("What is on the screen right now?");
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    /* The model repeats the control marker on follow-up. Surface the actual
+       tool result without showing the marker or executing another action. */
+    assert(reply && strstr(reply, "MEDIA OBSERVATION ERROR: no visible media frame"));
+    assert(!strstr(reply, "[MEDIA_SEE]"));
+    assert(messages.count > 0 &&
+           !strcmp(messages.items[messages.count - 1].role, "assistant") &&
+           !strcmp(messages.items[messages.count - 1].content, reply));
+    const char *followup = "Why wasn't a frame available?";
+    assert(message_add("user", followup) == 0);
+    set_response("The display had no visible frame.", "stop", 1);
+    char *answer = chat_with_relevant_memories(followup);
+    assert(answer && captured_contains(followup) && captured_contains(reply));
+    free(answer);
+    free(reply);
+    message_free_all();
+
+    set_response("[MEDIA_SEE] What is on the screen?\n[READ] turn-result-fixture.txt", "stop", 1);
+    core_initialized = 1;
+    reply = r2_talk("Inspect the screen again.");
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(reply && !strcmp(reply, "I couldn't produce a reply to this turn. Your message is still here."));
+    free(reply);
+    message_free_all();
+
     const char *unsaved = "This exchange must not produce unsourced learning.";
     assert(sqlite3_exec(db, "CREATE TRIGGER block_fixture_archive "
                         "BEFORE INSERT ON r2_log_pending_conversations "
@@ -1181,6 +1621,68 @@ static void check_compact_ranked_memory(void)
     ollama_audit_stage = old_stage;
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;
+}
+
+static void check_foreground_answer_replay(void)
+{
+    const char *query = "Which book did we put on the shelf?";
+    Message turn = {.role = "user", .content = (char *)query};
+    ollama_foreground_turn_mode = 1;
+    ollama_audit_stage = "conversation-answer";
+    ollama_authoritative_user_query = query;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    set_response("We put the blue book there.", "stop", 1);
+    const CURLcode results[] = {CURLE_OK, CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); ++i) {
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_result = results[i];
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                query, 512, 60, NULL);
+        assert(reply && !strcmp(reply, "We put the blue book there."));
+        assert(perform_count == before + 2 && !isolated_retry_payload);
+        assert(captured_contains(query));
+        free(reply);
+    }
+    invalid_body_result = CURLE_OK;
+    const char *empty_answers[] = {
+        blank_answer_body,
+        "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+        "\"thinking\":\"PRIVATE-THINKING-NEVER-ARCHIVE\"}}"
+    };
+    for (size_t i = 0; i < sizeof(empty_answers) / sizeof(empty_answers[0]); ++i) {
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_override = empty_answers[i];
+        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                query, 512, 60, NULL);
+        assert(reply && !strcmp(reply, "We put the blue book there."));
+        assert(perform_count == before + 2 && !isolated_retry_payload);
+        assert(captured_contains(query));
+        free(reply);
+    }
+    invalid_body_at = 0;
+    invalid_body_override = NULL;
+
+    free(response_body);
+    response_body = strdup(blank_answer_body);
+    assert(response_body);
+    int before = perform_count;
+    assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                      query, 512, 60, NULL));
+    assert(perform_count == before + 2);
+
+    const char *non_stop_reasons[] = {"length", "cancelled", "load", "missing"};
+    for (size_t i = 0; i < sizeof(non_stop_reasons) / sizeof(non_stop_reasons[0]); ++i) {
+        set_response("We put the blue book there.", non_stop_reasons[i], 1);
+        before = perform_count;
+        assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                          query, 512, 60, NULL));
+        assert(perform_count == before + 1);
+    }
+    ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+    ollama_foreground_turn_mode = 0;
 }
 
 static void check_isolated_response_replay(void)
@@ -1313,29 +1815,403 @@ static void check_first_answer_with_unavailable_source(void)
     db = NULL;
 }
 
+static void check_compact_reserves_current_instructions_before_history(void)
+{
+    assert(conversation_reply_token_budget("I got you up and running and fixed.") == 1024);
+    assert(conversation_reply_token_budget("Please fix this.") == 4096);
+    const char *query = "Which one did we decide on?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text. Use the user's exact words.";
+    const char *stale = "CURRENT REALITY STATUS: The live world snapshot could not be refreshed.";
+    const char *previous_question = "Which shelf should hold the blue book?";
+    const char *previous_answer = "Let's use the top shelf.";
+    size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    char *history = text(history_size, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = (char *)source},
+        {.role = "system", .content = (char *)stale},
+        {.role = "user", .content = (char *)previous_question},
+        {.role = "assistant", .content = (char *)previous_answer},
+        {.role = "user", .content = (char *)query},
+    };
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("The top shelf.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_compact_foreground_chat(turn, sizeof(turn) / sizeof(turn[0]),
+                                            5, query, 64, 60, capacity);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(source) && captured_contains(stale));
+    assert(captured_contains(previous_question) && captured_contains(previous_answer));
+    assert(!captured_contains("RECENT CONVERSATION CONTEXT"));
+    free(reply);
+    free(history);
+
+    /* This older block fits alongside current instructions by itself.
+       It must yield to the immediately preceding complete exchange. */
+    history_size -= strlen(source) + strlen(stale);
+    history = text(history_size, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    turn[0].content = history;
+    before = perform_count;
+    reply = r2_compact_foreground_chat(turn, sizeof(turn) / sizeof(turn[0]),
+                                       5, query, 64, 60, capacity);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(query) && captured_contains(previous_question) &&
+           captured_contains(previous_answer));
+    assert(!captured_contains(history));
+    free(reply);
+    free(history);
+}
+
+/* Exercise the ordinary second turn through policy selection and actual JSON
+ * serialization, not only the compact allocator with a hand-picked quota. */
+static void check_second_turn_uses_actual_wire_budget(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *first = "Hello R2, I put the blue book on the top shelf.";
+    const char *query = "Which one did we just agree on?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text.";
+    const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
+                   strlen(first) + strlen(query);
+    assert(capacity > fixed + 512U);
+    char *answer_text = text(capacity - fixed - 128U, 'a',
+                            "The blue book is on the top shelf. ");
+    char *identity = text(512, 'i',
+        "============================================================\n"
+        "IDENTITY AND PERSISTENT MEMORY\n");
+    char *history = text(1000, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = identity},
+        {.role = "system", .content = (char *)source},
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = answer_text},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("The top shelf.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_foreground_chat(turn, 6, r2_conversation_system_prompt,
+                                      query, 1024, 60);
+    assert(reply && !strcmp(reply, "The top shelf."));
+    assert(perform_count == before + 1);
+    assert(captured_contains(source) && captured_contains(first) &&
+           captured_contains(answer_text) && captured_contains(query));
+    assert(!captured_contains(history) && !captured_contains(identity));
+    struct json_object *array = NULL, *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t count = json_object_array_length(array);
+    assert(count >= 3);
+    const char *expected_roles[] = {"user", "assistant", "user"};
+    const char *expected_contents[] = {first, answer_text, query};
+    for (size_t i = 0; i < 3; ++i) {
+        struct json_object *entry = json_object_array_get_idx(array, count - 3 + i);
+        assert(json_object_object_get_ex(entry, "role", &value));
+        assert(!strcmp(json_object_get_string(value), expected_roles[i]));
+        assert(json_object_object_get_ex(entry, "content", &value));
+        assert(!strcmp(json_object_get_string(value), expected_contents[i]));
+    }
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_predict", &value));
+    int predict = json_object_get_int(value);
+    assert(predict >= 64 && predict <= 512);
+    size_t input_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, i),
+                                         "content", &value));
+        input_bytes += (size_t)json_object_get_string_len(value);
+    }
+    assert(input_bytes <= (size_t)(2048 - 512 - predict) * 32U / 10U);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    free(reply);
+    free(answer_text);
+    free(identity);
+    free(history);
+}
+
+/* Explicit recall is not permission to omit the conversation that just
+ * happened. Retain the entire selected historical record and both live turns
+ * by fitting the actual generation reservation to the complete wire input. */
+static void check_second_turn_explicit_recall_retains_dialogue(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *first = "Which book do you like?";
+    const char *query = "You said you liked the blue book. Is that still true?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text.";
+    assert(r2_query_explicitly_requests_recall(query));
+    size_t capacity = (4096U - 512U - 64U) * 32U / 10U;
+    char *history = text(4000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
+                   strlen(first) + strlen(query) + strlen(history);
+    assert(capacity > fixed + 512U);
+    char *previous = text(capacity - fixed - 128U, 'b',
+                          "I liked the blue book. ");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = (char *)source},
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = previous},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("Yes, I still like it.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_foreground_chat(turn, 5, r2_compact_conversation_policy,
+                                      query, 2048, 60);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(history) && captured_contains(source) &&
+           captured_contains(first) && captured_contains(previous) &&
+           captured_contains(query));
+    struct json_object *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_predict", &value));
+    int predict = json_object_get_int(value);
+    assert(predict >= 64 && predict < 2048);
+    assert(fixed + strlen(previous) <= (size_t)(4096 - 512 - predict) * 32U / 10U);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    free(reply);
+    free(previous);
+    free(history);
+}
+
+static void check_context_pressure_does_not_rewrite_short_turn(void)
+{
+    const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
+                        "since we last spoke. with each passing moon i find myself wondering when we might converse once more";
+    char *longer_query = text(720, 'q', query);
+    char *followup = text(4096, 'a', "[R2_INTERNAL_TOOL_REQUEST] ");
+    Message turn[] = {
+        {.role = "user", .content = longer_query},
+        {.role = "assistant", .content = followup},
+    };
+    /* The greeting and policy fit by themselves. The same-turn handoff
+       exhausts the remaining room. Even if the reviewer could generate
+       shorter wording, this case must never send the greeting for review. */
+    size_t capacity = strlen(r2_compact_conversation_policy) + strlen(followup) + strlen(longer_query) - 1;
+    set_response("Review fixture.", "stop", 1);
+    int requests_before = perform_count;
+    errno = 0;
+    assert(!r2_compact_foreground_chat(turn, 2, 0, longer_query, 64, 60, capacity));
+    assert(errno == E2BIG && perform_count == requests_before);
+    free(followup);
+    free(longer_query);
+}
+
 static void check_foreground_input_provenance(void)
 {
-    const char *query = "Hi, I missed you.";
-    Message turn = {.role = "user", .content = (char *)query};
+    const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
+                        "since we last spoke. with each passing moon i find myself wondering when we might converse once more";
+    Message turn[] = {
+        {.role = "user", .content = "Hello, R2."},
+        {.role = "assistant", .content = "I'm not sure what to make of that message."},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *contexts[] = {"2048", "4096", "8192"};
     ollama_authoritative_user_query = query;
     ollama_audit_stage = "conversation-answer";
     set_response("I missed you too.", "stop", 1);
-    for (int i = 0; i < 2; ++i) {
-        /* Transcribed input remains speech even if logging its event failed. */
-        r2_input_speech_event = i ? -1 : 0;
-        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt, query, 512, 60, NULL);
-        assert(reply && captured_contains(query));
-        assert(captured_contains(i ? "CURRENT USER INPUT: an Ears speech transcript." :
-                                     "CURRENT USER INPUT: typed keyboard text."));
-        assert(captured_contains(i ? "The transcript supplies words" :
-                                     "It contains no recording, voice, or microphone transcript."));
-        assert(captured_contains("Keep simple greetings brief and personal"));
-        assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
-        free(reply);
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        assert(setenv("R2_OLLAMA_NUM_CTX", contexts[i], 1) == 0);
+        for (int speech = 0; speech < 2; ++speech) {
+            /* Transcribed input remains speech even if logging its event failed. */
+            r2_input_speech_event = speech ? -1 : 0;
+            char *reply = r2_chat_with_input_source(turn, 3, r2_conversation_system_prompt,
+                                                     query, 512, 60, NULL);
+            assert(reply);
+            struct json_object *messages = NULL, *role = NULL, *content = NULL;
+            assert(json_object_object_get_ex(captured, "messages", &messages));
+            struct json_object *current = json_object_array_get_idx(
+                messages, json_object_array_length(messages) - 1);
+            assert(json_object_object_get_ex(current, "role", &role) &&
+                   !strcmp(json_object_get_string(role), "user"));
+            assert(json_object_object_get_ex(current, "content", &content) &&
+                   !strcmp(json_object_get_string(content), query));
+            assert(captured_contains(speech ? "CURRENT USER INPUT: an Ears speech transcript." :
+                                              "CURRENT USER INPUT: typed keyboard text."));
+            assert(captured_contains(speech ? "The transcript supplies words" :
+                                              "The user entered these words directly."));
+            if (!speech) assert(captured_contains("Watch status alone supplies no observation."));
+            assert(!captured_contains("CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL"));
+            assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
+            assert(captured_contains("Keep simple greetings brief and personal"));
+            assert(captured_contains("recognize her as Mom or Mother"));
+            assert(captured_contains("Use evidence for any experiences, activities, or perceptions you describe"));
+            free(reply);
+        }
     }
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
     r2_input_speech_event = 0;
     ollama_audit_stage = NULL;
     ollama_authoritative_user_query = NULL;
+}
+
+static void check_literal_retrieval_cues_precede_generated_cues(void)
+{
+    const char *query = "hello r2 my darling, this is your mother speaking to you. "
+                        "ive missed you dearly, how are you? did you know you have pocket?";
+    const char *generated = "conversation dialogue greeting sentiments interpersonal "
+                            "association identity diagnostic capability visual technology "
+                            "inspection context interpretation";
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    r2_associative_query_cache_clear();
+    set_response(generated, "stop", 1);
+    char *plan = r2_build_associative_search_query(query);
+    assert(plan && captured_contains(query));
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t count = extract_memory_keywords(plan, keywords);
+    assert(count > R2_TURN_HISTORY_SEARCHES);
+    int mother_found = 0, pocket_found = 0, generated_found = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (i < 6 && !strcmp(keywords[i], "mother")) mother_found = 1;
+        if (i < 6 && !strcmp(keywords[i], "pocket")) pocket_found = 1;
+        if (!strcmp(keywords[i], "interpersonal")) generated_found = 1;
+    }
+    assert(mother_found && pocket_found && generated_found);
+    free(plan);
+    r2_associative_query_cache_clear();
+}
+
+/* The second-turn planner must see the exact preceding visible exchange,
+ * not just the latest pronoun or the internal action that produced a reply. */
+static void check_associative_planner_retains_previous_exchange(void)
+{
+    const char *first = "What is in the blue folder?";
+    const char *reply = "The folder contains the old astronomy notes.";
+    const char *query = "Could you elaborate on that?";
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    message_free_all();
+    r2_associative_query_cache_clear();
+    assert(message_add("user", first) == 0);
+    assert(message_add("assistant", "[R2_INTERNAL_TOOL_REQUEST]\nFixture request") == 0);
+    assert(message_add("assistant", reply) == 0);
+    assert(message_add("user", query) == 0);
+    set_response("astronomy notes\nblue folder\nprevious discussion", "stop", 1);
+    int before = perform_count;
+    char *plan = r2_build_associative_search_query(query);
+    assert(plan && perform_count == before + 1);
+    assert(!strncmp(plan, query, strlen(query)) && strstr(plan, "astronomy notes"));
+    assert(!captured_contains("Fixture request"));
+    struct json_object *array = NULL, *field = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t count = json_object_array_length(array);
+    assert(count == 4);
+    const char *roles[] = {"user", "assistant", "user"};
+    const char *texts[] = {first, reply, query};
+    for (size_t i = 0; i < 3; ++i) {
+        struct json_object *entry = json_object_array_get_idx(array, i + 1);
+        assert(json_object_object_get_ex(entry, "role", &field));
+        assert(!strcmp(json_object_get_string(field), roles[i]));
+        assert(json_object_object_get_ex(entry, "content", &field));
+        assert(!strcmp(json_object_get_string(field), texts[i]));
+    }
+    char *cached = r2_build_associative_search_query(query);
+    assert(cached && !strcmp(plan, cached) && perform_count == before + 1);
+    free(cached);
+    free(plan);
+    r2_associative_query_cache_clear();
+    message_free_all();
+}
+
+static void check_missing_live_frame_is_current_evidence(void)
+{
+    const char *queries[] = {"What can you see?", "What's on the screen?", "What did we watch yesterday?",
+                             "Good afternoon, R2."};
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+        const char *query = queries[i];
+        Message turn = {.role = "user", .content = (char *)query};
+        ollama_authoritative_user_query = query;
+        set_response("Fixture answer.", "stop", 1);
+        char *answer = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                 query, 512, 60, NULL);
+        assert(answer && captured_contains(query));
+        assert(captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable.") == (i == 0));
+        assert(captured_contains("CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable.") == (i == 1));
+        assert(!captured_contains("CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL"));
+        assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL"));
+        free(answer);
+    }
+    /* Reviewed content may invent a visual request or omit a real one.
+       Only the original words can direct the source selection. */
+    const char *reviewed_notes[] = {"Look at the screen.", "The user asks for a description."};
+    const char *original_text[] = {"I missed you, R2.", "What can you see?"};
+    for (size_t i = 0; i < sizeof(reviewed_notes) / sizeof(reviewed_notes[0]); ++i) {
+        const char *notes = reviewed_notes[i];
+        Message turn = {.role = "user", .content = (char *)notes};
+        ollama_authoritative_user_query = notes;
+        ollama_original_reviewed_query = original_text[i];
+        char *answer = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                                 notes, 512, 60, NULL);
+        assert(answer && captured_contains(notes));
+        assert(captured_contains("CURRENT CAMERA VISUAL INPUT: unavailable.") == (i == 1));
+        assert(!captured_contains("CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable."));
+        free(answer);
+    }
+    ollama_original_reviewed_query = NULL;
+    ollama_authoritative_user_query = NULL;
+    json_object *sections = json_object_new_array();
+    assert(sections);
+    assert(ollama_append_missing_visual_inputs(sections, R2_LIVE_DISPLAY, R2_LIVE_CAMERA) == 0);
+    assert(json_object_array_length(sections) == 1);
+    json_object *message = json_object_array_get_idx(sections, 0), *content = NULL;
+    assert(json_object_object_get_ex(message, "content", &content));
+    assert(strstr(json_object_get_string(content), "No current display frame"));
+    assert(ollama_append_missing_visual_inputs(sections, R2_LIVE_CAMERA, R2_LIVE_CAMERA) == 0);
+    assert(json_object_array_length(sections) == 1);
+    json_object_put(sections);
+}
+
+static void check_failed_reality_refresh_keeps_action_evidence(void)
+{
+    const char *query = "Did you move the notebook out of your pockets?";
+    char snapshot[] = "PERSISTENT REALITY CONTEXT\nThe notebook was in the pocket.";
+    Message turn[] = {
+        {"system", snapshot, 0, 0},
+        {"user", (char *)query, 0, 0},
+        {"assistant", "[R2_INTERNAL_TOOL_REQUEST]\nMove the notebook.", 0, 0},
+        {"user", "[R2_INTERNAL_TOOL_RESULT]\nMoved the notebook to the shelf.", 0, 1},
+    };
+    const char *contexts[] = {"8192", "2048"};
+    ollama_foreground_turn_mode = 1;
+    ollama_audit_stage = "conversation-answer";
+    ollama_authoritative_user_query = query;
+    active_turn_history.action_result = turn[3].content;
+    r2_turn_reality_stale = 1;
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        assert(setenv("R2_OLLAMA_NUM_CTX", contexts[i], 1) == 0);
+        set_response("Yes, I moved it to the shelf.", "stop", 1);
+        int before = perform_count;
+        invalid_body_at = before + 1;
+        invalid_body_override = blank_answer_body;
+        char *reply = r2_chat_with_input_source(turn, 4, r2_conversation_system_prompt, query, 512, 60, NULL);
+        invalid_body_at = 0;
+        invalid_body_override = NULL;
+        assert(perform_count == before + 2 && !isolated_retry_payload);
+        assert(reply && captured_contains(query));
+        assert(captured_contains("CURRENT REALITY STATUS: The live world snapshot could not be refreshed"));
+        assert(captured_contains("Moved the notebook to the shelf."));
+        assert(!captured_contains("The notebook was in the pocket."));
+        assert(!captured_contains("selected current views"));
+        free(reply);
+    }
+    assert(!strcmp(turn[0].content, snapshot));
+    r2_turn_reality_stale = 0;
+    active_turn_history.action_result = NULL;
+    ollama_authoritative_user_query = NULL;
+    ollama_audit_stage = NULL;
+    ollama_foreground_turn_mode = 0;
 }
 
 static void check_memory_response_replay(void)
@@ -1353,6 +2229,94 @@ static void check_memory_response_replay(void)
     assert(captured_contains("The spare key is blue.") && captured_contains("NO GENERATED R2 RESPONSE"));
     free(result);
     puts("A partial memory response was replayed against the same saved evidence.");
+}
+
+/* Both memory-decision paths must ignore unrelated live input state while
+ * retaining the complete saved exchange and restoring their caller's scope. */
+static void check_memory_decision_private_scope(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *saved_query = ollama_authoritative_user_query;
+    const char *saved_stage = ollama_audit_stage;
+    int saved_sensory = ollama_autonomous_sensory_input;
+    int saved_isolated = ollama_isolated_request;
+    const char *unrelated = "UNRELATED-LIVE-TURN: What can you see?";
+    ollama_authoritative_user_query = unrelated;
+    ollama_audit_stage = "scope-fixture";
+    ollama_autonomous_sensory_input = 1;
+    ollama_isolated_request = 0;
+    set_response("knowledge | The user reported a green card.", "stop", 1);
+    int before = perform_count;
+    char *result = memory_decision("The spare card is green.", "I understand.", NULL, 0, NULL);
+    assert(result && !strcmp(result, "knowledge | The user reported a green card."));
+    assert(perform_count == before + 1 && captured_contains("The spare card is green."));
+    assert(!captured_contains(unrelated));
+    free(result);
+    assert(ollama_authoritative_user_query == unrelated && ollama_autonomous_sensory_input == 1);
+    assert(!strcmp(ollama_audit_stage, "scope-fixture") && !ollama_isolated_request);
+
+    assert(!reviewed_bytes && !reviewed_size);
+    char *long_reply = text(16000, 'r', "Complete saved response: ");
+    strcpy(long_reply + 15981, "EXACT-EVIDENCE-TAIL");
+    int64_t archive = 0;
+    capture_reviews = 1;
+    result = memory_decision("The spare card is green.", long_reply, NULL, 0, &archive);
+    capture_reviews = 0;
+    assert(result && !strcmp(result, "knowledge | The user reported a green card."));
+    assert(archive > 0 && reviewed_bytes && strstr(reviewed_bytes, long_reply));
+    assert(captured_contains("REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE"));
+    assert(!captured_contains(unrelated));
+    assert(ollama_authoritative_user_query == unrelated && ollama_autonomous_sensory_input == 1);
+    assert(!strcmp(ollama_audit_stage, "scope-fixture") && !ollama_isolated_request);
+    free(result);
+    free(long_reply);
+    free(reviewed_bytes);
+    reviewed_bytes = NULL;
+    reviewed_size = 0;
+    staged_calls = 0;
+    ollama_authoritative_user_query = saved_query;
+    ollama_audit_stage = saved_stage;
+    ollama_autonomous_sensory_input = saved_sensory;
+    ollama_isolated_request = saved_isolated;
+}
+
+/* Failed final-channel memory decisions must remain distinguishable from
+ * NONE without converting their content into factual memories. */
+static void check_rejected_memory_output_retains_evidence(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    int64_t event = r2_log_conversation_turn_for_learning(
+        "Memory parser fixture.", "This is the recorded response.", NULL, 0, NULL, 0, NULL);
+    assert(event > 0 && r2_log_ack_self_report(event) == 0);
+    const char *invalid[] = {
+        "  This response lacks its category.  \n",
+        "  imagination | An unsupported category. \n",
+        "  knowledge |  \t\n"
+    };
+    const char *reasons[] = {"missing category separator", "unknown category", "empty memory"};
+    sqlite3 *connection = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
+    for (size_t i = 0; i < 3; ++i) {
+        set_response(invalid[i], "stop", 1);
+        int before = perform_count;
+        assert(!memory_decision("Memory parser fixture.", "This is the recorded response.",
+                                NULL, event, NULL));
+        assert(perform_count == before + 1);
+        sqlite3_stmt *st = NULL;
+        assert(sqlite3_prepare_v2(connection,
+            "SELECT e.details,e.summary FROM r2_log_events e JOIN r2_log_links l ON l.from_event_id=e.id "
+            "WHERE e.event_type='post_turn_memory_invalid_output' AND l.to_event_id=? "
+            "AND l.relationship='memory_evaluation_failed_from' ORDER BY e.id DESC LIMIT 1;",
+            -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(st, 1, event) == SQLITE_OK);
+        assert(sqlite3_step(st) == SQLITE_ROW);
+        assert(sqlite3_column_bytes(st, 0) == (int)strlen(invalid[i]));
+        assert(!strcmp((const char *)sqlite3_column_text(st, 0), invalid[i]));
+        assert(strstr((const char *)sqlite3_column_text(st, 1), reasons[i]));
+        sqlite3_finalize(st);
+    }
+    assert(sqlite3_close(connection) == SQLITE_OK);
+    assert(r2_log_ack_learning(event) == 0);
 }
 
 static void *shutdown_fixture_worker(void *unused)
@@ -1415,6 +2379,15 @@ int main(void)
     assert(r2_log_init() == 0);
     check_structured_report_evidence();
     check_boundaries();
+    check_failed_reality_refresh_keeps_action_evidence();
+    check_missing_live_frame_is_current_evidence();
+    check_final_budget_prefers_recent_dialogue();
+    check_final_budget_keeps_exchanges_whole();
+    check_optional_snapshots_yield_to_dialogue();
+    check_oversized_history_leaves_room_for_complete_exchange();
+    check_history_slots_count_only_complete_exchanges();
+    check_malformed_conversation_input();
+    check_reflection_waits_for_existing_request();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();
@@ -1422,6 +2395,8 @@ int main(void)
     check_compact_ranked_memory();
     check_context_cache_write_overlap();
     check_first_answer_with_unavailable_source();
+    check_literal_retrieval_cues_precede_generated_cues();
+    check_associative_planner_retains_previous_exchange();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
@@ -1498,7 +2473,14 @@ int main(void)
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
     check_isolated_response_replay();
+    check_foreground_answer_replay();
     check_memory_response_replay();
+    check_memory_decision_private_scope();
+    check_rejected_memory_output_retains_evidence();
+    check_context_pressure_does_not_rewrite_short_turn();
+    check_compact_reserves_current_instructions_before_history();
+    check_second_turn_uses_actual_wire_budget();
+    check_second_turn_explicit_recall_retains_dialogue();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
@@ -1567,6 +2549,8 @@ int main(void)
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
+    check_conversation_learning_record_boundaries();
+    check_learning_dispatch_without_diary();
     check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();

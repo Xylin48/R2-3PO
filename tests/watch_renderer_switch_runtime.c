@@ -116,6 +116,90 @@ static int stop_input(int desktop, uint64_t token)
 int r2_ears_stop_desktop_if_watch_owned(uint64_t token) { return stop_input(1, token); }
 int r2_ears_stop_if_watch_owned(uint64_t token) { return stop_input(0, token); }
 
+/* Camera ownership is distinct from the optional replacement worker token. */
+static uint64_t camera_owner, capture_owner;
+static int camera_open, capture_running;
+static int camera_poll_count, camera_opens, camera_releases, capture_restarts;
+
+int r2_vision_camera_available(void) { return 1; }
+int r2_eyes_status(void) { return camera_open; }
+int r2_vision_watch_active(void) { return capture_running; }
+int r2_eyes_watch_owns(uint64_t token) { return token && token == camera_owner; }
+int r2_vision_watch_owns(uint64_t token) { return token && token == capture_owner; }
+
+uint64_t r2_eyes_start_for_watch(void)
+{
+    assert(!camera_open);
+    ++camera_opens;
+    camera_open = capture_running = 1;
+    return camera_owner = next_token++;
+}
+
+int r2_eyes_release_if_watch_owned(uint64_t token)
+{
+    if (r2_eyes_watch_owns(token)) {
+        ++camera_releases;
+        camera_open = capture_running = 0;
+        camera_owner = capture_owner = 0;
+    }
+    return 0;
+}
+
+uint64_t r2_vision_watch_start_for_watch(void)
+{
+    assert(camera_open && camera_owner && !capture_running);
+    ++capture_restarts;
+    capture_running = 1;
+    return capture_owner = next_token++;
+}
+
+int r2_vision_watch_stop_if_watch_owned(uint64_t token)
+{
+    if (r2_vision_watch_owns(token)) {
+        capture_running = 0;
+        capture_owner = 0;
+    }
+    return 0;
+}
+
+int r2_audio_discover_cancelable(R2AudioDiscovery *audio,
+                                 int (*cancelled)(void *), void *userdata)
+{
+    (void)audio;
+    assert(!cancelled(userdata));
+    ++camera_poll_count;
+    if (camera_poll_count == 2) {
+        assert(camera_open && camera_owner && capture_running);
+        /* Frame publication failed and the core worker exited. The same
+         * physical camera is still open and owned by Watch. */
+        capture_running = 0;
+    } else if (camera_poll_count == 3) {
+        assert(camera_open && camera_owner && capture_running && capture_owner);
+        assert(camera_opens == 1 && camera_releases == 0 && capture_restarts == 1);
+        atomic_store(&shell_watch_stop_requested, 1);
+    }
+    return -1; /* Audio discovery is independent of this camera recovery. */
+}
+
+void r2_audio_discovery_free(R2AudioDiscovery *audio)
+{
+    (void)audio;
+    assert(!"failed discovery must not be freed as a successful snapshot");
+}
+
+int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char *source,
+                                      int (*cancelled)(void *), void *userdata)
+{
+    (void)audio;
+    (void)source;
+    (void)cancelled;
+    (void)userdata;
+    assert(!"audio reconciliation requires a successful snapshot");
+    return -1;
+}
+
+void r2_ears_extra_stop_all(void) {}
+
 static const char *expected_media_path;
 int64_t r2_log_media_event(const char *action, const char *media_type,
                            const char *path, const char *details)
@@ -253,6 +337,9 @@ int main(void)
     assert(shell_watch_audio_input(&mic, 0, 1, "mic", &input) == 0);
     assert(mic && !strcmp(input.source, "mic"));
     free(input.source);
-    puts("Watch switches exact renderers, respects CRT withdrawal and preserves manual custody.");
+    assert(shell_watch_worker(NULL) == NULL);
+    assert(camera_poll_count == 3 && camera_releases == 1);
+    assert(!camera_open && !capture_running && !camera_owner && !capture_owner);
+    puts("Watch switches exact renderers, preserves manual custody, and restarts capture on an open camera.");
     return 0;
 }

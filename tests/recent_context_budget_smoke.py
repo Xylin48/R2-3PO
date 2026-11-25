@@ -51,10 +51,23 @@ require(
 require(
     "override_length = r2_utf8_safe_prefix_length(" in core
     and "content, OLLAMA_MAX_SYSTEM_MESSAGE_CHARS);" in core
-    and core.count("content, OLLAMA_MAX_MESSAGE_CHARS);") == 2
     and not re.search(r"^\s+length = OLLAMA_MAX_MESSAGE_CHARS;$", core, re.MULTILINE)
     and not re.search(r"^\s+length = OLLAMA_MAX_SYSTEM_MESSAGE_CHARS;$", core, re.MULTILINE),
     "provisional Ollama byte budgets use UTF-8 boundaries before final whole-message reservation",
+)
+history_start = core.index("/* Mark historical candidates only.")
+history_end = core.index("size_t complete_override_length", history_start)
+history_candidates = core[history_start:history_end]
+allocator_start = core.index("static int r2_preserve_inference_units(")
+allocator_end = core.index("typedef enum", allocator_start)
+allocator = core[allocator_start:allocator_end]
+require(
+    "include[i] = 1;" in history_candidates
+    and "input_budget" not in history_candidates
+    and "OLLAMA_MAX_RECENT_MESSAGES" not in history_candidates
+    and "exchange_messages <= message_slots" in allocator
+    and "message_slots -= exchange_messages;" in allocator,
+    "only the final whole-exchange allocator charges the history limits",
 )
 require(
     "r2_bound_context_records" not in core

@@ -17,7 +17,7 @@ if [[ "$(id -un)" != "r2" ]]; then
   fi
   R2_UID="$(id -u r2)"
   R2_GID="$(id -g r2)"
-  R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
+  R2_HOME_DIR="/home/r2"
   R2_RUNTIME_GROUPS="$(id -G r2 | tr ' ' ',')"
   for DEVICE_GROUP in audio video; do
     if DEVICE_GID="$(getent group "$DEVICE_GROUP" 2>/dev/null | cut -d: -f3)" &&
@@ -28,19 +28,19 @@ if [[ "$(id -un)" != "r2" ]]; then
       esac
     fi
   done
-  if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
+  if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ ]]; then
     printf '[FAIL] Could not resolve the r2 runtime identity.\n' >&2
     exit 1
   fi
   SCRIPT_PATH="$(readlink -f "$0")"
   DROP=(setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --)
   if [[ "$EUID" -eq 0 ]]; then
-    "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2 \
       R2_PREFLIGHT_AS_RUNTIME=1 R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
       R2_EXEC="$R2_EXEC" R2_FX_DIR="$R2_FX_DIR" R2_OLLAMA_URL="$OLLAMA_URL" \
       bash "$SCRIPT_PATH"
   else
-    sudo -n "${DROP[@]}" env HOME="$R2_ROOT" USER=r2 LOGNAME=r2 \
+    sudo -n "${DROP[@]}" env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2 \
       R2_PREFLIGHT_AS_RUNTIME=1 R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
       R2_EXEC="$R2_EXEC" R2_FX_DIR="$R2_FX_DIR" R2_OLLAMA_URL="$OLLAMA_URL" \
       bash "$SCRIPT_PATH"
@@ -238,28 +238,30 @@ fi
 # interactive preflight sees an empty ollama ps on 11434.
 if have systemctl && systemctl is-active --quiet r2-ollama.service 2>/dev/null; then
   fail "r2-ollama.service is active on 127.0.0.1:11435 and may be occupying the shared GPU; stop that service manually before interactive launch."
-elif curl --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
+elif curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 2 http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
   fail "a separate Ollama API is responding on 127.0.0.1:11435; it may be using the shared GPU. Stop that server before interactive launch, then retry."
 else
   pass "no competing R2 Ollama server detected on 127.0.0.1:11435"
 fi
 
-section "Ollama and unified Qwen 3.5 model"
-if TAGS="$(curl --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
+section "Ollama Llama conversation and Qwen3-VL vision models"
+if TAGS="$(curl --noproxy 127.0.0.1 --silent --show-error --fail --max-time 4 "$OLLAMA_URL" 2>/dev/null)"; then
   if printf '%s' "$TAGS" | python3 -c '
 import json
 import sys
 
 data = json.load(sys.stdin)
 models = data.get("models") if isinstance(data, dict) else None
-found = isinstance(models, list) and any(
-    isinstance(model, dict) and model.get("name") == "qwen3.5:9b"
-    for model in models
+required = ("llama3.1:8b", "qwen3-vl:4b-instruct-q4_K_M")
+found = isinstance(models, list) and all(
+    any(isinstance(model, dict) and model.get("name") == name
+        for model in models)
+    for name in required
 )
 sys.exit(0 if found else 1)
 ' >/dev/null 2>&1; then
-    pass "local Ollama API responds and qwen3.5:9b is installed"
-  else fail "Ollama responds but qwen3.5:9b is not installed"; fi
+    pass "local Ollama API responds; llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M are installed"
+  else fail "Ollama responds but both required models (llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M) are not installed"; fi
 else fail "Ollama API unreachable at $OLLAMA_URL"; fi
 if have ollama; then
   printf 'Ollama placement (when a model is loaded):\n'
@@ -282,6 +284,9 @@ else
 fi
 
 section "Audio, microphone, camera, TV, and emulator"
+if [[ ! -d "$HOME" || ! -O "$HOME" || ! -x "$HOME" || ! -w "$HOME" ]]; then
+  warn "Linux home $HOME must be owned, writable, and traversable by r2 for per-user audio configuration."
+fi
 if have mpg123 || have ffplay || have mpv; then pass "supported local MP3 playback process available"
 else
   warn "no mpg123/ffplay/mpv; sound effects will not play. On Ubuntu/Debian, install a decoder with: sudo apt-get update && sudo apt-get install -y ffmpeg"

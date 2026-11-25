@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the local Qwen 3.5 multimodal model can perform a real chat completion before R2 starts."""
+"""Verify the local Llama conversation and Qwen3-VL perception models before R2 starts."""
 from __future__ import annotations
 
 import argparse
@@ -16,24 +16,25 @@ import urllib.request
 from typing import Any
 
 DEFAULT_API_BASE = "http://127.0.0.1:11434"
+LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ALLOWED_API_BASES = {
     "http://127.0.0.1:11434",
     "http://127.0.0.1:11435",
 }
-MODEL = "qwen3.5:9b"
+MODEL = "llama3.1:8b"
+VISION_MODEL = "qwen3-vl:4b-instruct-q4_K_M"
 CAPACITY_EXIT = 75  # Both launchers use this for a smaller default-placement probe.
 
 
 class CapacityError(RuntimeError):
     """Ollama explicitly reported insufficient memory for inference."""
 
-def _is_required_model(item: Any) -> bool:
+def _is_required_model(item: Any, model: str = MODEL) -> bool:
     """Match the requested Ollama model, not a similarly prefixed tag.
 
-    Names such as qwen3.5:9b-other are different models and must never
-    establish either model availability or GPU placement for qwen3.5:9b.
+    Similarly prefixed tags must never establish availability or placement.
     """
-    return isinstance(item, dict) and item.get("name") == MODEL
+    return isinstance(item, dict) and item.get("name") == model
 
 
 
@@ -111,7 +112,7 @@ def _read_json(url: str, timeout: float, payload: dict[str, Any] | None = None) 
         headers={"Content-Type": "application/json"} if data is not None else {},
         method="POST" if data is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with LOCAL_OPENER.open(request, timeout=timeout) as response:
         result = json.load(response)
     if not isinstance(result, dict):
         raise ValueError("Ollama returned a non-object JSON response")
@@ -153,12 +154,11 @@ def _report_inference_http_error(exc: urllib.error.HTTPError, failure: str) -> N
 def _is_complete_assistant_turn(reply: dict[str, Any]) -> bool:
     """Match the core's non-streaming Ollama completion contract."""
     message = reply.get("message")
-    reason = reply.get("done_reason", "missing")
     return (
         isinstance(message, dict)
         and message.get("role") == "assistant"
         and reply.get("done") is True
-        and isinstance(reason, str) and bool(reason) and "\x00" not in reason and reason != "length"
+        and reply.get("done_reason", "stop") == "stop"
     )
 
 
@@ -205,9 +205,12 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
         try:
             tags = _read_json(f"{api_base}/api/tags", timeout=min(4, max(1, timeout)))
             models = tags.get("models", [])
-            if isinstance(models, list) and any(_is_required_model(item) for item in models):
+            if isinstance(models, list) and all(
+                any(_is_required_model(item, required) for item in models)
+                for required in (MODEL, VISION_MODEL)
+            ):
                 break
-            last_error = RuntimeError(f"required local model {MODEL} is not installed")
+            last_error = RuntimeError(f"both local models are required: {MODEL}, {VISION_MODEL}")
         except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
             last_error = exc
 
@@ -308,6 +311,19 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
         )
         return False
 
+    # Check text-model placement before visual generation can evict it from memory.
+    text_gpu_verified = False
+    if require_gpu_offload:
+        try:
+            ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
+            loaded = ps.get("models")
+            if isinstance(loaded, list):
+                active = next((item for item in loaded if _is_required_model(item, MODEL)), None)
+                if active is not None:
+                    text_gpu_verified = int(active.get("size_vram", 0)) > 0
+        except (OSError, ValueError, TypeError, urllib.error.URLError, TimeoutError):
+            pass
+
     # Exercise the same 640x480 image dimensions, JSON response mode, GPU/context
     # policy and context-dependent output cap used by Visual.c. This catches
     # image-encoder/KV-cache OOMs that text-only readiness can miss.
@@ -327,7 +343,7 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
             f"{api_base}/api/chat",
             timeout=timeout,
             payload={
-                "model": MODEL,
+                "model": VISION_MODEL,
                 "format": "json",
                 "messages": [
                     {
@@ -349,15 +365,15 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
             },
         )
     except urllib.error.HTTPError as exc:
-        _report_inference_http_error(exc, f"{MODEL} passed text generation but image-bearing chat failed")
+        _report_inference_http_error(exc, f"{VISION_MODEL} image-bearing chat failed")
         return False
     except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
-        print(f"ERROR: {MODEL} passed text generation but image-bearing chat failed: {exc}", file=sys.stderr)
+        print(f"ERROR: {VISION_MODEL} image-bearing chat failed: {exc}", file=sys.stderr)
         return False
 
     if not _is_complete_assistant_turn(vision_reply):
         print(
-            f"ERROR: {MODEL} returned an incomplete or invalid assistant turn for the image-bearing probe "
+            f"ERROR: {VISION_MODEL} returned an incomplete or invalid assistant turn for the image-bearing probe "
             "(expected message.role=assistant and done=true without a generation limit).",
             file=sys.stderr,
         )
@@ -372,7 +388,7 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     vision_color = vision_data.get("color") if isinstance(vision_data, dict) else None
     if not isinstance(vision_color, str) or vision_color.strip().casefold() != "blue":
         print(
-            f"ERROR: {MODEL} passed text generation but failed the JSON known-color vision probe "
+            f"ERROR: {VISION_MODEL} failed the JSON known-color vision probe "
             "(expected the image-bearing reply to report color=blue).",
             file=sys.stderr,
         )
@@ -390,9 +406,9 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     try:
         ps = _read_json(f"{api_base}/api/ps", timeout=min(8, max(1, timeout)))
         loaded = ps.get("models", [])
-        active = next((item for item in loaded if _is_required_model(item)), None) if isinstance(loaded, list) else None
+        active = next((item for item in loaded if _is_required_model(item, VISION_MODEL)), None) if isinstance(loaded, list) else None
         if active is None:
-            print("GPU verification: model not present in /api/ps; placement remains unverified.")
+            print("GPU verification: visual model not present in /api/ps; placement remains unverified.")
         else:
             vram = active.get("size_vram", 0)
             try:
@@ -420,16 +436,16 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     # memory really landed in VRAM. CPU-only success must not masquerade as a
     # successful GTX 1050 Ti policy preflight.
     if require_gpu_offload and (
-        not gpu_offload_verified or not mixed_placement_verified
+        not text_gpu_verified or not gpu_offload_verified
     ):
         print(
-            "ERROR: mixed CPU/GPU placement was required but Ollama did not report "
-            "both positive VRAM allocation and total model memory greater than VRAM.",
+            "ERROR: GPU offload was required but Ollama did not report "
+            "positive GPU VRAM allocation for both the text and visual models.",
             file=sys.stderr,
         )
         return False
 
-    print(f"Local Ollama is ready: {MODEL} passed real text and image-bearing chat generations (replies omitted).")
+    print(f"Local Ollama is ready: {MODEL} passed text and {VISION_MODEL} passed image-bearing chat (replies omitted).")
 
     # Host-side diagnostic; lack of nvidia-smi access does not fail preflight.
     try:
@@ -460,7 +476,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180,
                         help="timeout in seconds for each inference request")
     parser.add_argument("--require-gpu-offload", action="store_true",
-                        help="fail unless Ollama reports both VRAM allocation and model memory outside VRAM")
+                        help="fail unless Ollama reports VRAM allocation for both models")
     args = parser.parse_args()
     if args.timeout <= 0 or args.wait_seconds < 0:
         parser.error("--timeout must be positive and --wait-seconds cannot be negative")

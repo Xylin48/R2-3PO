@@ -182,6 +182,26 @@ int main(void)
     keywords[0] = "VISUAL-END";
     allowed_rows = 1; assert(!r2_collect_associated_records(keywords, 1, r2_visual_visit_search));
     failed_sql = NULL;
+
+    /* A byte-exact old-size allocation is the historical off-by-one bug.
+       Intercept that allocation, rather than relying on allocator padding
+       or a heap corruption symptom to make the regression fail. */
+    char *allocation_user = make_text('u', 12317, "USER-ALLOCATION-TAIL");
+    char *allocation_reply = make_text('r', 27533, "REPLY-ALLOCATION-TAIL");
+    char *allocation_tool = make_text('t', 3319, "TOOL-ALLOCATION-TAIL");
+    for (int with_tool = 0; with_tool <= 1; ++with_tool) {
+        const char *recorded = with_tool ? allocation_tool : NULL;
+        failed_malloc_size = strlen("USER SAID:\n") + strlen(allocation_user) +
+            strlen("\nR2 REPLIED:\n") + strlen(allocation_reply) +
+            (recorded ? strlen(R2_LOG_CONVERSATION_TOOL_PREFIX) + strlen(recorded) : 0);
+        int64_t event = r2_log_conversation_turn_for_learning(
+            allocation_user, allocation_reply, NULL, 0, NULL, 0, recorded);
+        failed_malloc_size = 0;
+        assert(event > 0);
+        assert(r2_log_ack_learning(event) == 0);
+        assert(r2_log_ack_self_report(event) == 0);
+    }
+    free(allocation_user); free(allocation_reply); free(allocation_tool);
     assert(sqlite3_close(connection) == SQLITE_OK);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);

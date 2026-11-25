@@ -20,6 +20,26 @@ typedef enum {
 /* Leave room for the message role and framing in the 32 MiB live buffer. */
 #define R2_MAX_TURN_INPUT_BYTES (32U * 1024U * 1024U - 64U)
 
+/* Check UTF-8 scalar values without changing the caller's bytes or locale. */
+static inline int r2_input_is_utf8(const char *text)
+{
+    const unsigned char *next = (const unsigned char *)text;
+    while (*next) {
+        unsigned char lead = *next++;
+        if (lead < 0x80) continue;
+        if (lead < 0xC2 || lead > 0xF4) return 0;
+
+        size_t following = lead < 0xE0 ? 1 : lead < 0xF0 ? 2 : 3;
+        unsigned char low = lead == 0xE0 ? 0xA0 : lead == 0xF0 ? 0x90 : 0x80;
+        unsigned char high = lead == 0xED ? 0x9F : lead == 0xF4 ? 0x8F : 0xBF;
+        if (*next < low || *next > high) return 0;
+        ++next;
+        for (size_t i = 1; i < following; ++i, ++next)
+            if (*next < 0x80 || *next > 0xBF) return 0;
+    }
+    return 1;
+}
+
 /* Grow on demand while retaining a hard storage bound. Drain an overlong
  * line without dispatching a prefix. LF and CRLF are terminal framing. */
 static inline R2InputLineStatus

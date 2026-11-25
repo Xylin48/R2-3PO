@@ -111,16 +111,38 @@ static int cancel_when_probe_started(void *path)
 }
 
 static atomic_int frame_waiting = ATOMIC_VAR_INIT(0);
+static atomic_int media_frame_waiting = ATOMIC_VAR_INIT(0);
 static atomic_int force_frame_timeout = ATOMIC_VAR_INIT(0);
 int __real_pthread_cond_clockwait(pthread_cond_t *, pthread_mutex_t *, clockid_t,
                                   const struct timespec *);
 int __wrap_pthread_cond_clockwait(pthread_cond_t *cond, pthread_mutex_t *lock,
                                  clockid_t clock_id, const struct timespec *deadline)
 {
-    assert(cond == &vision_watch_frame_cond && clock_id == CLOCK_MONOTONIC);
-    atomic_store(&frame_waiting, 1);
-    if (atomic_load(&force_frame_timeout)) return ETIMEDOUT;
+    assert(clock_id == CLOCK_MONOTONIC);
+    if (cond == &media_frame_cond) {
+        atomic_store(&media_frame_waiting, 1);
+    } else {
+        assert(cond == &vision_watch_frame_cond);
+        atomic_store(&frame_waiting, 1);
+        if (atomic_load(&force_frame_timeout)) return ETIMEDOUT;
+    }
     return __real_pthread_cond_clockwait(cond, lock, clock_id, deadline);
+}
+
+static void *inspect_first_media_frame(void *unused)
+{
+    (void)unused;
+    return r2_vision_media_see("Inspect the first display frame.");
+}
+
+static void wait_for_media_inspection(void)
+{
+    double deadline = monotonic_seconds() + 2.0;
+    while (!atomic_load(&media_frame_waiting)) {
+        assert(monotonic_seconds() < deadline);
+        struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
 }
 
 static void *wait_for_first_frame(void *unused)
@@ -227,6 +249,9 @@ int main(void)
         "    if mode.startswith('long-frame:') or mode == ':test-display': os.write(1, bytes(range(12)))\n"
         "    with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f:\n"
         "        f.write(str(os.getpid()))\n"
+        "    if mode == 'wait-for-first-frame':\n"
+        "        while not os.path.exists(os.environ['R2_EYES_TEST_RELEASE']): time.sleep(.001)\n"
+        "        os.write(1, bytes(range(12)))\n"
         "    while True: signal.pause()\n");
     const char *original = getenv("PATH");
     assert(snprintf(path, sizeof(path), "%s:%s", root,
@@ -369,12 +394,32 @@ int main(void)
     assert(r2_vision_open_file("stalled-partial") == 0);
     child = wait_for_child(ready);
     assert(r2_vision_media_set_attention(1) == 0);
+    assert(pthread_create(&look, NULL, inspect_first_media_frame, NULL) == 0);
+    wait_for_media_inspection();
     start = monotonic_seconds();
     assert(r2_vision_media_stop() == 0);
+    assert(pthread_join(look, &look_result) == 0 && !look_result);
     assert(monotonic_seconds() - start < 2.0);
     assert(!r2_vision_media_status() && !r2_vision_media_attention_status());
     assert_reaped(child);
     assert(unlink(ready) == 0);
+
+    /* A single deliberate inspection can wait for a complete first frame. */
+    expected_source = "wait-for-first-frame";
+    atomic_store(&media_frame_waiting, 0);
+    assert(r2_vision_open_file(expected_source) == 0);
+    child = wait_for_child(ready);
+    assert(pthread_create(&look, NULL, inspect_first_media_frame, NULL) == 0);
+    wait_for_media_inspection();
+    release_file = fopen(release, "w");
+    assert(release_file && fclose(release_file) == 0);
+    assert(pthread_join(look, &look_result) == 0 && look_result);
+    assert(!strcmp(look_result, "visual fixture result"));
+    free(look_result);
+    assert(!r2_vision_media_attention_status());
+    assert(r2_vision_media_stop() == 0);
+    assert_reaped(child);
+    assert(unlink(ready) == 0 && unlink(release) == 0);
 
     /* Restart yields exact complete frames, then clean EOF, without stale data. */
     assert(r2_eyes_open_file(eyes, "finite") == 0);

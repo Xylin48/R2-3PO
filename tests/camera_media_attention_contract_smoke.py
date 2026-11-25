@@ -32,11 +32,11 @@ assert (
 assert "if (!eyes->auxiliary_display) r2_vwebcam_stop_viewer()" in eyes
 
 camera = core[core.index("static void *vision_watch_capture_worker("):
-              core.index("static char *r2_vision_current_frame_base64(void)", core.index("static void *vision_watch_capture_worker("))]
+              core.index("static char *r2_vision_current_frame_base64(R2VisionRequestSource *captured_origin)", core.index("static void *vision_watch_capture_worker("))]
 assert "r2_eyes_capture_cancelable(eyes, r2_vision_capture_cancelled," in camera
 assert "camera_visual_change_notice" in camera
 assert "r2_vision_analyze_snapshot" not in camera
-current_frame = core[core.index("static char *r2_vision_current_frame_base64(void)\n{"):
+current_frame = core[core.index("static char *r2_vision_current_frame_base64(R2VisionRequestSource *captured_origin)\n{"):
                      core.index("static void *vision_watch_worker(")]
 assert "r2_eyes_capture_cancelable(eyes, r2_vision_direct_cancelled," in current_frame
 assert "r2_eyes_capture_cancelable(media_eyes, r2_vision_capture_cancelled," not in current_frame
@@ -53,7 +53,7 @@ assert "r2_eyes_stop()" not in worker, "auto source loss cannot imply chosen clo
 assert "r2_sense_auto_allowed(1)" in worker
 assert "r2_sense_auto_allowed(desktop ? 3 : 2)" in worker
 # A visual question cannot undo R2's explicit decision to close Eyes.
-assert "visual_requested && atomic_load(&eyes_auto_allowed)" in core
+assert "(query_requested_live_sources(query) & R2_LIVE_CAMERA) && atomic_load(&eyes_auto_allowed)" in core
 camera_analysis = core[core.index("static char *vision_analyze_current_frame(const char *question, int open_camera)\n{"):
                        core.index("char *r2_vision_see(const char *question)")]
 assert "!atomic_load(&eyes_auto_allowed)" in camera_analysis

@@ -1,8 +1,9 @@
 # Local speech input for R2 Ears
 
-R2's Ears capture layer reads microphone PCM. The Qwen 3.5 chat endpoint used by
-this project accepts text and images, not raw microphone PCM, so microphone
-capture alone cannot make spoken words part of a conversation. The explicit
+R2's Ears capture layer reads microphone PCM. The conversational Llama 3.1
+model accepts text, while Qwen3-VL interprets camera/display images. Neither
+chat request path directly accepts raw microphone PCM, so microphone capture
+alone cannot make spoken words part of a conversation. The explicit
 `ears listen` command connects the layers:
 
 1. Keep the microphone and desktop playback as independent continuous 48 kHz, stereo, 16-bit PCM streams; deliberate listening selects one exact interval without changing either live source.
@@ -97,8 +98,9 @@ is unavailable.
 
 
 This provides continuous raw PCM capture plus deliberate speech recognition.
-It is not yet semantic perception of non-speech sounds: Qwen 3.5 9B does not
-accept raw audio, and the current explicit Whisper bridge recognizes speech
+It is not yet semantic perception of non-speech sounds: the current Llama
+conversation and Qwen3-VL image paths do not process raw audio, and the
+existing Whisper bridge recognizes speech
 rather than classifying every environmental sound.
 
 The WAV conversion is exercised by a compiled C regression that checks the resulting file header, exact sample count, stereo-to-mono signal values, original source integrity, and failure on incomplete input; static wiring tests check the normal chat handoff. A passing CI build

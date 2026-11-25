@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static contract tests for R2's unified Qwen 3.5 conversation/vision path."""
+"""Static contract tests for dedicated Llama conversation and Qwen3-VL vision."""
 
 from pathlib import Path
 import re
@@ -29,8 +29,8 @@ log = read("Log.c")
 log_header = read("Log.h")
 
 require(
-    re.search(r'^#define R2_OLLAMA_MODEL "qwen3.5:9b"$', header, re.MULTILINE) is not None,
-    "one shared model constant selects qwen3.5:9b",
+    re.search(r'^#define R2_OLLAMA_MODEL "llama3\.1:8b"$', header, re.MULTILINE) is not None,
+    "Llama 3.1 8B is the conversation model",
 )
 require(
     "Interpret the user's current message first." in core
@@ -46,9 +46,16 @@ require(
     "user-facing chat failure fallbacks do not hardcode the user relationship",
 )
 require(
-    "Speak in first person as R2-3PO across turns" in core
+    "Speak in first person as R2-3PO, the robot running this program" in core
+    and "and recorded memories as the source of your personal history." in core
+    and "belong to their characters, even when their names resemble yours." in core
     and "Describe physical and software capabilities using your actual device and world state." in core,
     "identity guidance grounds R2 in his own environment",
+)
+require(
+    'R2_OLLAMA_SETOPT(CURLOPT_NOPROXY, "127.0.0.1")' in core
+    and 'R2_VISION_SETOPT(CURLOPT_NOPROXY, "127.0.0.1")' in visual,
+    "both runtime model requests bypass proxies for loopback Ollama",
 )
 require(
     re.search(r'^#define MODEL R2_OLLAMA_MODEL$', core, re.MULTILINE) is not None,
@@ -72,12 +79,12 @@ require(
     "endpoint helper supports interactive port 11434 and isolated service port 11435 only",
 )
 require(
-    re.search(r'^#define R2_VISION_DEFAULT_MODEL R2_OLLAMA_MODEL$', visual, re.MULTILINE) is not None,
-    "vision uses the exact same shared model constant",
+    re.search(r'^#define R2_VISION_DEFAULT_MODEL "qwen3-vl:4b-instruct-q4_K_M"$', header, re.MULTILINE) is not None,
+    "vision selects Qwen3-VL independently",
 )
 require(
-    'R2_VISION_MODEL="qwen3.5:9b"' in launcher,
-    "launcher explicitly selects the unified vision model",
+    'R2_VISION_MODEL="qwen3-vl:4b-instruct-q4_K_M"' in launcher,
+    "launcher explicitly selects the dedicated vision model",
 )
 require(
     'R2_OLLAMA_BASE_URL="${R2_OLLAMA_BASE_URL:-http://127.0.0.1:11434}"' in launcher
@@ -102,7 +109,7 @@ require(
 require(
     'strcmp(configured, R2_VISION_DEFAULT_MODEL) != 0' in visual
     and 'strcmp(model, R2_VISION_DEFAULT_MODEL) != 0' in visual,
-    "environment overrides and runtime setter cannot split conversation and vision models",
+    "visual-model setting is tied to the configured Qwen3-VL model",
 )
 require(
     "ollama_intent_summary" not in core
@@ -123,14 +130,18 @@ require(
 )
 require(
     "r2_vision_encode_snapshot(&frame, &origin)" in core
-    and '"images"' in core
-    and "CURRENT VISUAL INPUT: unavailable. Eyes could not open a live source for this request." in core
+    and 'r2_visual_describe_encoded_frame(' in core
+    and '"CAMERA", owned_image, camera_description, &camera' in core
+    and '"MEDIA DISPLAY", owned_media_image, media_description, &media' in core
+    and "CURRENT CAMERA VISUAL INPUT: unavailable." in core
+    and "CURRENT MEDIA DISPLAY VISUAL INPUT: unavailable." in core
+    and "ollama_append_missing_visual_inputs(arr, requested, available)" in core
     and "if (visual_requested && !r2_vision_watch_active())" not in core
     and "r2_visual_analyze_frame(" not in core[
         core.index("static void *vision_watch_worker(void *unused)"):
         core.index("int r2_vision_watch_start(void)")
     ],
-    "raw live images reach the conversation brain while background capture never forces image analysis",
+    "source-labeled camera and media observations reach Llama from Qwen3-VL without forced background inference",
 )
 require(
     "if (query_requests_visual_context(query) &&" not in core,
@@ -165,12 +176,12 @@ for setting, expected in [
     ('"presence_penalty", json_object_new_double(1.5)', "presence_penalty=1.5"),
     ('"repeat_penalty", json_object_new_double(1.0)', "repeat_penalty=1.0"),
 ]:
-    require(setting in core, f"chat explicitly sets Qwen3.5 sampler {expected}")
-    require(setting in visual, f"vision explicitly sets Qwen3.5 non-thinking sampler {expected}")
+    require(setting in core, f"chat retains explicit sampler {expected}")
+    require(setting in visual, f"vision retains independent non-thinking sampler {expected}")
 require(
     '"temperature", json_object_new_double(0.7)' in visual
     and '"top_p", json_object_new_double(0.8)' in visual,
-    "vision keeps Qwen3.5's recommended non-thinking sampler",
+    "vision retains explicit non-thinking sampler",
 )
 require(
     'visual_json_object_add_checked(root, "think", json_object_new_boolean(0))' in visual,
@@ -222,9 +233,9 @@ require(
     "vision output carries a natural-language sensory description plus structured focus metadata",
 )
 require(
-    "separate models are disabled." in shell
-    and "Confirm the single model shared by conversation and vision." in shell,
-    "the shell explains that conversation and vision cannot select different models",
+    "vision model qwen3-vl:4b-instruct-q4_K_M" in shell
+    and "Confirm the dedicated visual-perception model." in shell,
+    "the shell identifies the dedicated visual model",
 )
 
 require(
@@ -436,4 +447,4 @@ require(
     "the 72-hour hunger threshold is recorded as a factual Reality/Life Log event without writing a diary entry",
 )
 
-print("Qwen 3.5 unified-model contract checks passed.")
+print("Llama 3.1 and Qwen3-VL split-model contract checks passed.")

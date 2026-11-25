@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chosen media focus carries independent live display pixels alongside camera Eyes."""
+"""Chosen media focus translates independently captured camera and display frames for Llama."""
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
@@ -14,15 +14,17 @@ for api in ("r2_vision_media_attention_status", "r2_vision_media_set_attention")
 assert "static atomic_int media_attention_selected = ATOMIC_VAR_INIT(0);" in core
 focus = core[core.index("int r2_vision_media_attention_status(void)"):
              core.index("/* Capture and inference are separate workers.")]
-assert "atomic_exchange(&media_attention_selected, 1)" in focus
-assert "atomic_exchange(&media_attention_selected, 0)" in focus
+assert "atomic_load(&media_attention_selected) != selected" in focus
+assert focus.index("atomic_fetch_add(&media_attention_revision, 1)") < focus.index(
+    "atomic_store(&media_attention_selected, selected)"
+)
 assert "!atomic_load(&eyes_auto_allowed)" in focus
 assert "r2_log_sensory(\"media_attention_selected\"" in focus
 assert "r2_log_sensory(\"media_attention_released\"" in focus
 assert "r2_vision_media_status() ? 1 : 0;" in focus
 media_stop = core[core.index("static int r2_vision_media_stop_locked(void)"):
                   core.index("int r2_vision_media_stop(void)")]
-assert "r2_vision_media_end_capture(1);" in media_stop
+assert "r2_vision_media_end_capture();" in media_stop
 assert "media_attention_source_lost" in core
 assert "r2_eyes_close(media_eyes)" in media_stop
 assert "r2_eyes_close(eyes)" not in media_stop
@@ -43,7 +45,7 @@ assert 'extract_marker(reply, "[MEDIA_FOCUS]"' in tool
 assert "r2_process_media_focus_request(trim(request))" in tool
 assert 'extract_marker(reply, "[MEDIA_SEE]"' in tool
 
-media = core[core.index("static char *r2_vision_media_current_frame_base64(void)\n{"):
+media = core[core.index("static char *r2_vision_media_current_frame_base64(R2VisionRequestSource *captured_origin)\n{"):
              core.index("/* Capture and inference are separate workers.")]
 assert "pthread_mutex_lock(&media_frame_lock)" in media
 assert "memcpy(copy, frame.data, frame.size)" in media
@@ -62,10 +64,17 @@ assert "No camera frame is attached." in serializer
 
 turn = core[core.index("size_t ordered_count = r2_order_inference_messages("):
             core.index("free(message_order);", core.index("size_t ordered_count = r2_order_inference_messages("))]
-assert "owned_image = r2_vision_current_frame_base64()" in turn
+assert "owned_image = r2_vision_current_frame_base64(&camera)" in turn
 assert "if (atomic_load(&media_attention_selected))" in turn
-assert "owned_media_image = r2_vision_media_current_frame_base64()" in turn
-assert "limits[i], owned_image, owned_media_image)" in turn
+assert "owned_media_image = r2_vision_media_current_frame_base64(&media)" in turn
+assert '"CAMERA", owned_image, camera_description, &camera' in turn
+assert '"MEDIA DISPLAY", owned_media_image, media_description, &media' in turn
+assert "limits[i], NULL, NULL)" in turn
+assert 'r2_visual_describe_encoded_frame(' in core
+assert "r2_vision_request_source_changed()" in core
+assert "vision_request_source = origin;" in core
+assert "vision_request_source = previous_origin;" in core
+assert "CURRENT %s VISUAL INPUT: a frame was captured but visual interpretation" in core
 assert "free(owned_media_image);" in turn and "free(owned_image);" in turn
 
 diary = core[core.index("/* Autonomous reflection can deliberately use"):
@@ -83,4 +92,4 @@ close_sources = core[core.index("static int r2_eyes_stop_with_media(void)\n{"):
 assert "r2_eyes_stop_with_media();" in close_eyes
 assert "r2_eyes_stop_with_media();" in stop_eyes
 assert "r2_vision_media_set_attention(0);" in close_sources
-print("Autonomous media focus, primary camera priority, dual-image serialization and no forced interpretation passed.")
+print("Autonomous media focus, camera/display source identity, Qwen-to-Llama evidence, and no forced background interpretation passed.")

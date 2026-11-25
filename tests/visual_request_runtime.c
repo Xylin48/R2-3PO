@@ -417,7 +417,7 @@ int main(void)
     char *description = malloc(90030); assert(description); memset(description, 'd', 90000); strcpy(description+90000, "VISUAL-COMPLETE-END");
     json_object *observation = json_object_new_object(); json_object_object_add(observation, "description", json_object_new_string(description));
     json_object_object_add(observation, "focus", NULL);
-    response(json_object_to_json_string_ext(observation, JSON_C_TO_STRING_PLAIN), "stop");
+    response(json_object_to_json_string_ext(observation, JSON_C_TO_STRING_PLAIN), NULL);
     frame.frame_number++; char *actual = r2_visual_analyze_frame(&frame, source, "deliberate question");
     assert(actual && !strcmp(actual, description)); free(actual); temporary_files_gone();
     char *history = r2_visual_search("VISUAL-COMPLETE-END", 10); assert(history && strstr(history, description) && strstr(history, source)); free(history);
@@ -426,6 +426,10 @@ int main(void)
 
     const char *invalid[] = {"{\"description\":\"prefix\"} trailing", "{\"focus\":null}", "{\"description\":\"BEFORE\\u0000AFTER\"}", "{broken", "[\"not an observation\"]", "```json\n{\"description\":\"partial\"}", "{\"description\":\"   \"}"};
     for (size_t i=0; i<sizeof(invalid)/sizeof(invalid[0]); ++i) { response(invalid[i], "stop"); rejected_frame(&frame); }
+    response("{\"description\":\"cancelled vision must never be published\",\"focus\":null}", "cancelled");
+    rejected_frame(&frame);
+    response("{\"description\":\"empty completion reason must never be published\",\"focus\":null}", "");
+    rejected_frame(&frame);
     response("partial final-channel evidence", "length"); rejected_frame(&frame);
     history = r2_log_search("vision_output_limit_reached", 10); assert(history && strstr(history, "partial final-channel evidence") && !strstr(history,"PRIVATE-VISION-REASONING")); free(history);
     response("placeholder", "stop");
@@ -593,6 +597,16 @@ int main(void)
 
     response("{\"description\":\"stale session result\",\"focus\":null}","stop"); restart_library=1;
     frame.frame_number++; assert(!r2_visual_analyze_frame(&frame,"camera fixture","old library request")); assert(scalar(visual_db,"SELECT count(*) FROM r2_visual_experiences")==0); temporary_files_gone();
+    response("{\"description\":\"stale conversation view\",\"focus\":null}", "stop");
+    restart_library = 1;
+    assert(!r2_visual_describe_encoded_frame("fixture-image", "What do you see?"));
+    assert(!restart_library);
+    response("{\"description\":\"current conversation view\",\"focus\":null}", "stop");
+    actual = r2_visual_describe_encoded_frame("fixture-image", "What do you see?");
+    assert(actual && !strcmp(actual, "current conversation view"));
+    free(actual);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_visual_experiences") == 0);
+
     assert(sqlite3_exec(visual_db, "CREATE TRIGGER fail_after_detached_insert "
         "AFTER INSERT ON r2_visual_experiences BEGIN SELECT RAISE(FAIL, 'fixture'); END",
         NULL, NULL, NULL) == SQLITE_OK);

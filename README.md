@@ -6,7 +6,7 @@ R2-3PO is a C program with separate core, shell, diary, life-log, visual, eye, a
 
 For unattended overnight operation, boot-time activation, crash recovery, and sleep-inhibitor behavior, see [the overnight service guide](docs/overnight-service.md). For the staged preflight, database snapshot, real-device acceptance, and rollback gate, see the [rollout-readiness checklist](docs/rollout-readiness.md). The installer performs a database snapshot/integrity preflight before enabling the service. Do not run the systemd service and the interactive launcher at the same time.
 
-`R2_Launch_Code.sh` checks for an existing R2 process, applies a temporary UID-scoped firewall policy that allows Linux user `r2` to access only local Ollama at `127.0.0.1:11434`, then runs the read-only hardware preflight before compiling, opening the Observer, or launching R2. The firewall does not disable Wi-Fi or affect the desktop account, and is removed when the launcher exits. R2-side preflight, Ollama generation, compilation, workspace writes, Observer, and the core run as `r2`; their `HOME` is set to `/home/x/R2_Home` so `/home/r2` does not become a second project/data location. Review every `[FAIL]` and resolve it before continuing; `[WARN]` items identify optional or host-specific features that still need checking. You can also run `bash /home/x/R2_Home/R2/tools/preflight_r2_hardware.sh` manually before deployment. The launcher compiles with warnings treated as errors (`-Werror`), matching CI. See the guide for activation and live-device verification.
+`R2_Launch_Code.sh` checks for an existing R2 process, applies a temporary UID-scoped firewall policy that allows Linux user `r2` to access only local Ollama at `127.0.0.1:11434`, then runs the read-only hardware preflight before compiling, opening the Observer, or launching R2. The firewall does not disable Wi-Fi or affect the desktop account, and is removed when the launcher exits. R2-side preflight, Ollama generation, compilation, workspace writes, Observer, and the core run as `r2`; their Linux `HOME` is `/home/r2` for per-user configuration, while R2's project and data use `/home/x/R2_Home`. Review every `[FAIL]` and resolve it before continuing; `[WARN]` items identify optional or host-specific features that still need checking. You can also run `bash /home/x/R2_Home/R2/tools/preflight_r2_hardware.sh` manually before deployment. The launcher compiles with warnings treated as errors (`-Werror`), matching CI. See the guide for activation and live-device verification.
 
 ## Build on Ubuntu/Debian
 
@@ -27,23 +27,25 @@ The resulting executable is `./r2`. To remove it, run `make clean`.
 
 ## Ollama model: conversation and vision
 
-R2's default conversation model and visual-perception model are both `qwen3.5:9b`.
-Foreground and helper calls use Qwen 3.5's non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
-Install the model locally before launching R2:
+R2 uses `llama3.1:8b` for conversation and `qwen3-vl:4b-instruct-q4_K_M` for camera/TV visual perception. Both use the existing local Ollama endpoint and share R2's memory; the visual model supplies evidence rather than a second conversational identity.
+Foreground and helper calls use the current explicit non-thinking sampler (`temperature=0.7`, `top_p=0.8`, `top_k=20`, `min_p=0`, `presence_penalty=1.5`, `repeat_penalty=1.0`). The generation budget is available for the answer. The conversation reads the final `message.content` field.
+Install both models locally before launching R2 (no automatic downloads):
 
 ```sh
-ollama pull qwen3.5:9b
-ollama run qwen3.5:9b
+ollama pull llama3.1:8b
+ollama pull qwen3-vl:4b-instruct-q4_K_M
+ollama run llama3.1:8b
 ```
 
-At the Ollama prompt, test a short message and then enter `/bye`. The launch script
-also reports the expected model name. Qwen 3.5 9B uses the same model for text and image input; it does not accept raw microphone PCM as a chat input. Ears therefore remains a format-agnostic PCM capture layer, and speech transcription requires a separate audio/ASR component;
-visual inference shares the Ollama request lock with conversation and yields when a
-foreground conversation is waiting. Active model turns can receive an available camera
-frame and a separate display frame while R2 has chosen to watch. The request labels the
-sources actually attached. A selected display can supply the only image when the camera
-is unavailable. Watch continues capturing frames independently of model interpretation.
-The visual library records a result after a completed analysis.
+At the Ollama prompt, test a short message and then enter `/bye`. The launcher
+reports both required model names. Llama 3.1 handles text, while Qwen3-VL
+interprets images from the camera and chosen display as separate, source-labeled
+observations. Raw images are never sent to the text-only Llama model. Neither
+model takes raw microphone PCM through this chat API; Ears still uses a separate
+local Whisper speech-to-text path. Inference shares the existing Ollama request
+lock; conversation-owned visual observations queue ahead of opportunistic
+background work. Watch continues raw capture without automatically producing
+descriptions. The Visual library records completed explicit analyses separately.
 
 R2 builds a completed conversational response from the current user message and
 relevant memories/perceptions. A separate intent-summary inference is not used as an
@@ -234,7 +236,8 @@ For an unattended session, install the systemd service from the repository at it
 Before installing, make sure the local Ollama installation has the required model. This project intentionally does not download models or update package indexes during service startup:
 
 ```sh
-ollama pull qwen3.5:9b
+ollama pull llama3.1:8b
+ollama pull qwen3-vl:4b-instruct-q4_K_M
 ```
 
 Complete the [rollout-readiness checklist](docs/rollout-readiness.md) before installing R2 or launching him with his live data. For the final activation, verify and install the root-owned bootstrap using the [overnight service guide](docs/overnight-service.md), then run it from its installed location:
@@ -255,7 +258,7 @@ sudo systemctl start r2-3po.service
 sudo systemctl disable r2-3po.service
 ```
 
-The supervisor restarts unexpected exits during normal service. The service runner checks the local Ollama API and completes real text and image probes with `qwen3.5:9b` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for the core readiness marker before enabling the service at boot. If activation fails, it stops and disables the service before restoring an available previous executable, which stays stopped. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
+The supervisor restarts unexpected exits during normal service. The service runner checks the local Ollama API and completes real text and image probes with `llama3.1:8b` and `qwen3-vl:4b-instruct-q4_K_M` before starting the core. The rollout checklist describes the GPU and context retries. The installer waits for the core readiness marker before enabling the service at boot. If activation fails, it stops and disables the service before restoring an available previous executable, which stays stopped. The runner uses the existing `libfaketime` installation with a fixed `-852076800`-second timestamp offset, so R2's private clock rolls naturally through 1999 into 2000 and beyond and does not reset on relaunch; it does not alter Linux's actual clock, run `apt-get update`, or pull models automatically. A sleep inhibitor requests that the host not suspend during the session; firmware, power loss, forced shutdown, and administrative overrides can still stop it.
 
 Sound assets remain host-local at `/home/x/R2_Home/R2_sounds/FX`. Check the speaker, camera, microphone, and VLC dependencies with standalone tools in the desktop session before final activation. Use `R2_Launch_Code.sh` for the interactive desktop shell and Observer window after signoff.
 

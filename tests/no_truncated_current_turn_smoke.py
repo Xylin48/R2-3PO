@@ -8,9 +8,10 @@ start = source.find("static char *ollama_chat_with_limit")
 if start < 0:
     raise SystemExit("FAIL: payload builder was not found")
 guard = source.find("ollama_current_user_turn_truncated", start)
-serialize = source.find("int append_rc = ollama_json_append_message_with_image_sources(", guard)
-if guard < 0 or serialize < 0 or guard > serialize:
-    raise SystemExit("FAIL: active-turn truncation guard must run before payload serialization")
+vision = source.find("int append_rc = ollama_append_visual_observation(", guard)
+serialize = source.find("append_rc = ollama_json_append_message_with_image_sources(", guard)
+if guard < 0 or vision < 0 or serialize < 0 or not (guard < vision < serialize):
+    raise SystemExit("FAIL: active-turn truncation guard must run before visual inference and payload serialization")
 window = source[max(start, guard - 6000):guard + 1800]
 checks = {
     "the exact authoritative query length is checked": "size_t query_length = strlen(authoritative_query);" in window,

@@ -28,6 +28,12 @@ GREETING_REPLY = "Good evening, Mom. I've missed you too."
 REPORTED_GREETING = ("good afternoon R2, my darling. this is your mother speaking to you. "
                      "it has been awhile, oh iv missed you greatly")
 REPORTED_GREETING_REPLY = "Good afternoon, Mom. I've missed you too."
+REPORTED_POCKET_GREETING = ("hello r2 my darling, this is your mother speaking to you. "
+                            "ive missed you dearly, how are you? did you know you have pocket?")
+REPORTED_POCKET_GREETING_REPLY = "Hi, Mom. I've missed you too. I'm doing well, and yes, I have pockets."
+REPORTED_MOON_GREETING = ("hello R2, my darling. this is your mother speaking. it has been quite some time "
+                          "since we last spoke. with each passing moon i find myself wondering when we might converse once more")
+REPORTED_MOON_GREETING_REPLY = "Hi, Mom. I'm glad we can talk again."
 PRIVATE_GREETING_REASONING = "R2_PRIVATE_GREETING_REASONING_60125"
 CONVERSATION_POLICIES = (
     "You are R2-3PO. Use the conversation, memories, and perceptions",
@@ -80,7 +86,12 @@ IDENTITY_RECALL_REQUEST = "Hi R2, do you remember the brass compass I told you a
 IDENTITY_REPEAT_REQUEST = "Hi R2, I hope you had a good afternoon."
 IDENTITY_MEMORY = "Mom told me her brass compass came from her own grandfather."
 IDENTITY_REPLY = "I remember, Mom. You told me your brass compass came from your grandfather."
-IDENTITY_ANCHOR = "Speak in first person as R2-3PO across turns."
+IDENTITY_ANCHOR = "Speak in first person as R2-3PO, the robot running this program, with the same identity across turns."
+IDENTITY_HISTORY = (
+    "Use your lived experiences and recorded memories as the source of your personal history. "
+    "Events in stories you encounter through media or conversation belong to their characters, "
+    "even when their names resemble yours."
+)
 
 
 FOLLOWUP_RECOVERY_REQUEST = "Save the action recovery fixture."
@@ -111,6 +122,8 @@ class LocalOllama(BaseHTTPRequestHandler):
     requests: list[dict] = []
     post_action_attempts: dict[str, int] = {}
     lock = threading.Lock()
+    stalled_learning_started = threading.Event()
+    stalled_learning_release = threading.Event()
     slow_started = threading.Event()
     slow_release = threading.Event()
 
@@ -226,6 +239,12 @@ class LocalOllama(BaseHTTPRequestHandler):
                 reply = "experience | " + PRIVATE_TOOL_MEMORY
             if any(LEARNING_RESTART_REQUEST in message for message in user_messages):
                 reply = "knowledge | " + RESTART_MEMORY
+            if any("R2_STALLED_LEARNING_FIRST" in m for m in user_messages):
+                if not self.stalled_learning_started.is_set():
+                    self.stalled_learning_started.set()
+                    self.stalled_learning_release.wait(timeout=25)
+                    return
+                reply = "knowledge | " + INTERRUPTED_LEARNING_MEMORY
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -248,6 +267,10 @@ class LocalOllama(BaseHTTPRequestHandler):
         if (current_index >= 0 and user_messages[current_index] == REPORTED_GREETING
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             message["content"] = REPORTED_GREETING_REPLY
+        if current_index >= 0 and user_messages[current_index] == REPORTED_POCKET_GREETING and foreground:
+            message["content"] = REPORTED_POCKET_GREETING_REPLY
+        if current_index >= 0 and user_messages[current_index] == REPORTED_MOON_GREETING and foreground:
+            message["content"] = REPORTED_MOON_GREETING_REPLY
         if (current_index >= 0 and user_messages[current_index] in FOLLOWUP_FILES
                 and payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)):
             request = user_messages[current_index]
@@ -255,10 +278,13 @@ class LocalOllama(BaseHTTPRequestHandler):
                 with self.lock:
                     attempts = self.post_action_attempts.get(request, 0) + 1
                     self.post_action_attempts[request] = attempts
-                message["content"] = (
-                    FOLLOWUP_RECOVERY_ANSWER if request == FOLLOWUP_RECOVERY_REQUEST
-                    else "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
-                )
+                if request == FOLLOWUP_RECOVERY_REQUEST:
+                    if attempts == 1:
+                        message.update(content="", thinking=PRIVATE_GREETING_REASONING)
+                    else:
+                        message["content"] = FOLLOWUP_RECOVERY_ANSWER
+                else:
+                    message["content"] = "[DELETE] hidden-sentinel.txt\n[R2_SOUND:beep:curious]"
             else:
                 message["content"] = (
                     f"I will save the fixture.\n[WRITE] {FOLLOWUP_FILES[request]}\n"
@@ -281,7 +307,7 @@ class LocalOllama(BaseHTTPRequestHandler):
                 done_reason = "length"
                 message["content"] = "knowledge | The user said they keep"
         body = json.dumps({
-            "model": "qwen3.5:9b", "done": True, "done_reason": done_reason,
+            "model": "llama3.1:8b", "done": True, "done_reason": done_reason,
             "message": message,
         }).encode("utf-8")
         self.send_response(200)
@@ -382,35 +408,57 @@ def send_reported_greeting(binary: Path, workspace: Path, url: str) -> None:
         start = len(LocalOllama.requests)
         output = subprocess.run(
             [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, context),
-            input=f"{REPORTED_GREETING}\nexit\n", text=True, capture_output=True,
+            input=f"{REPORTED_GREETING}\n{REPORTED_POCKET_GREETING}\n{REPORTED_MOON_GREETING}\nexit\n",
+            text=True, capture_output=True,
             timeout=100, check=True,
         )
         assert output.stdout.count("R2-3PO: " + REPORTED_GREETING_REPLY) == 1, output.stderr
+        assert output.stdout.count("R2-3PO: " + REPORTED_POCKET_GREETING_REPLY) == 1, output.stderr
+        assert output.stdout.count("R2-3PO: " + REPORTED_MOON_GREETING_REPLY) == 1, output.stderr
         requests = [
             request for request in LocalOllama.requests[start:]
             if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
-            and request["messages"][-1] == {"role": "user", "content": REPORTED_GREETING}
+            and request["messages"][-1]["role"] == "user"
+            and request["messages"][-1]["content"] in (
+                REPORTED_GREETING, REPORTED_POCKET_GREETING, REPORTED_MOON_GREETING
+            )
         ]
-        assert len(requests) == 1, requests
-        assert requests[0]["options"]["num_ctx"] == context
-        system = [item["content"] for item in requests[0]["messages"] if item["role"] == "system"]
-        assert len(system) == 1 and requests[0]["messages"][0]["role"] == "system"
-        provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
-        assert "\n\n" not in system[0][provenance_at + 2:]
-        assert "supplies written words only" in system[0]
-        assert "no recording, voice, or microphone transcript" in system[0]
-        assert "Keep simple greetings brief and personal" in system[0]
-        assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
-        assert IDENTITY_ANCHOR in system[0]
-        assert "Summary: R2 Life Log integration" not in system[0]
-        assert "[world/reality_engine_started]" not in system[0]
-        assert "The current user message is spoken by the user" not in system[0]
-        assert "RESPONSE CORRECTION:" not in system[0]
+        assert [request["messages"][-1]["content"] for request in requests] == [
+            REPORTED_GREETING, REPORTED_POCKET_GREETING, REPORTED_MOON_GREETING,
+        ]
+        for request in requests:
+            assert request["options"]["num_ctx"] == context
+            system = [item["content"] for item in request["messages"] if item["role"] == "system"]
+            assert len(system) == 1 and request["messages"][0]["role"] == "system"
+            provenance_at = system[0].rindex("\n\nCURRENT USER INPUT: typed keyboard text.")
+            assert "\n\n" not in system[0][provenance_at + 2:]
+            assert "Watch status alone supplies no observation." in system[0][provenance_at:]
+            assert "CURRENT CAMERA VISUAL EVIDENCE (Qwen3-VL" not in system[0]
+            assert "CURRENT MEDIA DISPLAY VISUAL EVIDENCE (Qwen3-VL" not in system[0]
+            assert "Treat the input source as internal context." in system[0]
+            assert "Report inspections, device status, or inventory details only from available evidence." in system[0]
+            assert "Keep simple greetings brief and personal" in system[0]
+            assert "Use evidence for any experiences, activities, or perceptions you describe" in system[0]
+            assert IDENTITY_ANCHOR in system[0]
+            assert IDENTITY_HISTORY in system[0]
+            assert "recognize her as Mom or Mother and respond to her naturally." in system[0]
+            assert "Summary: R2 Life Log integration" not in system[0]
+            assert "[world/reality_engine_started]" not in system[0]
+            assert "The current user message is spoken by the user" not in system[0]
+            assert "RESPONSE CORRECTION:" not in system[0]
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         assert db.execute(
             "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
             (REPORTED_GREETING,),
         ).fetchall() == [(REPORTED_GREETING_REPLY,)] * 2
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (REPORTED_POCKET_GREETING,),
+        ).fetchall() == [(REPORTED_POCKET_GREETING_REPLY,)] * 2
+        assert db.execute(
+            "SELECT assistant_text FROM r2_log_conversations WHERE user_text = ?",
+            (REPORTED_MOON_GREETING,),
+        ).fetchall() == [(REPORTED_MOON_GREETING_REPLY,)] * 2
     print("PASS: the reported greeting reached the first R2 answer request as exact typed text.")
 
 
@@ -451,7 +499,9 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
     assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
     assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
     assert sentinel.read_bytes() == b"private planned action must remain inert"
-    assert all(LocalOllama.post_action_attempts.get(request) == 1 for request in FOLLOWUP_FILES)
+    assert PRIVATE_GREETING_REASONING not in output.stdout
+    assert LocalOllama.post_action_attempts.get(FOLLOWUP_RECOVERY_REQUEST) == 2
+    assert LocalOllama.post_action_attempts.get(FOLLOWUP_FALLBACK_REQUEST) == 1
     for request in FOLLOWUP_FILES:
         followups = [
             payload for payload in LocalOllama.requests
@@ -460,8 +510,10 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
             and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
                     for item in payload["messages"])
         ]
-        assert len(followups) == 1
+        expected_count = 2 if request == FOLLOWUP_RECOVERY_REQUEST else 1
+        assert len(followups) == expected_count
         assert followups[0]["messages"][-1]["role"] == "tool"
+        assert all(payload == followups[0] for payload in followups)
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         for request, name in FOLLOWUP_FILES.items():
             assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
@@ -478,7 +530,7 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
                 "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
                 (f"%/{name} (success)",),
             ).fetchone() == (1,)
-    print("PASS: each completed action produced one follow-up call with a tool-role result.")
+    print("PASS: a blank post-action answer replayed the same tool result without repeating the action.")
 
 
 def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) -> None:
@@ -522,8 +574,8 @@ def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) 
         if payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
         and payload["messages"][-1] == {"role": "user", "content": UNANSWERED_LEARNING_REQUEST}
     ]
-    assert len(requests) == 1
-    print("PASS: an empty model answer sent no second request and the exact user report remained available for learning.")
+    assert len(requests) == 2 and requests[0] == requests[1]
+    print("PASS: two blank model answers exhausted one replay and preserved the exact user report for learning.")
 
 
 def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:
@@ -948,6 +1000,67 @@ def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> 
             "SELECT COUNT(*) FROM r2_log_conversations WHERE instr(user_text,?)", (unfinished,)
         ).fetchone() == (0,)
     print("PASS: interactive SIGTERM left the incomplete line undispatched and closed cleanly.")
+
+
+INTERRUPTED_LEARNING_MEMORY = "The user reported seeing a blue notebook during the stalled-learning test."
+
+
+def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
+    first = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
+    second = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
+    log_file = workspace.parent / "second-turn-learning.log"
+    LocalOllama.stalled_learning_started.clear()
+    LocalOllama.stalled_learning_release.clear()
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {first}\n")
+            process.stdin.flush()
+            assert LocalOllama.stalled_learning_started.wait(20), log_file.read_text(errors="replace")
+            process.stdin.write(f"talk {second}\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 10
+            while process.poll() is None and time.monotonic() < deadline:
+                if log_file.read_text(errors="replace").count("R2-3PO: " + REPLY) == 2:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(log_file.read_text(errors="replace"))
+            LocalOllama.stalled_learning_release.set()
+            deadline = time.monotonic() + 10
+            with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+                while process.poll() is None and time.monotonic() < deadline:
+                    saved = db.execute(
+                        "SELECT count(*) FROM memories WHERE memory=?", (INTERRUPTED_LEARNING_MEMORY,),
+                    ).fetchone()
+                    pending = db.execute(
+                        "SELECT 1 FROM r2_log_pending_learning WHERE user_text IN (?,?)", (first, second),
+                    ).fetchone()
+                    if saved == (1,) and pending is None:
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError(log_file.read_text(errors="replace"))
+            process.stdin.write("exit\n")
+            process.stdin.flush()
+            assert process.wait(timeout=8) == 0
+        finally:
+            LocalOllama.stalled_learning_release.set()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute(
+            "SELECT user_text,assistant_text FROM r2_log_conversations "
+            "WHERE user_text IN (?,?) ORDER BY event_id", (first, second),
+        ).fetchall() == [(first, REPLY), (second, REPLY)]
+    print("PASS: a stalled post-turn model request yielded, resumed learning exactly once, "
+          "and preserved both replies.")
 
 
 def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
@@ -1642,6 +1755,7 @@ def main() -> int:
             sentinel = workspace / "hidden-sentinel.txt"
             sentinel.write_bytes(b"private planned action must remain inert")
             send_reported_greeting(binary, workspace, url)
+            second_turn_during_post_turn_learning(binary, workspace, url)
             generate_first_greeting(binary, workspace, url)
             complete_post_action_response(binary, workspace, url)
             preserve_robot_identity(binary, workspace, url)

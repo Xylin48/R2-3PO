@@ -33,13 +33,12 @@ if [[ "$R2_OLLAMA_BASE_URL" != "http://127.0.0.1:11434" ]]; then
 fi
 export R2_OLLAMA_BASE_URL
 
-# Keep R2's Linux identity separate from the canonical data location. HOME is
-# set to the project root for every R2 process, never to /home/r2.
+# Use R2's Linux home for per-user libraries. Project paths use R2_ROOT.
 if ! id r2 >/dev/null 2>&1; then echo "ERROR: Dedicated Linux account r2 does not exist."; exit 1; fi
 R2_UID="$(id -u r2)"
 R2_GID="$(id -g r2)"
-R2_HOME_DIR="$(getent passwd r2 | cut -d: -f6)"
-if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ || -z "$R2_HOME_DIR" ]]; then
+R2_HOME_DIR="/home/r2"
+if [[ ! "$R2_UID" =~ ^[0-9]+$ || ! "$R2_GID" =~ ^[0-9]+$ ]]; then
     echo "ERROR: Could not resolve the dedicated r2 account identity."
     exit 1
 fi
@@ -60,7 +59,7 @@ done
 
 # Drop privileges before executing any project or runtime command.
 R2_HANDOFF=(sudo -n setpriv --reuid="$R2_UID" --regid="$R2_GID" --groups="$R2_RUNTIME_GROUPS" --
-    env HOME="$R2_ROOT" USER=r2 LOGNAME=r2)
+    env HOME="$R2_HOME_DIR" USER=r2 LOGNAME=r2)
 run_as_r2() {
     "${R2_HANDOFF[@]}" "$@"
 }
@@ -68,6 +67,7 @@ run_as_r2() {
 R2_NETWORK_LOCK_ACTIVE=0
 OBSERVER_XHOST_GRANTED=0
 OBSERVER_PID=""
+R2_DIAGNOSTICS_DIR=""
 
 # Observer/display cleanup must run for every exit path, not only after R2
 # returns normally. In particular, an early launch failure after opening the
@@ -107,6 +107,10 @@ r2_network_cleanup() {
     local exit_status=$?
     trap - EXIT
     r2_observer_cleanup
+    if [[ -n "$R2_DIAGNOSTICS_DIR" ]]; then
+        rm -f -- "$R2_DIAGNOSTICS_DIR/Debug.txt"
+        rmdir -- "$R2_DIAGNOSTICS_DIR"
+    fi
     if [[ "$R2_NETWORK_LOCK_ACTIVE" -eq 1 ]]; then
         if r2_remove_network_lock; then
             echo "[Network] R2-only network lock removed."
@@ -232,6 +236,18 @@ fi
 if pgrep -x r2 >/dev/null 2>&1; then
     echo "ERROR: An R2 core is already running."
     echo "Stop the existing R2 session before launching another; both would write the same databases."
+    exit 1
+fi
+
+# Check from the desktop account before restricting r2 to port 11434.
+# Otherwise an independently started server on 11435 can escape detection
+# while still sharing the GPU with the desktop Ollama service.
+if { command -v systemctl >/dev/null 2>&1 &&
+     systemctl is-active --quiet r2-ollama.service 2>/dev/null; } ||
+   curl --noproxy 127.0.0.1 --silent --fail --max-time 2 \
+       http://127.0.0.1:11435/api/tags >/dev/null 2>&1; then
+    echo "ERROR: The separate R2 Ollama service or API on port 11435 is active."
+    echo "Stop that server before interactive launch so both Ollama servers do not compete for the GPU."
     exit 1
 fi
 
@@ -415,8 +431,8 @@ else
         echo
         echo "R2 was NOT launched."
         echo "The real model preflight failed. See its reported cause above."
-        echo "Start the local Ollama service and ensure 'ollama list' includes qwen3.5:9b."
-        echo "If the model is missing, run: ollama pull qwen3.5:9b"
+        echo "Start the local Ollama service and ensure 'ollama list' includes both required models."
+        echo "Missing models can be installed later: ollama pull llama3.1:8b; ollama pull qwen3-vl:4b-instruct-q4_K_M"
         echo "Then launch R2 again."
         read -p "Press Enter to exit..."
         exit 1
@@ -764,9 +780,9 @@ echo "Compilation successful."
 echo "Executable updated:"
 echo "    $R2_EXEC"
 echo
-echo "Unified conversation + vision model: qwen3.5:9b"
-echo "R2 uses one shared Ollama model for text and image perception."
-echo "If needed, install it with: ollama pull qwen3.5:9b"
+echo "Conversation model: llama3.1:8b"
+echo "Visual perception model: qwen3-vl:4b-instruct-q4_K_M"
+echo "Required local models: llama3.1:8b and qwen3-vl:4b-instruct-q4_K_M"
 echo
 echo "Modules compiled:"
 echo "    r2.c"
@@ -813,6 +829,30 @@ echo "Launching R2..."
 printf 'R2 diagnostics are saved in %s.\n' "$R2_ROOT/R2_Log/Debug.txt"
 echo
 
+# The terminal runs as the desktop user. Mirror the live stream into a
+# private temporary file so the saved log can remain accessible only to r2.
+R2_DIAGNOSTICS_TERMINAL=()
+if command -v ptyxis >/dev/null 2>&1; then
+    R2_DIAGNOSTICS_TERMINAL=(ptyxis --new-window --title="R2 Diagnostics" --)
+elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    R2_DIAGNOSTICS_TERMINAL=(x-terminal-emulator -e)
+fi
+R2_MIRROR_DIAGNOSTICS=0
+exec {R2_CORE_STDERR}>&2
+if [[ "${R2_LIVE_DIAGNOSTICS:-0}" == 1 ]]; then
+    if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" && ${#R2_DIAGNOSTICS_TERMINAL[@]} -gt 0 ]] &&
+       R2_DIAGNOSTICS_DIR="$(mktemp -d -- /tmp/r2-diagnostics.XXXXXX)" &&
+       : >"$R2_DIAGNOSTICS_DIR/Debug.txt"; then
+        exec {R2_CORE_STDERR}>&-
+        exec {R2_CORE_STDERR}>>"$R2_DIAGNOSTICS_DIR/Debug.txt"
+        R2_MIRROR_DIAGNOSTICS=1
+        "${R2_DIAGNOSTICS_TERMINAL[@]}" tail --pid="$$" -n +1 -f -- \
+            "$R2_DIAGNOSTICS_DIR/Debug.txt" </dev/null >/dev/null 2>&1 &
+    else
+        echo "WARNING: Could not open the live diagnostics window. See the saved Debug.txt." >&2
+    fi
+fi
+
 # Apply the private clock only to the core and its children.
 run_as_r2 env \
     DISPLAY="${DISPLAY:-}" \
@@ -833,7 +873,7 @@ run_as_r2 env \
     R2_GAMEBOY_ROOT="$R2_GAMEBOY_ROOT" \
     R2_GAMEBOY_DIR="$R2_GAMEBOY_DIR" \
     R2_CAMERA_DEVICE="${R2_CAMERA_DEVICE:-/dev/video0}" \
-    R2_VISION_MODEL="qwen3.5:9b" \
+    R2_VISION_MODEL="qwen3-vl:4b-instruct-q4_K_M" \
     R2_FX_DIR="$R2_FX_DIR" \
     bash -c '
         if [[ "$3" == 1 ]]; then
@@ -841,9 +881,10 @@ run_as_r2 env \
             exec "$1" 2> >(tee -a -- "$2" >&2)
         fi
         exec "$1" 2>>"$2"
-    ' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"
+    ' _ "$R2_EXEC" "$R2_ROOT/R2_Log/Debug.txt" "$R2_MIRROR_DIAGNOSTICS" 2>&"$R2_CORE_STDERR"
 
 status=$?
+exec {R2_CORE_STDERR}>&-
 
 # Also clean up immediately after a normal R2 exit; the EXIT trap is an
 # idempotent fallback for all early exits and signals.

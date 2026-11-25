@@ -26,18 +26,28 @@ static void write_executable(const char *path, const char *contents)
 
 static void verify_model_images(const char *media, int has_camera)
 {
-    char *camera = r2_vision_current_frame_base64();
+    R2VisionRequestSource camera_origin = {0}, display_origin = {0};
+    char *camera = r2_vision_current_frame_base64(&camera_origin);
     assert(has_camera ? camera && !strcmp(camera, "CAMERA") : !camera);
     char *display = NULL;
     for (int i = 0; media && !display && i < 400; ++i) {
-        display = r2_vision_media_current_frame_base64();
+        display = r2_vision_media_current_frame_base64(&display_origin);
         if (!display) {
             struct timespec pause = {0, 5000000L};
             nanosleep(&pause, NULL);
         }
     }
     if (media) assert(display && !strcmp(display, media));
-    else assert(!r2_vision_media_current_frame_base64());
+    else assert(!r2_vision_media_current_frame_base64(&display_origin));
+
+    if (camera) {
+        assert(camera_origin.revision == &eyes_source_revision);
+        assert(!camera_origin.expected_attention && !r2_vision_source_changed(&camera_origin));
+    }
+    if (display) {
+        assert(display_origin.revision == &media_source_revision);
+        assert(display_origin.expected_attention && !r2_vision_source_changed(&display_origin));
+    }
 
     struct json_object *messages = json_object_new_array(), *images = NULL;
     assert(messages && ollama_json_append_message_with_image_sources(
