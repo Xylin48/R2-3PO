@@ -93,6 +93,7 @@
 #include <json-c/json.h>
 #include "r2.h"
 #include "r2_input.h"
+#include "r2_context_budget.h"
 #include "R2Sounds.h"
 #include "R2Reply.h"
 
@@ -4058,14 +4059,15 @@ static int r2_fit_complete_input(size_t required_bytes, int num_ctx, int *num_pr
 {
     if (!num_predict || num_ctx <= 576 || *num_predict < 1 ||
         *num_predict > num_ctx - 512) { errno = EINVAL; return -1; }
-    size_t current = (size_t)(num_ctx - *num_predict - 512) * 32U / 10U;
+    size_t current = r2_text_input_bytes(num_ctx, *num_predict);
     if (required_bytes <= current) return 0;
     /* The existing byte/token estimate is an allocation heuristic, not a
        tokenizer guarantee. Preserve the existing 512-token safety margin
        and at least the established 64-token generation floor. */
-    size_t maximum = (size_t)(num_ctx - 512 - 64) * 32U / 10U;
+    size_t maximum = r2_text_input_bytes(num_ctx, R2_TEXT_MIN_GENERATION);
     if (required_bytes > maximum) { errno = E2BIG; return -1; }
-    size_t input_tokens = (required_bytes * 10U + 31U) / 32U;
+    size_t input_tokens = (required_bytes * R2_TEXT_BYTE_DENOMINATOR +
+                           R2_TEXT_BYTE_NUMERATOR - 1U) / R2_TEXT_BYTE_NUMERATOR;
     int fitted = num_ctx - 512 - (int)input_tokens;
     if (fitted < 64) { errno = E2BIG; return -1; }
     *num_predict = fitted;
@@ -4223,18 +4225,7 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
 static int r2_ollama_predict_budget(int num_ctx, int num_predict,
                                     const char *system_override)
 {
-    /* Keep answer generation inside the configured context window. */
-    int max_predict = num_ctx >= 16384 ? 8192 :
-                      num_ctx >= 12288 ? 6144 :
-                      num_ctx >= 8192 ? 4096 :
-                      num_ctx >= 4096 ? 2048 : 512;
-    int context_output_ceiling = num_ctx > 1536 ? num_ctx - 1536 : 256;
-    if (max_predict > context_output_ceiling)
-        max_predict = context_output_ceiling;
-    /* Omitted budgets are for helper calls; foreground calls request a
-       complexity-based budget and can use the full context-dependent ceiling. */
-    if (num_predict < 1) num_predict = num_ctx >= 12288 ? 2048 : 1024;
-    if (num_predict > max_predict) num_predict = max_predict;
+    num_predict = r2_text_predict_limit(num_ctx, num_predict);
 
     /*
      * Live conversation must budget input and output together. At a small
@@ -4255,7 +4246,8 @@ static int r2_ollama_predict_budget(int num_ctx, int num_predict,
         if (query_chars < 1500)
             query_chars = 1500;
         size_t required_chars = prompt_chars + query_chars + 1500;
-        size_t required_tokens = (required_chars * 10U + 31U) / 32U;
+        size_t required_tokens = (required_chars * R2_TEXT_BYTE_DENOMINATOR +
+                                  R2_TEXT_BYTE_NUMERATOR - 1U) / R2_TEXT_BYTE_NUMERATOR;
         int input_fitted_output = num_ctx - 512 - (int)required_tokens;
         /* Let long turns spend fewer than 256 tokens on the answer when that
            is what it takes to keep the complete prompt and current user turn. */
@@ -4421,7 +4413,7 @@ static char *ollama_chat_with_limit(
      * requested from Ollama. Reserve generation room plus tokenizer overhead,
      * and count the extra system override which is serialized separately.
      */
-    size_t input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+    size_t input_budget = r2_text_input_bytes(num_ctx, num_predict);
     if (input_budget > OLLAMA_MAX_TOTAL_CHARS)
         input_budget = OLLAMA_MAX_TOTAL_CHARS;
     /*
@@ -4685,7 +4677,7 @@ static char *ollama_chat_with_limit(
     }
 
     size_t complete_override_length = system_override ? strlen(system_override) : 0;
-    size_t actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+    size_t actual_input_budget = r2_text_input_bytes(num_ctx, num_predict);
     size_t required_context_chars = 0;
     /* Finalize the generation reservation against the complete preceding
        exchange as well as the active turn. This also covers explicit recall
@@ -4707,7 +4699,7 @@ static char *ollama_chat_with_limit(
                     return NULL;
                 }
                 num_predict = fitted;
-                actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+                actual_input_budget = r2_text_input_bytes(num_ctx, num_predict);
             }
         }
     }
@@ -4724,7 +4716,7 @@ static char *ollama_chat_with_limit(
                 free(include); free(limits); json_object_put(arr); json_object_put(root);
                 return NULL;
             }
-            actual_input_budget = (size_t)(num_ctx - num_predict - 512) * 32U / 10U;
+            actual_input_budget = r2_text_input_bytes(num_ctx, num_predict);
             preservation_rc = r2_preserve_inference_units(msgs, count, include, limits, current_user_index,
                                     complete_override_length, actual_input_budget, &required_context_chars);
             fprintf(stderr, "[R2 Ollama] Complete input retained by reallocating generation reserve: "
@@ -5670,7 +5662,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
            history or a second model call. */
         if (r2_fit_complete_input(total + recent_reserve, ctx, &num_predict) != 0)
             goto cleanup;
-        size_t wire_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+        size_t wire_budget = r2_text_input_bytes(ctx, num_predict);
         if (!recalled && wire_budget < history_budget) history_budget = wire_budget;
     }
     history_budget -= recent_reserve;
@@ -5839,7 +5831,7 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     int ctx = r2_ollama_context_tokens();
     if (ctx <= 576 || user == SIZE_MAX)
         return ollama_chat_with_limit(messages, count, system, num_predict, timeout);
-    size_t capacity = (size_t)(ctx - 512 - 64) * 32U / 10U;
+    size_t capacity = r2_text_input_bytes(ctx, R2_TEXT_MIN_GENERATION);
     size_t required = system ? strlen(system) : 0;
     size_t immutable = required;
     size_t required_system_count = required != 0;
@@ -5861,7 +5853,7 @@ static char *r2_foreground_chat(Message *messages, size_t count,
        not consume the space needed to understand a direct follow-up. */
     size_t recent_exchange = r2_prior_exchange_bytes(messages, count, user);
     int wire_predict = r2_ollama_predict_budget(ctx, num_predict, system);
-    size_t dialogue_capacity = (size_t)(ctx - 512 - wire_predict) * 32U / 10U;
+    size_t dialogue_capacity = r2_text_input_bytes(ctx, wire_predict);
     if (conversation_policy &&
         ((required > capacity &&
           (immutable >= capacity || capacity - immutable < 384)) ||
@@ -10445,7 +10437,7 @@ static char *generate_with_private_evidence(const char *policy, const char *task
     int output_tokens = num_ctx <= 4096 ? 384 : 1024;
     output_tokens = r2_ollama_predict_budget(num_ctx, output_tokens, policy);
     if (num_ctx <= 512 + output_tokens) return NULL;
-    size_t capacity = (size_t)(num_ctx - 512 - output_tokens) * 32U / 10U;
+    size_t capacity = r2_text_input_bytes(num_ctx, output_tokens);
     size_t policy_length = strlen(policy);
     if (policy_length > capacity) return NULL;
     size_t remaining = capacity - policy_length;

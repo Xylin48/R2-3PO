@@ -372,6 +372,9 @@ static void check_final_budget_keeps_exchanges_whole(void)
 
 static void check_boundaries(void)
 {
+    assert(r2_text_predict_limit(2048, 700) == 512);
+    assert(r2_text_input_bytes(2048, r2_text_predict_limit(2048, 700)) == 3276);
+    assert(r2_text_input_bytes(4096, r2_text_predict_limit(4096, 700)) == 9228);
     const int contexts[] = {2048, 4096, 8192, 12288, 16384};
     for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
         int ctx = contexts[i], original = ctx / 2, predict = original;
