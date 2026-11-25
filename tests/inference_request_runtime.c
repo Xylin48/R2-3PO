@@ -1152,6 +1152,63 @@ static void check_gameboy_delivery(void)
     assert(rmdir(directory) == 0);
 }
 
+typedef struct {
+    atomic_int started;
+    int result;
+} ReflectionSlotFixture;
+
+static void *reflection_slot_fixture(void *opaque)
+{
+    ReflectionSlotFixture *fixture = opaque;
+    ollama_background_mode = 1;
+    ollama_reflection_worker = 1;
+    atomic_store(&fixture->started, 1);
+    fixture->result = r2_ollama_background_request_begin();
+    if (fixture->result == 0) pthread_mutex_unlock(&ollama_request_lock);
+    return NULL;
+}
+
+static void check_reflection_waits_for_existing_request(void)
+{
+    int old_diary = atomic_exchange(&diary_running, 1);
+    int old_background = ollama_background_mode;
+    int *old_deferred = post_turn_deferred;
+    int deferred = 0;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 150000000L};
+
+    /* Ordinary learning still defers without queuing another inference. */
+    pthread_mutex_lock(&ollama_request_lock);
+    ollama_background_mode = 1;
+    post_turn_deferred = &deferred;
+    assert(r2_ollama_background_request_begin() == EBUSY && deferred);
+    post_turn_deferred = old_deferred;
+    ollama_background_mode = old_background;
+    pthread_mutex_unlock(&ollama_request_lock);
+
+    for (int foreground_arrives = 0; foreground_arrives < 2; ++foreground_arrives) {
+        ReflectionSlotFixture fixture = {.started = ATOMIC_VAR_INIT(0), .result = -1};
+        pthread_t thread;
+        pthread_mutex_lock(&ollama_request_lock);
+        assert(pthread_create(&thread, NULL, reflection_slot_fixture, &fixture) == 0);
+        while (!atomic_load(&fixture.started)) nanosleep(&pause, NULL);
+        nanosleep(&pause, NULL);
+        if (foreground_arrives) {
+            /* Cancellation is observable while another request still owns
+               the slot, not only after that request finally completes. */
+            atomic_store(&foreground_conversation_waiting, 1);
+            assert(pthread_join(thread, NULL) == 0);
+            assert(fixture.result == ECANCELED);
+            atomic_store(&foreground_conversation_waiting, 0);
+            pthread_mutex_unlock(&ollama_request_lock);
+        } else {
+            pthread_mutex_unlock(&ollama_request_lock);
+            assert(pthread_join(thread, NULL) == 0);
+            assert(fixture.result == 0);
+        }
+    }
+    atomic_store(&diary_running, old_diary);
+}
+
 static void check_reflection_stop_and_long_visual_query(void)
 {
     ollama_reflection_worker = 1;
@@ -1700,7 +1757,7 @@ static void check_second_turn_uses_actual_wire_budget(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     const char *first = "Hello R2, I put the blue book on the top shelf.";
-    const char *query = "Which shelf did we just agree on?";
+    const char *query = "Which one did we just agree on?";
     const char *source = "CURRENT USER INPUT: typed keyboard text.";
     const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
     size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
@@ -1763,6 +1820,55 @@ static void check_second_turn_uses_actual_wire_budget(void)
     free(reply);
     free(answer_text);
     free(identity);
+    free(history);
+}
+
+/* Explicit recall is not permission to omit the conversation that just
+ * happened. Retain the entire selected historical record and both live turns
+ * by fitting the actual generation reservation to the complete wire input. */
+static void check_second_turn_explicit_recall_retains_dialogue(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *first = "Which book do you like?";
+    const char *query = "You said you liked the blue book. Is that still true?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text.";
+    assert(r2_query_explicitly_requests_recall(query));
+    size_t capacity = (4096U - 512U - 64U) * 32U / 10U;
+    char *history = text(4000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
+                   strlen(first) + strlen(query) + strlen(history);
+    assert(capacity > fixed + 512U);
+    char *previous = text(capacity - fixed - 128U, 'b',
+                          "I liked the blue book. ");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = (char *)source},
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = previous},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("Yes, I still like it.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_foreground_chat(turn, 5, r2_compact_conversation_policy,
+                                      query, 2048, 60);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(history) && captured_contains(source) &&
+           captured_contains(first) && captured_contains(previous) &&
+           captured_contains(query));
+    struct json_object *options = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_predict", &value));
+    int predict = json_object_get_int(value);
+    assert(predict >= 64 && predict < 2048);
+    assert(fixed + strlen(previous) <= (size_t)(4096 - 512 - predict) * 32U / 10U);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    free(reply);
+    free(previous);
     free(history);
 }
 
@@ -2038,6 +2144,7 @@ int main(void)
     check_oversized_history_leaves_room_for_complete_exchange();
     check_history_slots_count_only_complete_exchanges();
     check_malformed_conversation_input();
+    check_reflection_waits_for_existing_request();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();
@@ -2127,6 +2234,7 @@ int main(void)
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
     check_second_turn_uses_actual_wire_budget();
+    check_second_turn_explicit_recall_retains_dialogue();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;
