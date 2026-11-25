@@ -123,8 +123,12 @@ require(
     "searches < 6" in association_search
     and "keywords, keyword_count, r2_diary_visit_search" in builder
     and "r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search" in association_search
-    and "r2_visual_visit_recent(3, r2_history_append_unique_row, &selection)" in association_search,
-    "diary and visual retrieval retain full selected records across bounded search slots",
+    and "search_fn(keywords[i], 3, r2_history_append_bounded_row, &bounded)" in association_search
+    and "r2_visual_visit_recent(4, r2_history_append_bounded_row, &bounded)" in association_search
+    and "bounded->selection->incomplete = 1" in core
+    and "diary_unavailable = diary_incomplete || !diary_matches;" in builder
+    and "visual_unavailable = visual_rc != 0 || visual_incomplete;" in builder,
+    "diary and visual retrieval retain complete selected records and report bounded matches",
 )
 require(
     "RELATED DIARY REFLECTIONS" in builder and "RELATED VISUAL EXPERIENCES" in association_search,
