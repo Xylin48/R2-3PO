@@ -2691,3 +2691,11 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Use one shared pure text-inference budget calculation, keep the existing model window, output ceilings, 512-token template margin, and byte/token estimate. Fit the complete formatted chunk by measuring its actual reference fields, keeping UTF-8 boundaries and full review trace; update build/preflight dependencies and both mock and native regressions.
 - Prior full run [45549950515](https://github.com/Xylin48/R2-3PO/actions/runs/45549950515) succeeded with all 128 steps, including the new startup/private-evidence fixtures and sanitizer integration.
 - Status: confirmed before repair.
+
+
+### R2-AUD-2026-11-25-313 — Reality TV status cannot represent some preserved legacy device identities
+
+- Traced `r2_reality_tv_status`, its callers in r2.c and shell.c, and legacy migration. Live device connection limits new names to 120 bytes; migration and the database schema intentionally preserve existing identities without that limit. A valid legacy connected device with a name longer than 8192 bytes makes the fixed 8192-byte status buffer fail, even though the database preserved the record. The shell and model tool-result append paths accept dynamically allocated strings; the raw socket status route sends the whole returned string. TV.py does not request status and its separate bounded command-response protocol is unchanged.
+- Repair the formatter to measure exact record lengths and expand its allocation. Check text fields for embedded NUL to avoid reporting a prefix as a complete identity. Preserve normal connection rules, media paths and device state. Also replace arbitrary spare bytes in fridge, room and combined Reality context formatting with exact dynamic formatting, keeping every existing heading and record.
+- Add a native legacy-sized device fixture exceeding 8192 bytes and confirm its full name and following tape state are returned; check malformed embedded NUL text is not silently accepted.
+- Status: confirmed before repair.
