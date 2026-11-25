@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
+text_budget = (ROOT / "r2_context_budget.h").read_text(encoding="utf-8")
 reality = (ROOT / "Reality.c").read_text(encoding="utf-8")
 visual = (ROOT / "Visual.c").read_text(encoding="utf-8")
 diary = (ROOT / "r2_diary.c").read_text(encoding="utf-8")
@@ -14,7 +15,8 @@ alternate_self = (ROOT / "AlternateSelf.c").read_text(encoding="utf-8")
 required = {
     "RAM-aware context selection": "int r2_ollama_context_tokens(void)",
     "Ollama receives explicit context length": '"num_ctx", json_object_new_int(num_ctx)',
-    "Output budget is capped to context headroom": "if (num_predict > max_predict) num_predict = max_predict;",
+    "Output budget uses the shared context limit":
+        "num_predict = r2_text_predict_limit(num_ctx, num_predict);",
     "Legacy memories are migrated additively": "static int migrate_memory_schema(void)",
     "Legacy content aliases are preserved": '"content", "memory_text", "text", "description", "value"',
     "Current-turn reserve prevents old context crowding it out": "size_t current_user_reserve = 1500;",
@@ -31,6 +33,10 @@ required = {
 for label, needle in required.items():
     if needle not in core:
         raise SystemExit(f"Missing runtime headroom safeguard: {label}")
+if ("int headroom = ctx > 1536 ? ctx - 1536 : 256;" not in text_budget or
+        "if (ceiling > headroom) ceiling = headroom;" not in text_budget or
+        "return requested > ceiling ? ceiling : requested;" not in text_budget):
+    raise SystemExit("Missing shared text-model generation headroom cap.")
 
 if "int r2_ollama_context_tokens(void);" not in (ROOT / "r2.h").read_text(encoding="utf-8"):
     raise SystemExit("Shared RAM-aware context sizing must be part of the core interface.")
