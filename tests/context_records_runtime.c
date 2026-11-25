@@ -171,6 +171,20 @@ int main(void)
     expect_copies(r2_sj_search(long_pattern, 1), long_pattern, 1);
     free(long_pattern);
     expect_contains(r2_collect_associated_records(keywords, 1, search_quoted_sentinel, NULL), "TAIL");
+    /* The seventh eligible cue is not searched by this bounded collector. */
+    const char *many_cues[] = {
+        "amber", "birch", "copper", "delta", "ember", "forest", "granite"
+    };
+    incomplete = 0;
+    bounded = r2_collect_associated_records(many_cues, 6, search_quoted_sentinel,
+        &incomplete);
+    assert(bounded && !incomplete);
+    free(bounded);
+    incomplete = 0;
+    bounded = r2_collect_associated_records(many_cues, 7, search_quoted_sentinel,
+        &incomplete);
+    assert(bounded && incomplete && strstr(bounded, "TAIL"));
+    free(bounded);
     expect_copies(r2_visual_search("not-in-the-fixture", 2), "(No visual experiences found.)\n", 1);
     char *assembled = strdup(memory_text); assert(assembled);
     assert(r2_append_association_section(&assembled, "DIARY:\n", diary_text) == 0);
