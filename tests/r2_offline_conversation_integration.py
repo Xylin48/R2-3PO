@@ -505,8 +505,8 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
     for request in FOLLOWUP_FILES:
         followups = [
             payload for payload in LocalOllama.requests
-            if any(item["role"] == "user" and item["content"] == request
-                   for item in payload["messages"])
+            if next((item["content"] for item in reversed(payload["messages"])
+                     if item["role"] == "user"), None) == request
             and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
                     for item in payload["messages"])
         ]
