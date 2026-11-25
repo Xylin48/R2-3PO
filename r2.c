@@ -6451,12 +6451,19 @@ static int r2_collect_associated_rows(
 {
     if (!search_fn) { errno = EINVAL; return -1; }
     int searches = 0;
-    for (size_t i = 0; i < keyword_count && searches < 6; ++i) {
+    size_t i = 0;
+    for (; i < keyword_count && searches < 6; ++i) {
         if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i])) continue;
         ++searches;
         R2BoundedAssociation bounded = {selection, 0, 2};
         if (search_fn(keywords[i], 3, r2_history_append_bounded_row, &bounded) != 0)
             return -1;
+    }
+    for (; i < keyword_count; ++i) {
+        if (keywords[i][0] && !r2_keyword_is_low_signal(keywords[i])) {
+            selection->incomplete = 1; /* An eligible cue was never searched. */
+            break;
+        }
     }
     return 0;
 }
@@ -7040,6 +7047,18 @@ static int r2_history_append_unique_records(R2HistorySelection *history,
     return 0;
 }
 
+static int r2_history_keyword_searchable(const char *word)
+{
+    if (r2_keyword_is_low_signal(word)) return 0;
+    static const char *const generic[] = {
+        "movie", "video", "watch", "watching", "talk", "said",
+        "thing", "show", "about"
+    };
+    for (size_t i = 0; i < sizeof(generic) / sizeof(generic[0]); ++i)
+        if (!strcasecmp(word, generic[i])) return 0;
+    return 1;
+}
+
 static char *chat_with_relevant_memories(
     const char *query)
 {
@@ -7097,19 +7116,10 @@ static char *chat_with_relevant_memories(
     size_t keyword_count = extract_memory_keywords(associative_query, keywords);
     if (query && *query && r2_log_is_initialized()) {
         int searches = 0;
+        size_t k = 0;
 
-        for (size_t k = 0; k < keyword_count &&
-             searches < history_search_limit; ++k) {
-            if (r2_keyword_is_low_signal(keywords[k]) ||
-                !strcasecmp(keywords[k], "movie") ||
-                !strcasecmp(keywords[k], "video") ||
-                !strcasecmp(keywords[k], "watch") ||
-                !strcasecmp(keywords[k], "watching") ||
-                !strcasecmp(keywords[k], "talk") ||
-                !strcasecmp(keywords[k], "said") ||
-                !strcasecmp(keywords[k], "thing") ||
-                !strcasecmp(keywords[k], "show") ||
-                !strcasecmp(keywords[k], "about"))
+        for (; k < keyword_count && searches < history_search_limit; ++k) {
+            if (!r2_history_keyword_searchable(keywords[k]))
                 continue;
 
             R2LogRecordBatch found = {0};
@@ -7125,6 +7135,12 @@ static char *chat_with_relevant_memories(
             }
             if (found.incomplete) history_unavailable = 1;
             r2_log_release_records(&found);
+        }
+        for (; k < keyword_count; ++k) {
+            if (r2_history_keyword_searchable(keywords[k])) {
+                history_unavailable = 1; /* The selected search slots ran out. */
+                break;
+            }
         }
     }
 
