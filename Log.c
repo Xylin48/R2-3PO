@@ -1510,7 +1510,7 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     const char user_prefix[] = "USER SAID:\n";
     const char reply_prefix[] = "\nR2 REPLIED:\n";
     size_t tool_len = tool_result ? strlen(tool_result) : 0;
-    size_t overhead = sizeof(user_prefix) - 1 + sizeof(reply_prefix) +
+    size_t overhead = (sizeof(user_prefix) - 1) + (sizeof(reply_prefix) - 1) +
                       (tool_len ? sizeof(log_conversation_tool_prefix) - 1 : 0);
     if (user_len > SIZE_MAX - overhead ||
         assistant_len > SIZE_MAX - overhead - user_len ||
