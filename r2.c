@@ -5455,14 +5455,16 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     if (!recalled && num_predict >= 64 && num_predict < ctx - 512)
         history_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
     size_t recent_reserve = 0;
-    if (!recalled && total < history_budget) {
+    /* The preferred reply reserve is optional when it would exclude the
+       immediate exchange despite room in the actual input window. */
+    if (!recalled && total < capacity) {
         size_t bytes = 0;
         size_t slots = 0;
         for (size_t i = user; i > 0;) {
             const Message *m = &messages[--i];
             if (m->role && !strcmp(m->role, "system")) continue;
             size_t length = m->content ? strlen(m->content) : 0;
-            if (!length || length > history_budget - total - bytes ||
+            if (!length || length > capacity - total - bytes ||
                 ++slots >= OLLAMA_MAX_RECENT_MESSAGES) break;
             bytes += length;
             if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
@@ -5471,7 +5473,12 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             }
         }
     }
-    history_budget -= recent_reserve;
+    /* Reserve history before selecting optional retrieval. The serializer
+       can lower num_predict to fit the complete selected input. */
+    if (recent_reserve > history_budget - (total < history_budget ? total : history_budget))
+        history_budget = total + recent_reserve;
+    else
+        history_budget -= recent_reserve;
 
     size_t selected_count = 0;
     size_t oversized_retrieval_bytes = 0;
@@ -5522,7 +5529,10 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
            The full allocation is available for the exact turn and live state. */
         if (num_predict >= 64 && num_predict < ctx - 512)
             input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
-        if (recent_reserve <= input_bytes) input_bytes -= recent_reserve;
+        if (recent_reserve > input_bytes - (total < input_bytes ? total : input_bytes))
+            input_bytes = total + recent_reserve;
+        else
+            input_bytes -= recent_reserve;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
             char *plan = r2_associative_query_cache_lookup(query);
             static char notice[] =
@@ -5549,6 +5559,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             }
             if (focused_retrieval)
                 selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
+            if (focused_retrieval) total += strlen(focused_retrieval);
         }
         fprintf(stderr, "[R2 Context] Focused retrieval selected %zu of %zu historical bytes "
                         "as complete ranked memory records (context=%d, input_budget_bytes=%zu).\n",
@@ -5561,8 +5572,16 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     const char *previous_original = ollama_original_reviewed_query;
     ollama_authoritative_user_query = effective_query;
     if (reviewed_query) ollama_original_reviewed_query = query;
+    int answer_predict = num_predict;
+    if (recent_reserve && total <= capacity && recent_reserve <= capacity - total &&
+        r2_fit_complete_input(total + recent_reserve, ctx, &answer_predict) == 0 &&
+        answer_predict < num_predict)
+        fprintf(stderr, "[R2 Context] Reserved the preceding exchange by adjusting the reply budget: %d -> %d tokens.\n",
+                num_predict, answer_predict);
+    else
+        answer_predict = num_predict;
     answer = r2_foreground_chat(selected, selected_count, r2_compact_conversation_policy,
-                                 effective_query, num_predict, timeout);
+                                 effective_query, answer_predict, timeout);
     ollama_original_reviewed_query = previous_original;
     ollama_authoritative_user_query = previous_query;
 cleanup:
@@ -10616,6 +10635,11 @@ static char *memory_decision(
 
     char *separator = strchr(text, '|');
     if (!separator) {
+        fprintf(stderr, "[R2 Post-turn] Memory decision rejected: missing category separator (event %lld).\n",
+                (long long)source_event_id);
+        (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
+                           "The model returned a memory decision without the required category separator.",
+                           res, "memory_decision");
         free(res);
         return NULL;
     }
@@ -10634,6 +10658,13 @@ static char *memory_decision(
         }
     }
     if (!canonical_category || !*memory) {
+        /* Restore the exact model output before recording the parse failure. */
+        *separator = '|';
+        fprintf(stderr, "[R2 Post-turn] Memory decision rejected: invalid category or empty memory (event %lld).\n",
+                (long long)source_event_id);
+        (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
+                           "The model returned an invalid memory category or empty memory.",
+                           res, "memory_decision");
         free(res);
         return NULL;
     }
