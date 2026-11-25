@@ -1823,9 +1823,9 @@ char *r2_fridge_context(void)
         return strdup("FRIDGE INACCESSIBLE: R2 is away from home. He must return home to access fridge stock.");
     char *items = r2_fridge_list();
     if (!items) return NULL;
-    size_t cap = strlen(items) + 320;
-    char *out = malloc(cap);
-    if (out) snprintf(out, cap, "FRIDGE (separate persistent database; physically at home and accessible only while R2 is home):\n%sOnly listed stock exists. When the fridge is empty, it stays empty until an explicit inventory addition or storage action occurs; do not imagine or claim replacement food.", items);
+    char *out = NULL;
+    if (asprintf(&out, "FRIDGE (separate persistent database; physically at home and accessible only while R2 is home):\n%sOnly listed stock exists. When the fridge is empty, it stays empty until an explicit inventory addition or storage action occurs; do not imagine or claim replacement food.", items) < 0)
+        out = NULL;
     free(items);
     return out;
 }
@@ -3994,11 +3994,11 @@ char *r2_reality_room_look(void)
         char *pockets = r2_reality_list("pockets");
         char *wallet = r2_reality_list("wallet");
         if (!pockets || !wallet) { free(pockets); free(wallet); return NULL; }
-        size_t n = strlen(pockets) + strlen(wallet) + 256;
-        char *out = malloc(n);
-        if (out) snprintf(out, n,
+        char *out = NULL;
+        if (asprintf(&out,
             "R2 IS AWAY FROM HOME\nHis room, shelf, storage box, and fridge are physically inaccessible until he returns home.\n"
-            "PORTABLE INVENTORY\nPockets: %sWallet: %s", pockets, wallet);
+            "PORTABLE INVENTORY\nPockets: %sWallet: %s", pockets, wallet) < 0)
+            out = NULL;
         free(pockets); free(wallet);
         return out;
     }
@@ -4011,12 +4011,12 @@ char *r2_reality_room_look(void)
     if (!room || !shelf || !box || !pockets || !wallet || !named) {
         free(room); free(shelf); free(box); free(pockets); free(wallet); free(named); return NULL;
     }
-    size_t n = strlen(room)+strlen(shelf)+strlen(box)+strlen(pockets)+strlen(wallet)+strlen(named)+720;
-    char *out = malloc(n);
-    if (out) snprintf(out,n,
+    char *out = NULL;
+    if (asprintf(&out,
         "R2'S ROOM\nRoom: %sShelf: %sBox: %sNamed containers in the room and their contents:\n%s"
         "SELF INVENTORY (outside the room)\nPockets: %sWallet (inside pockets): %s",
-        room,shelf,box,named,pockets,wallet);
+        room,shelf,box,named,pockets,wallet) < 0)
+        out = NULL;
     free(room); free(shelf); free(box); free(pockets); free(wallet); free(named);
     return out;
 }
@@ -4299,9 +4299,8 @@ char *r2_reality_context(void)
     if(!visual_memory) visual_memory=strdup("No stored visual observations are available.");
     if(!status||!room||!facts||!items_memory||!food_preferences||!food_experiences||!foods||!fridge||!age||!money||!recent_log||!visual_memory){
         free(status);free(room);free(fridge);free(facts);free(items_memory);free(food_preferences);free(food_experiences);free(foods);free(age);free(money);free(recent_log);free(visual_memory);return NULL;}
-    size_t n=strlen(status)+strlen(room)+strlen(fridge)+strlen(facts)+strlen(items_memory)+strlen(food_preferences)+strlen(food_experiences)+strlen(foods)+strlen(age)+strlen(money)+strlen(recent_log)+strlen(visual_memory)+6000;
-    char *out=malloc(n);
-    if(out)snprintf(out,n,
+    char *out = NULL;
+    if (asprintf(&out,
         "PERSISTENT REALITY CONTEXT (authoritative database state; do not invent changes):\n"
         "%s\n%s\n%s\n%s\n%s\nRECENT LIFE LOG EVIDENCE (events and observations; not automatically current):\n%s\nRECENT VISUAL EXPERIENCES (actual stored observations; not necessarily current):\n%s\nRECENT SELF-CONTINUITY FACTS (up to 40 newest; older facts remain stored):\n%s\nCOLLECTION MEMORIES (precision intentionally fades; not current inventory):\n%s\nLEARNED FOOD/INGREDIENT PREFERENCES (top 24 by average rating; full history remains stored):\n%s\nRECENT RATED FOOD EXPERIENCES:\n%s\nAVAILABLE FOOD METRICS:\n%s\n"
         "WORLD ACTIONS: Put one action on its own line. Use [WORLD] look to inspect the room; "
@@ -4323,7 +4322,8 @@ char *r2_reality_context(void)
         "SENSORY COUNTERFACTUALS: Imagine what a hypothetical view, sound, taste, smell, or touch might reveal without activating Eyes/Ears, changing the world, or claiming an actual sensation. Label imagined details as predictions. Ask 'what if I looked over here?' or 'would I still like X if I knew Y?' Use recent Life Log observations, stored visual experiences, learned preferences, and food/ingredient/taste metrics; distinguish evidence from guesses and update preferences only after real experience or explicit feedback. The current Ears subsystem can log audio source/sample activity without interpreting sound content; do not claim to recognize a sound unless an actual description or transcript exists. "
         "MONEY: cash is carried money; bank is stored in room/piggybank/. When the user explicitly says R2 receives money, use [WORLD] money_receive|amount; use [WORLD] money_deposit|amount, [WORLD] money_withdraw|amount, or [WORLD] buy|item|price|description|container. If R2 accepts an offer to buy something, transact only when its price is explicitly known; never invent a price or stock, and ask for the price if missing. A purchase goes to the named destination; use pockets for goods to carry to the fridge, and room for furniture placed in the room. A free gift is not a purchase. No stock, starting funds, or prices are hardcoded. "
         "Do not claim an action succeeded unless the action result confirms it.",
-        status, room, fridge, age, money, recent_log, visual_memory, facts, items_memory, food_preferences, food_experiences, foods);
+        status, room, fridge, age, money, recent_log, visual_memory, facts, items_memory, food_preferences, food_experiences, foods) < 0)
+        out = NULL;
     free(status); free(room); free(fridge); free(facts); free(items_memory); free(food_preferences); free(food_experiences); free(foods); free(age); free(money); free(recent_log); free(visual_memory);
     return out;
 }
@@ -5787,15 +5787,33 @@ char *r2_reality_get_self(const char *key)
  * the built-in VCR; external AV inputs and RF signals exist only when a
  * device has been explicitly connected. An empty tuned channel stays empty:
  * no snow-show or synthetic signal is generated here. */
-static int append_tv_status(char *out, size_t capacity, size_t *length,
+static int append_tv_status(char **out, size_t *capacity, size_t *length,
                              const char *format, ...)
 {
-    if (!out || !length || !format || *length >= capacity) return -1;
-    va_list args;
+    if (!out || !*out || !capacity || !length || !format || *length >= *capacity)
+        return -1;
+    va_list args, measure;
     va_start(args, format);
-    int written = vsnprintf(out + *length, capacity - *length, format, args);
+    va_copy(measure, args);
+    int measured = vsnprintf(NULL, 0, format, measure);
+    va_end(measure);
+    if (measured < 0 || (size_t)measured > SIZE_MAX - *length - 1U) {
+        va_end(args);
+        return -1;
+    }
+    size_t needed = *length + (size_t)measured + 1U;
+    if (needed > *capacity) {
+        size_t grown_capacity = *capacity;
+        while (grown_capacity < needed)
+            grown_capacity = grown_capacity > SIZE_MAX / 2U ? needed : grown_capacity * 2U;
+        char *grown = realloc(*out, grown_capacity);
+        if (!grown) { va_end(args); return -1; }
+        *out = grown;
+        *capacity = grown_capacity;
+    }
+    int written = vsnprintf(*out + *length, *capacity - *length, format, args);
     va_end(args);
-    if (written < 0 || (size_t)written >= capacity - *length) return -1;
+    if (written != measured) return -1;
     *length += (size_t)written;
     return 0;
 }
@@ -5816,7 +5834,7 @@ char *r2_reality_tv_status(void)
         pthread_mutex_unlock(&reality_lock);
         return NULL;
     }
-    const size_t capacity = 8192;
+    size_t capacity = 8192;
     size_t len = 0;
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(reality_db,
@@ -5834,9 +5852,14 @@ char *r2_reality_tv_status(void)
             } else {
                 power = sqlite3_column_int(st, 0);
                 const unsigned char *k = sqlite3_column_text(st, 1);
-                if (k) snprintf(kind, sizeof(kind), "%s", (const char *)k);
-                value = sqlite3_column_int(st, 2);
-                rc = SQLITE_OK;
+                size_t bytes = (size_t)sqlite3_column_bytes(st, 1);
+                if (!k || bytes >= sizeof(kind) || strlen((const char *)k) != bytes) {
+                    rc = SQLITE_CORRUPT;
+                } else {
+                    memcpy(kind, k, bytes + 1U);
+                    value = sqlite3_column_int(st, 2);
+                    rc = SQLITE_OK;
+                }
             }
         } else if (rc == SQLITE_DONE) {
             rc = SQLITE_NOTFOUND;
@@ -5852,7 +5875,7 @@ char *r2_reality_tv_status(void)
         (strcmp(kind, "vcr") == 0 && value != 1))
         goto tv_status_error;
 
-    if (append_tv_status(out, capacity, &len,
+    if (append_tv_status(&out, &capacity, &len,
         "CRT TV: %s\nSelected source: %s %d\n",
         power ? "ON" : "OFF",
         !strcmp(kind, "vcr") ? "built-in VCR/input" :
@@ -5898,7 +5921,7 @@ char *r2_reality_tv_status(void)
         st = NULL;
         if (rc != SQLITE_OK) goto tv_status_error;
     }
-    if (append_tv_status(out, capacity, &len, "Selected source signal: %s\n",
+    if (append_tv_status(&out, &capacity, &len, "Selected source signal: %s\n",
         signal ? "available" : "NO SIGNAL (nothing is connected/transmitting)") != 0)
         goto tv_status_error;
 
@@ -5911,11 +5934,15 @@ char *r2_reality_tv_status(void)
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *name = (const char *)sqlite3_column_text(st, 0);
             const char *dkind = (const char *)sqlite3_column_text(st, 1);
+            if ((name ? strlen(name) != (size_t)sqlite3_column_bytes(st, 0)
+                      : sqlite3_column_type(st, 0) != SQLITE_NULL) ||
+                !dkind || strlen(dkind) != (size_t)sqlite3_column_bytes(st, 1))
+                goto tv_status_error;
             int port = sqlite3_column_int(st, 2);
-            if (!count && append_tv_status(out, capacity, &len,
+            if (!count && append_tv_status(&out, &capacity, &len,
                                             "Detected external devices:\n") != 0)
                 goto tv_status_error;
-            if (append_tv_status(out, capacity, &len, "  %s — %s %d\n",
+            if (append_tv_status(&out, &capacity, &len, "  %s — %s %d\n",
                     name ? name : "unnamed device",
                     dkind && !strcmp(dkind, "rf") ? "RF channel" : "AV input",
                     port) != 0)
@@ -5927,7 +5954,7 @@ char *r2_reality_tv_status(void)
     if (st) sqlite3_finalize(st);
     st = NULL;
     if (rc != SQLITE_OK) goto tv_status_error;
-    if (!count && append_tv_status(out, capacity, &len,
+    if (!count && append_tv_status(&out, &capacity, &len,
                                     "Detected external devices: none\n") != 0)
         goto tv_status_error;
 
@@ -5940,7 +5967,8 @@ char *r2_reality_tv_status(void)
         if (rc == SQLITE_ROW) {
             const char *tape = (const char *)sqlite3_column_text(st, 0);
             const char *transport = (const char *)sqlite3_column_text(st, 1);
-            if (!transport ||
+            if ((tape && strlen(tape) != (size_t)sqlite3_column_bytes(st, 0)) ||
+                !transport || strlen(transport) != (size_t)sqlite3_column_bytes(st, 1) ||
                 (strcmp(transport, "play") != 0 &&
                  strcmp(transport, "pause") != 0 &&
                  strcmp(transport, "stop") != 0)) {
@@ -5950,16 +5978,16 @@ char *r2_reality_tv_status(void)
                 if ((sqlite3_column_type(st, 2) != SQLITE_INTEGER &&
                      sqlite3_column_type(st, 2) != SQLITE_FLOAT) ||
                     !isfinite(position) || position < 0.0 ||
-                    append_tv_status(out, capacity, &len,
+                    append_tv_status(&out, &capacity, &len,
                         "Built-in VCR: tape inserted (%s), saved position %.1f seconds\n",
                         transport, position) != 0 ||
-                    append_tv_status(out, capacity, &len, "Tape path: %s\n", tape) != 0) {
+                    append_tv_status(&out, &capacity, &len, "Tape path: %s\n", tape) != 0) {
                     rc = SQLITE_CORRUPT;
                 } else {
                     rc = SQLITE_OK;
                 }
             } else if (sqlite3_column_type(st, 0) == SQLITE_NULL) {
-                if (append_tv_status(out, capacity, &len, "Built-in VCR: empty\n") != 0)
+                if (append_tv_status(&out, &capacity, &len, "Built-in VCR: empty\n") != 0)
                     rc = SQLITE_TOOBIG;
                 else
                     rc = SQLITE_OK;
@@ -6100,9 +6128,8 @@ int r2_reality_tv_disconnect(const char *name)
     if (st) sqlite3_finalize(st);
     pthread_mutex_unlock(&reality_lock);
     if (rc != SQLITE_DONE || changed == 0) return -1;
-    char detail[192];
-    snprintf(detail, sizeof(detail), "%s was disconnected; any tuned source now has no signal unless another device supplies it.", name);
-    bridge_event("tv_device_disconnected", "An external device was disconnected from R2's CRT television.", detail, 1, 0);
+    bridge_eventf("tv_device_disconnected", "An external device was disconnected from R2's CRT television.", 1, 0,
+                  "%s was disconnected; any tuned source now has no signal unless another device supplies it.", name);
     return 0;
 }
 
