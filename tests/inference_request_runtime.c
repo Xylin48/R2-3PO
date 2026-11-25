@@ -2121,6 +2121,31 @@ static void check_associative_planner_retains_previous_exchange(void)
     free(cached);
     free(plan);
     r2_associative_query_cache_clear();
+
+    /* A planner which returns malformed JSON twice still has the preceding
+       visible exchange in hand. Search with that antecedent, not an isolated
+       pronoun from the latest turn, and do not repeat planning on reuse. */
+    free(response_body);
+    response_body = strdup("{invalid planner JSON");
+    assert(response_body);
+    before = perform_count;
+    plan = r2_build_associative_search_query(query);
+    assert(plan && perform_count == before + 2);
+    assert(!strncmp(plan, query, strlen(query)) &&
+           strstr(plan, first) && strstr(plan, reply));
+    assert(!strstr(plan, "Fixture request"));
+    cached = r2_build_associative_search_query(query);
+    assert(cached && !strcmp(cached, plan) && perform_count == before + 2);
+    const char *fallback_keywords[MAX_MEMORY_KEYWORDS];
+    size_t fallback_count = extract_memory_keywords(plan, fallback_keywords);
+    int found_antecedent = 0;
+    for (size_t i = 0; i < fallback_count && i < R2_TURN_HISTORY_SEARCHES; ++i)
+        if (!strcmp(fallback_keywords[i], "astronomy")) found_antecedent = 1;
+    assert(found_antecedent);
+    free(cached);
+    free(plan);
+    r2_associative_query_cache_clear();
+    set_response("Fixture answer.", "stop", 1);
     message_free_all();
 }
 

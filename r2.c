@@ -6589,6 +6589,22 @@ static void r2_associative_previous_exchange(const char *query,
     }
 }
 
+/* A malformed or unavailable planner reply must not erase the antecedent of
+ * a follow-up. These are search terms only, never a rewritten user message or
+ * a claim that either speaker's words are verified facts. */
+static char *r2_associative_fallback_query(const char *query,
+                                           const char *previous_user,
+                                           const char *previous_reply)
+{
+    char *fallback = NULL;
+    if (previous_user && previous_reply &&
+        asprintf(&fallback, "%s\n\n%s\n%s", query, previous_user, previous_reply) < 0)
+        fallback = NULL;
+    if (!fallback) fallback = xstrdup(query);
+    if (fallback) r2_associative_query_cache_store(query, fallback);
+    return fallback;
+}
+
 static char *r2_build_associative_search_query(const char *query)
 {
     if (!query || !*query)
@@ -6641,17 +6657,15 @@ static char *r2_build_associative_search_query(const char *query)
     ollama_isolated_request = 1;
     char *generated = ollama_chat_with_limit(
         probe, probe_count, retrieval_prompt, 128, 90L);
-    free(previous_user);
-    free(previous_reply);
     ollama_isolated_request = previous_isolated;
     ollama_authoritative_user_query = previous_query;
     ollama_audit_stage = previous_stage;
 
     if (!generated || !*generated) {
         free(generated);
-        char *fallback = xstrdup(query);
-        if (fallback)
-            r2_associative_query_cache_store(query, fallback);
+        char *fallback = r2_associative_fallback_query(query, previous_user, previous_reply);
+        free(previous_user);
+        free(previous_reply);
         return fallback;
     }
 
@@ -6659,11 +6673,13 @@ static char *r2_build_associative_search_query(const char *query)
     free(generated);
     if (!clean || !*clean) {
         free(clean);
-        char *fallback = xstrdup(query);
-        if (fallback)
-            r2_associative_query_cache_store(query, fallback);
+        char *fallback = r2_associative_fallback_query(query, previous_user, previous_reply);
+        free(previous_user);
+        free(previous_reply);
         return fallback;
     }
+    free(previous_user);
+    free(previous_reply);
 
     size_t query_length = strlen(query);
     size_t concepts_length = strlen(clean);
