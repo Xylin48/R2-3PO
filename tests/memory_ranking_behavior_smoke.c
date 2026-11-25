@@ -116,7 +116,7 @@ int main(void)
     assert(result && strstr(result, "nebula") && focused_partial);
     free(result);
     focused_partial = 0;
-    result = get_relevant_memories("no matching memory exists", 4, 128,
+    result = get_relevant_memories("uniquartzabsent", 4, 128,
                                    &focused_partial);
     assert(result && !*result && !focused_partial);
     free(result);
