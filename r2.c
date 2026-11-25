@@ -10870,6 +10870,7 @@ static char *memory_decision(
         "If nothing should be remembered, respond exactly:\n"
         "NONE\n"
         "\n"
+        "Write one decision on one line. Do not put a newline inside MEMORY.\n"
         "Otherwise respond exactly:\n"
         "CATEGORY | MEMORY\n"
         "\n"
@@ -10972,9 +10973,13 @@ static char *memory_decision(
             break;
         }
     }
-    if (!separator || !canonical_category || memory == end) {
+    int multiple_lines = separator && memory < end &&
+        (memchr(memory, '\n', (size_t)(end - memory)) != NULL ||
+         memchr(memory, '\r', (size_t)(end - memory)) != NULL);
+    if (!separator || !canonical_category || memory == end || multiple_lines) {
         const char *reason = !separator ? "missing category separator" :
-            !canonical_category ? "unknown category" : "empty memory";
+            !canonical_category ? "unknown category" :
+            memory == end ? "empty memory" : "multiple decision lines";
         char summary[256];
         snprintf(summary, sizeof(summary),
                  "Memory evaluation returned invalid final text (%s); not accepted as a memory.",
