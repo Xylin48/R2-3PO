@@ -2668,3 +2668,10 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Repair: allow complete rows to use the existing startup allocation including its actual NUL byte. Format any actual status notice separately using exact sizes; account for its additional bytes in the returned snapshot and use an exactly formatted wrapper. The existing final whole-message allocator measures the complete wrapped snapshot including its delimiter, and remains the authority on whether it fits the model request. Keep the 100-record selection limit, all database text, current-turn retrieval, configured model context and output reservation unchanged. No silent truncation.
 - Add regressions for a record that fills the startup byte allocation exactly, a one-byte-too-large record, simultaneous omitted/unreadable records, and the wrapper's exact preservation.
 - Status: confirmed before repair.
+
+
+### R2-AUD-2026-11-24-310 — Private evidence review triggered by unused fixed framing reservation
+
+- Source at `generate_with_private_evidence` in r2.c: the direct private-evidence payload is one complete system policy and one user message containing either context alone or context + two newline bytes + current input. It nevertheless subtracts a fixed 256 bytes from the available capacity before deciding whether to review. This can cause extra model calls and loss of direct verbatim evidence even when the entire original payload fits with the existing generation allocation. Review framing is only needed when a review is actually required.
+- Use direct exact byte accounting first. For the review path alone, measure the actual archive-reference format using the longest valid signed 64-bit positive ID; charge current input and two newline bytes when applicable. Preserve the existing context and generation policies, review provenance, archived originals and safety constraints. Test direct exact fit, one-byte excess requiring review, and separate current-input framing.
+- Status: confirmed before repair.
