@@ -3,6 +3,7 @@
 
 #include "Imagination.h"
 #include "r2.h"
+#include "r2_context_budget.h"
 #include "r2_diary.h"
 #include "Log.h"
 #include "Reality.h"
@@ -125,6 +126,37 @@ failed:
     return NULL;
 }
 
+static const char review_fragment_format[] =
+    "EVIDENCE REVIEW\nRequest: %s\n"
+    "Round %u, bytes [%zu,%zu) of %zu. "
+    "Round zero is original evidence; later rounds contain model review notes.\n"
+    "BEGIN FRAGMENT\n%.*s";
+
+/* The end offset can acquire another decimal digit at a boundary. Find the
+ * greatest fitting fragment using the actual format, then align to UTF-8. */
+static size_t review_fragment_bytes(const char *request, unsigned round,
+                                    const char *evidence, size_t offset,
+                                    size_t total, size_t budget)
+{
+    size_t low = 0, high = total - offset;
+    if (high > budget) high = budget;
+    if (high > INT_MAX) high = INT_MAX;
+    while (low < high) {
+        size_t length = low + (high - low + 1U) / 2U;
+        int framing = snprintf(NULL, 0, review_fragment_format, request, round,
+                               offset, offset + length, total, 0, "");
+        if (framing >= 0 && (size_t)framing <= budget &&
+            length <= budget - (size_t)framing)
+            low = length;
+        else
+            high = length - 1U;
+    }
+    if (low < total - offset)
+        while (low && ((unsigned char)evidence[offset + low] & 0xC0U) == 0x80U)
+            --low;
+    return low;
+}
+
 /* Shared review of complete evidence. Callers retain the original snapshot. */
 char *r2_review_context(const char *request, const char *context,
                          size_t max_note_bytes, char **processing_notes)
@@ -154,33 +186,21 @@ char *r2_review_context(const char *request, const char *context,
         /* Reserve generation and transport/template headroom with the same
            allocation estimate used by the shared model bridge. */
         int ctx = r2_ollama_context_tokens();
-        if (ctx <= 1024) goto failed;
-        size_t input_capacity = (size_t)(ctx - 512 - 512) * 32U / 10U;
-        size_t overhead = strlen(review_system) + strlen(request);
-        const size_t framing_reserve = 512;
-        if (overhead > input_capacity ||
-            input_capacity - overhead <= framing_reserve + 4)
-            goto failed;
-        size_t chunk_capacity = input_capacity - overhead - framing_reserve;
+        size_t input_capacity = r2_text_input_bytes(ctx, r2_text_predict_limit(ctx, 512));
+        size_t system_bytes = strlen(review_system);
+        if (system_bytes >= input_capacity) goto failed;
+        size_t user_capacity = input_capacity - system_bytes;
         size_t evidence_length = strlen(evidence);
         ImagineBuffer notes = {0};
         size_t offset = 0;
         while (offset < evidence_length) {
-            size_t length = evidence_length - offset;
-            if (length > chunk_capacity) {
-                length = chunk_capacity;
-                while (length && ((unsigned char)evidence[offset + length] & 0xC0U) == 0x80U)
-                    --length;
-            }
+            size_t length = review_fragment_bytes(request, round, evidence, offset,
+                                                  evidence_length, user_capacity);
             if (!length || r2_is_shutting_down()) {
                 free(notes.data);
                 goto failed;
             }
-            if (asprintf(&prompt,
-                "EVIDENCE REVIEW\nRequest: %s\n"
-                "Round %u, bytes [%zu,%zu) of %zu. "
-                "Round zero is original evidence; later rounds contain model review notes.\n"
-                "BEGIN FRAGMENT\n%.*s",
+            if (asprintf(&prompt, review_fragment_format,
                 request, round, offset, offset + length, evidence_length,
                 (int)length, evidence + offset) < 0) {
                 free(notes.data);
@@ -244,7 +264,7 @@ static const char reviewed_context_heading[] =
 static size_t imagination_input_capacity(void)
 {
     int ctx = r2_ollama_context_tokens();
-    return ctx > 1212 ? (size_t)(ctx - 1212) * 32U / 10U : 0;
+    return r2_text_input_bytes(ctx, r2_text_predict_limit(ctx, 700));
 }
 
 static char *review_imagination_request(const char *system, const char *request, char **trace)

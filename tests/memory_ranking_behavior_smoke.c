@@ -133,6 +133,67 @@ int main(void)
     assert(result && strstr(result, "contain embedded NUL bytes") &&
            strstr(result, "nebula spaceship telescope satellite overview"));
     free(result);
+    /* The record budget includes one NUL, not an unconditional 256-byte
+       notice reservation. Exact-size rows and real notices are independent. */
+    const char boundary_category[] = "startup boundary";
+    const char boundary_date[] = "2099-01-01T00:00:00";
+    size_t row_text = 2048U - 1U - 7U -
+        strlen(boundary_category) - strlen(boundary_date);
+    char *boundary = malloc(row_text + 1U);
+    assert(boundary);
+    memset(boundary, 'b', row_text);
+    boundary[row_text] = '\0';
+    assert(save_memory(boundary, boundary_category) == 0);
+    assert(db_exec("UPDATE memories SET updated_at='2099-01-01T00:00:00' "
+                   "WHERE category='startup boundary';") == 0);
+    result = get_startup_memories(1);
+    assert(result && strlen(result) == 2047U && strstr(result, boundary));
+    assert(!strstr(result, "exceeded the startup space"));
+    free(result);
+
+    assert(db_exec("UPDATE memories SET memory=memory||'z' "
+                   "WHERE category='startup boundary';") == 0);
+    result = get_startup_memories(1);
+    assert(result && strstr(result, "1 recent records exceeded") &&
+           !strstr(result, boundary));
+    free(result);
+    assert(db_exec("UPDATE memories SET memory=substr(memory,1,length(memory)-1) "
+                   "WHERE category='startup boundary';"
+                   "UPDATE memories SET updated_at='2098-01-01T00:00:00' "
+                   "WHERE memory LIKE 'rhodonite whole record %';"
+                   "UPDATE memories SET updated_at='2097-01-01T00:00:00' "
+                   "WHERE memory='nebula prefix'||char(0)||'tail';") == 0);
+    result = get_startup_memories(3);
+    assert(result && strlen(result) > 2047U && strstr(result, boundary) &&
+           strstr(result, "1 recent records exceeded") &&
+           strstr(result, "1 recent records contain embedded NUL bytes"));
+    char *wrapped = r2_format_startup_memory_context(result);
+    assert(wrapped);
+    const char begin[] = "----- BEGIN STARTUP PERSISTENT MEMORY -----\n";
+    const char *body = strstr(wrapped, begin);
+    assert(body);
+    body += sizeof(begin) - 1U;
+    assert(!memcmp(body, result, strlen(result)));
+    assert(!strncmp(body + strlen(result), "----- END STARTUP PERSISTENT MEMORY -----",
+                    sizeof("----- END STARTUP PERSISTENT MEMORY -----") - 1U));
+
+    Message selected[] = {
+        {.role = "system", .content = wrapped},
+        {.role = "user", .content = "hello"}
+    };
+    unsigned char include[2] = {0, 1};
+    size_t limits[2] = {0};
+    size_t wire_bytes = strlen(wrapped) + strlen("hello") + 2U + strlen("policy");
+    assert(r2_preserve_inference_units(selected, 2, include, limits, 1,
+                    strlen("policy"), wire_bytes, NULL) == 0);
+    assert(include[0] && limits[0] == strlen(wrapped));
+    assert(r2_preserve_inference_units(selected, 2, include, limits, 1,
+                    strlen("policy"), wire_bytes - 1U, NULL) == 0);
+    assert(!include[0] && include[1] && limits[1] == strlen("hello"));
+    free(wrapped);
+    free(result);
+    free(boundary);
+
     context_cache_invalidate();
     sqlite3_close(db);
     db = NULL;

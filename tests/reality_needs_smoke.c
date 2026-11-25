@@ -44,6 +44,17 @@ static void verify_complete_legacy_inventory(void)
         !strstr(list, "TAIL_2") || !strstr(list, "TAIL_3") || !strstr(list, "TAIL_4"))
         fail("legacy inventory omitted part of a row or result");
     free(list);
+    char *view = r2_reality_room_look();
+    if (!view || strlen(view) < 36000 || !strstr(view, "TAIL_1") ||
+        !strstr(view, "TAIL_2") || !strstr(view, "TAIL_3") || !strstr(view, "TAIL_4"))
+        fail("room context omitted a long legacy inventory record");
+    free(view);
+    char *combined = r2_reality_context();
+    if (!combined || strlen(combined) < 36000 || !strstr(combined, "TAIL_1") ||
+        !strstr(combined, "TAIL_2") || !strstr(combined, "TAIL_3") || !strstr(combined, "TAIL_4") ||
+        !strstr(combined, "Do not claim an action succeeded unless the action result confirms it."))
+        fail("combined Reality context omitted long records or final instructions");
+    free(combined);
 
     if (r2_reality_move_item("legacy_long_1", "shelf") != 0)
         fail("could not move an old item with a long description");
@@ -67,6 +78,33 @@ static void verify_complete_legacy_inventory(void)
     if (sqlite3_exec(db, "DELETE FROM r2_reality_objects WHERE name GLOB 'legacy_long_*';",
                      NULL, NULL, NULL) != SQLITE_OK)
         fail("could not clear inventory fixtures");
+    sqlite3_close(db);
+}
+
+static void verify_complete_legacy_tv_status(void)
+{
+    sqlite3 *db = NULL;
+    if (sqlite3_open(R2_HOME "/r2_reality.db", &db) != SQLITE_OK)
+        fail("could not open TV allocation fixture");
+    const char *seed =
+        "INSERT INTO r2_tv_devices(name,connection_kind,port,connected) "
+        "VALUES('LEGACY_TV_BEGIN_'||printf('%010000d',0)||'_LEGACY_TV_TAIL','rf',13,1);";
+    if (sqlite3_exec(db, seed, NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not seed long legacy TV identity");
+    char *status = r2_reality_tv_status();
+    if (!status || strlen(status) < 10000 || !strstr(status, "LEGACY_TV_BEGIN_") ||
+        !strstr(status, "_LEGACY_TV_TAIL — RF channel 13\n") ||
+        !strstr(status, "Tape path: legacy_tape.mkv\n"))
+        fail("TV status lost a long device identity or subsequent tape state");
+    free(status);
+    if (sqlite3_exec(db, "UPDATE r2_tv_devices SET name=name||char(0)||'suffix' "
+                         "WHERE connection_kind='rf' AND port=13;", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not seed embedded NUL device identity");
+    status = r2_reality_tv_status();
+    if (status) { free(status); fail("TV status accepted a partial device identity"); }
+    if (sqlite3_exec(db, "DELETE FROM r2_tv_devices WHERE connection_kind='rf' AND port=13;",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not remove TV allocation fixture");
     sqlite3_close(db);
 }
 
@@ -927,6 +965,7 @@ int main(void)
         fail("migrated legacy TV power/source/VCR state was not represented in device status");
     }
     free(initial_tv_status);
+    verify_complete_legacy_tv_status();
     verify_legacy_fridge_migration();
     verify_legacy_shared_reality_migration();
     verify_vcr_tape_identity();

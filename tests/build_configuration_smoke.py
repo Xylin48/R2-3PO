@@ -190,7 +190,16 @@ tv_start = reality.index("static int append_tv_status(")
 tv_end = reality.index("int r2_reality_tv_display_event(int opened)", tv_start)
 tv_block = reality[tv_start:tv_end]
 require(
-    "written < 0 || (size_t)written >= capacity - *length" in tv_block
+    "int measured = vsnprintf(NULL, 0, format, measure);" in tv_block
+    and "measured < 0 || (size_t)measured > SIZE_MAX - *length - 1U" in tv_block
+    and "size_t needed = *length + (size_t)measured + 1U;" in tv_block
+    and "if (needed > *capacity)" in tv_block
+    and "realloc(*out, grown_capacity)" in tv_block
+    and "if (written != measured) return -1;" in tv_block
+    and tv_block.index("if (written != measured) return -1;") <
+        tv_block.index("*length += (size_t)written;")
+    and "append_tv_status(out, capacity, &len," not in tv_block
+    and "strlen(name) != (size_t)sqlite3_column_bytes(st, 0)" in tv_block
     and "tv_status_error:" in tv_block
     and "if (rc != SQLITE_OK ||" in tv_block
     and "return NULL;" in tv_block

@@ -5,6 +5,7 @@
 #include "Reward.h"
 #include "AlternateSelf.h"
 #include "r2.h"
+#include "r2_context_budget.h"
 #include "r2_diary.h"
 #include "Visual.h"
 #include "Addiction.h"
@@ -145,6 +146,9 @@ int r2_reward_apply_once(const char *target, const char *source, int points,
 }
 char *r2_model_generate(const char *system_prompt, const char *user_prompt, int max_tokens)
 {
+    if (strlen(system_prompt) + strlen(user_prompt) >
+        r2_text_input_bytes(model_context, r2_text_predict_limit(model_context, max_tokens)))
+        return NULL;
     if (strstr(user_prompt, "EVIDENCE REVIEW\n") == user_prompt) {
         ++review_calls;
         if (review_calls == fail_review_at) return NULL;
@@ -203,6 +207,27 @@ int main(void)
     char *result = NULL;
 
     if (!check(r2_imagination_init() == 0, "initialize imagination")) goto done;
+    if (!check(r2_text_input_bytes(2048, r2_text_predict_limit(2048, 700)) == 3276,
+               "small imagination window matches actual wire allocation")) goto done;
+    model_context = 2048;
+    char long_cue[2351], original[501];
+    memset(long_cue, 'q', sizeof(long_cue) - 1U);
+    long_cue[sizeof(long_cue) - 1U] = '\0';
+    memset(original, 'e', sizeof(original) - 1U);
+    original[sizeof(original) - 1U] = '\0';
+    char *trace = NULL;
+    review_note_length = 8;
+    result = r2_review_context(long_cue, original, 240, &trace);
+    int boundary_ok = result && trace && reviewed_original &&
+                      reviewed_length == strlen(original) &&
+                      !strcmp(reviewed_original, original);
+    free(trace);
+    free(result); result = NULL;
+    free(reviewed_original); reviewed_original = NULL; reviewed_length = 0;
+    review_calls = 0;
+    review_note_length = 0;
+    model_context = 8192;
+    if (!check(boundary_ok, "exact review framing preserves all evidence for a long cue")) goto done;
     result = r2_imagination_create("Imagine the first movie in the CRT room.");
     if (!check(result && strstr(result, "hypothetical imagination") && strstr(result, "remembered CRT room"),
                "generate and persist a hypothetical scenario")) goto done;

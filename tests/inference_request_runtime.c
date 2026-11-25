@@ -314,9 +314,17 @@ static void check_optional_snapshots_yield_to_dialogue(void)
     for (size_t i = 2; i < 6; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 
+    all_budget += 4U; /* Three joined system sections have two delimiters. */
     memset(include, 1, sizeof(include));
+    /* The preliminary system pass may run out before these optional rows. */
+    include[0] = include[1] = 0;
     assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget, NULL) == 0);
     for (size_t i = 0; i < 6; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget - 1U, NULL) == 0);
+    assert(include[0] && !include[1]);
+    for (size_t i = 2; i < 6; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 }
 
@@ -343,6 +351,14 @@ static void check_final_budget_keeps_exchanges_whole(void)
     for (size_t i = 3; i < 8; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 
+    size_t all = recent + strlen(turns[0].content) +
+        strlen(turns[1].content) + strlen(turns[2].content);
+    memset(include, 1, sizeof(include));
+    include[0] = 0; /* Archive was not reached by the preliminary system pass. */
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, all, NULL) == 0);
+    for (size_t i = 0; i < 8; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
     for (int missing_start = 0; missing_start < 2; ++missing_start) {
         memset(include, 1, sizeof(include));
         if (missing_start) include[3] = 0;
@@ -356,6 +372,9 @@ static void check_final_budget_keeps_exchanges_whole(void)
 
 static void check_boundaries(void)
 {
+    assert(r2_text_predict_limit(2048, 700) == 512);
+    assert(r2_text_input_bytes(2048, r2_text_predict_limit(2048, 700)) == 3276);
+    assert(r2_text_input_bytes(4096, r2_text_predict_limit(4096, 700)) == 9228);
     const int contexts[] = {2048, 4096, 8192, 12288, 16384};
     for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
         int ctx = contexts[i], original = ctx / 2, predict = original;
@@ -380,6 +399,85 @@ static int captured_contains(const char *needle)
         if (strstr(json_object_get_string(content), needle)) return 1;
     }
     return 0;
+}
+
+/* Verify the production serializer, not only the final allocator in isolation.
+ * The override fills the provisional system budget but fits in the wire budget
+ * alongside both live turns and a complete startup snapshot. */
+static void check_optional_snapshot_survives_provisional_budget(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *query = "Which book did we choose?";
+    char *contract = text(1800, 'c', "Complete fixture contract. ");
+    const char *snapshot = "R2 PERSISTENT MEMORY - STARTUP CONTEXT: The book is blue.";
+    Message turn[] = {
+        {.role = "system", .content = (char *)snapshot},
+        {.role = "user", .content = "We chose a blue book."},
+        {.role = "assistant", .content = "The blue book."},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = NULL;
+    set_response("The blue book.", "stop", 1);
+    char *reply = ollama_chat_with_limit(turn, 4, contract, 512, 60);
+    assert(reply && captured_contains(contract) && captured_contains(snapshot) &&
+           captured_contains(turn[1].content) && captured_contains(turn[2].content) &&
+           captured_contains(query));
+    free(reply);
+    free(contract);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+}
+
+/* Compare the selection's arithmetic against actual JSON content at the
+ * maximum generation-floor boundary, including the joined system delimiter. */
+static void check_joined_system_exact_wire_boundary(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *policy = "Complete contract.";
+    const char *query = "Exact byte boundary?";
+    const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
+    size_t n = capacity - strlen(policy) - strlen(query) - 2U;
+    char *instructions = text(n, 'z', "Required fixture instructions. ");
+    Message turn[] = {
+        {.role = "system", .content = instructions},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = NULL;
+    set_response("Complete.", "stop", 1);
+    size_t measured = 0;
+    assert(r2_required_inference_bytes(turn, 2, 1, strlen(policy), &measured) == 0);
+    assert(measured == capacity);
+    int before = perform_count;
+    char *reply = ollama_chat_with_limit(turn, 2, policy, 64, 60);
+    assert(reply && perform_count == before + 1 &&
+           captured_contains(instructions) && captured_contains(query));
+    struct json_object *array = NULL, *value = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t wire = 0;
+    for (size_t i = 0; i < json_object_array_length(array); ++i) {
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, i), "content", &value));
+        wire += (size_t)json_object_get_string_len(value);
+    }
+    assert(wire == measured && wire == capacity);
+    assert(captured_contains("\n\nRequired fixture instructions."));
+    free(reply);
+    free(instructions);
+    instructions = text(n + 1U, 'z', "Required fixture instructions. ");
+    turn[0].content = instructions;
+    assert(r2_required_inference_bytes(turn, 2, 1, strlen(policy), &measured) == 0);
+    assert(measured == capacity + 1U);
+    before = perform_count;
+    assert(!ollama_chat_with_limit(turn, 2, policy, 64, 60));
+    assert(perform_count == before);
+    free(instructions);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
 }
 
 static int64_t unavailable_camera_events(void)
@@ -563,6 +661,22 @@ static void check_context_and_isolated_inputs(void)
     assert(!strcmp(ollama_audit_stage, "conversation-answer"));
     free(answer);
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    /* A 700-token request at this context is capped to 512 by the core.
+       The producer may use every estimated input byte left by that cap. */
+    const char small_policy[] = "Isolated contract";
+    const size_t small_capacity = 3276U;
+    char *exact_prompt = text(small_capacity - strlen(small_policy), 'p',
+                              "COMPLETE SMALL-CONTEXT IMAGINATION: ");
+    set_response("Exact isolated answer", "stop", 1);
+    before = perform_count;
+    answer = r2_model_generate(small_policy, exact_prompt, 700);
+    assert(answer && perform_count == before + 1 && captured_contains(exact_prompt));
+    struct json_object *small_options = NULL, *small_predict = NULL;
+    assert(json_object_object_get_ex(captured, "options", &small_options));
+    assert(json_object_object_get_ex(small_options, "num_predict", &small_predict));
+    assert(json_object_get_int(small_predict) == 512);
+    free(answer); free(exact_prompt);
+
     set_response("must not send clipped prompt", "stop", 1);
     before = perform_count;
     assert(!r2_model_generate("Isolated contract", prompt, 700) && perform_count == before);
@@ -801,7 +915,7 @@ static void check_failed_optional_history_review(void)
        review heading or notice, but the exact request can still be sent. */
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
-    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    size_t instructions_len = capacity - strlen(r2_compact_conversation_policy) - strlen(query) - 2U;
     char *instructions = text(instructions_len, 'z', "Required fixture instructions. ");
     Message tight[] = {
         {.role = "system", .content = history},
@@ -1598,6 +1712,7 @@ static void check_compact_ranked_memory(void)
            captured_contains(first) && captured_contains(second) && captured_contains(third));
     assert(!captured_contains("orchard orchard orchard oversized") &&
            !captured_contains(history) && !captured_contains(world));
+    assert(captured_contains("Focused memory retrieval was incomplete."));
     struct json_object *options = NULL, *value = NULL;
     assert(json_object_object_get_ex(captured, "options", &options));
     assert(json_object_object_get_ex(options, "num_ctx", &value) &&
@@ -1609,6 +1724,37 @@ static void check_compact_ranked_memory(void)
            strstr(full, third));
     free(full);
     free(answer);
+
+    /* A successful narrow query with no matching rows is not a complete
+       search of the omitted combined diary/Life Log/retrieved context. */
+    r2_associative_query_cache_store(query, "zxqvabsentfixturetoken");
+    before = perform_count;
+    answer = r2_foreground_chat(turn, 4, r2_conversation_system_prompt, query, 1024, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(query) &&
+           captured_contains("Focused memory retrieval was incomplete.") &&
+           captured_contains("broader historical evidence was not fully included."));
+    assert(!captured_contains(first) && !captured_contains(history));
+    free(answer);
+
+    /* With only the notice's exact byte count available, the answer can
+       still distinguish incomplete evidence from a negative search result. */
+    const char *notice = "Focused memory retrieval was incomplete. The broader historical evidence was not "
+                         "fully included. An incomplete search does not prove a memory is absent.";
+    Message tight[] = {
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(query);
+    for (int short_byte = 0; short_byte <= 1; ++short_byte) {
+        before = perform_count;
+        answer = r2_compact_foreground_chat(tight, 2, 1, query, 1024, 60,
+                                            fixed + strlen(notice) + 2U - (size_t)short_byte);
+        assert(answer && perform_count == before + 1 && captured_contains(query));
+        assert(captured_contains(notice) == !short_byte);
+        assert(!captured_contains(history));
+        free(answer);
+    }
 
     free(history);
     free(world);
@@ -1825,7 +1971,7 @@ static void check_compact_reserves_current_instructions_before_history(void)
     const char *previous_question = "Which shelf should hold the blue book?";
     const char *previous_answer = "Let's use the top shelf.";
     size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
-    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query);
+    size_t history_size = capacity - strlen(r2_compact_conversation_policy) - strlen(query) - 2U;
     char *history = text(history_size, 'h',
         "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     Message turn[] = {
@@ -1850,7 +1996,7 @@ static void check_compact_reserves_current_instructions_before_history(void)
 
     /* This older block fits alongside current instructions by itself.
        It must yield to the immediately preceding complete exchange. */
-    history_size -= strlen(source) + strlen(stale);
+    history_size -= strlen(source) + strlen(stale) + 4U;
     history = text(history_size, 'h',
         "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
     turn[0].content = history;
@@ -1875,7 +2021,7 @@ static void check_second_turn_uses_actual_wire_budget(void)
     const char *source = "CURRENT USER INPUT: typed keyboard text.";
     const size_t capacity = (2048U - 512U - 64U) * 32U / 10U;
     size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
-                   strlen(first) + strlen(query);
+                   strlen(first) + strlen(query) + 2U;
     assert(capacity > fixed + 512U);
     char *answer_text = text(capacity - fixed - 128U, 'a',
                             "The blue book is on the top shelf. ");
@@ -1950,7 +2096,7 @@ static void check_second_turn_explicit_recall_retains_dialogue(void)
     size_t capacity = (4096U - 512U - 64U) * 32U / 10U;
     char *history = text(4000, 'h', "CURRENT TURN RETRIEVED CONTEXT\n");
     size_t fixed = strlen(r2_compact_conversation_policy) + strlen(source) +
-                   strlen(first) + strlen(query) + strlen(history);
+                   strlen(first) + strlen(query) + strlen(history) + 4U;
     assert(capacity > fixed + 512U);
     char *previous = text(capacity - fixed - 128U, 'b',
                           "I liked the blue book. ");
@@ -2269,6 +2415,73 @@ static void check_memory_response_replay(void)
 
 /* Both memory-decision paths must ignore unrelated live input state while
  * retaining the complete saved exchange and restoring their caller's scope. */
+static void check_private_evidence_exact_framing(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *saved_stage = ollama_audit_stage;
+    const char *saved_query = ollama_authoritative_user_query;
+    int saved_isolated = ollama_isolated_request;
+    int saved_sensory = ollama_autonomous_sensory_input;
+    ollama_audit_stage = "private-evidence-fixture";
+    ollama_authoritative_user_query = NULL;
+    ollama_isolated_request = 1;
+    ollama_autonomous_sensory_input = 0;
+    const char policy[] = "Read exact private evidence.";
+    const char task[] = "Review the recorded evidence.";
+    const char current[] = "Exact separate current observation.";
+    size_t capacity = (4096U - 512U - 384U) * 32U / 10U;
+    size_t available = capacity - strlen(policy);
+    set_response("A complete private evidence note.", "stop", 1);
+
+    for (int separate = 0; separate <= 1; ++separate) {
+        size_t context_bytes = available - (separate ? strlen(current) + 2U : 0U);
+        char *context = text(context_bytes, 'x', "Exact historical evidence: ");
+        assert(strlen(context) == context_bytes);
+        int64_t archive = 0;
+        int before = perform_count;
+        char *reply = generate_with_private_evidence(policy, task, context,
+                            separate ? current : NULL, &archive);
+        assert(reply && perform_count == before + 1 && archive == 0);
+        struct json_object *array = NULL, *value = NULL, *options = NULL;
+        assert(json_object_object_get_ex(captured, "messages", &array));
+        assert(json_object_array_length(array) == 2);
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, 0), "content", &value));
+        assert(!strcmp(json_object_get_string(value), policy));
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, 1), "content", &value));
+        const char *wire = json_object_get_string(value);
+        assert(!memcmp(wire, context, context_bytes) && strlen(wire) == available);
+        assert(!strcmp(wire + context_bytes, separate ? "\n\nExact separate current observation." : ""));
+        assert(json_object_object_get_ex(captured, "options", &options));
+        assert(json_object_object_get_ex(options, "num_predict", &value));
+        assert(json_object_get_int(value) == 384);
+        free(reply);
+        free(context);
+    }
+
+    size_t context_bytes = available - strlen(current) - 2U + 1U;
+    char *context = text(context_bytes, 'x', "Exact historical evidence: ");
+    assert(!reviewed_bytes && !reviewed_size && !staged_calls);
+    int64_t archive = 0;
+    capture_reviews = 1;
+    char *reply = generate_with_private_evidence(policy, task, context, current, &archive);
+    capture_reviews = 0;
+    assert(reply && archive > 0 && staged_calls > 0);
+    assert(reviewed_bytes && reviewed_size == context_bytes && !strcmp(reviewed_bytes, context));
+    assert(captured_contains("REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE"));
+    assert(captured_contains(current));
+    free(reply);
+    free(context);
+    free(reviewed_bytes);
+    reviewed_bytes = NULL;
+    reviewed_size = 0;
+    staged_calls = 0;
+    ollama_audit_stage = saved_stage;
+    ollama_authoritative_user_query = saved_query;
+    ollama_isolated_request = saved_isolated;
+    ollama_autonomous_sensory_input = saved_sensory;
+    puts("Private evidence retains exact direct inputs at the wire boundary.");
+}
+
 static void check_memory_decision_private_scope(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
@@ -2420,6 +2633,8 @@ int main(void)
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
     check_optional_snapshots_yield_to_dialogue();
+    check_optional_snapshot_survives_provisional_budget();
+    check_joined_system_exact_wire_boundary();
     check_oversized_history_leaves_room_for_complete_exchange();
     check_history_slots_count_only_complete_exchanges();
     check_malformed_conversation_input();
@@ -2512,6 +2727,7 @@ int main(void)
     check_foreground_answer_replay();
     check_memory_response_replay();
     check_memory_decision_private_scope();
+    check_private_evidence_exact_framing();
     check_rejected_memory_output_retains_evidence();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();

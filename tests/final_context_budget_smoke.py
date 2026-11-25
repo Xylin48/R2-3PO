@@ -36,16 +36,23 @@ require(final_start > 0 and final_end > final_start,
 require("int translated_visual_inputs = 0;" in core
         and "if (json_object_array_length(arr) != before_visual_evidence)" in core
         and "translated_visual_inputs = 1;" in core
-        and "if (translated_visual_inputs) {" in core[final_start - 80:final_start],
-        "only appended live visual evidence or availability notices trigger a final visual budget check")
+        and "if (translated_visual_inputs) {" in core[final_start:final_end],
+        "only appended live visual evidence or availability notices trigger the extra visual fitting pass")
 final_wire = core[final_start:final_end]
 require("json_object_array_length(chat_messages)" in final_wire
         and "json_object_get_string_len(content_value)" in final_wire
-        and "final_input_bytes += content_bytes + 64U;" in final_wire
+        and "size_t template_bytes = translated_visual_inputs ? 64U : 0U;" in final_wire
+        and "final_input_bytes += content_bytes + template_bytes;" in final_wire
+        and "final_input_bytes > actual_input_budget" in final_wire
         and "r2_fit_complete_input(final_input_bytes, num_ctx, &num_predict)" in final_wire
         and 'ollama_json_object_add_checked(request_options, "num_predict"' in final_wire
         and "json_object_put(arr);" in final_wire,
         "full translated observations preserve the input and fit output or fail visibly")
+
+require("r2_add_inference_message_bytes(&required, &system_count" in core
+        and "size_t separator = system && *system_count ? 2U : 0U;" in core
+        and "used += n + separator;" in core,
+        "required and optional text allocation includes the actual system-section delimiter")
 
 require(body.find("if (life_history.length)") < body.find("size_t base_count"),
         "complete Life Log evidence is assembled before prompt construction")
