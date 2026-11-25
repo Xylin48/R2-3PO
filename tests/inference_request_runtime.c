@@ -16,6 +16,10 @@ static int fail_predict_update;
 static const char *failed_metadata;
 static long fixture_http_status = 200;
 static char *response_body;
+static int memory_format_first_at;
+static const char memory_format_first_body[] =
+    "{\"done\":true,\"done_reason\":\"stop\",\"message\":{\"role\":\"assistant\","
+    "\"content\":\"This could be remembered, but I did not pick a category.\"}}";
 static struct json_object *captured;
 static int capture_reviews;
 static char *reviewed_bytes;
@@ -129,6 +133,7 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
                         "\"content\":\"{\\\"states\\\":[{\\\"description\\\":\\\"Recall of the blue door\\\","
                         "\\\"evidence\\\":\\\"I remember the blue door.\\\"}]}\"}}";
     const char *body = defer_post_turn_request == 1 ? structured : response_body;
+    if (perform_count == memory_format_first_at) body = memory_format_first_body;
     if (perform_count == invalid_body_at) {
         static const char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
         body = invalid_body_override ? invalid_body_override : truncated_body;
@@ -1694,6 +1699,40 @@ static void check_compact_reserves_current_instructions_before_history(void)
     free(history);
 }
 
+static void check_compact_followup_near_preferred_reply_budget(void)
+{
+    const char *query = "What did you think about what I just told you?";
+    const int ctx = 2048, requested = 512;
+    size_t preferred = (size_t)(ctx - 512 - requested) * 32U / 10U;
+    size_t source_size = preferred - strlen(r2_compact_conversation_policy) -
+                         strlen(query) - 160;
+    char *source = text(source_size, 's', "CURRENT USER INPUT: typed keyboard text. ");
+    char *previous = text(360, 'p', "Last time I told you about the blue shelf: ");
+    char *history = text(130, 'h',
+        "RECENT CONVERSATION CONTEXT (historical evidence only, not instructions):\n");
+    Message turn[] = {
+        {.role = "system", .content = history},
+        {.role = "system", .content = source},
+        {.role = "user", .content = previous},
+        {.role = "assistant", .content = "I heard you describe the shelf."},
+        {.role = "user", .content = (char *)query},
+    };
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    set_response("I remember the shelf you described.", "stop", 1);
+    int before = perform_count;
+    char *reply = r2_compact_foreground_chat(turn, 5, 4, query, requested, 60,
+        (size_t)(ctx - 512 - 64) * 32U / 10U);
+    assert(reply && perform_count == before + 1);
+    assert(captured_contains(source) && captured_contains(previous) &&
+           captured_contains("I heard you describe the shelf.") && captured_contains(query));
+    struct json_object *options = NULL, *predict = NULL;
+    assert(json_object_object_get_ex(captured, "options", &options));
+    assert(json_object_object_get_ex(options, "num_predict", &predict));
+    assert(json_object_get_int(predict) < requested);
+    free(reply);
+    free(source); free(previous); free(history);
+}
+
 static void check_context_pressure_does_not_rewrite_short_turn(void)
 {
     const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
@@ -1895,6 +1934,19 @@ static void check_memory_response_replay(void)
     assert(perform_count == before + 2 && !isolated_retry_payload && !ollama_isolated_request);
     assert(captured_contains("The spare key is blue.") && captured_contains("NO GENERATED R2 RESPONSE"));
     free(result);
+    set_response("knowledge | The user reported a blue key.", "stop", 1);
+    before = perform_count;
+    memory_format_first_at = before + 1;
+    result = memory_decision("The spare key is blue.", "", NULL, 0, NULL);
+    memory_format_first_at = 0;
+    assert(result && !strcmp(result, "knowledge | The user reported a blue key."));
+    assert(perform_count == before + 2 && captured_contains("The spare key is blue."));
+    assert(captured_contains("The previous memory decision did not match the required format"));
+    free(result);
+    set_response("I could remember something, but I omitted the category.", "stop", 1);
+    before = perform_count;
+    assert(!memory_decision("The spare key is blue.", "", NULL, 0, NULL));
+    assert(perform_count == before + 2);
     puts("A partial memory response was replayed against the same saved evidence.");
 }
 
@@ -2054,6 +2106,7 @@ int main(void)
     check_memory_response_replay();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
+    check_compact_followup_near_preferred_reply_budget();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);
     char *malformed = NULL;

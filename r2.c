@@ -5455,14 +5455,16 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     if (!recalled && num_predict >= 64 && num_predict < ctx - 512)
         history_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
     size_t recent_reserve = 0;
-    if (!recalled && total < history_budget) {
+    /* The preferred reply reserve is optional when it would exclude the
+       immediate exchange despite room in the actual input window. */
+    if (!recalled && total < capacity) {
         size_t bytes = 0;
         size_t slots = 0;
         for (size_t i = user; i > 0;) {
             const Message *m = &messages[--i];
             if (m->role && !strcmp(m->role, "system")) continue;
             size_t length = m->content ? strlen(m->content) : 0;
-            if (!length || length > history_budget - total - bytes ||
+            if (!length || length > capacity - total - bytes ||
                 ++slots >= OLLAMA_MAX_RECENT_MESSAGES) break;
             bytes += length;
             if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
@@ -5471,7 +5473,12 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             }
         }
     }
-    history_budget -= recent_reserve;
+    /* Reserve history before selecting optional retrieval. The serializer
+       can lower num_predict to fit the complete selected input. */
+    if (recent_reserve > history_budget - (total < history_budget ? total : history_budget))
+        history_budget = total;
+    else
+        history_budget -= recent_reserve;
 
     size_t selected_count = 0;
     size_t oversized_retrieval_bytes = 0;
@@ -5522,7 +5529,10 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
            The full allocation is available for the exact turn and live state. */
         if (num_predict >= 64 && num_predict < ctx - 512)
             input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
-        if (recent_reserve <= input_bytes) input_bytes -= recent_reserve;
+        if (recent_reserve > input_bytes - (total < input_bytes ? total : input_bytes))
+            input_bytes = total;
+        else
+            input_bytes -= recent_reserve;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
             char *plan = r2_associative_query_cache_lookup(query);
             static char notice[] =
@@ -5549,6 +5559,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             }
             if (focused_retrieval)
                 selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
+            if (focused_retrieval) total += strlen(focused_retrieval);
         }
         fprintf(stderr, "[R2 Context] Focused retrieval selected %zu of %zu historical bytes "
                         "as complete ranked memory records (context=%d, input_budget_bytes=%zu).\n",
@@ -5561,8 +5572,16 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     const char *previous_original = ollama_original_reviewed_query;
     ollama_authoritative_user_query = effective_query;
     if (reviewed_query) ollama_original_reviewed_query = query;
+    int answer_predict = num_predict;
+    if (recent_reserve && total <= capacity && recent_reserve <= capacity - total &&
+        r2_fit_complete_input(total + recent_reserve, ctx, &answer_predict) == 0 &&
+        answer_predict < num_predict)
+        fprintf(stderr, "[R2 Context] Reserved the preceding exchange by adjusting the reply budget: %d -> %d tokens.\n",
+                num_predict, answer_predict);
+    else
+        answer_predict = num_predict;
     answer = r2_foreground_chat(selected, selected_count, r2_compact_conversation_policy,
-                                 effective_query, num_predict, timeout);
+                                 effective_query, answer_predict, timeout);
     ollama_original_reviewed_query = previous_original;
     ollama_authoritative_user_query = previous_query;
 cleanup:
@@ -10488,6 +10507,57 @@ static void *autonomous_thinking(void *arg)
    MEMORY DECISION
    ============================================================ */
 
+static char *r2_parse_memory_decision(const char *raw, const char **failure)
+{
+    char *copy = strdup(raw);
+    if (!copy) return NULL;
+    char *text = trim(copy);
+    if (!strcasecmp(text, "NONE")) {
+        free(copy);
+        return strdup("NONE");
+    }
+    char *separator = strchr(text, '|');
+    if (!separator) {
+        *failure = "missing category separator";
+        free(copy);
+        return NULL;
+    }
+    *separator = '\0';
+    const char *category = trim(text);
+    const char *memory = trim(separator + 1);
+    static const char *const allowed_categories[] = {
+        "self", "person", "experience", "preference", "knowledge", "relationship", "other"
+    };
+    const char *canonical_category = NULL;
+    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
+        if (!strcasecmp(category, allowed_categories[i])) {
+            canonical_category = allowed_categories[i];
+            break;
+        }
+    }
+    if (!canonical_category || !*memory) {
+        *failure = "invalid category or empty memory";
+        free(copy);
+        return NULL;
+    }
+    if (!strcmp(canonical_category, "self")) {
+        static const char *const identity_patterns[] = {
+            "i am ", "i'm ", "my identity is ", "i was created as ", "i was made as "
+        };
+        for (size_t i = 0; i < sizeof(identity_patterns) / sizeof(identity_patterns[0]); ++i) {
+            if (strcasestr(memory, identity_patterns[i])) {
+                free(copy);
+                return strdup("NONE");
+            }
+        }
+    }
+    char *normalized = NULL;
+    if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
+        normalized = NULL;
+    free(copy);
+    return normalized;
+}
+
 static char *memory_decision(
     const char *user,
     const char *reply,
@@ -10606,54 +10676,54 @@ static char *memory_decision(
         res = generate_with_private_evidence(sys, task, u, NULL, archive_id);
     }
 
-    free(u);
-
-    if (!res)
-        return NULL;
-
-    char *text = trim(res);
-    if (!strcasecmp(text, "NONE")) return res;
-
-    char *separator = strchr(text, '|');
-    if (!separator) {
-        free(res);
-        return NULL;
-    }
-    *separator = '\0';
-    const char *category = trim(text);
-    const char *memory = trim(separator + 1);
-
-    static const char *const allowed_categories[] = {
-        "self", "person", "experience", "preference", "knowledge", "relationship", "other"
-    };
-    const char *canonical_category = NULL;
-    for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
-        if (strcasecmp(category, allowed_categories[i]) == 0) {
-            canonical_category = allowed_categories[i];
-            break;
-        }
-    }
-    if (!canonical_category || !*memory) {
-        free(res);
-        return NULL;
-    }
-
-    if (!strcmp(canonical_category, "self")) {
-        static const char *const identity_patterns[] = {
-            "i am ", "i'm ", "my identity is ", "i was created as ", "i was made as "
-        };
-        for (size_t i = 0; i < sizeof(identity_patterns) / sizeof(identity_patterns[0]); ++i) {
-            if (strcasestr(memory, identity_patterns[i])) {
-                free(res);
-                return strdup("NONE");
+    if (!res) { free(u); return NULL; }
+    const char *failure = NULL;
+    char *normalized = r2_parse_memory_decision(res, &failure);
+    if (failure) {
+        char summary[192];
+        snprintf(summary, sizeof(summary),
+                 "Memory decision rejected: %s (event %lld).",
+                 failure, (long long)source_event_id);
+        fprintf(stderr, "[R2 Post-turn] %s\n", summary);
+        (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
+                           summary, res, "memory_decision");
+        /* Re-evaluate the same saved exchange once. The rejected answer is
+           diagnostic evidence, not a memory and not a user statement. */
+        static const char repair[] =
+            "The previous memory decision did not match the required format. "
+            "Re-evaluate only the supplied exchange. Return exactly NONE, or one "
+            "allowed category followed by | and a supported memory. No preface, "
+            "list, explanation, or invented event.";
+        char *repair_sys = NULL;
+        int repair_budget = 384;
+        if (!shutting_down &&
+            asprintf(&repair_sys, "%s\n\n%s", sys, repair) >= 0 &&
+            r2_fit_complete_input(strlen(repair_sys) + strlen(u),
+                                  r2_ollama_context_tokens(), &repair_budget) == 0) {
+            int previous_isolated = ollama_isolated_request;
+            const char *previous_stage = ollama_audit_stage;
+            ollama_isolated_request = 1;
+            ollama_audit_stage = "post-turn-memory-format-repair";
+            char *repaired = ollama_chat_with_limit(&m, 1, repair_sys, repair_budget, 90L);
+            ollama_audit_stage = previous_stage;
+            ollama_isolated_request = previous_isolated;
+            if (repaired) {
+                failure = NULL;
+                normalized = r2_parse_memory_decision(repaired, &failure);
+                if (failure) {
+                    snprintf(summary, sizeof(summary),
+                             "Memory format repair rejected: %s (event %lld).",
+                             failure, (long long)source_event_id);
+                    fprintf(stderr, "[R2 Post-turn] %s\n", summary);
+                    (void)r2_log_event(R2_LOG_ERROR, "memory_decision_invalid_format",
+                                       summary, repaired, "memory_decision");
+                }
+                free(repaired);
             }
         }
+        free(repair_sys);
     }
-
-    /* Trimming the category can insert a terminator before the separator. */
-    char *normalized = NULL;
-    if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
-        normalized = NULL;
+    free(u);
     free(res);
     return normalized;
 }

@@ -20,7 +20,7 @@ require(
 )
 require(
     'run_as_r2 env' in launcher and 'exec "$1" 2>>"$2"' in launcher
-    and '"$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"' in launcher,
+    and '"$R2_ROOT/R2_Log/Debug.txt" "$R2_MIRROR_DIAGNOSTICS"' in launcher,
     "R2 appends stderr to its private log by default under the shared runtime user",
 )
 require(
