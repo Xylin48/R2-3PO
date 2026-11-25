@@ -20,12 +20,20 @@ require(
 )
 require(
     'run_as_r2 env' in launcher and 'exec "$1" 2>>"$2"' in launcher
-    and '"$R2_ROOT/R2_Log/Debug.txt" "${R2_LIVE_DIAGNOSTICS:-0}"' in launcher,
+    and '"$R2_ROOT/R2_Log/Debug.txt" "$R2_MIRROR_DIAGNOSTICS"' in launcher
+    and 'R2_MIRROR_DIAGNOSTICS=0' in launcher,
     "R2 appends stderr to its private log by default under the shared runtime user",
 )
 require(
     '2> >(tee -a -- "$2" >&2)' in launcher,
     "opt-in live diagnostics show stderr while retaining the log",
+)
+require(
+    'if [[ "${R2_LIVE_DIAGNOSTICS:-0}" == 1 ]]; then' in launcher
+    and 'tail --pid="$" -n +1 -f --' in launcher
+    and 'exec {R2_CORE_STDERR}>>"$R2_DIAGNOSTICS_DIR/Debug.txt"' in launcher
+    and '2>&"$R2_CORE_STDERR"' in launcher,
+    "live diagnostics use the separate terminal stream without writing over conversation output",
 )
 require(
     '2>>"$2"' in launcher and '1>>"$2"' not in launcher,
