@@ -54,6 +54,7 @@
 #include "SensoryJournal.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -1857,173 +1858,85 @@ char *r2_diary_build_reflection_context(
  * ============================================================
  */
 
-char *r2_workspace_list(
-    const char *relative_directory
-)
+/* Append one complete formatted record. Limit text bytes, not allocation
+ * capacity, and distinguish a full output budget from an allocation error.
+ * A status marker is appended separately only after an actual omission. */
+static int workspace_append_formatted(char **out, size_t *length, size_t *capacity,
+                                      size_t max_content, const char *format, ...)
 {
-    int directory_fd;
-
-    DIR *directory;
-
-    struct dirent *entry;
-
-    size_t capacity = 4096;
-    size_t length = 0;
-
-    char *result;
-
-    if (
-        !relative_directory
-        ||
-        !*relative_directory
-    )
-    {
-        relative_directory = ".";
+    va_list args, copy;
+    va_start(args, format);
+    va_copy(copy, args);
+    int count = vsnprintf(NULL, 0, format, copy);
+    va_end(copy);
+    if (count < 0) { va_end(args); return -1; }
+    size_t add = (size_t)count;
+    if (*length > max_content || add > max_content - *length) {
+        va_end(args);
+        return 1;
     }
-
-    directory_fd = r2_workspace_open_checked(relative_directory, 1);
-    if (directory_fd < 0) return NULL;
-    directory = fdopendir(directory_fd);
-    if (!directory) {
-        close(directory_fd);
-        return NULL;
+    if (*length == SIZE_MAX || add > SIZE_MAX - *length - 1U) {
+        va_end(args);
+        errno = EOVERFLOW;
+        return -1;
     }
-
-    result = malloc(
-        capacity
-    );
-
-    if (!result)
-    {
-        closedir(directory);
-        return NULL;
+    size_t needed = *length + add + 1U;
+    if (needed > *capacity) {
+        size_t next = *capacity ? *capacity : 4096U;
+        while (next < needed) next = next > SIZE_MAX / 2U ? needed : next * 2U;
+        /* Avoid doubling the whole result just to append a short notice. */
+        if (next > max_content + 1U) next = needed;
+        char *grown = realloc(*out, next);
+        if (!grown) { va_end(args); return -1; }
+        *out = grown;
+        *capacity = next;
     }
+    int written = vsnprintf(*out + *length, *capacity - *length, format, args);
+    va_end(args);
+    if (written != count) return -1;
+    *length += add;
+    return 0;
+}
 
-    result[0] = '\0';
+char *r2_workspace_list(const char *relative_directory)
+{
+    if (!relative_directory || !*relative_directory) relative_directory = ".";
+    int fd = r2_workspace_open_checked(relative_directory, 1);
+    if (fd < 0) return NULL;
+    DIR *directory = fdopendir(fd);
+    if (!directory) { close(fd); return NULL; }
 
+    char *result = NULL;
+    size_t capacity = 0, length = 0;
+    int failed = 0;
     for (;;) {
-        /* errno from fstatat() must not masquerade as a readdir() failure. */
         errno = 0;
-        entry = readdir(directory);
-        if (!entry) break;
+        struct dirent *entry = readdir(directory);
+        if (!entry) { failed = errno != 0; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+
         struct stat st;
-
-        size_t required;
-
-        if (
-            strcmp(entry->d_name, ".") == 0
-            ||
-            strcmp(entry->d_name, "..") == 0
-        )
-        {
-            continue;
-        }
-
-        /* Classification is also anchored to the opened directory. */
-        if (fstatat(dirfd(directory), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-            continue;
-
-        required =
-            strlen(entry->d_name)
-            +
-            16;
-
-        if (required + 1 > R2_MAX_TOOL_OUTPUT - length) {
-            const char *marker = "[listing truncated at 1 MiB]\n";
-            size_t marker_length = strlen(marker);
-            if (marker_length + 1 <= R2_MAX_TOOL_OUTPUT - length) {
-                if (length + marker_length + 1 > capacity) {
-                    char *expanded = realloc(result, length + marker_length + 1);
-                    if (expanded) {
-                        result = expanded;
-                        capacity = length + marker_length + 1;
-                    }
-                }
-                if (length + marker_length + 1 <= capacity) {
-                    memcpy(result + length, marker, marker_length + 1);
-                    length += marker_length;
-                }
-            }
+        if (fstatat(dirfd(directory), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            failed = 1;
             break;
         }
-
-        if (length + required + 1 >= capacity) {
-            size_t new_capacity = capacity * 2;
-            if (new_capacity > R2_MAX_TOOL_OUTPUT)
-                new_capacity = R2_MAX_TOOL_OUTPUT;
-            while (length + required + 1 >= new_capacity &&
-                   new_capacity < R2_MAX_TOOL_OUTPUT) {
-                size_t next_capacity = new_capacity * 2;
-                new_capacity = next_capacity > R2_MAX_TOOL_OUTPUT
-                    ? R2_MAX_TOOL_OUTPUT : next_capacity;
-            }
-
-            char *expanded = realloc(result, new_capacity);
-            if (!expanded) {
-                closedir(directory);
-                free(result);
-                return NULL;
-            }
-            result = expanded;
-            capacity = new_capacity;
-        }
-
-        if (S_ISDIR(st.st_mode))
-        {
-            length += (size_t)snprintf(
-                result + length,
-                capacity - length,
-                "[DIR]  %s\n",
-                entry->d_name
-            );
-        }
-        else if (S_ISREG(st.st_mode))
-        {
-            length += (size_t)snprintf(
-                result + length,
-                capacity - length,
-                "[FILE] %s\n",
-                entry->d_name
-            );
-        }
-        else if (S_ISLNK(st.st_mode))
-        {
-            length += (size_t)snprintf(
-                result + length,
-                capacity - length,
-                "[LINK] %s\n",
-                entry->d_name
-            );
-        }
-        else
-        {
-            length += (size_t)snprintf(
-                result + length,
-                capacity - length,
-                "[OTHER] %s\n",
-                entry->d_name
-            );
+        const char *kind = S_ISDIR(st.st_mode) ? "[DIR]  " :
+                           S_ISREG(st.st_mode) ? "[FILE] " :
+                           S_ISLNK(st.st_mode) ? "[LINK] " : "[OTHER] ";
+        int rc = workspace_append_formatted(&result, &length, &capacity,
+                       R2_MAX_TOOL_OUTPUT - 1U, "%s%s\n", kind, entry->d_name);
+        if (rc < 0) { failed = 1; break; }
+        if (rc > 0) {
+            failed = workspace_append_formatted(&result, &length, &capacity,
+                       R2_MAX_TOOL_OUTPUT - 1U + sizeof("[listing truncated at 1 MiB]\n") - 1U,
+                       "%s", "[listing truncated at 1 MiB]\n") != 0;
+            break;
         }
     }
-
-    int read_error = errno;
-    closedir(directory);
-    if (read_error) {
-        free(result);
-        errno = read_error;
-        return NULL;
-    }
-
-    if (length == 0)
-    {
-        snprintf(
-            result,
-            capacity,
-            "(empty)"
-        );
-    }
-
-    return result;
+    int saved = errno;
+    if (closedir(directory) != 0) { saved = errno; failed = 1; }
+    if (failed) { free(result); errno = saved; return NULL; }
+    return result ? result : strdup("(empty)");
 }
 
 
@@ -2278,147 +2191,48 @@ char *r2_workspace_read_chunk(
  * ============================================================
  */
 
-char *r2_workspace_search(
-    const char *relative_path,
-    const char *term
-)
+char *r2_workspace_search(const char *relative_path, const char *term)
 {
-    int fd;
-
-    FILE *file;
-
-    char line[8192];
-
-    char *result;
-
-    size_t capacity = 8192;
-    size_t length = 0;
-
-    unsigned long line_number = 0;
-
-    if (
-        !relative_path
-        ||
-        !term
-        ||
-        !*term
-    )
-    {
-        return NULL;
-    }
-
-    fd = r2_workspace_open_checked(relative_path, 0);
+    if (!relative_path || !term || !*term) return NULL;
+    int fd = r2_workspace_open_checked(relative_path, 0);
     if (fd < 0) return NULL;
-    file = fdopen(fd, "r");
-    if (!file) {
-        close(fd);
-        return NULL;
-    }
+    FILE *file = fdopen(fd, "r");
+    if (!file) { close(fd); return NULL; }
 
-    result = malloc(
-        capacity
-    );
-
-    if (!result)
-    {
-        fclose(file);
-        return NULL;
-    }
-
-    result[0] = '\0';
-
-    while (
-        fgets(
-            line,
-            sizeof(line),
-            file
-        )
-    )
-    {
-        line_number++;
-
-        if (
-            !strcasestr(
-                line,
-                term
-            )
-        )
-        {
-            continue;
-        }
-
-        size_t required = strlen(line) + 64;
-
-        if (required + 1 > R2_MAX_TOOL_OUTPUT - length) {
-            const char *marker = "[search results truncated at 1 MiB]\n";
-            size_t marker_length = strlen(marker);
-            if (marker_length + 1 <= R2_MAX_TOOL_OUTPUT - length) {
-                if (length + marker_length + 1 > capacity) {
-                    char *expanded = realloc(result, length + marker_length + 1);
-                    if (expanded) {
-                        result = expanded;
-                        capacity = length + marker_length + 1;
-                    }
-                }
-                if (length + marker_length + 1 <= capacity) {
-                    memcpy(result + length, marker, marker_length + 1);
-                    length += marker_length;
-                }
-            }
+    char *result = NULL, *line = NULL;
+    size_t capacity = 0, length = 0, line_capacity = 0;
+    unsigned long line_number = 0;
+    int failed = 0;
+    for (;;) {
+        ssize_t bytes = getdelim(&line, &line_capacity, '\n', file);
+        if (bytes < 0) {
+            failed = ferror(file) || !feof(file);
             break;
         }
-
-        if (length + required + 1 >= capacity) {
-            size_t new_capacity = capacity * 2;
-            if (new_capacity > R2_MAX_TOOL_OUTPUT)
-                new_capacity = R2_MAX_TOOL_OUTPUT;
-            while (length + required + 1 >= new_capacity &&
-                   new_capacity < R2_MAX_TOOL_OUTPUT) {
-                size_t next_capacity = new_capacity * 2;
-                new_capacity = next_capacity > R2_MAX_TOOL_OUTPUT
-                    ? R2_MAX_TOOL_OUTPUT : next_capacity;
-            }
-
-            char *expanded = realloc(result, new_capacity);
-            if (!expanded) {
-                fclose(file);
-                free(result);
-                return NULL;
-            }
-            result = expanded;
-            capacity = new_capacity;
+        if (memchr(line, '\0', (size_t)bytes)) {
+            errno = EILSEQ;
+            failed = 1;
+            break;
         }
+        if (line_number == ULONG_MAX) { errno = EOVERFLOW; failed = 1; break; }
+        ++line_number;
+        if (!strcasestr(line, term)) continue;
 
-        length += (size_t)snprintf(
-            result + length,
-            capacity - length,
-
-            "Line %lu: %s",
-
-            line_number,
-            line
-        );
+        int rc = workspace_append_formatted(&result, &length, &capacity,
+                           R2_MAX_TOOL_OUTPUT - 1U, "Line %lu: %s", line_number, line);
+        if (rc < 0) { failed = 1; break; }
+        if (rc > 0) {
+            failed = workspace_append_formatted(&result, &length, &capacity,
+                       R2_MAX_TOOL_OUTPUT - 1U + sizeof("[search results truncated at 1 MiB]\n") - 1U,
+                       "%s", "[search results truncated at 1 MiB]\n") != 0;
+            break;
+        }
     }
-
-    /* Do not report a partially searched file as a complete result. */
-    if (ferror(file)) {
-        fclose(file);
-        free(result);
-        errno = EIO;
-        return NULL;
-    }
-    fclose(file);
-
-    if (length == 0)
-    {
-        snprintf(
-            result,
-            capacity,
-            "No matches found."
-        );
-    }
-
-    return result;
+    int saved = errno;
+    free(line);
+    if (fclose(file) != 0) { saved = errno; failed = 1; }
+    if (failed) { free(result); errno = saved; return NULL; }
+    return result ? result : strdup("No matches found.");
 }
 
 
