@@ -1844,25 +1844,40 @@ static char *get_startup_memories(int limit)
     /* Append exactly the notices that are needed. Their allocation is
        separate from the record allowance; the final request measures all
        of the returned text, not just the record portion. */
-    char *deferred_note = NULL, *unreadable_note = NULL;
-    if ((deferred && asprintf(&deferred_note,
-            "%u recent records exceeded the startup space. Their complete text remains available through memory retrieval.\n",
-            deferred) < 0) ||
-        (unreadable && asprintf(&unreadable_note,
-            "%u recent records contain embedded NUL bytes and could not be supplied as text.\n",
-            unreadable) < 0)) {
-        free(deferred_note); free(unreadable_note); free(out);
+    static const char deferred_format[] =
+        "%u recent records exceeded the startup space. Their complete text remains available through memory retrieval.\n";
+    static const char unreadable_format[] =
+        "%u recent records contain embedded NUL bytes and could not be supplied as text.\n";
+    int deferred_size = deferred ? snprintf(NULL, 0, deferred_format, deferred) : 0;
+    int unreadable_size = unreadable ? snprintf(NULL, 0, unreadable_format, unreadable) : 0;
+    if (deferred_size < 0 || unreadable_size < 0 ||
+        (size_t)deferred_size > SIZE_MAX - len - 1U ||
+        (size_t)unreadable_size > SIZE_MAX - len - 1U - (size_t)deferred_size) {
+        free(out);
         return NULL;
     }
-    if (deferred || unreadable) {
-        char *complete = NULL;
-        int formatted = asprintf(&complete, "%s%s%s", out,
-                                 deferred_note ? deferred_note : "",
-                                 unreadable_note ? unreadable_note : "");
-        free(out);
-        out = formatted < 0 ? NULL : complete;
+    size_t needed = len + (size_t)deferred_size + (size_t)unreadable_size + 1U;
+    if (needed > cap) {
+        char *grown = realloc(out, needed);
+        if (!grown) { free(out); return NULL; }
+        out = grown;
+        cap = needed;
     }
-    free(deferred_note); free(unreadable_note);
+    if (deferred) {
+        if (snprintf(out + len, cap - len, deferred_format, deferred) != deferred_size) {
+            free(out);
+            return NULL;
+        }
+        len += (size_t)deferred_size;
+    }
+    if (unreadable) {
+        if (snprintf(out + len, cap - len, unreadable_format, unreadable) != unreadable_size) {
+            free(out);
+            return NULL;
+        }
+        len += (size_t)unreadable_size;
+    }
+    out[len] = '\0';
     if (unreadable)
         fprintf(stderr, "[R2 memory] Startup omitted %u record(s) with embedded NUL bytes.\n", unreadable);
     return out;
