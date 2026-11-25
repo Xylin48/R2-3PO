@@ -315,6 +315,8 @@ static void check_optional_snapshots_yield_to_dialogue(void)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 
     memset(include, 1, sizeof(include));
+    /* The preliminary system pass may run out before these optional rows. */
+    include[0] = include[1] = 0;
     assert(r2_preserve_inference_units(turns, 6, include, limits, 5, 0, all_budget, NULL) == 0);
     for (size_t i = 0; i < 6; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
@@ -341,6 +343,14 @@ static void check_final_budget_keeps_exchanges_whole(void)
     assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, recent, NULL) == 0);
     assert(!include[0] && !include[1] && !include[2]);
     for (size_t i = 3; i < 8; ++i)
+        assert(include[i] && limits[i] == strlen(turns[i].content));
+
+    size_t all = recent + strlen(turns[0].content) +
+        strlen(turns[1].content) + strlen(turns[2].content);
+    memset(include, 1, sizeof(include));
+    include[0] = 0; /* Archive was not reached by the preliminary system pass. */
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, all, NULL) == 0);
+    for (size_t i = 0; i < 8; ++i)
         assert(include[i] && limits[i] == strlen(turns[i].content));
 
     for (int missing_start = 0; missing_start < 2; ++missing_start) {
@@ -1598,6 +1608,7 @@ static void check_compact_ranked_memory(void)
            captured_contains(first) && captured_contains(second) && captured_contains(third));
     assert(!captured_contains("orchard orchard orchard oversized") &&
            !captured_contains(history) && !captured_contains(world));
+    assert(captured_contains("Focused memory retrieval was incomplete."));
     struct json_object *options = NULL, *value = NULL;
     assert(json_object_object_get_ex(captured, "options", &options));
     assert(json_object_object_get_ex(options, "num_ctx", &value) &&
@@ -1608,6 +1619,18 @@ static void check_compact_ranked_memory(void)
     assert(full && strstr(full, large) && strstr(full, first) && strstr(full, second) &&
            strstr(full, third));
     free(full);
+    free(answer);
+
+    /* A successful narrow query with no matching rows is not a complete
+       search of the omitted combined diary/Life Log/retrieved context. */
+    r2_associative_query_cache_store(query, "zxqvabsentfixturetoken");
+    before = perform_count;
+    answer = r2_foreground_chat(turn, 4, r2_conversation_system_prompt, query, 1024, 60);
+    assert(answer && perform_count == before + 1);
+    assert(captured_contains(query) &&
+           captured_contains("Focused memory retrieval was incomplete.") &&
+           captured_contains("broader historical evidence was not fully included."));
+    assert(!captured_contains(first) && !captured_contains(history));
     free(answer);
 
     free(history);
