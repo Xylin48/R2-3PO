@@ -27,7 +27,7 @@ static int replace_mirror_directory = 0;
 static char replaced_mirror_name[14];
 static int fail_diary_readdir = 0;
 static int fail_diary_fread = 0;
-static int fail_diary_fgets = 0;
+static int fail_diary_getdelim = 0;
 static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
 static void maybe_swap_checked_workspace_open(const char *path, int flags)
 {
@@ -115,14 +115,61 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
     return __real_fread(ptr, size, nmemb, stream);
 }
 
-char *__real_fgets(char *ptr, int size, FILE *stream);
-char *__wrap_fgets(char *ptr, int size, FILE *stream)
+ssize_t __real_getdelim(char **ptr, size_t *size, int delimiter, FILE *stream);
+ssize_t __wrap_getdelim(char **ptr, size_t *size, int delimiter, FILE *stream)
 {
-    if (fail_diary_fgets) {
-        fail_diary_fgets = 0;
+    if (fail_diary_getdelim) {
+        fail_diary_getdelim = 0;
         assert(close(fileno(stream)) == 0);
     }
-    return __real_fgets(ptr, size, stream);
+    return __real_getdelim(ptr, size, delimiter, stream);
+}
+
+static void verify_workspace_search_allocation(void)
+{
+    const char *name = "audit-search-boundary.txt";
+    const char *path = R2_WORKSPACE "/audit-search-boundary.txt";
+    const size_t content_limit = 1024U * 1024U - 1U;
+    const char prefix[] = "Line 1: ";
+    const char marker[] = "[search results truncated at 1 MiB]\n";
+    size_t row_bytes = content_limit - (sizeof(prefix) - 1U);
+    char *line = malloc(row_bytes + 1U);
+    assert(line);
+    memset(line, 'x', row_bytes);
+    memcpy(line + 8188, "needle", 6); /* crosses old fgets boundary */
+    line[row_bytes - 1U] = '\n';
+    line[row_bytes] = '\0';
+
+    FILE *file = fopen(path, "wb");
+    assert(file && fwrite(line, 1, row_bytes, file) == row_bytes && fclose(file) == 0);
+    char *result = r2_workspace_search(name, "needle");
+    assert(result && strlen(result) == content_limit);
+    assert(!memcmp(result, prefix, sizeof(prefix) - 1U));
+    assert(!memcmp(result + sizeof(prefix) - 1U, line, row_bytes));
+    free(result);
+
+    file = fopen(path, "ab");
+    assert(file && fputs("needle again\n", file) >= 0 && fclose(file) == 0);
+    result = r2_workspace_search(name, "needle");
+    assert(result && strlen(result) == content_limit + sizeof(marker) - 1U);
+    assert(!memcmp(result + sizeof(prefix) - 1U, line, row_bytes));
+    assert(!strcmp(result + content_limit, marker));
+    free(result);
+
+    /* Long physical lines must not change the next line number. */
+    file = fopen(path, "wb");
+    assert(file && fwrite(line, 1, 8195, file) == 8195);
+    assert(fputs("\nneedle again\n", file) >= 0 && fclose(file) == 0);
+    result = r2_workspace_search(name, "needle");
+    assert(result && strstr(result, "\nLine 2: needle again\n"));
+    free(result);
+
+    static const char binary[] = {'n','e','e','d','l','e','\0','x','\n'};
+    file = fopen(path, "wb");
+    assert(file && fwrite(binary, 1, sizeof(binary), file) == sizeof(binary) && fclose(file) == 0);
+    assert(!r2_workspace_search(name, "needle"));
+    free(line);
+    assert(unlink(path) == 0);
 }
 
 static void verify_workspace_text_byte_counts(void)
@@ -221,9 +268,9 @@ static void verify_diary_workspace_path_swaps(void)
     assert(!read_error && !fail_diary_fread);
     free(read_error);
 
-    fail_diary_fgets = 1;
+    fail_diary_getdelim = 1;
     read_error = r2_workspace_search("workspace-race/note.txt", "fixture");
-    assert(!read_error && !fail_diary_fgets);
+    assert(!read_error && !fail_diary_getdelim);
     free(read_error);
 
     fail_diary_readdir = 1;
@@ -998,6 +1045,7 @@ int main(void)
     verify_mirror_flush_failure();
     verify_mirror_symlink_is_not_followed();
     verify_detached_mirror_is_replayed();
+    verify_workspace_search_allocation();
     verify_workspace_text_byte_counts();
     verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
