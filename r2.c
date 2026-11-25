@@ -6295,7 +6295,11 @@ static int r2_keyword_is_low_signal(const char *word)
     static const char *const low_signal[] = {
         "hello", "hi", "hey", "yo", "r2", "speaking", "there", "here",
         "actually", "really", "just", "also", "fully", "know", "thing", "things",
-        "thank", "thanks", "okay", "ok", "lol", "lmao", "how", "up"
+        "thank", "thanks", "okay", "ok", "lol", "lmao", "how", "up",
+        /* A follow-up often asks for elaboration without naming its subject.
+           These conversational verbs must not spend the six searches shared
+           with the preceding exchange in diary and visual retrieval. */
+        "please", "explain", "elaborate", "detail", "details", "more", "tell"
     };
     for (size_t i = 0; i < sizeof(low_signal) / sizeof(low_signal[0]); ++i) {
         if (!strcasecmp(word, low_signal[i]))
