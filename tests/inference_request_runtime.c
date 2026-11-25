@@ -2083,6 +2083,47 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
     r2_associative_query_cache_clear();
 }
 
+/* The second-turn planner must see the exact preceding visible exchange,
+ * not just the latest pronoun or the internal action that produced a reply. */
+static void check_associative_planner_retains_previous_exchange(void)
+{
+    const char *first = "What is in the blue folder?";
+    const char *reply = "The folder contains the old astronomy notes.";
+    const char *query = "Could you elaborate on that?";
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    message_free_all();
+    r2_associative_query_cache_clear();
+    assert(message_add("user", first) == 0);
+    assert(message_add("assistant", "[R2_INTERNAL_TOOL_REQUEST]\nFixture request") == 0);
+    assert(message_add("assistant", reply) == 0);
+    assert(message_add("user", query) == 0);
+    set_response("astronomy notes\nblue folder\nprevious discussion", "stop", 1);
+    int before = perform_count;
+    char *plan = r2_build_associative_search_query(query);
+    assert(plan && perform_count == before + 1);
+    assert(!strncmp(plan, query, strlen(query)) && strstr(plan, "astronomy notes"));
+    assert(!captured_contains("Fixture request"));
+    struct json_object *array = NULL, *field = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    size_t count = json_object_array_length(array);
+    assert(count == 4);
+    const char *roles[] = {"user", "assistant", "user"};
+    const char *texts[] = {first, reply, query};
+    for (size_t i = 0; i < 3; ++i) {
+        struct json_object *entry = json_object_array_get_idx(array, i + 1);
+        assert(json_object_object_get_ex(entry, "role", &field));
+        assert(!strcmp(json_object_get_string(field), roles[i]));
+        assert(json_object_object_get_ex(entry, "content", &field));
+        assert(!strcmp(json_object_get_string(field), texts[i]));
+    }
+    char *cached = r2_build_associative_search_query(query);
+    assert(cached && !strcmp(plan, cached) && perform_count == before + 1);
+    free(cached);
+    free(plan);
+    r2_associative_query_cache_clear();
+    message_free_all();
+}
+
 static void check_missing_live_frame_is_current_evidence(void)
 {
     const char *queries[] = {"What can you see?", "What's on the screen?", "What did we watch yesterday?",
@@ -2316,6 +2357,7 @@ int main(void)
     check_context_cache_write_overlap();
     check_first_answer_with_unavailable_source();
     check_literal_retrieval_cues_precede_generated_cues();
+    check_associative_planner_retains_previous_exchange();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
