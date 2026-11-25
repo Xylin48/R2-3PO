@@ -2280,6 +2280,45 @@ static void check_memory_decision_private_scope(void)
     ollama_isolated_request = saved_isolated;
 }
 
+/* Failed final-channel memory decisions must remain distinguishable from
+ * NONE without converting their content into factual memories. */
+static void check_rejected_memory_output_retains_evidence(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    int64_t event = r2_log_conversation_turn_for_learning(
+        "Memory parser fixture.", "This is the recorded response.", NULL, 0, NULL, 0, NULL);
+    assert(event > 0 && r2_log_ack_self_report(event) == 0);
+    const char *invalid[] = {
+        "  This response lacks its category.  \n",
+        "  imagination | An unsupported category. \n",
+        "  knowledge |  \t\n"
+    };
+    const char *reasons[] = {"missing category separator", "unknown category", "empty memory"};
+    sqlite3 *connection = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
+    for (size_t i = 0; i < 3; ++i) {
+        set_response(invalid[i], "stop", 1);
+        int before = perform_count;
+        assert(!memory_decision("Memory parser fixture.", "This is the recorded response.",
+                                NULL, event, NULL));
+        assert(perform_count == before + 1);
+        sqlite3_stmt *st = NULL;
+        assert(sqlite3_prepare_v2(connection,
+            "SELECT e.details,e.summary FROM r2_log_events e JOIN r2_log_links l ON l.from_event_id=e.id "
+            "WHERE e.event_type='post_turn_memory_invalid_output' AND l.to_event_id=? "
+            "AND l.relationship='memory_evaluation_failed_from' ORDER BY e.id DESC LIMIT 1;",
+            -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(st, 1, event) == SQLITE_OK);
+        assert(sqlite3_step(st) == SQLITE_ROW);
+        assert(sqlite3_column_bytes(st, 0) == (int)strlen(invalid[i]));
+        assert(!strcmp((const char *)sqlite3_column_text(st, 0), invalid[i]));
+        assert(strstr((const char *)sqlite3_column_text(st, 1), reasons[i]));
+        sqlite3_finalize(st);
+    }
+    assert(sqlite3_close(connection) == SQLITE_OK);
+    assert(r2_log_ack_learning(event) == 0);
+}
+
 static void *shutdown_fixture_worker(void *unused)
 {
     (void)unused;
@@ -2437,6 +2476,7 @@ int main(void)
     check_foreground_answer_replay();
     check_memory_response_replay();
     check_memory_decision_private_scope();
+    check_rejected_memory_output_retains_evidence();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
     check_second_turn_uses_actual_wire_budget();
