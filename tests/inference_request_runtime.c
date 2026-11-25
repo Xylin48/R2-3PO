@@ -392,6 +392,36 @@ static int captured_contains(const char *needle)
     return 0;
 }
 
+/* Verify the production serializer, not only the final allocator in isolation.
+ * The override fills the provisional system budget but fits in the wire budget
+ * alongside both live turns and a complete startup snapshot. */
+static void check_optional_snapshot_survives_provisional_budget(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *query = "Which book did we choose?";
+    char *contract = text(1800, 'c', "Complete fixture contract. ");
+    const char *snapshot = "R2 PERSISTENT MEMORY - STARTUP CONTEXT: The book is blue.";
+    Message turn[] = {
+        {.role = "system", .content = (char *)snapshot},
+        {.role = "user", .content = "We chose a blue book."},
+        {.role = "assistant", .content = "The blue book."},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = NULL;
+    set_response("The blue book.", "stop", 1);
+    char *reply = ollama_chat_with_limit(turn, 4, contract, 512, 60);
+    assert(reply && captured_contains(contract) && captured_contains(snapshot) &&
+           captured_contains(turn[1].content) && captured_contains(turn[2].content) &&
+           captured_contains(query));
+    free(reply);
+    free(contract);
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+}
+
 static int64_t unavailable_camera_events(void)
 {
     sqlite3 *fixture = NULL;
@@ -1633,6 +1663,25 @@ static void check_compact_ranked_memory(void)
     assert(!captured_contains(first) && !captured_contains(history));
     free(answer);
 
+    /* With only the notice's exact byte count available, the answer can
+       still distinguish incomplete evidence from a negative search result. */
+    const char *notice = "Focused memory retrieval was incomplete. The broader historical evidence was not "
+                         "fully included. An incomplete search does not prove a memory is absent.";
+    Message tight[] = {
+        {.role = "system", .content = history},
+        {.role = "user", .content = (char *)query},
+    };
+    size_t fixed = strlen(r2_compact_conversation_policy) + strlen(query);
+    for (int short_byte = 0; short_byte <= 1; ++short_byte) {
+        before = perform_count;
+        answer = r2_compact_foreground_chat(tight, 2, 1, query, 1024, 60,
+                                            fixed + strlen(notice) - (size_t)short_byte);
+        assert(answer && perform_count == before + 1 && captured_contains(query));
+        assert(captured_contains(notice) == !short_byte);
+        assert(!captured_contains(history));
+        free(answer);
+    }
+
     free(history);
     free(world);
     free(large);
@@ -2443,6 +2492,7 @@ int main(void)
     check_final_budget_prefers_recent_dialogue();
     check_final_budget_keeps_exchanges_whole();
     check_optional_snapshots_yield_to_dialogue();
+    check_optional_snapshot_survives_provisional_budget();
     check_oversized_history_leaves_room_for_complete_exchange();
     check_history_slots_count_only_complete_exchanges();
     check_malformed_conversation_input();
