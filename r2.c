@@ -6392,6 +6392,7 @@ typedef struct {
     int64_t *ids;
     size_t count;
     int incomplete;
+    int unsearched_cues;
 } R2HistorySelection;
 
 static void r2_history_release(R2HistorySelection *history)
@@ -6461,7 +6462,7 @@ static int r2_collect_associated_rows(
     }
     for (; i < keyword_count; ++i) {
         if (keywords[i][0] && !r2_keyword_is_low_signal(keywords[i])) {
-            selection->incomplete = 1; /* An eligible cue was never searched. */
+            selection->unsearched_cues = 1;
             break;
         }
     }
@@ -6470,25 +6471,28 @@ static int r2_collect_associated_rows(
 
 static char *r2_collect_associated_records(
     const char *const keywords[], size_t keyword_count, R2AssociationSearchFn search_fn,
-    int *incomplete)
+    int *incomplete, int *unsearched_cues)
 {
     R2HistorySelection selection = {0};
     if (incomplete) *incomplete = 0;
+    if (unsearched_cues) *unsearched_cues = 0;
     if (r2_collect_associated_rows(keywords, keyword_count, search_fn, &selection) != 0) {
         r2_history_release(&selection);
         return NULL;
     }
     if (incomplete) *incomplete = selection.incomplete;
+    if (unsearched_cues) *unsearched_cues = selection.unsearched_cues;
     free(selection.ids);
     return selection.text ? selection.text : xstrdup("");
 }
 
 static int r2_append_visual_associations(char **context,
     const char *const keywords[], size_t keyword_count, int include_recent,
-    int *incomplete)
+    int *incomplete, int *unsearched_cues)
 {
     R2HistorySelection selection = {0};
     if (incomplete) *incomplete = 0;
+    if (unsearched_cues) *unsearched_cues = 0;
     int rc = r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search, &selection);
     if (rc == 0 && selection.text)
         rc = r2_append_association_section(context,
@@ -6507,6 +6511,7 @@ static int r2_append_visual_associations(char **context,
                 selection.text);
     }
     if (rc == 0 && incomplete) *incomplete = selection.incomplete;
+    if (rc == 0 && unsearched_cues) *unsearched_cues = selection.unsearched_cues;
     r2_history_release(&selection);
     return rc;
 }
@@ -7112,6 +7117,7 @@ static char *chat_with_relevant_memories(
        later media encounter can reconnect to an earlier discussion.
     */
     R2HistorySelection life_history = {0};
+    int history_cues_unsearched = 0;
     const char *keywords[MAX_MEMORY_KEYWORDS];
     size_t keyword_count = extract_memory_keywords(associative_query, keywords);
     if (query && *query && r2_log_is_initialized()) {
@@ -7138,7 +7144,7 @@ static char *chat_with_relevant_memories(
         }
         for (; k < keyword_count; ++k) {
             if (r2_history_keyword_searchable(keywords[k])) {
-                history_unavailable = 1; /* The selected search slots ran out. */
+                history_cues_unsearched = 1;
                 break;
             }
         }
@@ -7147,9 +7153,10 @@ static char *chat_with_relevant_memories(
     /* Diary reflections and visual experience descriptions are separate
        stores, so search them directly instead of assuming every experience
        was promoted into the generic memories table or Life Log. */
-    int diary_incomplete = 0;
+    int diary_incomplete = 0, diary_cues_unsearched = 0;
     char *diary_matches = r2_collect_associated_records(
-        keywords, keyword_count, r2_diary_visit_search, &diary_incomplete);
+        keywords, keyword_count, r2_diary_visit_search,
+        &diary_incomplete, &diary_cues_unsearched);
     diary_unavailable = diary_incomplete || !diary_matches;
     if (diary_matches && r2_append_association_section(&memory_context,
         "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n",
@@ -7160,11 +7167,30 @@ static char *chat_with_relevant_memories(
     archive_unavailable = r2_append_original_archive_matches(&memory_context, keywords, keyword_count) != 0;
 
     int visual_requested = query_requests_visual_context(query);
+    int visual_cues_unsearched = 0;
     if (r2_visual_is_initialized()) {
         int visual_incomplete = 0;
         int visual_rc = r2_append_visual_associations(&memory_context, keywords, keyword_count,
-            visual_requested || r2_eyes_status() > 0, &visual_incomplete);
+            visual_requested || r2_eyes_status() > 0,
+            &visual_incomplete, &visual_cues_unsearched);
         visual_unavailable = visual_rc != 0 || visual_incomplete;
+    }
+
+    /* Search-plan coverage is historical retrieval metadata, not a required
+       instruction. Keep it with optional evidence so it cannot displace a
+       complete original-archive review in a small inference window. */
+    if (history_cues_unsearched || diary_cues_unsearched || visual_cues_unsearched) {
+        char cue_notice[240];
+        snprintf(cue_notice, sizeof(cue_notice),
+            "Eligible cues remained unsearched in:%s%s%s. "
+            "Selected records are complete, but absence of other records is unverified.",
+            history_cues_unsearched ? " Life Log" : "",
+            diary_cues_unsearched ? " diary" : "",
+            visual_cues_unsearched ? " visual history" : "");
+        if (r2_append_association_section(&memory_context,
+                "ASSOCIATIVE SEARCH COVERAGE (historical search metadata):\n",
+                cue_notice) != 0)
+            history_unavailable = 1;
     }
 
     if (r2_is_shutting_down()) {
