@@ -4098,18 +4098,27 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
         }
         end = start;
     }
-    /* Keep startup and learning snapshots ahead of the optional archive. */
+    /* Keep startup and learning snapshots ahead of the optional archive.
+     * The preliminary system-category pass is not an eligibility boundary:
+     * the final budget may have room even if that earlier pass ran out.
+     * All optional system messages supplied by the caller are candidates. */
     for (int archive = 0; archive <= 1; ++archive) {
         for (size_t i = 0; i < count; ++i) {
             if (!msgs[i].role || strcmp(msgs[i].role, "system") ||
-                !include[i] || r2_inference_unit_required(&msgs[i], i, current_user))
+                r2_inference_unit_required(&msgs[i], i, current_user))
                 continue;
             const char *content = msgs[i].content ? msgs[i].content : "";
             int is_archive = r2_inference_system_priority(content, r2_inference_user_intent()) == 7;
             if (is_archive != archive) continue;
             size_t n = strlen(content);
-            if (n <= input_budget - used) { limits[i] = n; used += n; }
-            else { include[i] = 0; limits[i] = 0; }
+            if (n && n <= input_budget - used) {
+                include[i] = 1;
+                limits[i] = n;
+                used += n;
+            } else {
+                include[i] = 0;
+                limits[i] = 0;
+            }
         }
     }
     return 0;
