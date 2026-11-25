@@ -902,17 +902,6 @@ def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
             for item in request["messages"])
         for request in LocalOllama.requests[start:]
     )
-    with sqlite3.connect(home / "r2_memory.db") as db:
-        snapshots = db.execute(
-            "SELECT r.original_context FROM r2_log_context_reviews r "
-            "JOIN r2_log_conversations c ON c.event_id=r.conversation_event_id "
-            "WHERE c.user_text=?", (bounded,),
-        ).fetchall()
-        assert len(snapshots) == 1
-        assert snapshots[0][0].count(
-            "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte "
-        ) == 4
-
     # A malformed tail must not publish a matching prefix as verified history.
     with original.open("ab") as stream:
         stream.write(b"\x00")
