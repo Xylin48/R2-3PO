@@ -2565,6 +2565,7 @@ static void check_memory_decision_private_scope(void)
 static void check_rejected_memory_output_retains_evidence(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    assert(db == NULL && init_db() == 0);
     int64_t event = r2_log_conversation_turn_for_learning(
         "Memory parser fixture.", "This is the recorded response.", NULL, 0, NULL, 0, NULL);
     assert(event > 0 && r2_log_ack_self_report(event) == 0);
@@ -2618,6 +2619,8 @@ static void check_rejected_memory_output_retains_evidence(void)
     sqlite3_finalize(st);
     assert(sqlite3_close(connection) == SQLITE_OK);
     assert(r2_log_ack_learning(event) == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
 }
 
 static void *shutdown_fixture_worker(void *unused)
