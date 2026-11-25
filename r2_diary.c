@@ -1885,7 +1885,7 @@ static int workspace_append_formatted(char **out, size_t *length, size_t *capaci
         size_t next = *capacity ? *capacity : 4096U;
         while (next < needed) next = next > SIZE_MAX / 2U ? needed : next * 2U;
         /* Avoid doubling the whole result just to append a short notice. */
-        if (next > max_content + 1U) next = needed;
+        if (next - 1U > max_content) next = needed;
         char *grown = realloc(*out, next);
         if (!grown) { va_end(args); return -1; }
         *out = grown;
@@ -2205,8 +2205,9 @@ char *r2_workspace_search(const char *relative_path, const char *term)
     int failed = 0;
     for (;;) {
         ssize_t bytes = getdelim(&line, &line_capacity, '\n', file);
+        if (ferror(file)) { failed = 1; break; }
         if (bytes < 0) {
-            failed = ferror(file) || !feof(file);
+            failed = !feof(file);
             break;
         }
         if (memchr(line, '\0', (size_t)bytes)) {
