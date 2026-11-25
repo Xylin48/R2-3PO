@@ -2396,6 +2396,73 @@ static void check_memory_response_replay(void)
 
 /* Both memory-decision paths must ignore unrelated live input state while
  * retaining the complete saved exchange and restoring their caller's scope. */
+static void check_private_evidence_exact_framing(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *saved_stage = ollama_audit_stage;
+    const char *saved_query = ollama_authoritative_user_query;
+    int saved_isolated = ollama_isolated_request;
+    int saved_sensory = ollama_autonomous_sensory_input;
+    ollama_audit_stage = "private-evidence-fixture";
+    ollama_authoritative_user_query = NULL;
+    ollama_isolated_request = 1;
+    ollama_autonomous_sensory_input = 0;
+    const char policy[] = "Read exact private evidence.";
+    const char task[] = "Review the recorded evidence.";
+    const char current[] = "Exact separate current observation.";
+    size_t capacity = (4096U - 512U - 384U) * 32U / 10U;
+    size_t available = capacity - strlen(policy);
+    set_response("A complete private evidence note.", "stop", 1);
+
+    for (int separate = 0; separate <= 1; ++separate) {
+        size_t context_bytes = available - (separate ? strlen(current) + 2U : 0U);
+        char *context = text(context_bytes, 'x', "Exact historical evidence: ");
+        assert(strlen(context) == context_bytes);
+        int64_t archive = 0;
+        int before = perform_count;
+        char *reply = generate_with_private_evidence(policy, task, context,
+                            separate ? current : NULL, &archive);
+        assert(reply && perform_count == before + 1 && archive == 0);
+        struct json_object *array = NULL, *value = NULL, *options = NULL;
+        assert(json_object_object_get_ex(captured, "messages", &array));
+        assert(json_object_array_length(array) == 2);
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, 0), "content", &value));
+        assert(!strcmp(json_object_get_string(value), policy));
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, 1), "content", &value));
+        const char *wire = json_object_get_string(value);
+        assert(!memcmp(wire, context, context_bytes) && strlen(wire) == available);
+        assert(!strcmp(wire + context_bytes, separate ? "\n\nExact separate current observation." : ""));
+        assert(json_object_object_get_ex(captured, "options", &options));
+        assert(json_object_object_get_ex(options, "num_predict", &value));
+        assert(json_object_get_int(value) == 384);
+        free(reply);
+        free(context);
+    }
+
+    size_t context_bytes = available - strlen(current) - 2U + 1U;
+    char *context = text(context_bytes, 'x', "Exact historical evidence: ");
+    assert(!reviewed_bytes && !reviewed_size && !staged_calls);
+    int64_t archive = 0;
+    capture_reviews = 1;
+    char *reply = generate_with_private_evidence(policy, task, context, current, &archive);
+    capture_reviews = 0;
+    assert(reply && archive > 0 && staged_calls > 0);
+    assert(reviewed_bytes && reviewed_size == context_bytes && !strcmp(reviewed_bytes, context));
+    assert(captured_contains("REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE"));
+    assert(captured_contains(current));
+    free(reply);
+    free(context);
+    free(reviewed_bytes);
+    reviewed_bytes = NULL;
+    reviewed_size = 0;
+    staged_calls = 0;
+    ollama_audit_stage = saved_stage;
+    ollama_authoritative_user_query = saved_query;
+    ollama_isolated_request = saved_isolated;
+    ollama_autonomous_sensory_input = saved_sensory;
+    puts("Private evidence retains exact direct inputs at the wire boundary.");
+}
+
 static void check_memory_decision_private_scope(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
@@ -2641,6 +2708,7 @@ int main(void)
     check_foreground_answer_replay();
     check_memory_response_replay();
     check_memory_decision_private_scope();
+    check_private_evidence_exact_framing();
     check_rejected_memory_output_retains_evidence();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
