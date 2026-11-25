@@ -908,6 +908,60 @@ static void check_stale_needs_decision(void)
     db = NULL;
 }
 
+/* Accepted learning must drain even when the diary is explicitly stopped.
+ * Exercise the production dispatcher and the real SQLite/model bridge. */
+static void check_learning_dispatch_without_diary(void)
+{
+    assert(init_db() == 0);
+    assert(!atomic_load(&diary_running) && !shutting_down);
+    const char *user = "Learning scheduler fixture: the spare card is green.";
+    int64_t event = r2_log_conversation_turn_for_learning(
+        user, "I understand.", NULL, 0, NULL, 0, NULL);
+    assert(event > 0 && r2_log_ack_self_report(event) == 0);
+    char *pending = sqlite3_mprintf(
+        "SELECT count(*) FROM r2_log_pending_learning WHERE event_id=%lld;",
+        (long long)event);
+    assert(pending && memory_fixture_count(pending) == 1);
+    assert(!atomic_load(&post_turn_replay_requested));
+    assert(!post_turn_active);
+    set_response("knowledge | The spare card is green.", "stop", 1);
+    int before = perform_count;
+    /* A live turn owns the scheduling boundary; the queue remains staged. */
+    pthread_mutex_lock(&conversation_turn_lock);
+    atomic_store(&foreground_conversation_waiting, 1);
+    atomic_store(&post_turn_replay_requested, 1);
+    pthread_t scheduler;
+    assert(pthread_create(&scheduler, NULL, post_turn_scheduler, NULL) == 0);
+    const struct timespec first_poll = {.tv_sec = 1, .tv_nsec = 200000000L};
+    nanosleep(&first_poll, NULL);
+    assert(memory_fixture_count(pending) == 1);
+    pthread_mutex_unlock(&conversation_turn_lock);
+    atomic_store(&foreground_conversation_waiting, 0);
+    const struct timespec poll = {.tv_sec = 0, .tv_nsec = 100000000L};
+    int remaining = 1;
+    for (int i = 0; i < 60 && remaining; ++i) {
+        nanosleep(&poll, NULL);
+        pthread_mutex_lock(&db_lock);
+        remaining = memory_fixture_count(pending);
+        pthread_mutex_unlock(&db_lock);
+    }
+    assert(!remaining);
+    shutting_down = 1;
+    assert(pthread_join(scheduler, NULL) == 0);
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    shutting_down = 0;
+    assert(!atomic_load(&diary_running));
+    assert(perform_count == before + 1);
+    assert(memory_fixture_count("SELECT count(*) FROM memories "
+                                "WHERE memory='The spare card is green.';") == 1);
+    assert(!atomic_load(&post_turn_replay_requested));
+    sqlite3_free(pending);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_post_turn_retry(void)
 {
     assert(init_db() == 0);
@@ -2361,6 +2415,7 @@ int main(void)
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
     check_conversation_learning_record_boundaries();
+    check_learning_dispatch_without_diary();
     check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();
