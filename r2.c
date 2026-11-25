@@ -194,6 +194,8 @@ static pthread_mutex_t post_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t post_turn_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int post_turn_active = 0;
 static atomic_bool post_turn_replay_requested = ATOMIC_VAR_INIT(0);
+static pthread_t post_turn_scheduler_thread;
+static atomic_int post_turn_scheduler_started = ATOMIC_VAR_INIT(0);
 /* A conversation turn must be atomic so failed-turn rollback cannot erase another turn. */
 static pthread_mutex_t conversation_turn_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t vision_watch_thread;
@@ -10301,7 +10303,6 @@ static void *autonomous_thinking(void *arg)
     const uint64_t interval_ms = (uint64_t)THINK_INTERVAL * 1000U;
     uint64_t last_periodic_check_ms = 0;
     uint64_t last_reflection_ms = 0;
-    int retry_learning = 0;
 
     while (!shutting_down && atomic_load(&diary_running)) {
         /* Poll once per real second so the idle timer resets immediately when
@@ -10309,13 +10310,6 @@ static void *autonomous_thinking(void *arg)
         sleep(1);
         if (shutting_down || !atomic_load(&diary_running))
             break;
-
-        /* Let the previous tick finish its own reflection and needs requests
-           before handing leftover work to a background replay worker. */
-        if (retry_learning || atomic_load(&post_turn_replay_requested)) {
-            retry_learning = 0;
-            resume_post_turn_learning();
-        }
 
         uint64_t now_ms = r2_log_elapsed_ms();
         if (!now_ms)
@@ -10338,8 +10332,7 @@ static void *autonomous_thinking(void *arg)
         if (now_ms >= last_periodic_check_ms &&
             now_ms - last_periodic_check_ms >= interval_ms) {
             last_periodic_check_ms = now_ms;
-            retry_learning = 1;
-            /* Retry durable work even if new reflections are deferred. */
+            /* Replay archive and diary mirrors independently of new reflections. */
             if (r2_log_replay_conversation_archives() != 0)
                 fprintf(stderr, "[R2 Life Log] Some conversation archives or evidence links remain pending.\n");
             if (shutting_down || !atomic_load(&diary_running))
@@ -10935,7 +10928,8 @@ int r2_think_interval(void){ return THINK_INTERVAL; }
 int r2_worker_count(void)
 {
     return (hands_thread_started ? 1 : 0) +
-           (diary_thread_started ? 1 : 0);
+           (diary_thread_started ? 1 : 0) +
+           (atomic_load(&post_turn_scheduler_started) ? 1 : 0);
 }
 
 long r2_memory_count(void)
@@ -14998,6 +14992,28 @@ static void resume_post_turn_learning(void)
     log_post_turn_start_failure("pending learning replay", through);
 }
 
+/* Queue dispatch belongs to the learning subsystem, not the optional diary
+ * worker. Move the existing one-second dispatch and periodic durable sweep
+ * here so stopping reflection cannot strand accepted conversation evidence.
+ * The existing resume function still serializes reservations with foreground
+ * turns and the active post-turn worker. */
+static void *post_turn_scheduler(void *opaque)
+{
+    (void)opaque;
+    const uint64_t interval_ms = (uint64_t)THINK_INTERVAL * 1000U;
+    uint64_t last_scan = r2_log_elapsed_ms();
+    while (!shutting_down) {
+        sleep(1);
+        if (shutting_down) break;
+        uint64_t now = r2_log_elapsed_ms();
+        int periodic = now >= last_scan && now - last_scan >= interval_ms;
+        if (periodic) last_scan = now;
+        if (periodic || atomic_load(&post_turn_replay_requested))
+            resume_post_turn_learning();
+    }
+    return NULL;
+}
+
 /* Takes ownership of the recorded result, when a tool was run. */
 static void schedule_post_turn_processing(const char *user, const char *reply,
                                           int64_t event_id, char *tool_result)
@@ -16378,6 +16394,12 @@ int r2_init(void)
 
     atomic_store(&diary_thread_started, 1);
 
+    if (r2_startup_thread_create(&post_turn_scheduler_thread,
+                                 post_turn_scheduler, NULL,
+                                 "R2_TEST_FAIL_LEARNING_THREAD_CREATE") != 0)
+        R2_INIT_FAIL("could not start the persistent learning scheduler");
+    atomic_store(&post_turn_scheduler_started, 1);
+
     /* ========================================================
        ONLINE MESSAGE
        ======================================================== */
@@ -16523,6 +16545,12 @@ void r2_shutdown(void)
     free(completed_pending_handoff);
     completed_pending_handoff = NULL;
     pthread_mutex_unlock(&completed_handoff_lock);
+
+    /* Stop queue dispatch before draining accepted post-turn workers. */
+    if (atomic_load(&post_turn_scheduler_started)) {
+        pthread_join(post_turn_scheduler_thread, NULL);
+        atomic_store(&post_turn_scheduler_started, 0);
+    }
 
     /* Stop background post-turn Ollama/DB work before closing persistent stores. */
     pthread_mutex_lock(&post_turn_lock);
