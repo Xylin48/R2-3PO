@@ -10766,32 +10766,52 @@ static char *memory_decision(
     if (!res)
         return NULL;
 
-    char *text = trim(res);
-    if (!strcasecmp(text, "NONE")) return res;
-
-    char *separator = strchr(text, '|');
-    if (!separator) {
-        free(res);
-        return NULL;
+    /* Examine the response without changing its bytes until classification
+       succeeds. Malformed final-channel output is useful failure evidence,
+       but is not a learned fact or an accepted memory. */
+    const char *text = res;
+    while (*text && isspace((unsigned char)*text)) ++text;
+    char *end = res + strlen(res);
+    while (end > text && isspace((unsigned char)end[-1])) --end;
+    if (end - text == 4 && !strncasecmp(text, "NONE", 4)) {
+        *end = '\0';
+        return res;
     }
-    *separator = '\0';
-    const char *category = trim(text);
-    const char *memory = trim(separator + 1);
+
+    const char *separator = memchr(text, '|', (size_t)(end - text));
+    const char *category_end = separator ? separator : end;
+    while (category_end > text && isspace((unsigned char)category_end[-1]))
+        --category_end;
+    const char *memory = separator ? separator + 1 : end;
+    while (memory < end && isspace((unsigned char)*memory)) ++memory;
 
     static const char *const allowed_categories[] = {
         "self", "person", "experience", "preference", "knowledge", "relationship", "other"
     };
     const char *canonical_category = NULL;
     for (size_t i = 0; i < sizeof(allowed_categories) / sizeof(allowed_categories[0]); ++i) {
-        if (strcasecmp(category, allowed_categories[i]) == 0) {
+        if (strlen(allowed_categories[i]) == (size_t)(category_end - text) &&
+            !strncasecmp(text, allowed_categories[i], (size_t)(category_end - text))) {
             canonical_category = allowed_categories[i];
             break;
         }
     }
-    if (!canonical_category || !*memory) {
+    if (!separator || !canonical_category || memory == end) {
+        const char *reason = !separator ? "missing category separator" :
+            !canonical_category ? "unknown category" : "empty memory";
+        char summary[256];
+        snprintf(summary, sizeof(summary),
+                 "Memory evaluation returned invalid final text (%s); not accepted as a memory.",
+                 reason);
+        int64_t failure_event = r2_log_event(R2_LOG_ERROR,
+            "post_turn_memory_invalid_output", summary, res, "memory_decision");
+        if (failure_event > 0 && source_event_id > 0)
+            (void)r2_log_link(failure_event, source_event_id,
+                              "memory_evaluation_failed_from", "invalid model output");
         free(res);
         return NULL;
     }
+    *end = '\0';
 
     if (!strcmp(canonical_category, "self")) {
         static const char *const identity_patterns[] = {
@@ -10805,7 +10825,7 @@ static char *memory_decision(
         }
     }
 
-    /* Trimming the category can insert a terminator before the separator. */
+    /* Canonicalize the accepted category without changing the memory text. */
     char *normalized = NULL;
     if (asprintf(&normalized, "%s | %s", canonical_category, memory) < 0)
         normalized = NULL;
