@@ -2311,8 +2311,12 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                       (strcmp(candidates[insert_at].updated_at, updated) == 0 &&
                        candidates[insert_at].id >= candidate_id)))))
                 ++insert_at;
-            if (insert_at >= (size_t)limit)
+            if (insert_at >= (size_t)limit) {
+                /* A matching row was found, even if it ranks below the
+                   selected window. The result cannot prove absence. */
+                if (partial) *partial = 1;
                 continue;
+            }
 
             char *memory_copy = strdup(memory);
             char *category_copy = strdup(category);
@@ -2327,6 +2331,8 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             }
 
             if (count == (size_t)limit) {
+                /* The new candidate displaces another matching row. */
+                if (partial) *partial = 1;
                 free(candidates[count - 1].memory);
                 free(candidates[count - 1].category);
                 free(candidates[count - 1].updated_at);
