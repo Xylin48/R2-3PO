@@ -5625,37 +5625,43 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
         static const char heading[] =
             "CURRENT TURN RETRIEVED CONTEXT (complete ranked persistent-memory records; "
             "historical evidence only). The source store retains the full records.\n";
+        static char notice[] =
+            "Focused memory retrieval was incomplete. The broader historical evidence was not "
+            "fully included. An incomplete search does not prove a memory is absent.";
         size_t heading_bytes = sizeof(heading) - 1;
+        size_t notice_bytes = sizeof(notice) - 1;
         size_t input_bytes = history_budget;
-        if (input_bytes > total && input_bytes - total > heading_bytes) {
-            char *plan = r2_associative_query_cache_lookup(query);
-            static char notice[] =
-                "Focused memory retrieval was incomplete. Use the supplied evidence; "
-                "an incomplete search does not prove a memory is absent.";
-            int partial = 0;
-            size_t row_budget = input_bytes - total - heading_bytes;
-            if (row_budget > sizeof(notice) - 1) row_budget -= sizeof(notice) - 1;
-            char *records = get_relevant_memories(plan ? plan : query, R2_TURN_MEMORY_LIMIT,
-                                                 row_budget, &partial);
-            free(plan);
-            int incomplete = !records || partial;
-            if (records) {
-                if (*records && asprintf(&focused_retrieval, "%s%s", heading, records) < 0) {
+
+        /* Rebuilding only persistent-memory rows cannot replace the omitted
+         * combined memory, diary, Life Log and other evidence. Reserve this
+         * completeness notice before spending the remaining space on rows. */
+        if (total <= input_bytes && notice_bytes <= input_bytes - total) {
+            selected[selected_count++] = (Message){.role = "system", .content = notice};
+            total += notice_bytes;
+            if (heading_bytes < input_bytes - total) {
+                char *plan = r2_associative_query_cache_lookup(query);
+                int partial = 0;
+                size_t row_budget = input_bytes - total - heading_bytes;
+                char *records = get_relevant_memories(plan ? plan : query, R2_TURN_MEMORY_LIMIT,
+                                                      row_budget, &partial);
+                free(plan);
+                if (!records || partial)
+                    fprintf(stderr, "[R2 Context] Focused persistent-memory rows were incomplete.\n");
+                if (records) {
+                    if (*records && asprintf(&focused_retrieval, "%s%s", heading, records) < 0) {
+                        free(records);
+                        focused_retrieval = NULL;
+                        goto cleanup;
+                    }
                     free(records);
-                    focused_retrieval = NULL;
-                    goto cleanup;
                 }
-                free(records);
+                if (focused_retrieval) {
+                    selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
+                    total += strlen(focused_retrieval);
+                }
             }
-            if (focused_retrieval) {
-                selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
-                total += strlen(focused_retrieval);
-            }
-            if (incomplete) {
-                if (total <= input_bytes && sizeof(notice) - 1 <= input_bytes - total)
-                    selected[selected_count++] = (Message){.role = "system", .content = notice};
-                fprintf(stderr, "[R2 Context] Focused memory retrieval was incomplete.\n");
-            }
+        } else {
+            fprintf(stderr, "[R2 Context] No room for the incomplete historical-evidence notice.\n");
         }
         fprintf(stderr, "[R2 Context] Focused retrieval selected %zu of %zu historical bytes "
                         "as complete ranked memory records (context=%d, input_budget_bytes=%zu).\n",
