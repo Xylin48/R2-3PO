@@ -3397,6 +3397,10 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
     int rc;
 
     limit = normalize_limit(limit);
+    /* Structured retrieval needs one extra row to distinguish an exact fit
+       from a bounded result. The probe is never copied into the batch. */
+    int query_limit = limit + (batch != NULL);
+    int selected_events = 0;
 
     pthread_mutex_lock(&log_lock);
 
@@ -3434,10 +3438,10 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
 
     if (query) {
         rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, query_limit);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, conversational);
     } else {
-        rc = sqlite3_bind_int(statement, 1, limit);
+        rc = sqlite3_bind_int(statement, 1, query_limit);
     }
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(log_db,
@@ -3459,7 +3463,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
             "WHERE (l.from_event_id = ?1 OR l.to_event_id = ?1) "
             "AND (?2=0 OR NOT (COALESCE(e.source,'')='r2_init' AND "
             "COALESCE(e.category,'') IN ('continuity','lifecycle','system'))) "
-            "ORDER BY l.id DESC LIMIT 4;";
+            "ORDER BY l.id DESC LIMIT 5;";
         rc = sqlite3_prepare_v2(log_db, sql_links, -1, &link_statement, NULL);
         if (rc != SQLITE_OK) {
             sqlite3_finalize(statement);
@@ -3483,6 +3487,12 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
     capacity = 4096;
 
     while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        if (batch && selected_events == limit) {
+            batch->incomplete = 1;
+            rc = SQLITE_DONE; /* The extra row was a probe, not a returned record. */
+            break;
+        }
+        ++selected_events;
         int64_t id = sqlite3_column_int64(statement, 0);
         int base_already_seen = query && event_id_seen(seen_ids, seen_count, id);
         if (query && !base_already_seen &&
@@ -3532,7 +3542,7 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
         }
         }
 
-        if (query && link_statement && linked_total < 8) {
+        if (query && link_statement && (linked_total < 8 || batch)) {
             sqlite3_reset(link_statement);
             sqlite3_clear_bindings(link_statement);
             int link_bind_rc = sqlite3_bind_int64(link_statement, 1, id);
@@ -3546,12 +3556,20 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
 
             int link_rc = SQLITE_OK;
             int links_for_event = 0;
+            int examined_links = 0;
             while ((link_rc = sqlite3_step(link_statement)) == SQLITE_ROW) {
+                if (++examined_links > 4) {
+                    if (batch) batch->incomplete = 1;
+                    link_rc = SQLITE_DONE; /* Probe beyond the link scan bound. */
+                    break;
+                }
                 int64_t linked_id = sqlite3_column_int64(link_statement, 2);
                 if (linked_id == id || event_id_seen(seen_ids, seen_count, linked_id))
                     continue;
-                if (linked_total >= 8 || links_for_event >= 2)
+                if (linked_total >= 8 || links_for_event >= 2) {
+                    if (batch) batch->incomplete = 1;
                     continue;
+                }
                 if (seen_count < sizeof(seen_ids) / sizeof(seen_ids[0]))
                     seen_ids[seen_count++] = linked_id;
 

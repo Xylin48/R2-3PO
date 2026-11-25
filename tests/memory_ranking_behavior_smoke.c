@@ -38,9 +38,10 @@ int main(void)
         "UPDATE memories SET updated_at='2030-01-01T00:00:00' "
         "WHERE memory='nebula telescope satellite observation';") == 0);
 
+    int ranked_partial = 0;
     char *result = get_relevant_memories(
-        "nebula spaceship telescope satellite", 3, SIZE_MAX, NULL);
-    assert(result != NULL);
+        "nebula spaceship telescope satellite", 3, SIZE_MAX, &ranked_partial);
+    assert(result != NULL && ranked_partial);
 
     const char *strongest = strstr(
         result, "nebula spaceship telescope satellite overview");
@@ -54,6 +55,13 @@ int main(void)
     assert(strongest < newer_tie);
     assert(newer_tie < older_tie);
     assert(strstr(result, "nebula quiet") == NULL);
+    free(result);
+
+    /* A full ranking window is incomplete when another matching row is
+       omitted, even though the selected three are whole and correctly ranked. */
+    ranked_partial = 0;
+    result = get_relevant_memories("nebula", 4, SIZE_MAX, &ranked_partial);
+    assert(result && !ranked_partial);
     free(result);
 
     /* Equal timestamps also need a stable tie-break: newest durable ID first. */

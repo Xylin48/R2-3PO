@@ -2229,6 +2229,37 @@ static void check_literal_retrieval_cues_precede_generated_cues(void)
     r2_associative_query_cache_clear();
 }
 
+static int followup_subject_searches;
+static int record_followup_subject_search(const char *word, int limit,
+    int (*visit)(void *, int64_t, const char *, size_t), void *context)
+{
+    (void)limit;
+    (void)visit;
+    (void)context;
+    if (!strcmp(word, "meteorite")) ++followup_subject_searches;
+    return 0;
+}
+
+/* A generic request for more detail must not use every diary/visual search
+ * slot before reaching the subject named in the preceding visible answer. */
+static void check_followup_subject_reaches_associated_stores(void)
+{
+    const char *query = "Could you please explain and elaborate in more detail on that?";
+    char *plan = r2_associative_fallback_query(query, "What happened?",
+                                              "I saw a meteorite.");
+    assert(plan && strstr(plan, "I saw a meteorite."));
+    const char *keywords[MAX_MEMORY_KEYWORDS];
+    size_t count = extract_memory_keywords(plan, keywords);
+    R2HistorySelection selection = {0};
+    followup_subject_searches = 0;
+    assert(r2_collect_associated_rows(keywords, count,
+                                      record_followup_subject_search, &selection) == 0);
+    assert(followup_subject_searches == 1);
+    r2_history_release(&selection);
+    free(plan);
+    r2_associative_query_cache_clear();
+}
+
 /* The second-turn planner must see the exact preceding visible exchange,
  * not just the latest pronoun or the internal action that produced a reply. */
 static void check_associative_planner_retains_previous_exchange(void)
@@ -2534,18 +2565,23 @@ static void check_memory_decision_private_scope(void)
 static void check_rejected_memory_output_retains_evidence(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    assert(db == NULL && init_db() == 0);
     int64_t event = r2_log_conversation_turn_for_learning(
         "Memory parser fixture.", "This is the recorded response.", NULL, 0, NULL, 0, NULL);
     assert(event > 0 && r2_log_ack_self_report(event) == 0);
     const char *invalid[] = {
         "  This response lacks its category.  \n",
         "  imagination | An unsupported category. \n",
-        "  knowledge |  \t\n"
+        "  knowledge |  \t\n",
+        "knowledge | The user reported a blue notebook.\n"
+        "relationship | An unverified second memory.\n"
     };
-    const char *reasons[] = {"missing category separator", "unknown category", "empty memory"};
+    const char *reasons[] = {
+        "missing category separator", "unknown category", "empty memory", "multiple decision lines"
+    };
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
-    for (size_t i = 0; i < 3; ++i) {
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         set_response(invalid[i], "stop", 1);
         int before = perform_count;
         assert(!memory_decision("Memory parser fixture.", "This is the recorded response.",
@@ -2564,8 +2600,27 @@ static void check_rejected_memory_output_retains_evidence(void)
         assert(strstr((const char *)sqlite3_column_text(st, 1), reasons[i]));
         sqlite3_finalize(st);
     }
+    /* The real post-turn caller must not save either line or acknowledge the
+       source exchange after receiving this malformed decision. */
+    set_response(invalid[3], "stop", 1);
+    preserve_evidence_memory("Memory parser fixture.", "This is the recorded response.",
+                             NULL, event);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM memories WHERE memory LIKE '%unverified second memory%';",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
+    sqlite3_finalize(st);
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM r2_log_pending_learning WHERE event_id=?;",
+        -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(st, 1, event) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 1);
+    sqlite3_finalize(st);
     assert(sqlite3_close(connection) == SQLITE_OK);
     assert(r2_log_ack_learning(event) == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
 }
 
 static void *shutdown_fixture_worker(void *unused)
@@ -2648,6 +2703,7 @@ int main(void)
     check_first_answer_with_unavailable_source();
     check_literal_retrieval_cues_precede_generated_cues();
     check_associative_planner_retains_previous_exchange();
+    check_followup_subject_reaches_associated_stores();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");

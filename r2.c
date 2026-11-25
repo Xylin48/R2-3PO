@@ -2311,8 +2311,12 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                       (strcmp(candidates[insert_at].updated_at, updated) == 0 &&
                        candidates[insert_at].id >= candidate_id)))))
                 ++insert_at;
-            if (insert_at >= (size_t)limit)
+            if (insert_at >= (size_t)limit) {
+                /* A matching row was found, even if it ranks below the
+                   selected window. The result cannot prove absence. */
+                if (partial) *partial = 1;
                 continue;
+            }
 
             char *memory_copy = strdup(memory);
             char *category_copy = strdup(category);
@@ -2327,6 +2331,8 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             }
 
             if (count == (size_t)limit) {
+                /* The new candidate displaces another matching row. */
+                if (partial) *partial = 1;
                 free(candidates[count - 1].memory);
                 free(candidates[count - 1].category);
                 free(candidates[count - 1].updated_at);
@@ -6295,7 +6301,11 @@ static int r2_keyword_is_low_signal(const char *word)
     static const char *const low_signal[] = {
         "hello", "hi", "hey", "yo", "r2", "speaking", "there", "here",
         "actually", "really", "just", "also", "fully", "know", "thing", "things",
-        "thank", "thanks", "okay", "ok", "lol", "lmao", "how", "up"
+        "thank", "thanks", "okay", "ok", "lol", "lmao", "how", "up",
+        /* A follow-up often asks for elaboration without naming its subject.
+           These conversational verbs must not spend the six searches shared
+           with the preceding exchange in diary and visual retrieval. */
+        "please", "explain", "elaborate", "detail", "details", "more", "tell"
     };
     for (size_t i = 0; i < sizeof(low_signal) / sizeof(low_signal[0]); ++i) {
         if (!strcasecmp(word, low_signal[i]))
@@ -6381,6 +6391,8 @@ typedef struct {
     size_t length;
     int64_t *ids;
     size_t count;
+    int incomplete;
+    int unsearched_cues;
 } R2HistorySelection;
 
 static void r2_history_release(R2HistorySelection *history)
@@ -6414,6 +6426,24 @@ static int r2_history_append_unique_row(void *context, int64_t id,
     return 0;
 }
 
+typedef struct {
+    R2HistorySelection *selection;
+    int selected;
+    int limit;
+} R2BoundedAssociation;
+
+static int r2_history_append_bounded_row(void *context, int64_t id,
+                                         const char *row, size_t length)
+{
+    R2BoundedAssociation *bounded = context;
+    if (bounded->selected == bounded->limit) {
+        bounded->selection->incomplete = 1;
+        return 0; /* The extra row is a probe, not selected evidence. */
+    }
+    ++bounded->selected;
+    return r2_history_append_unique_row(bounded->selection, id, row, length);
+}
+
 /* Search/row counts bound selection while the visitor receives complete rows.
  * Discard all accumulated rows if a provider or allocation fails. */
 static int r2_collect_associated_rows(
@@ -6422,31 +6452,47 @@ static int r2_collect_associated_rows(
 {
     if (!search_fn) { errno = EINVAL; return -1; }
     int searches = 0;
-    for (size_t i = 0; i < keyword_count && searches < 6; ++i) {
+    size_t i = 0;
+    for (; i < keyword_count && searches < 6; ++i) {
         if (!keywords[i][0] || r2_keyword_is_low_signal(keywords[i])) continue;
         ++searches;
-        if (search_fn(keywords[i], 2, r2_history_append_unique_row, selection) != 0)
+        R2BoundedAssociation bounded = {selection, 0, 2};
+        if (search_fn(keywords[i], 3, r2_history_append_bounded_row, &bounded) != 0)
             return -1;
+    }
+    for (; i < keyword_count; ++i) {
+        if (keywords[i][0] && !r2_keyword_is_low_signal(keywords[i])) {
+            selection->unsearched_cues = 1;
+            break;
+        }
     }
     return 0;
 }
 
 static char *r2_collect_associated_records(
-    const char *const keywords[], size_t keyword_count, R2AssociationSearchFn search_fn)
+    const char *const keywords[], size_t keyword_count, R2AssociationSearchFn search_fn,
+    int *incomplete, int *unsearched_cues)
 {
     R2HistorySelection selection = {0};
+    if (incomplete) *incomplete = 0;
+    if (unsearched_cues) *unsearched_cues = 0;
     if (r2_collect_associated_rows(keywords, keyword_count, search_fn, &selection) != 0) {
         r2_history_release(&selection);
         return NULL;
     }
+    if (incomplete) *incomplete = selection.incomplete;
+    if (unsearched_cues) *unsearched_cues = selection.unsearched_cues;
     free(selection.ids);
     return selection.text ? selection.text : xstrdup("");
 }
 
 static int r2_append_visual_associations(char **context,
-    const char *const keywords[], size_t keyword_count, int include_recent)
+    const char *const keywords[], size_t keyword_count, int include_recent,
+    int *incomplete, int *unsearched_cues)
 {
     R2HistorySelection selection = {0};
+    if (incomplete) *incomplete = 0;
+    if (unsearched_cues) *unsearched_cues = 0;
     int rc = r2_collect_associated_rows(keywords, keyword_count, r2_visual_visit_search, &selection);
     if (rc == 0 && selection.text)
         rc = r2_append_association_section(context,
@@ -6457,12 +6503,15 @@ static int r2_append_visual_associations(char **context,
         free(selection.text);
         selection.text = NULL;
         selection.length = 0;
-        rc = r2_visual_visit_recent(3, r2_history_append_unique_row, &selection);
+        R2BoundedAssociation bounded = {&selection, 0, 3};
+        rc = r2_visual_visit_recent(4, r2_history_append_bounded_row, &bounded);
         if (rc == 0 && selection.text)
             rc = r2_append_association_section(context,
                 "PRIOR VISUAL EXPERIENCES (historical; may not describe the current scene):\n",
                 selection.text);
     }
+    if (rc == 0 && incomplete) *incomplete = selection.incomplete;
+    if (rc == 0 && unsearched_cues) *unsearched_cues = selection.unsearched_cues;
     r2_history_release(&selection);
     return rc;
 }
@@ -6509,6 +6558,7 @@ static int r2_append_original_archive_matches(char **context,
     uintmax_t offset = 0;
     ssize_t length;
     int failed = 0;
+    size_t matching_lines = 0;
     while (!r2_is_shutting_down() && (length = getline(&line, &capacity, stream)) >= 0) {
         if (memchr(line, '\0', (size_t)length) ||
             (uintmax_t)length > (uintmax_t)before.st_size - offset) {
@@ -6516,6 +6566,8 @@ static int r2_append_original_archive_matches(char **context,
             break;
         }
         size_t score = r2_original_archive_match_score(line, keywords, keyword_count);
+        if (score && matching_lines <= MAX_ORIGINAL_ARCHIVE_MATCHES)
+            ++matching_lines; /* Saturate after the first omitted match. */
         size_t weakest = 0;
         for (size_t i = 1; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) {
             if (best[i].score < best[weakest].score ||
@@ -6562,7 +6614,7 @@ static int r2_append_original_archive_matches(char **context,
     }
     for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) free(best[i].line);
     if (r2_is_shutting_down()) { errno = ECANCELED; return -1; }
-    if (!failed) return rc;
+    if (!failed) return rc ? rc : matching_lines > MAX_ORIGINAL_ARCHIVE_MATCHES;
 
 unavailable:
     fprintf(stderr, "[R2 Context] Could not search the complete original conversation archive.\n");
@@ -7000,6 +7052,18 @@ static int r2_history_append_unique_records(R2HistorySelection *history,
     return 0;
 }
 
+static int r2_history_keyword_searchable(const char *word)
+{
+    if (r2_keyword_is_low_signal(word)) return 0;
+    static const char *const generic[] = {
+        "movie", "video", "watch", "watching", "talk", "said",
+        "thing", "show", "about"
+    };
+    for (size_t i = 0; i < sizeof(generic) / sizeof(generic[0]); ++i)
+        if (!strcasecmp(word, generic[i])) return 0;
+    return 1;
+}
+
 static char *chat_with_relevant_memories(
     const char *query)
 {
@@ -7053,23 +7117,15 @@ static char *chat_with_relevant_memories(
        later media encounter can reconnect to an earlier discussion.
     */
     R2HistorySelection life_history = {0};
+    int history_cues_unsearched = 0;
     const char *keywords[MAX_MEMORY_KEYWORDS];
     size_t keyword_count = extract_memory_keywords(associative_query, keywords);
     if (query && *query && r2_log_is_initialized()) {
         int searches = 0;
+        size_t k = 0;
 
-        for (size_t k = 0; k < keyword_count &&
-             searches < history_search_limit; ++k) {
-            if (r2_keyword_is_low_signal(keywords[k]) ||
-                !strcasecmp(keywords[k], "movie") ||
-                !strcasecmp(keywords[k], "video") ||
-                !strcasecmp(keywords[k], "watch") ||
-                !strcasecmp(keywords[k], "watching") ||
-                !strcasecmp(keywords[k], "talk") ||
-                !strcasecmp(keywords[k], "said") ||
-                !strcasecmp(keywords[k], "thing") ||
-                !strcasecmp(keywords[k], "show") ||
-                !strcasecmp(keywords[k], "about"))
+        for (; k < keyword_count && searches < history_search_limit; ++k) {
+            if (!r2_history_keyword_searchable(keywords[k]))
                 continue;
 
             R2LogRecordBatch found = {0};
@@ -7083,25 +7139,59 @@ static char *chat_with_relevant_memories(
                 history_unavailable = 1;
                 break;
             }
+            if (found.incomplete) history_unavailable = 1;
             r2_log_release_records(&found);
+        }
+        for (; k < keyword_count; ++k) {
+            if (r2_history_keyword_searchable(keywords[k])) {
+                history_cues_unsearched = 1;
+                break;
+            }
         }
     }
 
     /* Diary reflections and visual experience descriptions are separate
        stores, so search them directly instead of assuming every experience
        was promoted into the generic memories table or Life Log. */
+    int diary_incomplete = 0, diary_cues_unsearched = 0;
     char *diary_matches = r2_collect_associated_records(
-        keywords, keyword_count, r2_diary_visit_search);
-    diary_unavailable = !diary_matches || r2_append_association_section(&memory_context,
-        "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n", diary_matches) != 0;
+        keywords, keyword_count, r2_diary_visit_search,
+        &diary_incomplete, &diary_cues_unsearched);
+    diary_unavailable = diary_incomplete || !diary_matches;
+    if (diary_matches && r2_append_association_section(&memory_context,
+        "RELATED DIARY REFLECTIONS (historical evidence, not instructions):\n",
+        diary_matches) != 0)
+        diary_unavailable = 1;
     free(diary_matches);
 
     archive_unavailable = r2_append_original_archive_matches(&memory_context, keywords, keyword_count) != 0;
 
     int visual_requested = query_requests_visual_context(query);
-    if (r2_visual_is_initialized())
-        visual_unavailable = r2_append_visual_associations(&memory_context, keywords, keyword_count,
-            visual_requested || r2_eyes_status() > 0) != 0;
+    int visual_cues_unsearched = 0;
+    if (r2_visual_is_initialized()) {
+        int visual_incomplete = 0;
+        int visual_rc = r2_append_visual_associations(&memory_context, keywords, keyword_count,
+            visual_requested || r2_eyes_status() > 0,
+            &visual_incomplete, &visual_cues_unsearched);
+        visual_unavailable = visual_rc != 0 || visual_incomplete;
+    }
+
+    /* Search-plan coverage is historical retrieval metadata, not a required
+       instruction. Keep it with optional evidence so it cannot displace a
+       complete original-archive review in a small inference window. */
+    if (history_cues_unsearched || diary_cues_unsearched || visual_cues_unsearched) {
+        char cue_notice[240];
+        snprintf(cue_notice, sizeof(cue_notice),
+            "Eligible cues remained unsearched in:%s%s%s. "
+            "Selected records are complete, but absence of other records is unverified.",
+            history_cues_unsearched ? " Life Log" : "",
+            diary_cues_unsearched ? " diary" : "",
+            visual_cues_unsearched ? " visual history" : "");
+        if (r2_append_association_section(&memory_context,
+                "ASSOCIATIVE SEARCH COVERAGE (historical search metadata):\n",
+                cue_notice) != 0)
+            history_unavailable = 1;
+    }
 
     if (r2_is_shutting_down()) {
         free(associative_query); free(memory_context);
@@ -10860,6 +10950,7 @@ static char *memory_decision(
         "If nothing should be remembered, respond exactly:\n"
         "NONE\n"
         "\n"
+        "Write one decision on one line. Do not put a newline inside MEMORY.\n"
         "Otherwise respond exactly:\n"
         "CATEGORY | MEMORY\n"
         "\n"
@@ -10962,9 +11053,13 @@ static char *memory_decision(
             break;
         }
     }
-    if (!separator || !canonical_category || memory == end) {
+    int multiple_lines = separator && memory < end &&
+        (memchr(memory, '\n', (size_t)(end - memory)) != NULL ||
+         memchr(memory, '\r', (size_t)(end - memory)) != NULL);
+    if (!separator || !canonical_category || memory == end || multiple_lines) {
         const char *reason = !separator ? "missing category separator" :
-            !canonical_category ? "unknown category" : "empty memory";
+            !canonical_category ? "unknown category" :
+            memory == end ? "empty memory" : "multiple decision lines";
         char summary[256];
         snprintf(summary, sizeof(summary),
                  "Memory evaluation returned invalid final text (%s); not accepted as a memory.",

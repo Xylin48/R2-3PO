@@ -155,7 +155,7 @@ int main(void)
 
     /* Selected associated records remain complete, including multibyte text. */
     const char *keywords[] = {"signal"};
-    char *associated = r2_collect_associated_records(keywords, 1, fake_associated_search);
+    char *associated = r2_collect_associated_records(keywords, 1, fake_associated_search, NULL, NULL);
     assert(associated != NULL);
     assert(test_valid_utf8((const unsigned char *)associated));
     assert(strcmp(associated, "A\xe2\x98\x83ZZZZ\n") == 0);

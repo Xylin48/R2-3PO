@@ -356,6 +356,7 @@ typedef struct {
     char *text;
     R2LogRecordSpan *records;
     size_t count;
+    int incomplete; /* More matching base events exist beyond the requested limit. */
 } R2LogRecordBatch;
 int r2_log_search_records(const char *query, int limit, R2LogRecordBatch *batch);
 /* Implicit conversation retrieval skips internal initialization records. */
