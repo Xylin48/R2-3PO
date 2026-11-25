@@ -2097,11 +2097,22 @@ static void check_associative_planner_retains_previous_exchange(void)
     assert(message_add("assistant", "[R2_INTERNAL_TOOL_REQUEST]\nFixture request") == 0);
     assert(message_add("assistant", reply) == 0);
     assert(message_add("user", query) == 0);
-    set_response("astronomy notes\nblue folder\nprevious discussion", "stop", 1);
+    /* Valid syntax is not evidence that the planner chose useful cues. */
+    set_response("previous discussion\ncontext\nmore detail", "stop", 1);
     int before = perform_count;
     char *plan = r2_build_associative_search_query(query);
     assert(plan && perform_count == before + 1);
-    assert(!strncmp(plan, query, strlen(query)) && strstr(plan, "astronomy notes"));
+    assert(!strncmp(plan, query, strlen(query)) &&
+           strstr(plan, first) && strstr(plan, reply));
+    char *success_search = strdup(plan);
+    assert(success_search);
+    const char *success_keywords[MAX_MEMORY_KEYWORDS];
+    size_t success_count = extract_memory_keywords(success_search, success_keywords);
+    int found_astronomy = 0;
+    for (size_t i = 0; i < success_count && i < R2_TURN_HISTORY_SEARCHES; ++i)
+        if (!strcmp(success_keywords[i], "astronomy")) found_astronomy = 1;
+    assert(found_astronomy);
+    free(success_search);
     assert(!captured_contains("Fixture request"));
     struct json_object *array = NULL, *field = NULL;
     assert(json_object_object_get_ex(captured, "messages", &array));
