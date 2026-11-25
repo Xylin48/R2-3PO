@@ -10778,7 +10778,7 @@ static char *memory_decision(
         return res;
     }
 
-    const char *separator = memchr(text, '|', (size_t)(end - text));
+    const char *separator = strchr(text, '|');
     const char *category_end = separator ? separator : end;
     while (category_end > text && isspace((unsigned char)category_end[-1]))
         --category_end;
