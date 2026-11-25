@@ -105,6 +105,22 @@ int main(void)
     assert(result && strstr(result, large));
     free(result);
 
+    /* A focused input budget can omit an otherwise matching whole record.
+       The empty selected text must not claim the search found no evidence. */
+    int focused_partial = 0;
+    result = get_relevant_memories("rhodonite", 1, 128, &focused_partial);
+    assert(result && !*result && focused_partial);
+    free(result);
+    focused_partial = 0;
+    result = get_relevant_memories("nebula", 4, 80, &focused_partial);
+    assert(result && strstr(result, "nebula") && focused_partial);
+    free(result);
+    focused_partial = 0;
+    result = get_relevant_memories("uniquartzabsent", 4, 128,
+                                   &focused_partial);
+    assert(result && !*result && !focused_partial);
+    free(result);
+
     assert(db_exec("UPDATE memories SET memory='nebula prefix'||char(0)||'tail' "
                    "WHERE memory='nebula quiet';") == 0);
     assert(get_relevant_memories("nebula", 10, SIZE_MAX, NULL) == NULL);

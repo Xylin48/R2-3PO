@@ -2204,9 +2204,6 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                 failed = 1;
                 break;
             }
-            if (byte_budget < 4 || category_length > byte_budget - 4 ||
-                memory_length > byte_budget - 4 - category_length)
-                continue;
             size_t combined_length = memory_length + category_length + 2;
             char *combined = malloc(combined_length + 1);
             if (!combined) {
@@ -2233,6 +2230,14 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             free(combined);
             if (score <= 0)
                 continue;
+            /* A relevant row that cannot fit is missing evidence, not an
+               empty successful search. Preserve that distinction for the
+               compact answer's retrieval-status notice. */
+            if (byte_budget < 4 || category_length > byte_budget - 4 ||
+                memory_length > byte_budget - 4 - category_length) {
+                if (partial) *partial = 1;
+                continue;
+            }
 
             sqlite3_int64 candidate_id = sqlite3_column_int64(st, 0);
             size_t insert_at = 0;
@@ -2283,8 +2288,10 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                 size_t category_bytes = strlen(candidates[i].category);
                 size_t remaining = byte_budget - length;
                 if (remaining < 4 || category_bytes > remaining - 4 ||
-                    strlen(candidates[i].memory) > remaining - 4 - category_bytes)
+                    strlen(candidates[i].memory) > remaining - 4 - category_bytes) {
+                    if (partial) *partial = 1;
                     continue;
+                }
                 if (append_memory_record(&out, &length, &capacity,
                                          candidates[i].category,
                                          candidates[i].memory) != 0) {
@@ -2342,8 +2349,10 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             size_t category_bytes = strlen(category);
             size_t remaining = byte_budget - length;
             if (remaining < 4 || category_bytes > remaining - 4 ||
-                strlen(memory) > remaining - 4 - category_bytes)
+                strlen(memory) > remaining - 4 - category_bytes) {
+                if (partial) *partial = 1;
                 continue;
+            }
             if (append_memory_record(&out, &length, &capacity, category, memory) != 0) {
                 fprintf(stderr, "[R2 memory] Could not serialize recent-memory context.\n");
                 failed = 1;
@@ -6589,6 +6598,22 @@ static void r2_associative_previous_exchange(const char *query,
     }
 }
 
+/* A malformed or unavailable planner reply must not erase the antecedent of
+ * a follow-up. These are search terms only, never a rewritten user message or
+ * a claim that either speaker's words are verified facts. */
+static char *r2_associative_fallback_query(const char *query,
+                                           const char *previous_user,
+                                           const char *previous_reply)
+{
+    char *fallback = NULL;
+    if (previous_user && previous_reply &&
+        asprintf(&fallback, "%s\n\n%s\n%s", query, previous_user, previous_reply) < 0)
+        fallback = NULL;
+    if (!fallback) fallback = xstrdup(query);
+    if (fallback) r2_associative_query_cache_store(query, fallback);
+    return fallback;
+}
+
 static char *r2_build_associative_search_query(const char *query)
 {
     if (!query || !*query)
@@ -6641,17 +6666,15 @@ static char *r2_build_associative_search_query(const char *query)
     ollama_isolated_request = 1;
     char *generated = ollama_chat_with_limit(
         probe, probe_count, retrieval_prompt, 128, 90L);
-    free(previous_user);
-    free(previous_reply);
     ollama_isolated_request = previous_isolated;
     ollama_authoritative_user_query = previous_query;
     ollama_audit_stage = previous_stage;
 
     if (!generated || !*generated) {
         free(generated);
-        char *fallback = xstrdup(query);
-        if (fallback)
-            r2_associative_query_cache_store(query, fallback);
+        char *fallback = r2_associative_fallback_query(query, previous_user, previous_reply);
+        free(previous_user);
+        free(previous_reply);
         return fallback;
     }
 
@@ -6659,38 +6682,55 @@ static char *r2_build_associative_search_query(const char *query)
     free(generated);
     if (!clean || !*clean) {
         free(clean);
-        char *fallback = xstrdup(query);
-        if (fallback)
-            r2_associative_query_cache_store(query, fallback);
+        char *fallback = r2_associative_fallback_query(query, previous_user, previous_reply);
+        free(previous_user);
+        free(previous_reply);
         return fallback;
     }
-
     size_t query_length = strlen(query);
     size_t concepts_length = strlen(clean);
+    size_t previous_length = 0;
+    if (previous_user && previous_reply) {
+        size_t user_length = strlen(previous_user);
+        size_t reply_length = strlen(previous_reply);
+        if (reply_length > SIZE_MAX - 3 ||
+            user_length > SIZE_MAX - reply_length - 3) {
+            free(clean); free(previous_user); free(previous_reply);
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        previous_length = user_length + reply_length + 3;
+    }
     /* Search consumers use a bounded prefix of the keyword list. Give the
-     * user's own words those slots first, then add model-derived synonyms. */
+     * user's own words those slots first, then the exact previous exchange.
+     * A plausible but off-topic planner result must not erase the antecedent. */
     const char separator[] = "\n\n";
     if (query_length > SIZE_MAX - sizeof(separator) ||
-        concepts_length > SIZE_MAX - sizeof(separator) - query_length) {
-        free(clean);
+        previous_length > SIZE_MAX - sizeof(separator) - query_length ||
+        concepts_length > SIZE_MAX - sizeof(separator) - query_length - previous_length) {
+        free(clean); free(previous_user); free(previous_reply);
         errno = EOVERFLOW;
         return NULL;
     }
-    size_t total = concepts_length + sizeof(separator) + query_length;
+    size_t total = concepts_length + sizeof(separator) + query_length + previous_length;
     char *combined = malloc(total);
     if (!combined) {
         free(clean);
-        char *fallback = xstrdup(query);
-        if (fallback)
-            r2_associative_query_cache_store(query, fallback);
+        char *fallback = r2_associative_fallback_query(query, previous_user, previous_reply);
+        free(previous_user); free(previous_reply);
         return fallback;
     }
-
-    snprintf(combined, total, "%s%s%s", query, separator, clean);
+    if (previous_length)
+        snprintf(combined, total, "%s%s%s\n%s%s%s", query, separator,
+                 previous_user, previous_reply, separator, clean);
+    else
+        snprintf(combined, total, "%s%s%s", query, separator, clean);
     fprintf(stderr,
             "[R2 Association] Generated associative retrieval cues (%zu chars); original user text remains unchanged.\n",
             concepts_length);
     free(clean);
+    free(previous_user);
+    free(previous_reply);
     r2_associative_query_cache_store(query, combined);
     return combined;
 }
@@ -10778,7 +10818,7 @@ static char *memory_decision(
         return res;
     }
 
-    const char *separator = memchr(text, '|', (size_t)(end - text));
+    const char *separator = strchr(text, '|');
     const char *category_end = separator ? separator : end;
     while (category_end > text && isspace((unsigned char)category_end[-1]))
         --category_end;
