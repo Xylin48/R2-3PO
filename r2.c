@@ -10425,45 +10425,61 @@ static char *generate_with_private_evidence(const char *policy, const char *task
                                             const char *context, const char *current,
                                             int64_t *archive_id)
 {
+    if (!policy || !task || !context) return NULL;
     const int num_ctx = r2_ollama_context_tokens();
     int output_tokens = num_ctx <= 4096 ? 384 : 1024;
+    output_tokens = r2_ollama_predict_budget(num_ctx, output_tokens, policy);
     if (num_ctx <= 512 + output_tokens) return NULL;
     size_t capacity = (size_t)(num_ctx - 512 - output_tokens) * 32U / 10U;
     size_t policy_length = strlen(policy);
+    if (policy_length > capacity) return NULL;
+    size_t remaining = capacity - policy_length;
+    size_t context_length = strlen(context);
     size_t current_length = current ? strlen(current) : 0;
-    size_t overhead = policy_length + current_length + 256;
+    size_t separator = current ? 2U : 0U;
     char *combined = NULL;
-    if (overhead >= capacity && current) {
-        if (asprintf(&combined, "%s\n\n%s", context, current) < 0)
-            return NULL;
-        context = combined;
-        current = NULL;
-        overhead = policy_length + 256;
-    }
-    if (overhead >= capacity) {
-        free(combined);
-        return NULL;
-    }
-
     char *notes = NULL;
     char *trace = NULL;
     char *input = NULL;
     char *reply = NULL;
-    if (strlen(context) > capacity - overhead) {
+
+    /* The direct route sends the exact policy and evidence. Do not reserve
+       review framing unless the direct input actually exceeds the budget. */
+    if (context_length <= remaining &&
+        separator <= remaining - context_length &&
+        current_length <= remaining - context_length - separator) {
+        if (current && asprintf(&input, "%s\n\n%s", context, current) < 0)
+            goto cleanup;
+    } else {
+        static const char review_format[] =
+            "REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE %lld (model-derived, not new observations):\n%s%s%s";
+        int heading = snprintf(NULL, 0, review_format, (long long)INT64_MAX, "", "", "");
+        if (heading < 0 || (size_t)heading >= remaining) goto cleanup;
+        size_t note_capacity = remaining - (size_t)heading;
+
+        /* Keep current input separate and exact whenever notes can coexist
+           with it. Otherwise review the combined evidence, as before, and
+           archive its complete original bytes. */
+        if (current && (current_length >= note_capacity ||
+                        2U >= note_capacity - current_length)) {
+            if (asprintf(&combined, "%s\n\n%s", context, current) < 0)
+                goto cleanup;
+            context = combined;
+            current = NULL;
+            current_length = 0;
+            separator = 0;
+        }
+        note_capacity -= current_length + separator;
         int previous_sensory_input = ollama_autonomous_sensory_input;
         ollama_autonomous_sensory_input = 0;
-        notes = r2_review_context(task, context, capacity - overhead, &trace);
+        notes = r2_review_context(task, context, note_capacity, &trace);
         ollama_autonomous_sensory_input = previous_sensory_input;
         if (!notes || !trace) goto cleanup;
         int64_t review_id = r2_log_archive_context_review(task, context, trace);
         if (review_id <= 0) goto cleanup;
         if (archive_id) *archive_id = review_id;
-        if (asprintf(&input,
-            "REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE %lld (model-derived, not new observations):\n%s%s%s",
-            (long long)review_id, notes, current ? "\n\n" : "", current ? current : "") < 0)
-            goto cleanup;
-    } else if (current) {
-        if (asprintf(&input, "%s\n\n%s", context, current) < 0)
+        if (asprintf(&input, review_format, (long long)review_id,
+                     notes, current ? "\n\n" : "", current ? current : "") < 0)
             goto cleanup;
     }
     Message message = {"user", input ? input : (char *)context, 0, 0};
