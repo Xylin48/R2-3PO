@@ -7093,6 +7093,7 @@ static char *chat_with_relevant_memories(
                 history_unavailable = 1;
                 break;
             }
+            if (found.incomplete) history_unavailable = 1;
             r2_log_release_records(&found);
         }
     }
