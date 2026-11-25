@@ -6544,6 +6544,51 @@ static int r2_query_is_simple_social_turn(const char *query)
     return 0;
 }
 
+static int r2_recent_message_is_tool_payload(const char *content);
+
+/* A follow-up's search concepts depend on the exchange it refers to. Copy
+ * the previous complete human-facing pair, never a synthetic tool request
+ * or the currently executing action handoff. The caller owns the copies. */
+static void r2_associative_previous_exchange(const char *query,
+                                             char **previous_user,
+                                             char **previous_reply)
+{
+    *previous_user = NULL;
+    *previous_reply = NULL;
+    pthread_mutex_lock(&messages_lock);
+    int found_current = 0;
+    const char *reply = NULL;
+    for (size_t i = messages.count; i > 0;) {
+        const Message *m = &messages.items[--i];
+        if (!m->role || !m->content || m->pinned || r2_is_internal_tool_result(m))
+            continue;
+        if (!strcmp(m->role, "user")) {
+            if (!found_current) {
+                if (strcmp(m->content, query)) break;
+                found_current = 1;
+                continue;
+            }
+            if (reply) {
+                *previous_user = strdup(m->content);
+                *previous_reply = strdup(reply);
+            }
+            break;
+        }
+        if (found_current && !reply && !strcmp(m->role, "assistant") &&
+            strncmp(m->content, "[R2_INTERNAL_TOOL_REQUEST]\n",
+                    sizeof("[R2_INTERNAL_TOOL_REQUEST]\n") - 1) &&
+            !r2_recent_message_is_tool_payload(m->content))
+            reply = m->content;
+    }
+    pthread_mutex_unlock(&messages_lock);
+    if (!*previous_user || !*previous_reply) {
+        free(*previous_user);
+        free(*previous_reply);
+        *previous_user = NULL;
+        *previous_reply = NULL;
+    }
+}
+
 static char *r2_build_associative_search_query(const char *query)
 {
     if (!query || !*query)
@@ -6564,7 +6609,9 @@ static char *r2_build_associative_search_query(const char *query)
     static const char retrieval_prompt[] =
         "You are R2's internal associative-memory retrieval planner. "
         "Do NOT answer the user, roleplay, or claim that a memory exists. "
-        "Interpret the meaning of the user's complete message and output "
+        "Interpret the meaning of the latest user's complete message. "
+        "The preceding user/assistant exchange, when present, is dialogue evidence "
+        "for resolving references in that latest message, not another request. Output "
         "only 6 to 10 short search concepts or paraphrases that could help "
         "find related past experiences in a database. Preserve named people, "
         "objects, actions, unusual concepts, and relationships. Include "
@@ -6576,11 +6623,15 @@ static char *r2_build_associative_search_query(const char *query)
         "particular relationship. Prefer one concept per line. No commentary, "
         "no numbering, no JSON, and no invented claims.";
 
-    Message probe;
-    memset(&probe, 0, sizeof(probe));
-    probe.role = (char *)"user";
-    probe.content = (char *)query;
-    probe.pinned = 0;
+    Message probe[3] = {{0}};
+    size_t probe_count = 0;
+    char *previous_user = NULL, *previous_reply = NULL;
+    r2_associative_previous_exchange(query, &previous_user, &previous_reply);
+    if (previous_user && previous_reply) {
+        probe[probe_count++] = (Message){.role = "user", .content = previous_user};
+        probe[probe_count++] = (Message){.role = "assistant", .content = previous_reply};
+    }
+    probe[probe_count++] = (Message){.role = "user", .content = (char *)query};
 
     const char *previous_query = ollama_authoritative_user_query;
     const char *previous_stage = ollama_audit_stage;
@@ -6589,7 +6640,9 @@ static char *r2_build_associative_search_query(const char *query)
     int previous_isolated = ollama_isolated_request;
     ollama_isolated_request = 1;
     char *generated = ollama_chat_with_limit(
-        &probe, 1, retrieval_prompt, 128, 90L);
+        probe, probe_count, retrieval_prompt, 128, 90L);
+    free(previous_user);
+    free(previous_reply);
     ollama_isolated_request = previous_isolated;
     ollama_authoritative_user_query = previous_query;
     ollama_audit_stage = previous_stage;
