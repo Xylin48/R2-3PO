@@ -2190,6 +2190,55 @@ static void check_memory_response_replay(void)
     puts("A partial memory response was replayed against the same saved evidence.");
 }
 
+/* Both memory-decision paths must ignore unrelated live input state while
+ * retaining the complete saved exchange and restoring their caller's scope. */
+static void check_memory_decision_private_scope(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *saved_query = ollama_authoritative_user_query;
+    const char *saved_stage = ollama_audit_stage;
+    int saved_sensory = ollama_autonomous_sensory_input;
+    int saved_isolated = ollama_isolated_request;
+    const char *unrelated = "UNRELATED-LIVE-TURN: What can you see?";
+    ollama_authoritative_user_query = unrelated;
+    ollama_audit_stage = "scope-fixture";
+    ollama_autonomous_sensory_input = 1;
+    ollama_isolated_request = 0;
+    set_response("knowledge | The user reported a green card.", "stop", 1);
+    int before = perform_count;
+    char *result = memory_decision("The spare card is green.", "I understand.", NULL, 0, NULL);
+    assert(result && !strcmp(result, "knowledge | The user reported a green card."));
+    assert(perform_count == before + 1 && captured_contains("The spare card is green."));
+    assert(!captured_contains(unrelated));
+    free(result);
+    assert(ollama_authoritative_user_query == unrelated && ollama_autonomous_sensory_input == 1);
+    assert(!strcmp(ollama_audit_stage, "scope-fixture") && !ollama_isolated_request);
+
+    assert(!reviewed_bytes && !reviewed_size);
+    char *long_reply = text(16000, 'r', "Complete saved response: ");
+    strcpy(long_reply + 15981, "EXACT-EVIDENCE-TAIL");
+    int64_t archive = 0;
+    capture_reviews = 1;
+    result = memory_decision("The spare card is green.", long_reply, NULL, 0, &archive);
+    capture_reviews = 0;
+    assert(result && !strcmp(result, "knowledge | The user reported a green card."));
+    assert(archive > 0 && reviewed_bytes && strstr(reviewed_bytes, long_reply));
+    assert(captured_contains("REVIEW NOTES FROM PRIVATE EVIDENCE ARCHIVE"));
+    assert(!captured_contains(unrelated));
+    assert(ollama_authoritative_user_query == unrelated && ollama_autonomous_sensory_input == 1);
+    assert(!strcmp(ollama_audit_stage, "scope-fixture") && !ollama_isolated_request);
+    free(result);
+    free(long_reply);
+    free(reviewed_bytes);
+    reviewed_bytes = NULL;
+    reviewed_size = 0;
+    staged_calls = 0;
+    ollama_authoritative_user_query = saved_query;
+    ollama_audit_stage = saved_stage;
+    ollama_autonomous_sensory_input = saved_sensory;
+    ollama_isolated_request = saved_isolated;
+}
+
 static void *shutdown_fixture_worker(void *unused)
 {
     (void)unused;
@@ -2345,6 +2394,7 @@ int main(void)
     check_isolated_response_replay();
     check_foreground_answer_replay();
     check_memory_response_replay();
+    check_memory_decision_private_scope();
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
     check_second_turn_uses_actual_wire_budget();
