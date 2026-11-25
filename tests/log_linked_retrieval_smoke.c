@@ -88,6 +88,48 @@ int main(void)
     if (!edge_ok)
         fprintf(stderr, "Stored relationship verification failed.\n");
 
+    /* Two selected neighbors cannot make a larger link set appear complete. */
+    int link_bound_ok = 1;
+    int64_t bounded_anchor = r2_log_event(R2_LOG_MEMORY, "bounded_anchor",
+        "LIMITED-RELATION-ANCHOR", "one base event", "link-smoke");
+    for (int i = 0; i < 5; ++i) {
+        char marker[40];
+        snprintf(marker, sizeof(marker), "LIMITED-LINK-%d", i);
+        int64_t neighbor = r2_log_event(R2_LOG_MEMORY, "bounded_neighbor",
+            marker, "related evidence", "link-smoke");
+        if (bounded_anchor <= 0 || neighbor <= 0 ||
+            r2_log_link(bounded_anchor, neighbor, "related_evidence", NULL) != 0)
+            link_bound_ok = 0;
+    }
+    R2LogRecordBatch bounded = {0};
+    if (r2_log_search_records("LIMITED-RELATION-ANCHOR", 1, &bounded) != 0)
+        link_bound_ok = 0;
+    else if (bounded.count != 3 || !bounded.incomplete ||
+             !strstr(bounded.text, "LIMITED-LINK-4") ||
+             !strstr(bounded.text, "LIMITED-LINK-3") ||
+             strstr(bounded.text, "LIMITED-LINK-2"))
+        link_bound_ok = 0;
+    r2_log_release_records(&bounded);
+    if (r2_log_search_records("unique identity seed event", 1, &bounded) != 0 ||
+        bounded.incomplete) link_bound_ok = 0;
+    r2_log_release_records(&bounded);
+    for (int i = 0; i < 5; ++i) {
+        int64_t base = r2_log_event(R2_LOG_MEMORY, "bounded_base",
+            "LIMITED-MULTIBASE", "separate source event", "link-smoke");
+        for (int j = 0; j < 2; ++j) {
+            int64_t neighbor = r2_log_event(R2_LOG_MEMORY, "bounded_child",
+                "another related event", "global link boundary", "link-smoke");
+            if (base <= 0 || neighbor <= 0 ||
+                r2_log_link(base, neighbor, "related_evidence", NULL) != 0)
+                link_bound_ok = 0;
+        }
+    }
+    if (r2_log_search_records("LIMITED-MULTIBASE", 5, &bounded) != 0 ||
+        bounded.count != 13 || !bounded.incomplete) link_bound_ok = 0;
+    r2_log_release_records(&bounded);
+    if (!link_bound_ok)
+        fprintf(stderr, "Bounded Life Log links hid retrieval incompleteness.\n");
+
     char *from_seed = r2_log_search("identity", 10);
     char *from_relation = r2_log_search("explicit current-user identity relationship", 10);
     int ok = from_seed && from_relation &&
@@ -242,7 +284,7 @@ int main(void)
     }
 
     r2_log_shutdown();
-    if (!ok || !memory_update_ok || !edge_ok || !exact_ok || !archive_ok) return 1;
+    if (!ok || !memory_update_ok || !edge_ok || !exact_ok || !archive_ok || !link_bound_ok) return 1;
     puts("Life Log linked retrieval and failed memory_saved bookkeeping are handled correctly.");
     return 0;
 }
