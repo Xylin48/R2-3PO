@@ -4077,39 +4077,12 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
                                 long timeout_seconds,
                                 OllamaRetryReason *retry);
 
-static char *ollama_chat_with_limit(
-    Message *msgs,
-    size_t count,
-    const char *system_override,
-    int num_predict,
-    long timeout_seconds)
+/* The policy selector, compact allocator and wire serializer must use the
+ * same generation quota. In particular, a 1024-token requested answer on a
+ * 2048-token context does not actually reserve 1024 tokens on the wire. */
+static int r2_ollama_predict_budget(int num_ctx, int num_predict,
+                                    const char *system_override)
 {
-    struct json_object *root = json_object_new_object();
-    if (!root) return NULL;
-
-    /* Do not silently fall back to Ollama defaults if request metadata
-       cannot be allocated or inserted. */
-    if (ollama_json_object_add_checked(root, "model",
-                                       json_object_new_string(MODEL)) != 0 ||
-        ollama_json_object_add_checked(root, "stream",
-                                       json_object_new_boolean(0)) != 0 ||
-        ollama_json_object_add_checked(root, "truncate",
-                                       json_object_new_boolean(0)) != 0 ||
-        ollama_json_object_add_checked(root, "shift",
-                                       json_object_new_boolean(0)) != 0) {
-        json_object_put(root);
-        return NULL;
-    }
-    /* Reserve the requested generation budget for the visible answer. */
-    if (ollama_json_object_add_checked(root, "think",
-                                       json_object_new_boolean(0)) != 0 ||
-        ollama_json_object_add_checked(root, "keep_alive",
-                                       json_object_new_string("10m")) != 0) {
-        json_object_put(root);
-        return NULL;
-    }
-
-    int num_ctx = r2_ollama_context_tokens();
     /* Keep answer generation inside the configured context window. */
     int max_predict = num_ctx >= 16384 ? 8192 :
                       num_ctx >= 12288 ? 6144 :
@@ -4151,6 +4124,69 @@ static char *ollama_chat_with_limit(
         if (num_predict > fitted_output_floor)
             num_predict = fitted_output_floor;
     }
+
+    return num_predict;
+}
+
+/* Measure the most recent complete exchange using the same slot accounting
+ * as the final whole-message allocator, including any recorded action pair. */
+static size_t r2_prior_exchange_bytes(const Message *msgs, size_t count,
+                                      size_t current_user)
+{
+    if (current_user == SIZE_MAX || current_user >= count) return 0;
+    size_t slots = OLLAMA_MAX_RECENT_MESSAGES;
+    for (size_t i = current_user; i < count; ++i) {
+        if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
+        if (slots) --slots;
+    }
+    size_t bytes = 0;
+    for (size_t i = current_user; i > 0;) {
+        const Message *m = &msgs[--i];
+        if (m->role && !strcmp(m->role, "system")) continue;
+        size_t n = strlen(m->content ? m->content : "");
+        if (!n || !slots || n > SIZE_MAX - bytes) return 0;
+        --slots;
+        bytes += n;
+        if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result)
+            return bytes;
+    }
+    return 0;
+}
+
+static char *ollama_chat_with_limit(
+    Message *msgs,
+    size_t count,
+    const char *system_override,
+    int num_predict,
+    long timeout_seconds)
+{
+    struct json_object *root = json_object_new_object();
+    if (!root) return NULL;
+
+    /* Do not silently fall back to Ollama defaults if request metadata
+       cannot be allocated or inserted. */
+    if (ollama_json_object_add_checked(root, "model",
+                                       json_object_new_string(MODEL)) != 0 ||
+        ollama_json_object_add_checked(root, "stream",
+                                       json_object_new_boolean(0)) != 0 ||
+        ollama_json_object_add_checked(root, "truncate",
+                                       json_object_new_boolean(0)) != 0 ||
+        ollama_json_object_add_checked(root, "shift",
+                                       json_object_new_boolean(0)) != 0) {
+        json_object_put(root);
+        return NULL;
+    }
+    /* Reserve the requested generation budget for the visible answer. */
+    if (ollama_json_object_add_checked(root, "think",
+                                       json_object_new_boolean(0)) != 0 ||
+        ollama_json_object_add_checked(root, "keep_alive",
+                                       json_object_new_string("10m")) != 0) {
+        json_object_put(root);
+        return NULL;
+    }
+
+    int num_ctx = r2_ollama_context_tokens();
+    num_predict = r2_ollama_predict_budget(num_ctx, num_predict, system_override);
 
     struct json_object *options = json_object_new_object();
     if (!options) {
@@ -5452,24 +5488,20 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
        evidence. Preserve the requested reply budget when history is optional. */
     int ctx = r2_ollama_context_tokens();
     size_t history_budget = capacity;
-    if (!recalled && num_predict >= 64 && num_predict < ctx - 512)
-        history_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
     size_t recent_reserve = 0;
-    if (!recalled && total < history_budget) {
-        size_t bytes = 0;
-        size_t slots = 0;
-        for (size_t i = user; i > 0;) {
-            const Message *m = &messages[--i];
-            if (m->role && !strcmp(m->role, "system")) continue;
-            size_t length = m->content ? strlen(m->content) : 0;
-            if (!length || length > history_budget - total - bytes ||
-                ++slots >= OLLAMA_MAX_RECENT_MESSAGES) break;
-            bytes += length;
-            if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
-                recent_reserve = bytes;
-                break;
-            }
-        }
+    if (!recalled && ctx > 576) {
+        num_predict = r2_ollama_predict_budget(ctx, num_predict,
+                                              r2_compact_conversation_policy);
+        size_t previous = r2_prior_exchange_bytes(messages, count, user);
+        if (previous <= capacity - total)
+            recent_reserve = previous;
+        /* Prefer the complete previous exchange over optional evidence. If
+           needed, use the existing output reallocation, not a smaller reply
+           history or a second model call. */
+        if (r2_fit_complete_input(total + recent_reserve, ctx, &num_predict) != 0)
+            goto cleanup;
+        size_t wire_budget = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+        if (wire_budget < history_budget) history_budget = wire_budget;
     }
     history_budget -= recent_reserve;
 
@@ -5506,7 +5538,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             /* Required instructions are reserved above. The final allocator
                budgets optional snapshots after recent dialogue. */
             selected[selected_count++] = m;
-        } else if (length <= capacity - total) {
+        } else if (total <= history_budget && length <= history_budget - total) {
             selected[selected_count++] = m;
             total += length;
         }
@@ -5516,13 +5548,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             "CURRENT TURN RETRIEVED CONTEXT (complete ranked persistent-memory records; "
             "historical evidence only). The source store retains the full records.\n";
         size_t heading_bytes = sizeof(heading) - 1;
-        int ctx = r2_ollama_context_tokens();
-        size_t input_bytes = capacity;
-        /* Preserve the normal answer quota when choosing additional evidence.
-           The full allocation is available for the exact turn and live state. */
-        if (num_predict >= 64 && num_predict < ctx - 512)
-            input_bytes = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
-        if (recent_reserve <= input_bytes) input_bytes -= recent_reserve;
+        size_t input_bytes = history_budget;
         if (input_bytes > total && input_bytes - total > heading_bytes) {
             char *plan = r2_associative_query_cache_lookup(query);
             static char notice[] =
@@ -5647,23 +5673,9 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     /* Budget the immediately preceding complete exchange before deciding
        whether the full conversation policy fits. Historical retrieval must
        not consume the space needed to understand a direct follow-up. */
-    size_t recent_exchange = 0;
-    int recent_anchored = 0;
-    for (size_t i = user; i > 0;) {
-        const Message *m = &messages[--i];
-        if (m->role && !strcmp(m->role, "system")) continue;
-        size_t n = strlen(m->content ? m->content : "");
-        if (n > SIZE_MAX - recent_exchange) { errno = EOVERFLOW; return NULL; }
-        recent_exchange += n;
-        if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
-            recent_anchored = 1;
-            break;
-        }
-    }
-    if (!recent_anchored) recent_exchange = 0;
-    size_t dialogue_capacity = capacity;
-    if (num_predict >= 64 && num_predict < ctx - 512)
-        dialogue_capacity = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+    size_t recent_exchange = r2_prior_exchange_bytes(messages, count, user);
+    int wire_predict = r2_ollama_predict_budget(ctx, num_predict, system);
+    size_t dialogue_capacity = (size_t)(ctx - 512 - wire_predict) * 32U / 10U;
     if (conversation_policy &&
         ((required > capacity &&
           (immutable >= capacity || capacity - immutable < 384)) ||
