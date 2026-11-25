@@ -835,6 +835,63 @@ static int memory_fixture_count(const char *query)
     return count;
 }
 
+/* Check both Life Log allocation shapes, including the exact last byte of
+ * the recorded tool result, and the learning evidence staged by that write. */
+static void check_conversation_learning_record_boundaries(void)
+{
+    assert(init_db() == 0);
+    char *user = text(4097, 'u', "Long user message: ");
+    char *reply = text(8193, 'r', "Long R2 response: ");
+    char *tool = text(2049, 't', "Recorded tool evidence: ");
+    const char tail[] = "END!";
+    memcpy(user + strlen(user) - sizeof(tail) + 1, tail, sizeof(tail));
+    memcpy(reply + strlen(reply) - sizeof(tail) + 1, tail, sizeof(tail));
+    memcpy(tool + strlen(tool) - sizeof(tail) + 1, tail, sizeof(tail));
+
+    for (int with_tool = 0; with_tool <= 1; ++with_tool) {
+        const char *recorded = with_tool ? tool : NULL;
+        int64_t event_id = r2_log_conversation_turn_for_learning(
+            user, reply, NULL, 0, NULL, 0, recorded);
+        assert(event_id > 0);
+        char *expected = NULL;
+        assert(asprintf(&expected, "USER SAID:\n%s\nR2 REPLIED:\n%s%s%s",
+                        user, reply,
+                        recorded ? R2_LOG_CONVERSATION_TOOL_PREFIX : "",
+                        recorded ? recorded : "") >= 0);
+        sqlite3_stmt *statement = NULL;
+        assert(sqlite3_prepare_v2(db,
+            "SELECT e.details,l.user_text,l.assistant_text,l.tool_result,s.assistant_text "
+            "FROM r2_log_events e JOIN r2_log_pending_learning l ON l.event_id=e.id "
+            "JOIN r2_log_pending_self_reports s ON s.event_id=e.id WHERE e.id=?;",
+            -1, &statement, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(statement, 1, event_id) == SQLITE_OK);
+        assert(sqlite3_step(statement) == SQLITE_ROW);
+        const char *values[] = {expected, user, reply, recorded, reply};
+        for (int col = 0; col < 5; ++col) {
+            if (!values[col]) {
+                assert(sqlite3_column_type(statement, col) == SQLITE_NULL);
+                continue;
+            }
+            assert(sqlite3_column_type(statement, col) == SQLITE_TEXT);
+            const unsigned char *actual = sqlite3_column_text(statement, col);
+            assert(actual && (size_t)sqlite3_column_bytes(statement, col) == strlen(values[col]));
+            assert(memcmp(actual, values[col], strlen(values[col])) == 0);
+            assert(actual[strlen(values[col])] == '\0');
+        }
+        assert(sqlite3_step(statement) == SQLITE_DONE);
+        sqlite3_finalize(statement);
+        assert(r2_log_ack_learning(event_id) == 0);
+        assert(r2_log_ack_self_report(event_id) == 0);
+        free(expected);
+    }
+
+    free(user);
+    free(reply);
+    free(tool);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+}
+
 static void check_stale_needs_decision(void)
 {
     assert(init_db() == 0 && r2_reality_init() == 0);
@@ -2303,6 +2360,7 @@ int main(void)
     assert(stored && strstr(stored, partial)); free(stored);
     check_imagination_persistence_and_feedback();
     check_evaluated_memory_atomicity();
+    check_conversation_learning_record_boundaries();
     check_post_turn_retry();
     check_staged_imagination();
     check_stale_needs_decision();
