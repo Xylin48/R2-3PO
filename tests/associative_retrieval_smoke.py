@@ -131,6 +131,12 @@ require(
     "diary and visual retrieval retain complete selected records and report bounded matches",
 )
 require(
+    "selection->incomplete = 1; /* An eligible cue was never searched. */" in association_search
+    and "r2_history_keyword_searchable(keywords[k])" in builder
+    and "history_unavailable = 1; /* The selected search slots ran out. */" in builder,
+    "unsearched eligible diary, visual, and Life Log cues are reported as incomplete",
+)
+require(
     "RELATED DIARY REFLECTIONS" in builder and "RELATED VISUAL EXPERIENCES" in association_search,
     "diary and visual evidence is labeled as historical context rather than current fact",
 )
