@@ -5644,8 +5644,32 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     }
     int conversation_policy = system == r2_conversation_system_prompt;
     int optional_history = conversation_policy || system == r2_compact_conversation_policy;
-    if (conversation_policy && required > capacity &&
-        (immutable >= capacity || capacity - immutable < 384))
+    /* Budget the immediately preceding complete exchange before deciding
+       whether the full conversation policy fits. Historical retrieval must
+       not consume the space needed to understand a direct follow-up. */
+    size_t recent_exchange = 0;
+    int recent_anchored = 0;
+    for (size_t i = user; i > 0;) {
+        const Message *m = &messages[--i];
+        if (m->role && !strcmp(m->role, "system")) continue;
+        size_t n = strlen(m->content ? m->content : "");
+        if (n > SIZE_MAX - recent_exchange) { errno = EOVERFLOW; return NULL; }
+        recent_exchange += n;
+        if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result) {
+            recent_anchored = 1;
+            break;
+        }
+    }
+    if (!recent_anchored) recent_exchange = 0;
+    size_t dialogue_capacity = capacity;
+    if (num_predict >= 64 && num_predict < ctx - 512)
+        dialogue_capacity = (size_t)(ctx - 512 - num_predict) * 32U / 10U;
+    if (conversation_policy &&
+        ((required > capacity &&
+          (immutable >= capacity || capacity - immutable < 384)) ||
+         (recent_exchange && !r2_query_explicitly_requests_recall(query) &&
+          (required > dialogue_capacity ||
+           recent_exchange > dialogue_capacity - required))))
         return r2_compact_foreground_chat(messages, count, user, query,
                                           num_predict, timeout, capacity);
     if (required <= capacity || !review_count)
