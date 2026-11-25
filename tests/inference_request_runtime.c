@@ -661,6 +661,22 @@ static void check_context_and_isolated_inputs(void)
     assert(!strcmp(ollama_audit_stage, "conversation-answer"));
     free(answer);
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    /* A 700-token request at this context is capped to 512 by the core.
+       The producer may use every estimated input byte left by that cap. */
+    const char small_policy[] = "Isolated contract";
+    const size_t small_capacity = 3276U;
+    char *exact_prompt = text(small_capacity - strlen(small_policy), 'p',
+                              "COMPLETE SMALL-CONTEXT IMAGINATION: ");
+    set_response("Exact isolated answer", "stop", 1);
+    before = perform_count;
+    answer = r2_model_generate(small_policy, exact_prompt, 700);
+    assert(answer && perform_count == before + 1 && captured_contains(exact_prompt));
+    struct json_object *small_options = NULL, *small_predict = NULL;
+    assert(json_object_object_get_ex(captured, "options", &small_options));
+    assert(json_object_object_get_ex(small_options, "num_predict", &small_predict));
+    assert(json_object_get_int(small_predict) == 512);
+    free(answer); free(exact_prompt);
+
     set_response("must not send clipped prompt", "stop", 1);
     before = perform_count;
     assert(!r2_model_generate("Isolated contract", prompt, 700) && perform_count == before);

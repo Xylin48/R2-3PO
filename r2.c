@@ -4057,8 +4057,10 @@ static int r2_inference_unit_required(const Message *message, size_t index, size
  * increasing the configured model context or changing any input bytes. */
 static int r2_fit_complete_input(size_t required_bytes, int num_ctx, int *num_predict)
 {
-    if (!num_predict || num_ctx <= 576 || *num_predict < 1 ||
-        *num_predict > num_ctx - 512) { errno = EINVAL; return -1; }
+    if (!num_predict || num_ctx <= R2_TEXT_TEMPLATE_RESERVE + R2_TEXT_MIN_GENERATION ||
+        *num_predict < 1 || *num_predict > num_ctx - R2_TEXT_TEMPLATE_RESERVE) {
+        errno = EINVAL; return -1;
+    }
     size_t current = r2_text_input_bytes(num_ctx, *num_predict);
     if (required_bytes <= current) return 0;
     /* The existing byte/token estimate is an allocation heuristic, not a
@@ -4068,8 +4070,8 @@ static int r2_fit_complete_input(size_t required_bytes, int num_ctx, int *num_pr
     if (required_bytes > maximum) { errno = E2BIG; return -1; }
     size_t input_tokens = (required_bytes * R2_TEXT_BYTE_DENOMINATOR +
                            R2_TEXT_BYTE_NUMERATOR - 1U) / R2_TEXT_BYTE_NUMERATOR;
-    int fitted = num_ctx - 512 - (int)input_tokens;
-    if (fitted < 64) { errno = E2BIG; return -1; }
+    int fitted = num_ctx - R2_TEXT_TEMPLATE_RESERVE - (int)input_tokens;
+    if (fitted < R2_TEXT_MIN_GENERATION) { errno = E2BIG; return -1; }
     *num_predict = fitted;
     return 0;
 }
@@ -4248,11 +4250,11 @@ static int r2_ollama_predict_budget(int num_ctx, int num_predict,
         size_t required_chars = prompt_chars + query_chars + 1500;
         size_t required_tokens = (required_chars * R2_TEXT_BYTE_DENOMINATOR +
                                   R2_TEXT_BYTE_NUMERATOR - 1U) / R2_TEXT_BYTE_NUMERATOR;
-        int input_fitted_output = num_ctx - 512 - (int)required_tokens;
+        int input_fitted_output = num_ctx - R2_TEXT_TEMPLATE_RESERVE - (int)required_tokens;
         /* Let long turns spend fewer than 256 tokens on the answer when that
            is what it takes to keep the complete prompt and current user turn. */
-        int fitted_output_floor = input_fitted_output < 64
-            ? 64 : input_fitted_output;
+        int fitted_output_floor = input_fitted_output < R2_TEXT_MIN_GENERATION
+            ? R2_TEXT_MIN_GENERATION : input_fitted_output;
         if (num_predict > fitted_output_floor)
             num_predict = fitted_output_floor;
     }
@@ -5651,7 +5653,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     int ctx = r2_ollama_context_tokens();
     size_t history_budget = capacity;
     size_t recent_reserve = 0;
-    if (ctx > 576) {
+    if (ctx > R2_TEXT_TEMPLATE_RESERVE + R2_TEXT_MIN_GENERATION) {
         num_predict = r2_ollama_predict_budget(ctx, num_predict,
                                               r2_compact_conversation_policy);
         size_t previous = r2_prior_exchange_bytes(messages, count, user);
@@ -5829,7 +5831,7 @@ static char *r2_foreground_chat(Message *messages, size_t count,
         break;
     }
     int ctx = r2_ollama_context_tokens();
-    if (ctx <= 576 || user == SIZE_MAX)
+    if (ctx <= R2_TEXT_TEMPLATE_RESERVE + R2_TEXT_MIN_GENERATION || user == SIZE_MAX)
         return ollama_chat_with_limit(messages, count, system, num_predict, timeout);
     size_t capacity = r2_text_input_bytes(ctx, R2_TEXT_MIN_GENERATION);
     size_t required = system ? strlen(system) : 0;
@@ -10436,7 +10438,7 @@ static char *generate_with_private_evidence(const char *policy, const char *task
     const int num_ctx = r2_ollama_context_tokens();
     int output_tokens = num_ctx <= 4096 ? 384 : 1024;
     output_tokens = r2_ollama_predict_budget(num_ctx, output_tokens, policy);
-    if (num_ctx <= 512 + output_tokens) return NULL;
+    if (num_ctx <= R2_TEXT_TEMPLATE_RESERVE + output_tokens) return NULL;
     size_t capacity = r2_text_input_bytes(num_ctx, output_tokens);
     size_t policy_length = strlen(policy);
     if (policy_length > capacity) return NULL;
