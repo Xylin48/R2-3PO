@@ -6519,6 +6519,7 @@ static int r2_append_original_archive_matches(char **context,
     uintmax_t offset = 0;
     ssize_t length;
     int failed = 0;
+    size_t matching_lines = 0;
     while (!r2_is_shutting_down() && (length = getline(&line, &capacity, stream)) >= 0) {
         if (memchr(line, '\0', (size_t)length) ||
             (uintmax_t)length > (uintmax_t)before.st_size - offset) {
@@ -6526,6 +6527,8 @@ static int r2_append_original_archive_matches(char **context,
             break;
         }
         size_t score = r2_original_archive_match_score(line, keywords, keyword_count);
+        if (score && matching_lines <= MAX_ORIGINAL_ARCHIVE_MATCHES)
+            ++matching_lines; /* Saturate after the first omitted match. */
         size_t weakest = 0;
         for (size_t i = 1; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) {
             if (best[i].score < best[weakest].score ||
@@ -6572,7 +6575,7 @@ static int r2_append_original_archive_matches(char **context,
     }
     for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) free(best[i].line);
     if (r2_is_shutting_down()) { errno = ECANCELED; return -1; }
-    if (!failed) return rc;
+    if (!failed) return rc ? rc : matching_lines > MAX_ORIGINAL_ARCHIVE_MATCHES;
 
 unavailable:
     fprintf(stderr, "[R2 Context] Could not search the complete original conversation archive.\n");
