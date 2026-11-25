@@ -2729,3 +2729,8 @@ Manually inspect every line in every tracked source file, not merely signatures,
 
 - Draft #193 push run [45577665748](https://github.com/Xylin48/R2-3PO/actions/runs/45577665748) stopped after 58 successful steps at `qwen35_model_smoke.py`: its static assertion looked for `input_fitted_output < 64`, although the #192 source already uses the shared `R2_TEXT_MIN_GENERATION` constant. The assertion fails against the unchanged #192 source as well; native follow-up and ranking fixtures had not yet run.
 - Aligned the static check to the shared constant; the complete split-model static check passes locally. This does not change the runtime generation floor, model selection or allocation. The subsequent full CI run must verify both native fixtures at its exact new head.
+
+### R2-AUD-2026-11-25-319 — Headroom check still inspects removed core-local clamp
+
+- Draft #193 run [45578559079](https://github.com/Xylin48/R2-3PO/actions/runs/45578559079) passed the native inference-request fixture and 84 workflow steps, then stopped at `runtime_headroom_smoke.py`. It still demanded `if (num_predict > max_predict)` inside r2.c. The #192 shared allocation code moved that headroom cap into `r2_text_predict_limit` in `r2_context_budget.h`; the static assertion fails against the unchanged #192 source too, before the memory-ranking fixture runs.
+- Updated the static regression to check both the core's shared helper call and that helper's actual headroom calculation, cap and return. `runtime_headroom_smoke.py` and diff check pass locally. Runtime context and output settings are unchanged; a fresh exact-head native run remains necessary.
