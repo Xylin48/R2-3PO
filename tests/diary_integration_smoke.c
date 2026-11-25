@@ -125,6 +125,44 @@ char *__wrap_fgets(char *ptr, int size, FILE *stream)
     return __real_fgets(ptr, size, stream);
 }
 
+static void verify_workspace_text_byte_counts(void)
+{
+    const char *path = R2_WORKSPACE "/audit-byte-count-fixture.txt";
+    static const char binary[] = {'A', '\0', 'B'};
+    FILE *file = fopen(path, "wb");
+    assert(file);
+    assert(fwrite(binary, 1, sizeof(binary), file) == sizeof(binary));
+    assert(fclose(file) == 0);
+
+    size_t count = 0;
+    long next = -1;
+    char *raw = r2_workspace_read("audit-byte-count-fixture.txt", &count);
+    assert(raw && count == sizeof(binary) && memcmp(raw, binary, count) == 0);
+    free(raw);
+    raw = r2_workspace_read_chunk("audit-byte-count-fixture.txt", 0, 3, &count, &next);
+    assert(raw && count == sizeof(binary) && next == 3 && memcmp(raw, binary, count) == 0);
+    free(raw);
+
+    char *reply = r2_diary_tool("FILE_READ", "audit-byte-count-fixture.txt");
+    assert(reply && strstr(reply, "Embedded NUL"));
+    free(reply);
+    reply = r2_diary_tool("FILE_READ_CHUNK", "audit-byte-count-fixture.txt|0|3");
+    assert(reply && strstr(reply, "Embedded NUL") && !strstr(reply, "[NEXT_OFFSET="));
+    free(reply);
+
+    file = fopen(path, "wb");
+    assert(file);
+    assert(fwrite("abc", 1, 3, file) == 3);
+    assert(fclose(file) == 0);
+    reply = r2_diary_tool("FILE_READ_CHUNK", "audit-byte-count-fixture.txt|0|3");
+    assert(reply && strcmp(reply, "abc\n\n[CHUNK_BYTES_READ=3]\n[NEXT_OFFSET=3]\n") == 0);
+    free(reply);
+    reply = r2_diary_tool("FILE_READ_CHUNK", "audit-byte-count-fixture.txt|3|3");
+    assert(reply && strcmp(reply, "\n\n[CHUNK_BYTES_READ=0]\n[NEXT_OFFSET=3]\n") == 0);
+    free(reply);
+    assert(unlink(path) == 0);
+}
+
 static void verify_diary_workspace_path_swaps(void)
 {
     const char *inside = R2_WORKSPACE "/workspace-race/note.txt";
@@ -960,6 +998,7 @@ int main(void)
     verify_mirror_flush_failure();
     verify_mirror_symlink_is_not_followed();
     verify_detached_mirror_is_replayed();
+    verify_workspace_text_byte_counts();
     verify_diary_workspace_path_swaps();
     r2_diary_shutdown();
     puts("Diary/Life Log/memory integration smoke test passed.");
