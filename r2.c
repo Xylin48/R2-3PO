@@ -3088,6 +3088,31 @@ static int ollama_progress(void *userdata,
            foreground_has_priority;
 }
 
+/* Reflections are scheduled work, not opportunistic probes. A busy model
+ * is not a failed diary generation: wait for the current inference owner
+ * while idle, then acquire the same shared slot. Foreground priority and
+ * shutdown cancellation still use the existing progress callback. */
+static int r2_ollama_background_request_begin(void)
+{
+    if (ollama_progress(NULL, 0, 0, 0, 0)) return ECANCELED;
+    int rc;
+    const struct timespec wait = {.tv_sec = 0, .tv_nsec = 100000000L};
+    while ((rc = pthread_mutex_trylock(&ollama_request_lock)) == EBUSY &&
+           ollama_reflection_worker) {
+        if (ollama_progress(NULL, 0, 0, 0, 0)) return ECANCELED;
+        nanosleep(&wait, NULL);
+    }
+    if (rc != 0) {
+        if (rc == EBUSY && post_turn_deferred) *post_turn_deferred = 1;
+        return rc;
+    }
+    if (ollama_progress(NULL, 0, 0, 0, 0)) {
+        pthread_mutex_unlock(&ollama_request_lock);
+        return ECANCELED;
+    }
+    return 0;
+}
+
 int r2_ollama_vision_request_begin(void)
 {
     /* Vision is opportunistic for background watchers, but a foreground
@@ -4993,13 +5018,9 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
 #undef R2_OLLAMA_SETOPT
 
     if (ollama_background_mode) {
-        /* Never queue background reflection/bookkeeping ahead of a live turn. */
-        int lock_result = pthread_mutex_trylock(&ollama_request_lock);
-        if (lock_result != 0 || ollama_progress(NULL, 0, 0, 0, 0)) {
-            if (lock_result == 0)
-                pthread_mutex_unlock(&ollama_request_lock);
-            if (lock_result == EBUSY && post_turn_deferred)
-                *post_turn_deferred = 1;
+        /* Reflection waits for model ownership during idle time; post-turn
+           bookkeeping retains its existing deferral and durable queue. */
+        if (r2_ollama_background_request_begin() != 0) {
             curl_slist_free_all(headers);
             curl_easy_cleanup(curl);
             free(b.data);
@@ -5597,11 +5618,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             char *records = get_relevant_memories(plan ? plan : query, R2_TURN_MEMORY_LIMIT,
                                                  row_budget, &partial);
             free(plan);
-            if (!records || partial) {
-                if (sizeof(notice) - 1 <= capacity - total)
-                    selected[selected_count++] = (Message){.role = "system", .content = notice};
-                fprintf(stderr, "[R2 Context] Focused memory retrieval was incomplete.\n");
-            }
+            int incomplete = !records || partial;
             if (records) {
                 if (*records && asprintf(&focused_retrieval, "%s%s", heading, records) < 0) {
                     free(records);
@@ -5610,8 +5627,15 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
                 }
                 free(records);
             }
-            if (focused_retrieval)
+            if (focused_retrieval) {
                 selected[selected_count++] = (Message){.role = "system", .content = focused_retrieval};
+                total += strlen(focused_retrieval);
+            }
+            if (incomplete) {
+                if (total <= input_bytes && sizeof(notice) - 1 <= input_bytes - total)
+                    selected[selected_count++] = (Message){.role = "system", .content = notice};
+                fprintf(stderr, "[R2 Context] Focused memory retrieval was incomplete.\n");
+            }
         }
         fprintf(stderr, "[R2 Context] Focused retrieval selected %zu of %zu historical bytes "
                         "as complete ranked memory records (context=%d, input_budget_bytes=%zu).\n",
