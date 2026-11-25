@@ -30,7 +30,7 @@ require(
 )
 require(
     'if [[ "${R2_LIVE_DIAGNOSTICS:-0}" == 1 ]]; then' in launcher
-    and 'tail --pid="$" -n +1 -f --' in launcher
+    and 'tail --pid="$$" -n +1 -f --' in launcher
     and 'exec {R2_CORE_STDERR}>>"$R2_DIAGNOSTICS_DIR/Debug.txt"' in launcher
     and '2>&"$R2_CORE_STDERR"' in launcher,
     "live diagnostics use the separate terminal stream without writing over conversation output",
