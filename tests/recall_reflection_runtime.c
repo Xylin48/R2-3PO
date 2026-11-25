@@ -113,6 +113,16 @@ int main(void)
     check_allocator(history.text);
     r2_log_release_records(&batch); r2_history_release(&history); free(payload);
 
+    /* A one-row search must report the other matching source record without
+       returning a fragment of it or changing the selected newest record. */
+    assert(r2_log_search_records("BOUNDARY-SEARCH", 1, &batch) == 0);
+    assert(batch.count == 1 && batch.records[0].event_id == first && batch.incomplete);
+    assert(strstr(batch.text, "PAYLOAD-END") && !strstr(batch.text, "ACTUAL-SECOND-EVENT"));
+    r2_log_release_records(&batch);
+    assert(r2_log_search_records("BOUNDARY-SEARCH", 2, &batch) == 0);
+    assert(batch.count == 2 && !batch.incomplete);
+    r2_log_release_records(&batch);
+
     int64_t speech[] = {
         r2_log_sensory("speech_transcribed", "Actual first recognized clip", "same recognized words", "physical mic"),
         r2_log_sensory("speech_transcribed", "Actual second recognized clip", "same recognized words", "movie monitor")
