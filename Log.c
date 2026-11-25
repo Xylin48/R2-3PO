@@ -3397,6 +3397,10 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
     int rc;
 
     limit = normalize_limit(limit);
+    /* Structured retrieval needs one extra row to distinguish an exact fit
+       from a bounded result. The probe is never copied into the batch. */
+    int query_limit = limit + (batch != NULL);
+    int selected_events = 0;
 
     pthread_mutex_lock(&log_lock);
 
@@ -3434,10 +3438,10 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
 
     if (query) {
         rc = sqlite3_bind_text64(statement, 1, query, strlen(query), SQLITE_TRANSIENT, SQLITE_UTF8);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, limit);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 2, query_limit);
         if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 3, conversational);
     } else {
-        rc = sqlite3_bind_int(statement, 1, limit);
+        rc = sqlite3_bind_int(statement, 1, query_limit);
     }
     if (rc == SQLITE_OK)
         rc = sqlite3_prepare_v2(log_db,
@@ -3483,6 +3487,12 @@ static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,
     capacity = 4096;
 
     while ((rc = sqlite3_step(statement)) == SQLITE_ROW) {
+        if (batch && selected_events == limit) {
+            batch->incomplete = 1;
+            rc = SQLITE_DONE; /* The extra row was a probe, not a returned record. */
+            break;
+        }
+        ++selected_events;
         int64_t id = sqlite3_column_int64(statement, 0);
         int base_already_seen = query && event_id_seen(seen_ids, seen_count, id);
         if (query && !base_already_seen &&
