@@ -563,6 +563,36 @@ int main(void)
         free(messages.items[i].content);
     }
     free(messages.items);
+    messages = (MessageList){0};
+
+    /* Exercise the independent message-slot boundary, not only the byte cap. */
+    int slot_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 2; ++i) {
+        if (message_add(i % 2 ? "assistant" : "user", "retained dialogue") != 0) {
+            slot_fixture_ready = 0;
+            break;
+        }
+    }
+    if (slot_fixture_ready)
+        slot_fixture_ready = message_add_pair_locked(
+            "system", "PERSISTENT REALITY CONTEXT old",
+            "system", "PERSISTENT LEARNING CONTEXT old") == 0;
+    ok &= check(slot_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill every live-history message slot with dialogue and snapshots");
+    if (slot_fixture_ready && messages.count == MAX_MESSAGES) {
+        const char *first = messages.items[0].content;
+        const char *last_dialogue = messages.items[MAX_MESSAGES - 3].content;
+        int rc = message_add_pair_planned_locked(
+            "system", "PERSISTENT REALITY CONTEXT fresh",
+            "system", "PERSISTENT LEARNING CONTEXT fresh", SIZE_MAX, 1);
+        ok &= check(rc == 0 && messages.count == MAX_MESSAGES &&
+                    messages.items[0].content == first &&
+                    messages.items[MAX_MESSAGES - 3].content == last_dialogue &&
+                    !strcmp(messages.items[MAX_MESSAGES - 2].content, "PERSISTENT REALITY CONTEXT fresh") &&
+                    !strcmp(messages.items[MAX_MESSAGES - 1].content, "PERSISTENT LEARNING CONTEXT fresh"),
+                    "snapshot replacement preserves complete dialogue at the exact slot cap");
+    }
+    message_free_all();
     messages = previous_messages;
 
     for (size_t i = 0; i < messages.count; ++i) {
