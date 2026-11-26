@@ -231,7 +231,8 @@ int r2_sounds_select_file(const char *fx_dir, const char *kind,
                                      fx_dir, entry->d_name);
         struct stat file_info;
         if (candidate_len < 0 || (size_t)candidate_len >= sizeof(candidate) ||
-            stat(candidate, &file_info) != 0 || !S_ISREG(file_info.st_mode))
+            stat(candidate, &file_info) != 0 || !S_ISREG(file_info.st_mode) ||
+            faccessat(AT_FDCWD, candidate, R_OK, AT_EACCESS) != 0)
             continue;
         int score = filename_score(entry->d_name, normalized_kind, state);
         if (score < 0) continue;
