@@ -606,7 +606,7 @@ int main(void)
     if (hands_fixture_ready && message_add("user", "current request") == 0) {
         active_turn_history.user = messages.items[messages.count - 1].content;
         hands_fixture_ready = append_pending_hands_result_locked(
-            "[R2_INTERNAL_TOOL_RESULT]\\nexact pending evidence") == 0;
+            "[R2_INTERNAL_TOOL_RESULT]\nexact pending evidence") == 0;
     } else {
         hands_fixture_ready = 0;
     }

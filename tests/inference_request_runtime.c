@@ -1580,7 +1580,8 @@ static void check_action_result_under_history_pressure(void)
     assert(!strcmp(messages.items[2].role, "assistant") &&
            !strcmp(messages.items[2].content, reply));
     assert(!active_turn_history.user && !active_turn_history.action_request &&
-           !active_turn_history.action_result);
+           !active_turn_history.action_result && !active_turn_history.hands_request &&
+           !active_turn_history.hands_result);
 
     sqlite3_stmt *statement = NULL;
     assert(sqlite3_prepare_v2(db,
