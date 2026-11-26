@@ -593,6 +593,49 @@ int main(void)
                     "snapshot replacement preserves complete dialogue at the exact slot cap");
     }
     message_free_all();
+
+    /* An admitted durable Hands result must remain owned by its active turn
+       even when a later action pair would otherwise evict the handoff. */
+    int hands_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 3; ++i) {
+        if (message_add_pinned("system", "retained context") != 0) {
+            hands_fixture_ready = 0;
+            break;
+        }
+    }
+    if (hands_fixture_ready && message_add("user", "current request") == 0) {
+        active_turn_history.user = messages.items[messages.count - 1].content;
+        hands_fixture_ready = append_pending_hands_result_locked(
+            "[R2_INTERNAL_TOOL_RESULT]\\nexact pending evidence") == 0;
+    } else {
+        hands_fixture_ready = 0;
+    }
+    ok &= check(hands_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill live-history slots with protected context and an admitted Hands result");
+    if (hands_fixture_ready && messages.count == MAX_MESSAGES) {
+        const char *request = active_turn_history.hands_request;
+        const char *result = active_turn_history.hands_result;
+        int action_rc = message_add_pair_locked("assistant", "later action",
+                                               "user", "later result");
+        ok &= check(action_rc != 0 && messages.count == MAX_MESSAGES &&
+                    messages.items[MAX_MESSAGES - 2].content == request &&
+                    messages.items[MAX_MESSAGES - 1].content == result &&
+                    messages.items[MAX_MESSAGES - 1].internal_tool_result == R2_INTERNAL_PENDING_HANDS_RESULT,
+                    "active Hands pair cannot disappear during later action admission");
+        remove_pending_hands_result_locked();
+        ok &= check(messages.count == MAX_MESSAGES - 2 &&
+                    !active_turn_history.hands_request && !active_turn_history.hands_result &&
+                    messages.items[MAX_MESSAGES - 3].content == active_turn_history.user,
+                    "temporary Hands pair releases both slots without removing the active user");
+        ok &= check(message_add("assistant", "visible answer") == 0 &&
+                    messages.count == MAX_MESSAGES - 1 &&
+                    !strcmp(messages.items[MAX_MESSAGES - 2].content, "visible answer"),
+                    "final visible reply uses the released temporary capacity");
+        remove_pending_hands_result_locked();
+        ok &= check(messages.count == MAX_MESSAGES - 1,
+                    "early-exit cleanup is idempotent after normal Hands release");
+    }
+    message_free_all();
     messages = previous_messages;
 
     for (size_t i = 0; i < messages.count; ++i) {

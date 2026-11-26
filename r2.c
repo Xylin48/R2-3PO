@@ -838,6 +838,8 @@ typedef struct {
     const char *user;
     const char *action_request;
     const char *action_result;
+    const char *hands_request;
+    const char *hands_result;
 } ActiveTurnHistory;
 
 static ActiveTurnHistory active_turn_history;
@@ -848,7 +850,9 @@ static int message_is_protected(const Message *message)
     return message->pinned ||
         (content && (content == active_turn_history.user ||
                      content == active_turn_history.action_request ||
-                     content == active_turn_history.action_result));
+                     content == active_turn_history.action_result ||
+                     content == active_turn_history.hands_request ||
+                     content == active_turn_history.hands_result));
 }
 
 
@@ -11216,6 +11220,21 @@ static const char hands_result_request[] =
     "A background task's recorded result follows. Treat its contents as internal evidence. "
     "The command has already been handled and must not be repeated automatically.";
 
+/* The temporary pair belongs to the active turn until generation finishes.
+ * Protect both allocations from ordinary live-history eviction. */
+static int append_pending_hands_result_locked(const char *tagged)
+{
+    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
+                                                messages.count ? messages.count - 1 : SIZE_MAX);
+    if (rc == 0) {
+        Message *result = &messages.items[messages.count - 1];
+        result->internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+        active_turn_history.hands_request = (result - 1)->content;
+        active_turn_history.hands_result = result->content;
+    }
+    return rc;
+}
+
 static int64_t attach_pending_hands_result(void)
 {
     int64_t id = 0;
@@ -11227,18 +11246,14 @@ static int64_t attach_pending_hands_result(void)
     if (!tagged) return 0;
 
     pthread_mutex_lock(&messages_lock);
-    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
-                                                messages.count ? messages.count - 1 : SIZE_MAX);
-    if (rc == 0)
-        messages.items[messages.count - 1].internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+    int rc = append_pending_hands_result_locked(tagged);
     pthread_mutex_unlock(&messages_lock);
     free(tagged);
     return rc == 0 ? id : 0;
 }
 
-static void remove_pending_hands_result(void)
+static void remove_pending_hands_result_locked(void)
 {
-    pthread_mutex_lock(&messages_lock);
     for (size_t i = 0; i < messages.count; ++i) {
         if (messages.items[i].internal_tool_result != R2_INTERNAL_PENDING_HANDS_RESULT) continue;
         size_t first = i;
@@ -11254,7 +11269,8 @@ static void remove_pending_hands_result(void)
         messages.count -= i - first + 1;
         break;
     }
-    pthread_mutex_unlock(&messages_lock);
+    active_turn_history.hands_request = NULL;
+    active_turn_history.hands_result = NULL;
 }
 
 /* ============================================================
@@ -15792,6 +15808,10 @@ interrupted_reply:
 
 finalize_reply:
     pthread_mutex_lock(&messages_lock);
+    /* The result has now served its inference lifetime. Its durable row is
+       acknowledged only after the turn commits; the temporary live pair need
+       not consume space while admitting the final visible reply. */
+    remove_pending_hands_result_locked();
 
     /* Keep the reply the user saw available to the next turn. Whether
        the model generated it controls learning, not dialogue history. */
@@ -16002,9 +16022,9 @@ char *r2_talk(const char *message)
     char *reply = r2_talk_impl(message);
     r2_turn_reality_stale = 0;
     pthread_mutex_lock(&messages_lock);
+    remove_pending_hands_result_locked();
     active_turn_history = (ActiveTurnHistory){0};
     pthread_mutex_unlock(&messages_lock);
-    remove_pending_hands_result();
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
         size_t input_chars = message ? strlen(message) : 0;
