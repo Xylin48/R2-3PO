@@ -11053,9 +11053,10 @@ static char *memory_decision(
             break;
         }
     }
-    int multiple_lines = separator && memory < end &&
-        (memchr(memory, '\n', (size_t)(end - memory)) != NULL ||
-         memchr(memory, '\r', (size_t)(end - memory)) != NULL);
+    /* Examine the whole trimmed decision, not only the memory body.
+       Category/pipe whitespace must not hide an internal line boundary. */
+    int multiple_lines = memchr(text, '\n', (size_t)(end - text)) != NULL ||
+                         memchr(text, '\r', (size_t)(end - text)) != NULL;
     if (!separator || !canonical_category || memory == end || multiple_lines) {
         const char *reason = !separator ? "missing category separator" :
             !canonical_category ? "unknown category" :
