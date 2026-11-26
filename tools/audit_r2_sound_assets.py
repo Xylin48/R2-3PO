@@ -29,15 +29,28 @@ STATES_TO_REPORT = ("curious", "happy", "confused", "alert", "sleepy",
 def tokens(filename: str) -> set[str]:
     word: list[str] = []
     result: set[str] = set()
-    for char in filename.lower():
-        if char.isalnum():
-            word.append(char)
+    # Match the runtime's byte-oriented C-locale tokenization and bounds.
+    count = 0
+    for char in filename:
+        if char.isascii() and char.isalnum():
+            if len(word) < 63:
+                word.append(char.lower())
         elif word:
             result.add("".join(word))
             word.clear()
+            count += 1
+            if count == 64:
+                return result
     if word:
         result.add("".join(word))
     return result
+
+
+def state_labels(words: set[str], kind: str) -> set[str]:
+    """Match filename_score's explicit state-label classification."""
+    kinds = BEEP if kind == "beep" else WHISTLE
+    return {word for word in words - kinds - GENERIC - {"r2", "mp3"}
+            if any(char.isascii() and char.isalpha() for char in word)}
 
 
 def audit_root(root: Path) -> int:
@@ -65,9 +78,8 @@ def audit_root(root: Path) -> int:
     for kind, entries in by_kind.items():
         print(f"{kind.title()} candidates: {len(entries)}")
         for path, words in entries:
-            states = sorted(words & STATE_TOKENS)
-            labels = ", ".join(states) if states else (
-                "generic" if words & GENERIC else "unlabelled fallback")
+            states = sorted(state_labels(words, kind) | (words & GENERIC))
+            labels = ", ".join(states) if states else "unlabelled fallback"
             print(f"  {path.name} [{labels}]")
         if not entries:
             print(f"  WARNING: no filename-token match for {kind}")
@@ -91,16 +103,15 @@ def audit_root(root: Path) -> int:
             if any(words & aliases[state] for _, words in entries):
                 exact.append(kind)
             elif any((words & GENERIC) and
-                     not (words & (STATE_TOKENS - GENERIC))
+                     not state_labels(words, kind)
                      for _, words in entries):
                 # A generic token cannot turn a state-labeled clip into a
                 # generic fallback for an unrelated state.
                 fallback.append(kind)
-            elif any(not (words & STATE_TOKENS) and not (words & GENERIC)
+            elif any(not state_labels(words, kind) and not (words & GENERIC)
                      for _, words in entries):
-                # The C selector can use a kind-specific file with no recognized
-                # state token as a last resort, but it never substitutes a
-                # different explicitly state-labeled clip.
+                # Only a genuinely unlabelled kind-specific clip is eligible.
+                # Unknown custom state names are explicit labels at runtime.
                 unlabelled.append(kind)
         detail = []
         if exact:
