@@ -513,6 +513,48 @@ int main(void)
                     messages.count == original_count &&
                     !strcmp(messages.items[original_count - 1].content, "surviving earlier turn"),
                     "optional Hands result cannot evict the authoritative current user turn");
+
+        /* Both old and new snapshots fit separately next to the dialogue.
+           Requiring them to coexist would evict that dialogue unnecessarily. */
+        char old_reality[320], old_learning[320], fresh_reality[320], fresh_learning[320];
+        memset(old_reality, 'o', sizeof(old_reality) - 1);
+        memset(old_learning, 'l', sizeof(old_learning) - 1);
+        memset(fresh_reality, 'r', sizeof(fresh_reality) - 1);
+        memset(fresh_learning, 'n', sizeof(fresh_learning) - 1);
+        memcpy(old_reality, "PERSISTENT REALITY CONTEXT", sizeof("PERSISTENT REALITY CONTEXT") - 1);
+        memcpy(fresh_reality, "PERSISTENT REALITY CONTEXT", sizeof("PERSISTENT REALITY CONTEXT") - 1);
+        memcpy(old_learning, "PERSISTENT LEARNING CONTEXT", sizeof("PERSISTENT LEARNING CONTEXT") - 1);
+        memcpy(fresh_learning, "PERSISTENT LEARNING CONTEXT", sizeof("PERSISTENT LEARNING CONTEXT") - 1);
+        old_reality[319] = old_learning[319] = fresh_reality[319] = fresh_learning[319] = '\0';
+
+        int fixture_ready = old_ok &&
+            message_add("assistant", "surviving earlier answer") == 0 &&
+            message_add_pair_locked("system", old_reality, "system", old_learning) == 0;
+        ok &= check(fixture_ready && messages.count == 5,
+                    "allocate old snapshots and complete dialogue at live-history pressure");
+        if (fixture_ready && messages.count == 5) {
+            const char *old_user = messages.items[1].content;
+            const char *old_answer = messages.items[2].content;
+            const char *old_state = messages.items[3].content;
+            const char *old_reinforcement = messages.items[4].content;
+            int replace_failed = message_add_pair_planned_locked(
+                "system", too_large, "system", fresh_learning, SIZE_MAX, 1);
+            ok &= check(replace_failed != 0 && messages.count == 5 &&
+                        messages.items[1].content == old_user &&
+                        messages.items[2].content == old_answer &&
+                        messages.items[3].content == old_state &&
+                        messages.items[4].content == old_reinforcement,
+                        "failed snapshot replacement leaves original snapshots and dialogue untouched");
+            int replace_ok = message_add_pair_planned_locked(
+                "system", fresh_reality, "system", fresh_learning, SIZE_MAX, 1);
+            ok &= check(replace_ok == 0 && messages.count == 5 &&
+                        messages.items[0].pinned &&
+                        messages.items[1].content == old_user &&
+                        messages.items[2].content == old_answer &&
+                        !strcmp(messages.items[3].content, fresh_reality) &&
+                        !strcmp(messages.items[4].content, fresh_learning),
+                        "snapshot replacement budgets final state and retains the earlier exchange");
+        }
     }
     free(pinned);
     free(too_large);

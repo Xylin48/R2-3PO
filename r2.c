@@ -1170,9 +1170,21 @@ static int message_add(
  * so allocate and budget both messages before evicting history or appending.
  * This function owns messages_lock for the complete operation.
  */
-static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
-                                              const char *role_b, const char *content_b,
-                                              size_t preserve_index)
+/* Snapshot replacement is part of the same atomic admission plan as the
+ * new pair: old state need not coexist with its replacement in live history. */
+static int message_is_live_snapshot(const Message *message)
+{
+    return message->role && !strcmp(message->role, "system") &&
+        message->content &&
+        (!strncmp(message->content, "PERSISTENT REALITY CONTEXT",
+                  sizeof("PERSISTENT REALITY CONTEXT") - 1) ||
+         !strncmp(message->content, "PERSISTENT LEARNING CONTEXT",
+                  sizeof("PERSISTENT LEARNING CONTEXT") - 1));
+}
+
+static int message_add_pair_planned_locked(const char *role_a, const char *content_a,
+                                           const char *role_b, const char *content_b,
+                                           size_t preserve_index, int replace_live_snapshots)
 {
     if (!role_a || !content_a || !role_b || !content_b)
         return -1;
@@ -1211,6 +1223,15 @@ static int message_add_pair_preserving_locked(const char *role_a, const char *co
 
     size_t simulated_count = messages.count;
     size_t simulated_bytes = live_bytes;
+    if (replace_live_snapshots) {
+        for (size_t i = 0; i < messages.count; ++i) {
+            if (!message_is_live_snapshot(&messages.items[i])) continue;
+            evict[i] = 1;
+            --simulated_count;
+            simulated_bytes -= strlen(messages.items[i].role) + 1;
+            simulated_bytes -= strlen(messages.items[i].content) + 1;
+        }
+    }
     while (simulated_count + 2 > MAX_MESSAGES ||
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
         size_t remove_index = SIZE_MAX;
@@ -1269,6 +1290,14 @@ static int message_add_pair_preserving_locked(const char *role_a, const char *co
     messages.items[messages.count++] = (Message){role_a_copy, content_a_copy, 0, 0};
     messages.items[messages.count++] = (Message){role_b_copy, content_b_copy, 0, 0};
     return 0;
+}
+
+static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
+                                              const char *role_b, const char *content_b,
+                                              size_t preserve_index)
+{
+    return message_add_pair_planned_locked(role_a, content_a, role_b, content_b,
+                                           preserve_index, 0);
 }
 
 static int message_add_pair_locked(const char *role_a, const char *content_a,
@@ -15439,41 +15468,12 @@ static int refresh_reality_context_message(void)
         return -1; /* Preserve the last valid snapshot if refresh allocation fails. */
     }
 
-    /*
-     * Add both fresh snapshots before removing the old ones. If allocation or
-     * the live-history budget prevents the replacement, the old snapshots stay
-     * intact. The pair append is atomic while messages_lock is held.
-     */
+    /* Reserve the complete fresh pair against the final live-history size,
+     * counting superseded snapshots only once. The admission planner removes
+     * them only after all copies, byte/slot accounting and growth succeed. */
     pthread_mutex_lock(&messages_lock);
-    int add_rc = message_add_pair_locked("system", context,
-                                         "system", learning);
-    if (add_rc == 0) {
-        int kept_reality = 0, kept_learning = 0;
-        for (size_t i = messages.count; i > 0; ) {
-            --i;
-            Message *m = &messages.items[i];
-            int is_reality = m->role && !strcmp(m->role, "system") &&
-                m->content &&
-                !strncmp(m->content, "PERSISTENT REALITY CONTEXT",
-                         strlen("PERSISTENT REALITY CONTEXT"));
-            int is_learning = m->role && !strcmp(m->role, "system") &&
-                m->content &&
-                !strncmp(m->content, "PERSISTENT LEARNING CONTEXT",
-                         strlen("PERSISTENT LEARNING CONTEXT"));
-            int duplicate = (is_reality && kept_reality) ||
-                            (is_learning && kept_learning);
-            if (is_reality) kept_reality = 1;
-            if (is_learning) kept_learning = 1;
-            if (duplicate) {
-                free(m->role);
-                free(m->content);
-                if (i + 1 < messages.count)
-                    memmove(&messages.items[i], &messages.items[i + 1],
-                            (messages.count - i - 1) * sizeof(messages.items[0]));
-                messages.count--;
-            }
-        }
-    }
+    int add_rc = message_add_pair_planned_locked("system", context,
+                                                 "system", learning, SIZE_MAX, 1);
     pthread_mutex_unlock(&messages_lock);
     free(context);
     free(learning);
