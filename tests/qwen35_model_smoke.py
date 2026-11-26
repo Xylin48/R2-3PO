@@ -405,8 +405,12 @@ refresh_start = core.find("static int refresh_reality_context_message(void)")
 refresh_end = core.find("\nstatic int reply_has_visible_text", refresh_start)
 require(
     refresh_start >= 0 and refresh_end > refresh_start
-    and 'message_add_pair_locked("system", context,' in core[refresh_start:refresh_end]
-    and "if (add_rc == 0)" in core[refresh_start:refresh_end]
+    and re.search(r'message_add_pair_planned_locked\("system", context,\s*"system", learning, SIZE_MAX, 1\)', core[refresh_start:refresh_end]) is not None
+    and "if (replace_live_snapshots)" in core
+    and "if (!message_is_live_snapshot(&messages.items[i])) continue;" in core
+    and core.index("if (replace_live_snapshots)") < core.index("while (simulated_count + 2 > MAX_MESSAGES")
+    and "size_t needed = simulated_count + 2;" in core
+    and "return add_rc == 0 ? 0 : -1;" in core[refresh_start:refresh_end]
     and "Preserve the last valid snapshot if refresh allocation fails." in core[refresh_start:refresh_end],
     "Reality and learning context refresh together and preserve the last valid snapshot on failure",
 )

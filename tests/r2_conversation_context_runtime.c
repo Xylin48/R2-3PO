@@ -513,6 +513,48 @@ int main(void)
                     messages.count == original_count &&
                     !strcmp(messages.items[original_count - 1].content, "surviving earlier turn"),
                     "optional Hands result cannot evict the authoritative current user turn");
+
+        /* Both old and new snapshots fit separately next to the dialogue.
+           Requiring them to coexist would evict that dialogue unnecessarily. */
+        char old_reality[320], old_learning[320], fresh_reality[320], fresh_learning[320];
+        memset(old_reality, 'o', sizeof(old_reality) - 1);
+        memset(old_learning, 'l', sizeof(old_learning) - 1);
+        memset(fresh_reality, 'r', sizeof(fresh_reality) - 1);
+        memset(fresh_learning, 'n', sizeof(fresh_learning) - 1);
+        memcpy(old_reality, "PERSISTENT REALITY CONTEXT", sizeof("PERSISTENT REALITY CONTEXT") - 1);
+        memcpy(fresh_reality, "PERSISTENT REALITY CONTEXT", sizeof("PERSISTENT REALITY CONTEXT") - 1);
+        memcpy(old_learning, "PERSISTENT LEARNING CONTEXT", sizeof("PERSISTENT LEARNING CONTEXT") - 1);
+        memcpy(fresh_learning, "PERSISTENT LEARNING CONTEXT", sizeof("PERSISTENT LEARNING CONTEXT") - 1);
+        old_reality[319] = old_learning[319] = fresh_reality[319] = fresh_learning[319] = '\0';
+
+        int fixture_ready = old_ok &&
+            message_add("assistant", "surviving earlier answer") == 0 &&
+            message_add_pair_locked("system", old_reality, "system", old_learning) == 0;
+        ok &= check(fixture_ready && messages.count == 5,
+                    "allocate old snapshots and complete dialogue at live-history pressure");
+        if (fixture_ready && messages.count == 5) {
+            const char *old_user = messages.items[1].content;
+            const char *old_answer = messages.items[2].content;
+            const char *old_state = messages.items[3].content;
+            const char *old_reinforcement = messages.items[4].content;
+            int replace_failed = message_add_pair_planned_locked(
+                "system", too_large, "system", fresh_learning, SIZE_MAX, 1);
+            ok &= check(replace_failed != 0 && messages.count == 5 &&
+                        messages.items[1].content == old_user &&
+                        messages.items[2].content == old_answer &&
+                        messages.items[3].content == old_state &&
+                        messages.items[4].content == old_reinforcement,
+                        "failed snapshot replacement leaves original snapshots and dialogue untouched");
+            int replace_ok = message_add_pair_planned_locked(
+                "system", fresh_reality, "system", fresh_learning, SIZE_MAX, 1);
+            ok &= check(replace_ok == 0 && messages.count == 5 &&
+                        messages.items[0].pinned &&
+                        messages.items[1].content == old_user &&
+                        messages.items[2].content == old_answer &&
+                        !strcmp(messages.items[3].content, fresh_reality) &&
+                        !strcmp(messages.items[4].content, fresh_learning),
+                        "snapshot replacement budgets final state and retains the earlier exchange");
+        }
     }
     free(pinned);
     free(too_large);
@@ -521,6 +563,79 @@ int main(void)
         free(messages.items[i].content);
     }
     free(messages.items);
+    messages = (MessageList){0};
+
+    /* Exercise the independent message-slot boundary, not only the byte cap. */
+    int slot_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 2; ++i) {
+        if (message_add(i % 2 ? "assistant" : "user", "retained dialogue") != 0) {
+            slot_fixture_ready = 0;
+            break;
+        }
+    }
+    if (slot_fixture_ready)
+        slot_fixture_ready = message_add_pair_locked(
+            "system", "PERSISTENT REALITY CONTEXT old",
+            "system", "PERSISTENT LEARNING CONTEXT old") == 0;
+    ok &= check(slot_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill every live-history message slot with dialogue and snapshots");
+    if (slot_fixture_ready && messages.count == MAX_MESSAGES) {
+        const char *first = messages.items[0].content;
+        const char *last_dialogue = messages.items[MAX_MESSAGES - 3].content;
+        int rc = message_add_pair_planned_locked(
+            "system", "PERSISTENT REALITY CONTEXT fresh",
+            "system", "PERSISTENT LEARNING CONTEXT fresh", SIZE_MAX, 1);
+        ok &= check(rc == 0 && messages.count == MAX_MESSAGES &&
+                    messages.items[0].content == first &&
+                    messages.items[MAX_MESSAGES - 3].content == last_dialogue &&
+                    !strcmp(messages.items[MAX_MESSAGES - 2].content, "PERSISTENT REALITY CONTEXT fresh") &&
+                    !strcmp(messages.items[MAX_MESSAGES - 1].content, "PERSISTENT LEARNING CONTEXT fresh"),
+                    "snapshot replacement preserves complete dialogue at the exact slot cap");
+    }
+    message_free_all();
+
+    /* An admitted durable Hands result must remain owned by its active turn
+       even when a later action pair would otherwise evict the handoff. */
+    int hands_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 3; ++i) {
+        if (message_add_pinned("system", "retained context") != 0) {
+            hands_fixture_ready = 0;
+            break;
+        }
+    }
+    if (hands_fixture_ready && message_add("user", "current request") == 0) {
+        active_turn_history.user = messages.items[messages.count - 1].content;
+        hands_fixture_ready = append_pending_hands_result_locked(
+            "[R2_INTERNAL_TOOL_RESULT]\nexact pending evidence") == 0;
+    } else {
+        hands_fixture_ready = 0;
+    }
+    ok &= check(hands_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill live-history slots with protected context and an admitted Hands result");
+    if (hands_fixture_ready && messages.count == MAX_MESSAGES) {
+        const char *request = active_turn_history.hands_request;
+        const char *result = active_turn_history.hands_result;
+        int action_rc = message_add_pair_locked("assistant", "later action",
+                                               "user", "later result");
+        ok &= check(action_rc != 0 && messages.count == MAX_MESSAGES &&
+                    messages.items[MAX_MESSAGES - 2].content == request &&
+                    messages.items[MAX_MESSAGES - 1].content == result &&
+                    messages.items[MAX_MESSAGES - 1].internal_tool_result == R2_INTERNAL_PENDING_HANDS_RESULT,
+                    "active Hands pair cannot disappear during later action admission");
+        remove_pending_hands_result_locked();
+        ok &= check(messages.count == MAX_MESSAGES - 2 &&
+                    !active_turn_history.hands_request && !active_turn_history.hands_result &&
+                    messages.items[MAX_MESSAGES - 3].content == active_turn_history.user,
+                    "temporary Hands pair releases both slots without removing the active user");
+        ok &= check(message_add("assistant", "visible answer") == 0 &&
+                    messages.count == MAX_MESSAGES - 1 &&
+                    !strcmp(messages.items[MAX_MESSAGES - 2].content, "visible answer"),
+                    "final visible reply uses the released temporary capacity");
+        remove_pending_hands_result_locked();
+        ok &= check(messages.count == MAX_MESSAGES - 1,
+                    "early-exit cleanup is idempotent after normal Hands release");
+    }
+    message_free_all();
     messages = previous_messages;
 
     for (size_t i = 0; i < messages.count; ++i) {

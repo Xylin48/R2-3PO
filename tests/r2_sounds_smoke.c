@@ -47,6 +47,18 @@ int main(void)
     char path[4096];
     assert(r2_sounds_select_file(root, "beep", "curious", path, sizeof(path)) == 0);
     assert(strstr(path, "R2_Beep_Curious.mp3"));
+    /* An unreadable exact match must not mask a readable generic clip. */
+    char unreadable_file[4096];
+    snprintf(unreadable_file, sizeof(unreadable_file), "%s/R2_Beep_Curious.mp3", root);
+    assert(chmod(unreadable_file, 0000) == 0);
+    if (access(unreadable_file, R_OK) != 0) {
+        assert(r2_sounds_select_file(root, "beep", "curious", path, sizeof(path)) == 0);
+        assert(strstr(path, "R2_Beep_Default.mp3"));
+    }
+    /* Root can still read a mode-000 file; do not assert otherwise. */
+    assert(chmod(unreadable_file, 0600) == 0);
+    assert(r2_sounds_select_file(root, "beep", "curious", path, sizeof(path)) == 0);
+    assert(strstr(path, "R2_Beep_Curious.mp3"));
     /* State vocabulary belongs to R2, not to a hard-coded allowlist. An
        unfamiliar label may use a generic asset when no matching clip exists. */
     assert(r2_sounds_select_file(root, "beep", "banana", path, sizeof(path)) == 0);

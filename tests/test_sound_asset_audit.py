@@ -60,6 +60,33 @@ class SoundAssetAuditTests(unittest.TestCase):
             self.assertIn("State curious: no named match", report)
             self.assertIn("State happy: no named match", report)
 
+    def test_custom_state_names_do_not_count_as_unrelated_fallbacks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("R2_Beep_Nostalgic_Default.mp3",
+                         "R2_Whistle_Reflective.mp3"):
+                (root / name).write_bytes(b"fixture-not-a-real-mp3")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(audit.audit_root(root), 0)
+            report = output.getvalue()
+            self.assertIn("R2_Beep_Nostalgic_Default.mp3 [default, nostalgic]", report)
+            self.assertIn("R2_Whistle_Reflective.mp3 [reflective]", report)
+            self.assertIn("State curious: no named match", report)
+            self.assertIn("State happy: no named match", report)
+
+            (root / "R2_Beep_01.mp3").write_bytes(b"fixture-not-a-real-mp3")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(audit.audit_root(root), 0)
+            self.assertIn("State happy: unlabelled fallback=beep", output.getvalue())
+
+    def test_tokenizer_retains_runtime_bounds(self):
+        self.assertEqual(audit.tokens("a" * 70 + ".MP3"), {"a" * 63, "mp3"})
+        self.assertNotIn("last", audit.tokens("_".join(str(i) for i in range(64)) + "_last"))
+        self.assertEqual(audit.state_labels({"r2", "beep", "01", "mp3"}, "beep"), set())
+        self.assertEqual(audit.state_labels({"beep", "whistle"}, "beep"), {"whistle"})
+
     def test_missing_directory_is_reported_without_creating_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "missing"

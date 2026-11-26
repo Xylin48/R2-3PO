@@ -1580,7 +1580,8 @@ static void check_action_result_under_history_pressure(void)
     assert(!strcmp(messages.items[2].role, "assistant") &&
            !strcmp(messages.items[2].content, reply));
     assert(!active_turn_history.user && !active_turn_history.action_request &&
-           !active_turn_history.action_result);
+           !active_turn_history.action_result && !active_turn_history.hands_request &&
+           !active_turn_history.hands_result);
 
     sqlite3_stmt *statement = NULL;
     assert(sqlite3_prepare_v2(db,
@@ -2574,10 +2575,13 @@ static void check_rejected_memory_output_retains_evidence(void)
         "  imagination | An unsupported category. \n",
         "  knowledge |  \t\n",
         "knowledge | The user reported a blue notebook.\n"
-        "relationship | An unverified second memory.\n"
+        "relationship | An unverified second memory.\n",
+        "knowledge\n | An invalid split-category memory.",
+        "knowledge |\r\n An invalid split-body memory."
     };
     const char *reasons[] = {
-        "missing category separator", "unknown category", "empty memory", "multiple decision lines"
+        "missing category separator", "unknown category", "empty memory",
+        "multiple decision lines", "multiple decision lines", "multiple decision lines"
     };
     sqlite3 *connection = NULL;
     assert(sqlite3_open(R2_DIARY_DATABASE, &connection) == SQLITE_OK);
@@ -2602,12 +2606,16 @@ static void check_rejected_memory_output_retains_evidence(void)
     }
     /* The real post-turn caller must not save either line or acknowledge the
        source exchange after receiving this malformed decision. */
-    set_response(invalid[3], "stop", 1);
-    preserve_evidence_memory("Memory parser fixture.", "This is the recorded response.",
-                             NULL, event);
+    for (size_t i = 3; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        set_response(invalid[i], "stop", 1);
+        preserve_evidence_memory("Memory parser fixture.", "This is the recorded response.",
+                                 NULL, event);
+    }
     sqlite3_stmt *st = NULL;
     assert(sqlite3_prepare_v2(connection,
-        "SELECT count(*) FROM memories WHERE memory LIKE '%unverified second memory%';",
+        "SELECT count(*) FROM memories WHERE memory LIKE '%unverified second memory%' "
+        "OR memory LIKE '%invalid split-category memory%' "
+        "OR memory LIKE '%invalid split-body memory%';",
         -1, &st, NULL) == SQLITE_OK);
     assert(sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) == 0);
     sqlite3_finalize(st);

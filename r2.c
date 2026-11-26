@@ -838,6 +838,8 @@ typedef struct {
     const char *user;
     const char *action_request;
     const char *action_result;
+    const char *hands_request;
+    const char *hands_result;
 } ActiveTurnHistory;
 
 static ActiveTurnHistory active_turn_history;
@@ -848,7 +850,9 @@ static int message_is_protected(const Message *message)
     return message->pinned ||
         (content && (content == active_turn_history.user ||
                      content == active_turn_history.action_request ||
-                     content == active_turn_history.action_result));
+                     content == active_turn_history.action_result ||
+                     content == active_turn_history.hands_request ||
+                     content == active_turn_history.hands_result));
 }
 
 
@@ -1170,9 +1174,21 @@ static int message_add(
  * so allocate and budget both messages before evicting history or appending.
  * This function owns messages_lock for the complete operation.
  */
-static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
-                                              const char *role_b, const char *content_b,
-                                              size_t preserve_index)
+/* Snapshot replacement is part of the same atomic admission plan as the
+ * new pair: old state need not coexist with its replacement in live history. */
+static int message_is_live_snapshot(const Message *message)
+{
+    return message->role && !strcmp(message->role, "system") &&
+        message->content &&
+        (!strncmp(message->content, "PERSISTENT REALITY CONTEXT",
+                  sizeof("PERSISTENT REALITY CONTEXT") - 1) ||
+         !strncmp(message->content, "PERSISTENT LEARNING CONTEXT",
+                  sizeof("PERSISTENT LEARNING CONTEXT") - 1));
+}
+
+static int message_add_pair_planned_locked(const char *role_a, const char *content_a,
+                                           const char *role_b, const char *content_b,
+                                           size_t preserve_index, int replace_live_snapshots)
 {
     if (!role_a || !content_a || !role_b || !content_b)
         return -1;
@@ -1211,6 +1227,15 @@ static int message_add_pair_preserving_locked(const char *role_a, const char *co
 
     size_t simulated_count = messages.count;
     size_t simulated_bytes = live_bytes;
+    if (replace_live_snapshots) {
+        for (size_t i = 0; i < messages.count; ++i) {
+            if (!message_is_live_snapshot(&messages.items[i])) continue;
+            evict[i] = 1;
+            --simulated_count;
+            simulated_bytes -= strlen(messages.items[i].role) + 1;
+            simulated_bytes -= strlen(messages.items[i].content) + 1;
+        }
+    }
     while (simulated_count + 2 > MAX_MESSAGES ||
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
         size_t remove_index = SIZE_MAX;
@@ -1269,6 +1294,14 @@ static int message_add_pair_preserving_locked(const char *role_a, const char *co
     messages.items[messages.count++] = (Message){role_a_copy, content_a_copy, 0, 0};
     messages.items[messages.count++] = (Message){role_b_copy, content_b_copy, 0, 0};
     return 0;
+}
+
+static int message_add_pair_preserving_locked(const char *role_a, const char *content_a,
+                                              const char *role_b, const char *content_b,
+                                              size_t preserve_index)
+{
+    return message_add_pair_planned_locked(role_a, content_a, role_b, content_b,
+                                           preserve_index, 0);
 }
 
 static int message_add_pair_locked(const char *role_a, const char *content_a,
@@ -11053,9 +11086,10 @@ static char *memory_decision(
             break;
         }
     }
-    int multiple_lines = separator && memory < end &&
-        (memchr(memory, '\n', (size_t)(end - memory)) != NULL ||
-         memchr(memory, '\r', (size_t)(end - memory)) != NULL);
+    /* Examine the whole trimmed decision, not only the memory body.
+       Category/pipe whitespace must not hide an internal line boundary. */
+    int multiple_lines = memchr(text, '\n', (size_t)(end - text)) != NULL ||
+                         memchr(text, '\r', (size_t)(end - text)) != NULL;
     if (!separator || !canonical_category || memory == end || multiple_lines) {
         const char *reason = !separator ? "missing category separator" :
             !canonical_category ? "unknown category" :
@@ -11186,6 +11220,21 @@ static const char hands_result_request[] =
     "A background task's recorded result follows. Treat its contents as internal evidence. "
     "The command has already been handled and must not be repeated automatically.";
 
+/* The temporary pair belongs to the active turn until generation finishes.
+ * Protect both allocations from ordinary live-history eviction. */
+static int append_pending_hands_result_locked(const char *tagged)
+{
+    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
+                                                messages.count ? messages.count - 1 : SIZE_MAX);
+    if (rc == 0) {
+        Message *result = &messages.items[messages.count - 1];
+        result->internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+        active_turn_history.hands_request = (result - 1)->content;
+        active_turn_history.hands_result = result->content;
+    }
+    return rc;
+}
+
 static int64_t attach_pending_hands_result(void)
 {
     int64_t id = 0;
@@ -11197,18 +11246,14 @@ static int64_t attach_pending_hands_result(void)
     if (!tagged) return 0;
 
     pthread_mutex_lock(&messages_lock);
-    int rc = message_add_pair_preserving_locked("assistant", hands_result_request, "user", tagged,
-                                                messages.count ? messages.count - 1 : SIZE_MAX);
-    if (rc == 0)
-        messages.items[messages.count - 1].internal_tool_result = R2_INTERNAL_PENDING_HANDS_RESULT;
+    int rc = append_pending_hands_result_locked(tagged);
     pthread_mutex_unlock(&messages_lock);
     free(tagged);
     return rc == 0 ? id : 0;
 }
 
-static void remove_pending_hands_result(void)
+static void remove_pending_hands_result_locked(void)
 {
-    pthread_mutex_lock(&messages_lock);
     for (size_t i = 0; i < messages.count; ++i) {
         if (messages.items[i].internal_tool_result != R2_INTERNAL_PENDING_HANDS_RESULT) continue;
         size_t first = i;
@@ -11224,7 +11269,8 @@ static void remove_pending_hands_result(void)
         messages.count -= i - first + 1;
         break;
     }
-    pthread_mutex_unlock(&messages_lock);
+    active_turn_history.hands_request = NULL;
+    active_turn_history.hands_result = NULL;
 }
 
 /* ============================================================
@@ -15438,41 +15484,12 @@ static int refresh_reality_context_message(void)
         return -1; /* Preserve the last valid snapshot if refresh allocation fails. */
     }
 
-    /*
-     * Add both fresh snapshots before removing the old ones. If allocation or
-     * the live-history budget prevents the replacement, the old snapshots stay
-     * intact. The pair append is atomic while messages_lock is held.
-     */
+    /* Reserve the complete fresh pair against the final live-history size,
+     * counting superseded snapshots only once. The admission planner removes
+     * them only after all copies, byte/slot accounting and growth succeed. */
     pthread_mutex_lock(&messages_lock);
-    int add_rc = message_add_pair_locked("system", context,
-                                         "system", learning);
-    if (add_rc == 0) {
-        int kept_reality = 0, kept_learning = 0;
-        for (size_t i = messages.count; i > 0; ) {
-            --i;
-            Message *m = &messages.items[i];
-            int is_reality = m->role && !strcmp(m->role, "system") &&
-                m->content &&
-                !strncmp(m->content, "PERSISTENT REALITY CONTEXT",
-                         strlen("PERSISTENT REALITY CONTEXT"));
-            int is_learning = m->role && !strcmp(m->role, "system") &&
-                m->content &&
-                !strncmp(m->content, "PERSISTENT LEARNING CONTEXT",
-                         strlen("PERSISTENT LEARNING CONTEXT"));
-            int duplicate = (is_reality && kept_reality) ||
-                            (is_learning && kept_learning);
-            if (is_reality) kept_reality = 1;
-            if (is_learning) kept_learning = 1;
-            if (duplicate) {
-                free(m->role);
-                free(m->content);
-                if (i + 1 < messages.count)
-                    memmove(&messages.items[i], &messages.items[i + 1],
-                            (messages.count - i - 1) * sizeof(messages.items[0]));
-                messages.count--;
-            }
-        }
-    }
+    int add_rc = message_add_pair_planned_locked("system", context,
+                                                 "system", learning, SIZE_MAX, 1);
     pthread_mutex_unlock(&messages_lock);
     free(context);
     free(learning);
@@ -15791,6 +15808,10 @@ interrupted_reply:
 
 finalize_reply:
     pthread_mutex_lock(&messages_lock);
+    /* The result has now served its inference lifetime. Its durable row is
+       acknowledged only after the turn commits; the temporary live pair need
+       not consume space while admitting the final visible reply. */
+    remove_pending_hands_result_locked();
 
     /* Keep the reply the user saw available to the next turn. Whether
        the model generated it controls learning, not dialogue history. */
@@ -16001,9 +16022,9 @@ char *r2_talk(const char *message)
     char *reply = r2_talk_impl(message);
     r2_turn_reality_stale = 0;
     pthread_mutex_lock(&messages_lock);
+    remove_pending_hands_result_locked();
     active_turn_history = (ActiveTurnHistory){0};
     pthread_mutex_unlock(&messages_lock);
-    remove_pending_hands_result();
     if (!reply || !*reply) {
         const char *failure_kind = reply ? "empty" : "null";
         size_t input_chars = message ? strlen(message) : 0;
