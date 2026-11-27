@@ -388,7 +388,22 @@ int main(void)
     int64_t associated_turn = r2_log_conversation_turn("Fixture source changed after completion.",
                                                       "The source snapshot belongs to that turn.");
     assert(associated_turn > 0);
+    /* An ignored edge is a failed transaction, not an orphan source event.
+       Keep the other exact sources independent and then retry the rejected
+       association directly against the same durable turn. */
+    sql(connection, "CREATE TRIGGER reject_display_association BEFORE INSERT ON r2_log_links "
+                    "WHEN NEW.relationship='media_display_was_available' "
+                    "BEGIN SELECT RAISE(IGNORE); END;");
     r2_publish_turn_sources(associated_turn, &turn_sources);
+    sqlite3_stmt *rejected = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM r2_log_events WHERE event_type='conversation_with_media_display_available'",
+        -1, &rejected, NULL) == SQLITE_OK);
+    assert(sqlite3_step(rejected) == SQLITE_ROW && sqlite3_column_int(rejected, 0) == 0);
+    sqlite3_finalize(rejected);
+    sql(connection, "DROP TRIGGER reject_display_association;");
+    R2TurnSources display_only = {.display_source = turn_sources.display_source};
+    r2_publish_turn_sources(associated_turn, &display_only); /* borrowed fixture identity */
     r2_release_turn_sources(&turn_sources);
     assert(!turn_sources.visual_source && !turn_sources.display_source);
     sqlite3_stmt *associated = NULL;
@@ -407,6 +422,38 @@ int main(void)
     assert(strstr((const char *)sqlite3_column_text(associated, 1), "attended=not_established"));
     assert(!strcmp((const char *)sqlite3_column_text(associated, 2), "media_display_was_available"));
     assert(sqlite3_step(associated) == SQLITE_DONE);
+    sqlite3_finalize(associated);
+
+    /* Preserve exact source identities across an ignored link and a missing
+       parent. No unlinked event or Journal projection may be committed. */
+    const char audio_type[] = "conversation_during_audio_input";
+    const char audio_relation[] = "conversation_occurred_during_audio";
+    const char audio_detail[] = "sampled_at=turn_finalization; exact fixture";
+    assert(r2_log_conversation_source(INT64_MAX, audio_type, "Fixture source",
+                                     audio_detail, names[0], audio_relation) < 0);
+    sql(connection, "CREATE TRIGGER reject_audio_event BEFORE INSERT ON r2_log_events "
+                    "WHEN NEW.event_type='conversation_during_audio_input' "
+                    "BEGIN SELECT RAISE(ABORT,'fixture'); END;");
+    assert(r2_log_conversation_source(associated_turn, audio_type, "Fixture source",
+                                     audio_detail, names[0], audio_relation) < 0);
+    sql(connection, "DROP TRIGGER reject_audio_event;");
+    int64_t audio_association = r2_log_conversation_source(associated_turn, audio_type,
+        "Fixture source", audio_detail, names[0], audio_relation);
+    assert(audio_association > 0);
+    verify_event(connection, audio_association, names[0], audio_detail);
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM r2_log_events e JOIN r2_log_links l ON l.to_event_id=e.id "
+        "WHERE e.event_type=? AND l.from_event_id=? AND l.relationship=? AND l.notes=e.source",
+        -1, &associated, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(associated, 1, audio_type, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_bind_int64(associated, 2, associated_turn) == SQLITE_OK);
+    assert(sqlite3_bind_text(associated, 3, audio_relation, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 1);
+    sqlite3_finalize(associated);
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT count(*) FROM r2_log_events WHERE event_type=?", -1, &associated, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(associated, 1, audio_type, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 1);
     sqlite3_finalize(associated);
     assert(r2_vision_watch_stop() == 0);
     r2_eyes_shutdown(eyes);

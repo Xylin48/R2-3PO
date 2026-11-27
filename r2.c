@@ -15997,13 +15997,10 @@ static void r2_publish_turn_sources(int64_t turn_event_id, const R2TurnSources *
                      (long long)turn_event_id, sources->visual_source,
                      sources->visual_origin == R2_VISION_VLC ? "VLC window" :
                      sources->visual_origin == R2_VISION_WINDOW ? "active video window" : "file") >= 0) {
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_during_visual_media",
-                "A visual media source was open at conversation turn finalization.",
-                details, sources->visual_source);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "conversation_occurred_during_media", sources->visual_source);
+            if (r2_log_conversation_source(turn_event_id, "conversation_during_visual_media",
+                    "A visual media source was open at conversation turn finalization.",
+                    details, sources->visual_source, "conversation_occurred_during_media") <= 0)
+                fprintf(stderr, "[R2 Life Log] Could not commit the conversation visual-source association.\n");
             free(details);
         }
     }
@@ -16015,13 +16012,10 @@ static void r2_publish_turn_sources(int64_t turn_event_id, const R2TurnSources *
                      "sampled_at=turn_finalization\n"
                      "display_available=1; attended=not_established; interpreted=not_established",
                      (long long)turn_event_id, sources->display_source) >= 0) {
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_with_media_display_available",
-                "A separate video display was available at conversation turn finalization.",
-                details, sources->display_source);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "media_display_was_available", sources->display_source);
+            if (r2_log_conversation_source(turn_event_id, "conversation_with_media_display_available",
+                    "A separate video display was available at conversation turn finalization.",
+                    details, sources->display_source, "media_display_was_available") <= 0)
+                fprintf(stderr, "[R2 Life Log] Could not commit the conversation display-source association.\n");
             free(details);
         }
     }
@@ -16037,14 +16031,11 @@ static void r2_publish_turn_sources(int64_t turn_event_id, const R2TurnSources *
                  (long long)turn_event_id, i == 1 ? "desktop_playback" :
                  audio[i]->origin == R2_HEARING_FILE ? "file" :
                  audio[i]->origin == R2_HEARING_WORLD ? "world/desktop" : "unknown");
-        int64_t association_id = r2_log_event(
-            R2_LOG_CONVERSATION, "conversation_during_audio_input",
-            i == 1 ? "A desktop audio source was open at conversation turn finalization." :
-                     "An Ears source was open at conversation turn finalization.",
-            details, audio[i]->source_name);
-        if (association_id > 0)
-            r2_log_link(turn_event_id, association_id,
-                        "conversation_occurred_during_audio", audio[i]->source_name);
+        if (r2_log_conversation_source(turn_event_id, "conversation_during_audio_input",
+                i == 1 ? "A desktop audio source was open at conversation turn finalization." :
+                         "An Ears source was open at conversation turn finalization.",
+                details, audio[i]->source_name, "conversation_occurred_during_audio") <= 0)
+            fprintf(stderr, "[R2 Life Log] Could not commit a conversation audio-source association.\n");
     }
 }
 

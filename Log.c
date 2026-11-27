@@ -1090,6 +1090,34 @@ int64_t r2_log_event(R2LogCategory category, const char *event_type,
     return inserted_id;
 }
 
+/* A sampled source is evidence for one accepted conversation, not a
+ * standalone event that can survive a failed provenance relationship. */
+int64_t r2_log_conversation_source(int64_t turn_event_id, const char *event_type,
+                                  const char *summary, const char *details,
+                                  const char *source, const char *relationship)
+{
+    if (turn_event_id <= 0 || !valid_text(event_type) || !valid_text(summary) ||
+        !valid_text(details) || !valid_text(source) || !valid_text(relationship) ||
+        strlen(event_type) > 128 || strlen(summary) > 8192 || strlen(relationship) > 128)
+        return -1;
+
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+
+    int64_t event_id = log_insert_event_locked(R2_LOG_CONVERSATION, event_type,
+                                               summary, details, source);
+    int saved = event_id > 0 &&
+        log_link_locked(turn_event_id, event_id, relationship, source) == 0;
+    int result = log_finish_write(saved);
+    pthread_mutex_unlock(&log_lock);
+    if (result != 0) return -1;
+    r2_sj_index_event(event_id, "conversation", event_type, source);
+    return event_id;
+}
+
 int r2_log_save_shared_sensory(sqlite3 *peer, const char *event_type, const char *summary,
                                 const char *details, const char *source,
                                 int (*save)(sqlite3 *, int64_t, void *), void *context)

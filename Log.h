@@ -77,6 +77,13 @@ int64_t r2_log_event(
     const char *source
 );
 
+/* Commit a conversation source snapshot and its provenance link together.
+ * Both the event and the relationship must exist before indexing the event.
+ * Returns the inserted event ID on success, -1 on rollback/failure. */
+int64_t r2_log_conversation_source(int64_t turn_event_id, const char *event_type,
+                                  const char *summary, const char *details,
+                                  const char *source, const char *relationship);
+
 struct sqlite3;
 /* Commit a sensory event with a companion row in the same database.
  * The callback uses the supplied connection, returns SQLITE_DONE on success,
