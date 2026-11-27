@@ -594,6 +594,66 @@ int main(void)
     }
     message_free_all();
 
+    /* The slot allocator must not orphan the old assistant or tool pair
+       when a new user needs only one slot. A pinned system message between
+       the old user and answer is independent of that exchange. */
+    int exchange_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 6; ++i) {
+        if (message_add_pinned("system", "fixed context") != 0) {
+            exchange_fixture_ready = 0;
+            break;
+        }
+    }
+    exchange_fixture_ready = exchange_fixture_ready &&
+        message_add("user", "old exchange user") == 0 &&
+        message_add_pinned("system", "interleaved identity") == 0 &&
+        message_add_pair_locked("assistant", "[R2_INTERNAL_TOOL_REQUEST]\nold request",
+                                "user", "old result") == 0;
+    if (exchange_fixture_ready)
+        messages.items[messages.count - 1].internal_tool_result = 1;
+    exchange_fixture_ready = exchange_fixture_ready &&
+        message_add("assistant", "old answer") == 0 &&
+        message_add("user", "newer unanswered turn") == 0;
+    ok &= check(exchange_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill slot cap with complete old exchange and newer user");
+    if (exchange_fixture_ready && messages.count == MAX_MESSAGES) {
+        const char *identity = messages.items[MAX_MESSAGES - 5].content;
+        const char *newer = messages.items[MAX_MESSAGES - 1].content;
+        int added = message_add("user", "fresh user");
+        ok &= check(added == 0 && messages.count == MAX_MESSAGES - 3 &&
+                    messages.items[MAX_MESSAGES - 6].content == identity &&
+                    messages.items[MAX_MESSAGES - 5].content == newer &&
+                    !strcmp(messages.items[MAX_MESSAGES - 4].content, "fresh user"),
+                    "single append evicts the complete old exchange, not its individual messages");
+    }
+    message_free_all();
+
+    /* A pair admission must also preserve the visible exchange when it
+       contains a protected answer, not merely protect the answer itself. */
+    int pair_fixture_ready = 1;
+    for (size_t i = 0; i < MAX_MESSAGES - 3; ++i) {
+        if (message_add_pinned("system", "fixed context") != 0) {
+            pair_fixture_ready = 0;
+            break;
+        }
+    }
+    pair_fixture_ready = pair_fixture_ready &&
+        message_add("user", "old protected exchange user") == 0 &&
+        message_add("assistant", "protected answer") == 0 &&
+        message_add("user", "active user") == 0;
+    ok &= check(pair_fixture_ready && messages.count == MAX_MESSAGES,
+                "fill slot cap for protected exchange pair admission");
+    if (pair_fixture_ready && messages.count == MAX_MESSAGES) {
+        active_turn_history.user = messages.items[MAX_MESSAGES - 1].content;
+        active_turn_history.action_result = messages.items[MAX_MESSAGES - 2].content;
+        const char *prior = messages.items[MAX_MESSAGES - 3].content;
+        int rc = message_add_pair_locked("assistant", "request", "user", "result");
+        ok &= check(rc != 0 && messages.count == MAX_MESSAGES &&
+                    messages.items[MAX_MESSAGES - 3].content == prior,
+                    "pair admission cannot split a protected historical exchange");
+    }
+    message_free_all();
+
     /* An admitted durable Hands result must remain owned by its active turn
        even when a later action pair would otherwise evict the handoff. */
     int hands_fixture_ready = 1;

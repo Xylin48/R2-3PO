@@ -1035,6 +1035,62 @@ static int mkdir_p(const char *path)
    MESSAGE MEMORY
    ============================================================ */
 
+/* Match the serializer's historical exchange boundaries: a real user
+ * starts an exchange, synthetic tool results do not. System messages can
+ * be interleaved but have independent lifetimes. Plan only complete groups
+ * and never evict a group containing any protected message. */
+static int message_history_user(const Message *message)
+{
+    return message->role && !strcmp(message->role, "user") &&
+           !message->internal_tool_result;
+}
+
+static int message_history_system(const Message *message)
+{
+    return message->role && !strcmp(message->role, "system");
+}
+
+static int message_plan_oldest_eviction(unsigned char *evict, size_t preserve_index,
+                                        size_t *kept_count, size_t *kept_bytes)
+{
+    size_t group_end = 0;
+    for (size_t i = 0; i < messages.count; ++i) {
+        if (evict[i]) continue;
+        if (message_history_system(&messages.items[i])) {
+            if (i == preserve_index || message_is_protected(&messages.items[i]))
+                continue;
+            evict[i] = 1;
+            --*kept_count;
+            *kept_bytes -= strlen(messages.items[i].role) + 1;
+            *kept_bytes -= strlen(messages.items[i].content ? messages.items[i].content : "") + 1;
+            return 0;
+        }
+        if (i < group_end) continue;
+        group_end = i + 1;
+        while (group_end < messages.count &&
+               !message_history_user(&messages.items[group_end]))
+            ++group_end;
+        int removable = 1;
+        for (size_t j = i; j < group_end; ++j) {
+            if (message_history_system(&messages.items[j])) continue;
+            if (j == preserve_index || message_is_protected(&messages.items[j])) {
+                removable = 0;
+                break;
+            }
+        }
+        if (!removable) continue;
+        for (size_t j = i; j < group_end; ++j) {
+            if (evict[j] || message_history_system(&messages.items[j])) continue;
+            evict[j] = 1;
+            --*kept_count;
+            *kept_bytes -= strlen(messages.items[j].role ? messages.items[j].role : "") + 1;
+            *kept_bytes -= strlen(messages.items[j].content ? messages.items[j].content : "") + 1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
 static int message_add_ex(
     const char *role,
     const char *content,
@@ -1078,25 +1134,12 @@ static int message_add_ex(
     size_t kept_bytes = live_bytes;
     while (kept_count >= MAX_MESSAGES ||
            kept_bytes > MAX_LIVE_MESSAGE_BYTES - new_bytes) {
-        size_t remove_index = SIZE_MAX;
-        for (size_t i = 0; i < messages.count; ++i) {
-            if (!evict[i] && !message_is_protected(&messages.items[i])) {
-                remove_index = i;
-                break;
-            }
-        }
-        if (remove_index == SIZE_MAX) {
+        if (message_plan_oldest_eviction(evict, SIZE_MAX, &kept_count, &kept_bytes) != 0) {
             free(role_copy);
             free(content_copy);
             fprintf(stderr, "[R2 memory] Protected context prevents an atomic live-history append.\n");
             return -1;
         }
-        evict[remove_index] = 1;
-        kept_count--;
-        kept_bytes -= strlen(messages.items[remove_index].role ?
-                             messages.items[remove_index].role : "") + 1;
-        kept_bytes -= strlen(messages.items[remove_index].content ?
-                             messages.items[remove_index].content : "") + 1;
     }
 
     const size_t needed = kept_count + 1;
@@ -1186,7 +1229,9 @@ static int message_add_pair_planned_locked(const char *role_a, const char *conte
 
     size_t role_a_len = strlen(role_a), content_a_len = strlen(content_a);
     size_t role_b_len = strlen(role_b), content_b_len = strlen(content_b);
-    if (role_a_len + content_a_len + 2 > MAX_LIVE_MESSAGE_BYTES ||
+    if (role_a_len > MAX_LIVE_MESSAGE_BYTES || content_a_len > MAX_LIVE_MESSAGE_BYTES ||
+        role_b_len > MAX_LIVE_MESSAGE_BYTES || content_b_len > MAX_LIVE_MESSAGE_BYTES ||
+        role_a_len + content_a_len + 2 > MAX_LIVE_MESSAGE_BYTES ||
         role_b_len + content_b_len + 2 > MAX_LIVE_MESSAGE_BYTES)
         return -1;
 
@@ -1229,14 +1274,8 @@ static int message_add_pair_planned_locked(const char *role_a, const char *conte
     }
     while (simulated_count + 2 > MAX_MESSAGES ||
            simulated_bytes > MAX_LIVE_MESSAGE_BYTES - pair_bytes) {
-        size_t remove_index = SIZE_MAX;
-        for (size_t i = 0; i < messages.count; ++i) {
-            if (i != preserve_index && !evict[i] && !message_is_protected(&messages.items[i])) {
-                remove_index = i;
-                break;
-            }
-        }
-        if (remove_index == SIZE_MAX) {
+        if (message_plan_oldest_eviction(evict, preserve_index,
+                                         &simulated_count, &simulated_bytes) != 0) {
             free(role_a_copy);
             free(content_a_copy);
             free(role_b_copy);
@@ -1244,10 +1283,6 @@ static int message_add_pair_planned_locked(const char *role_a, const char *conte
             fprintf(stderr, "[R2 memory] Cannot fit complete assistant/tool history pair without evicting protected context.\n");
             return -1;
         }
-        evict[remove_index] = 1;
-        simulated_count--;
-        simulated_bytes -= strlen(messages.items[remove_index].role ? messages.items[remove_index].role : "") + 1;
-        simulated_bytes -= strlen(messages.items[remove_index].content ? messages.items[remove_index].content : "") + 1;
     }
 
     size_t needed = simulated_count + 2;

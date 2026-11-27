@@ -65,7 +65,8 @@ followup = talk.index("chat_with_relevant_memories(message);", refresh)
 recorded_result = talk.index("reply = recorded_action_reply(tool_evidence);", followup)
 assert followup_start < refresh < followup < recorded_result
 assert talk.count("chat_with_relevant_memories(message)") == 2
-assert talk.count("process_tools(") == 1
+assert talk.count("process_tools_with_capture_status(") == 1
+assert "process_tools(" not in talk and "process_tools_with_status(" not in talk
 
 for label, source, needle in (
     ("fridge schema migration", reality, "static int fridge_migrate_schema(const char *legacy_path)"),
