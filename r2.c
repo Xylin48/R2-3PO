@@ -931,6 +931,18 @@ static FILE *open_original_archive(struct stat *status)
     return NULL;
 }
 
+static int original_archive_unchanged(const struct stat *before,
+                                      const struct stat *after)
+{
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_size == after->st_size &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+}
+
 static int prepare_original_archive(char **original)
 {
     original_archive_on_disk = 0;
@@ -938,9 +950,15 @@ static int prepare_original_archive(char **original)
     struct stat status;
     FILE *stream = open_original_archive(&status);
     if (!stream) return errno == ENOENT ? 0 : -1;
+    if (status.st_size < 0) {
+        fclose(stream);
+        errno = EIO;
+        return -1;
+    }
     if (status.st_size > MAX_PINNED_ORIGINAL_ARCHIVE_BYTES) {
+        if (fclose(stream) != 0) return -1;
         original_archive_on_disk = 1;
-        return fclose(stream);
+        return 0;
     }
 
     size_t length = (size_t)status.st_size;
@@ -951,8 +969,11 @@ static int prepare_original_archive(char **original)
     }
     size_t read_length = fread(data, 1, length, stream);
     int extra = fgetc(stream);
+    struct stat after;
     int failed = ferror(stream) || read_length != length ||
-        memchr(data, '\0', read_length) != NULL;
+        memchr(data, '\0', read_length) != NULL ||
+        fstat(fileno(stream), &after) != 0 ||
+        !original_archive_unchanged(&status, &after);
     if (fclose(stream) != 0) failed = 1;
     if (failed || extra != EOF) {
         free(data);
@@ -6681,6 +6702,7 @@ static size_t r2_original_archive_match_score(const char *line,
     size_t score = 0;
     for (size_t i = 0; i < keyword_count; ++i) {
         const char *word = keywords[i];
+        if (!word || !*word) continue;
         if (!strcmp(word, "remember") || !strcmp(word, "remembered") ||
             !strcmp(word, "memory") || !strcmp(word, "recall") ||
             !strcmp(word, "conversation") || !strcmp(word, "earlier")) continue;
@@ -6707,6 +6729,10 @@ static int r2_append_original_archive_matches(char **context,
     struct stat before, after;
     FILE *stream = open_original_archive(&before);
     if (!stream) goto unavailable;
+    if (before.st_size < 0) {
+        fclose(stream);
+        goto unavailable;
+    }
     struct {
         char *line;
         size_t score;
@@ -6748,10 +6774,7 @@ static int r2_append_original_archive_matches(char **context,
     }
     if (ferror(stream) || !feof(stream) || offset != (uintmax_t)before.st_size ||
         fstat(fileno(stream), &after) != 0 ||
-        before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
-        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
-        before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
-        before.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
+        !original_archive_unchanged(&before, &after))
         failed = 1;
     if (fclose(stream) != 0) failed = 1;
     free(line);
@@ -6777,8 +6800,10 @@ static int r2_append_original_archive_matches(char **context,
 
 unavailable:
     fprintf(stderr, "[R2 Context] Could not search the complete original conversation archive.\n");
-    return r2_append_association_section(context, "ORIGINAL CONVERSATION ARCHIVE STATUS:\n",
+    (void)r2_append_association_section(context, "ORIGINAL CONVERSATION ARCHIVE STATUS:\n",
         "The source could not be read completely for this turn. Its contents are unverified.");
+    /* Successfully formatting the diagnostic does not mean retrieval succeeded. */
+    return -1;
 }
 
 static pthread_mutex_t r2_associative_query_cache_lock = PTHREAD_MUTEX_INITIALIZER;

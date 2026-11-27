@@ -110,6 +110,59 @@ static void verify_complete_reads(void)
            strstr(ctx, "Archived R2 reply:\nCONVERSATION-END\n"));
     free(ctx);
 }
+static void verify_original_archive_status(void)
+{
+    const char *keywords[] = {"cobalt"};
+    char *original = NULL;
+    int fd = open(ORIGINAL_CONVERSATION, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0);
+    const char small[] = "small original cobalt conversation\n";
+    assert(write(fd, small, sizeof(small) - 1) == (ssize_t)(sizeof(small) - 1));
+    assert(close(fd) == 0);
+    assert(prepare_original_archive(&original) == 0 && original &&
+           !strcmp(original, small) && !original_archive_on_disk);
+    free(original);
+
+    struct stat before, after;
+    assert(stat(ORIGINAL_CONVERSATION, &before) == 0);
+    after = before;
+    assert(original_archive_unchanged(&before, &after));
+    after.st_mtim.tv_sec += 1;
+    assert(!original_archive_unchanged(&before, &after));
+    after = before;
+    after.st_ctim.tv_sec += 1;
+    assert(!original_archive_unchanged(&before, &after));
+    after = before;
+    after.st_size += 1;
+    assert(!original_archive_unchanged(&before, &after));
+
+    FILE *archive = fopen(ORIGINAL_CONVERSATION, "wb");
+    assert(archive);
+    for (size_t i = 0; i <= MAX_PINNED_ORIGINAL_ARCHIVE_BYTES; ++i)
+        assert(fputc('x', archive) == 'x');
+    assert(fputs("\ncobalt exact historical tail\n", archive) >= 0);
+    assert(fclose(archive) == 0);
+    original = NULL;
+    assert(prepare_original_archive(&original) == 0 && !original && original_archive_on_disk);
+    char *context = strdup("BASE");
+    assert(context && r2_append_original_archive_matches(&context, keywords, 1) == 0);
+    assert(strstr(context, "cobalt exact historical tail"));
+    free(context);
+    archive = fopen(ORIGINAL_CONVERSATION, "ab");
+    assert(archive && fputc(0, archive) == 0 && fclose(archive) == 0);
+    context = strdup("BASE");
+    assert(context && r2_append_original_archive_matches(&context, keywords, 1) != 0);
+    assert(strstr(context, "ORIGINAL CONVERSATION ARCHIVE STATUS") &&
+           !strstr(context, "cobalt exact historical tail"));
+    free(context);
+    assert(unlink(ORIGINAL_CONVERSATION) == 0);
+    context = strdup("BASE");
+    assert(context && r2_append_original_archive_matches(&context, keywords, 1) != 0);
+    assert(strstr(context, "ORIGINAL CONVERSATION ARCHIVE STATUS"));
+    free(context);
+    assert(prepare_original_archive(&original) == 0 && !original && !original_archive_on_disk);
+}
+
 int main(void)
 {
     diary_text = make_text('d', 150000, "\n\nDIARY-END\xe2\x98\x83");
@@ -118,6 +171,7 @@ int main(void)
     reward_text = make_text('r', 15000, "REWARD-END");
     interest_text = make_text('i', 17000, "INTEREST-END");
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
+    verify_original_archive_status();
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     char *empty = r2_diary_recent(20); assert(empty && !*empty); free(empty);
     empty = r2_diary_search("missing", 20); assert(empty && !*empty); free(empty);
