@@ -918,15 +918,21 @@ def oversized_original_archive(binary: Path, workspace: Path, url: str) -> None:
     output = conversation(binary, workspace, url, (unavailable,), 2048)
     assert "Could not search the complete original conversation archive" in output
     sources = []
+    foreground_sources = []
     for request in LocalOllama.requests[start:]:
         if any(item.get("role") == "user" and item.get("content") == unavailable
                for item in request["messages"]):
-            sources.extend(item["content"] for item in request["messages"] if item.get("role") == "system")
+            system_text = [item["content"] for item in request["messages"] if item.get("role") == "system"]
+            sources.extend(system_text)
+            if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES):
+                foreground_sources.extend(system_text)
         sources.extend(item["content"] for item in request["messages"]
                        if item.get("role") == "user"
                        and item["content"].startswith(f"EVIDENCE REVIEW\nRequest: {unavailable}\n")
                        and "\nRound 0," in item["content"].split("BEGIN FRAGMENT", 1)[0])
-    assert any("ORIGINAL CONVERSATION ARCHIVE STATUS:" in item for item in sources)
+    assert any("CURRENT TURN RETRIEVAL STATUS:" in item
+               and "ORIGINAL CONVERSATION ARCHIVE STATUS:" in item
+               for item in foreground_sources), foreground_sources
     assert all("ORIGINAL CONVERSATION ARCHIVE (historical text" not in item and tail not in item
                for item in sources)
     original.unlink()

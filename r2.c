@@ -6726,6 +6726,7 @@ static int r2_append_original_archive_matches(char **context,
     const char *const keywords[], size_t keyword_count)
 {
     if (!original_archive_on_disk || !keyword_count) return 0;
+    size_t original_length = strlen(*context);
     struct stat before, after;
     FILE *stream = open_original_archive(&before);
     if (!stream) goto unavailable;
@@ -6746,6 +6747,7 @@ static int r2_append_original_archive_matches(char **context,
     size_t matching_lines = 0;
     while (!r2_is_shutting_down() && (length = getline(&line, &capacity, stream)) >= 0) {
         if (memchr(line, '\0', (size_t)length) ||
+            !r2_input_is_utf8(line) ||
             (uintmax_t)length > (uintmax_t)before.st_size - offset) {
             failed = 1;
             break;
@@ -6796,13 +6798,13 @@ static int r2_append_original_archive_matches(char **context,
     }
     for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) free(best[i].line);
     if (r2_is_shutting_down()) { errno = ECANCELED; return -1; }
-    if (!failed) return rc ? rc : matching_lines > MAX_ORIGINAL_ARCHIVE_MATCHES;
+    if (!failed && rc == 0) return matching_lines > MAX_ORIGINAL_ARCHIVE_MATCHES;
 
 unavailable:
+    /* The caller's required retrieval status carries this failure. Never
+       leave a partially assembled archive section in optional history. */
+    (*context)[original_length] = '\0';
     fprintf(stderr, "[R2 Context] Could not search the complete original conversation archive.\n");
-    (void)r2_append_association_section(context, "ORIGINAL CONVERSATION ARCHIVE STATUS:\n",
-        "The source could not be read completely for this turn. Its contents are unverified.");
-    /* Successfully formatting the diagnostic does not mean retrieval succeeded. */
     return -1;
 }
 
@@ -7298,7 +7300,7 @@ static char *chat_with_relevant_memories(
         return NULL;
 
     int memory_unavailable = 0, history_unavailable = 0;
-    int diary_unavailable = 0, visual_unavailable = 0, archive_unavailable = 0;
+    int diary_unavailable = 0, visual_unavailable = 0, archive_result = 0;
     uint64_t cache_generation = 0;
     char *memory_context = context_cache_get(associative_query, memory_limit, &cache_generation);
     if (!memory_context) {
@@ -7372,7 +7374,7 @@ static char *chat_with_relevant_memories(
         diary_unavailable = 1;
     free(diary_matches);
 
-    archive_unavailable = r2_append_original_archive_matches(&memory_context, keywords, keyword_count) != 0;
+    archive_result = r2_append_original_archive_matches(&memory_context, keywords, keyword_count);
 
     int visual_requested = query_requests_visual_context(query);
     int visual_cues_unsearched = 0;
@@ -7438,19 +7440,22 @@ static char *chat_with_relevant_memories(
         history_unavailable = 1;
     r2_history_release(&life_history);
 
-    char retrieval_status[384];
+    char retrieval_status[512];
     const char *status = NULL;
     if (memory_unavailable || history_unavailable || diary_unavailable ||
-        archive_unavailable || visual_unavailable) {
+        archive_result != 0 || visual_unavailable) {
         snprintf(retrieval_status, sizeof(retrieval_status),
             "CURRENT TURN RETRIEVAL STATUS: The following sources could not be read fully:%s%s%s%s%s. "
             "Use available evidence and mention the gap if it affects the answer. "
-            "An incomplete search does not prove a memory is absent.",
+            "An incomplete search does not prove a memory is absent.%s",
             memory_unavailable ? " persistent memory" : "",
             history_unavailable ? " Life Log" : "",
             diary_unavailable ? " diary" : "",
-            archive_unavailable ? " original archive" : "",
-            visual_unavailable ? " visual history" : "");
+            archive_result != 0 ? " original archive" : "",
+            visual_unavailable ? " visual history" : "",
+            archive_result < 0
+                ? "\nORIGINAL CONVERSATION ARCHIVE STATUS: The source could not be read completely; its contents are unverified."
+                : "");
         fprintf(stderr, "[R2 Context] %s\n", retrieval_status);
         status = retrieval_status;
     }

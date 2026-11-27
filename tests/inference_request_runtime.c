@@ -2177,6 +2177,52 @@ static void check_first_answer_with_unavailable_source(void)
     assert(captured_contains("azurite recovered sibling"));
     assert(!captured_contains("could not be read fully: persistent memory"));
     free(reply);
+
+    /* Exercise the on-disk scanner directly with a tiny owned fixture.
+       The offline integration separately exercises the real size threshold. */
+    FILE *archive = fopen(ORIGINAL_CONVERSATION, "wx");
+    assert(archive);
+    for (int i = 0; i < 5; ++i)
+        assert(fprintf(archive, "azurite archive fixture record %d.\n", i) > 0);
+    assert(fclose(archive) == 0);
+    int previous_archive_mode = original_archive_on_disk;
+    original_archive_on_disk = 1;
+    const char *cues[] = {"azurite"};
+    char *archive_context = strdup("Other verified evidence.");
+    assert(archive_context);
+    assert(r2_append_original_archive_matches(&archive_context, cues, 1) == 1);
+    assert(!strstr(archive_context, "record 0."));
+    for (int i = 1; i < 5; ++i) {
+        char marker[32];
+        snprintf(marker, sizeof(marker), "record %d.", i);
+        assert(strstr(archive_context, marker));
+    }
+    free(archive_context);
+
+    /* A malformed tail invalidates the whole scan, even after valid matches.
+       Its specific status must survive compact history selection. */
+    for (int malformed = 0; malformed < 2; ++malformed) {
+        archive = fopen(ORIGINAL_CONVERSATION, "wb");
+        assert(archive);
+        assert(fputs("azurite archive fixture record 0.\n", archive) >= 0);
+        assert(fputc(malformed ? 0xff : 0, archive) != EOF);
+        assert(fclose(archive) == 0);
+        archive_context = strdup("Other verified evidence.");
+        assert(archive_context);
+        assert(r2_append_original_archive_matches(&archive_context, cues, 1) < 0);
+        assert(!strcmp(archive_context, "Other verified evidence."));
+        free(archive_context);
+        assert(setenv("R2_OLLAMA_NUM_CTX", malformed ? "8192" : "2048", 1) == 0);
+        reply = chat_with_relevant_memories(query);
+        assert(reply && captured_contains(query));
+        assert(captured_contains("CURRENT TURN RETRIEVAL STATUS:") &&
+               captured_contains("ORIGINAL CONVERSATION ARCHIVE STATUS:"));
+        assert(!captured_contains("azurite archive fixture record"));
+        free(reply);
+    }
+    assert(unlink(ORIGINAL_CONVERSATION) == 0);
+    original_archive_on_disk = previous_archive_mode;
+    assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
     context_cache_invalidate();
     r2_associative_query_cache_clear();
     message_free_all();
