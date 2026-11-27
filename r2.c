@@ -15921,13 +15921,50 @@ int r2_talk_last_reply_generated(void)
 /* Snapshot availability at the turn boundary, before the database write can
  * block or the capture sources can change. Each source is sampled under its
  * own lock; availability is not attention, interpretation or a transcript. */
+typedef struct R2TurnExtraSource {
+    char *monitor;
+    struct R2TurnExtraSource *next;
+} R2TurnExtraSource;
+
 typedef struct {
     char *visual_source;
     R2VisionOrigin visual_origin;
     char *display_source;
     R2HearingEvent hearing_event;
     R2HearingEvent desktop_event;
+    R2TurnExtraSource *extra_desktop;
 } R2TurnSources;
+
+/* The published list owns the receiver and monitor name until detachment.
+ * Copy identities under that lock, not the lifecycle/reconciliation lock;
+ * connecting a new output or joining a retired one cannot delay this walk.
+ * A running worker is not evidence that its PCM has been interpreted. */
+static int r2_capture_turn_extra_sources(R2TurnSources *sources)
+{
+    R2TurnExtraSource **tail = &sources->extra_desktop;
+    int result = 0;
+    pthread_mutex_lock(&extra_desktop_lock);
+    for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
+        if (!atomic_load(&entry->running) || !entry->monitor || !*entry->monitor)
+            continue;
+        /* A reroute can briefly expose the same monitor in both receivers.
+         * Availability of that exact desktop monitor is one association. */
+        if (sources->desktop_event.source_name &&
+            !strcmp(sources->desktop_event.source_name, entry->monitor))
+            continue;
+        R2TurnExtraSource *copy = calloc(1, sizeof(*copy));
+        if (copy) copy->monitor = strdup(entry->monitor);
+        if (!copy || !copy->monitor) {
+            free(copy);
+            result = -1;
+            break;
+        }
+        *tail = copy;
+        tail = &copy->next;
+    }
+    pthread_mutex_unlock(&extra_desktop_lock);
+    return result;
+}
 
 static R2TurnSources r2_capture_turn_sources(void)
 {
@@ -15968,6 +16005,8 @@ static R2TurnSources r2_capture_turn_sources(void)
         r2_ears_is_open(ears_desktop))
         (void)r2_ears_get_event(ears_desktop, &sources.desktop_event);
     pthread_mutex_unlock(&ears_desktop_capture_lock);
+    if (r2_capture_turn_extra_sources(&sources) != 0)
+        fprintf(stderr, "[R2 Life Log] Could not copy all active desktop source identities.\n");
     return sources;
 }
 
@@ -15977,7 +16016,28 @@ static void r2_release_turn_sources(R2TurnSources *sources)
     free(sources->display_source);
     r2_ears_release_event(&sources->hearing_event);
     r2_ears_release_event(&sources->desktop_event);
+    while (sources->extra_desktop) {
+        R2TurnExtraSource *entry = sources->extra_desktop;
+        sources->extra_desktop = entry->next;
+        free(entry->monitor);
+        free(entry);
+    }
     *sources = (R2TurnSources){0};
+}
+
+static void r2_publish_turn_audio_source(int64_t turn_event_id, const char *source,
+                                         const char *origin, const char *route,
+                                         const char *summary, const char *availability)
+{
+    if (!source || !*source) return;
+    char details[512];
+    snprintf(details, sizeof(details),
+             "conversation_event_id=%lld\naudio_origin=%s\naudio_route=%s\n"
+             "sampled_at=turn_finalization\n%s; transcription and interpretation are not established.",
+             (long long)turn_event_id, origin, route, availability);
+    if (r2_log_conversation_source(turn_event_id, "conversation_during_audio_input",
+            summary, details, source, "conversation_occurred_during_audio") <= 0)
+        fprintf(stderr, "[R2 Life Log] Could not commit a conversation audio-source association.\n");
 }
 
 /* Retain the existing event/relationship kinds for historical consumers.
@@ -16020,23 +16080,22 @@ static void r2_publish_turn_sources(int64_t turn_event_id, const R2TurnSources *
         }
     }
 
-    const R2HearingEvent *audio[] = {&sources->hearing_event, &sources->desktop_event};
-    for (size_t i = 0; i < sizeof(audio) / sizeof(audio[0]); ++i) {
-        if (!audio[i]->source_name || !*audio[i]->source_name) continue;
-        char details[320];
-        snprintf(details, sizeof(details),
-                 "conversation_event_id=%lld\naudio_origin=%s\n"
-                 "sampled_at=turn_finalization\n"
-                 "Ears source was open; transcription and interpretation are not established.",
-                 (long long)turn_event_id, i == 1 ? "desktop_playback" :
-                 audio[i]->origin == R2_HEARING_FILE ? "file" :
-                 audio[i]->origin == R2_HEARING_WORLD ? "world/desktop" : "unknown");
-        if (r2_log_conversation_source(turn_event_id, "conversation_during_audio_input",
-                i == 1 ? "A desktop audio source was open at conversation turn finalization." :
-                         "An Ears source was open at conversation turn finalization.",
-                details, audio[i]->source_name, "conversation_occurred_during_audio") <= 0)
-            fprintf(stderr, "[R2 Life Log] Could not commit a conversation audio-source association.\n");
-    }
+    /* R2_HEARING_WORLD identifies any live recording input; it does not
+     * independently establish that the selected input is a microphone. */
+    r2_publish_turn_audio_source(turn_event_id, sources->hearing_event.source_name,
+        sources->hearing_event.origin == R2_HEARING_FILE ? "file" :
+        sources->hearing_event.origin == R2_HEARING_WORLD ? "live_recording" : "unknown",
+        "primary_ears", "An Ears source was open at conversation turn finalization.",
+        "Ears source was open");
+    r2_publish_turn_audio_source(turn_event_id, sources->desktop_event.source_name,
+        "desktop_playback", "primary_desktop",
+        "A desktop audio source was open at conversation turn finalization.",
+        "Desktop source was open");
+    for (const R2TurnExtraSource *entry = sources->extra_desktop; entry; entry = entry->next)
+        r2_publish_turn_audio_source(turn_event_id, entry->monitor,
+            "desktop_playback", "additional_desktop",
+            "An independent desktop capture worker was active at conversation turn finalization.",
+            "Desktop capture worker was active");
 }
 
 static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)

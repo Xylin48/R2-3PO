@@ -369,6 +369,10 @@ int main(void)
     verify_event(connection, independent_id, independent_source, expected);
     free(independent_transcript);
     free(independent_source);
+    R2TurnSources extra_snapshot = r2_capture_turn_sources();
+    assert(extra_snapshot.extra_desktop &&
+           !strcmp(extra_snapshot.extra_desktop->monitor, extra_name) &&
+           !extra_snapshot.extra_desktop->next);
     extra_desktop_head = NULL;
     r2_ears_extra_requested = NULL;
     pthread_mutex_destroy(&extra.history_lock);
@@ -388,6 +392,25 @@ int main(void)
     int64_t associated_turn = r2_log_conversation_turn("Fixture source changed after completion.",
                                                       "The source snapshot belongs to that turn.");
     assert(associated_turn > 0);
+    /* Publish the independent monitor after its list entry has disappeared.
+       Use only its captured identity, not another live source lookup. */
+    R2TurnSources extra_only = {.extra_desktop = extra_snapshot.extra_desktop};
+    r2_publish_turn_sources(associated_turn, &extra_only);
+    r2_release_turn_sources(&extra_snapshot);
+    sqlite3_stmt *extra_edge = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT e.source,e.details,l.notes FROM r2_log_links l "
+        "JOIN r2_log_events e ON e.id=l.to_event_id WHERE l.from_event_id=? "
+        "AND l.relationship='conversation_occurred_during_audio'",
+        -1, &extra_edge, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(extra_edge, 1, associated_turn) == SQLITE_OK);
+    assert(sqlite3_step(extra_edge) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(extra_edge, 0), extra_name));
+    assert(strstr((const char *)sqlite3_column_text(extra_edge, 1), "audio_origin=desktop_playback"));
+    assert(strstr((const char *)sqlite3_column_text(extra_edge, 1), "audio_route=additional_desktop"));
+    assert(!strcmp((const char *)sqlite3_column_text(extra_edge, 2), extra_name));
+    assert(sqlite3_step(extra_edge) == SQLITE_DONE);
+    sqlite3_finalize(extra_edge);
     /* An ignored edge is a failed transaction, not an orphan source event.
        Keep the other exact sources independent and then retry the rejected
        association directly against the same durable turn. */
@@ -448,12 +471,12 @@ int main(void)
     assert(sqlite3_bind_text(associated, 1, audio_type, -1, SQLITE_STATIC) == SQLITE_OK);
     assert(sqlite3_bind_int64(associated, 2, associated_turn) == SQLITE_OK);
     assert(sqlite3_bind_text(associated, 3, audio_relation, -1, SQLITE_STATIC) == SQLITE_OK);
-    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 1);
+    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 2);
     sqlite3_finalize(associated);
     assert(sqlite3_prepare_v2(connection,
         "SELECT count(*) FROM r2_log_events WHERE event_type=?", -1, &associated, NULL) == SQLITE_OK);
     assert(sqlite3_bind_text(associated, 1, audio_type, -1, SQLITE_STATIC) == SQLITE_OK);
-    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 1);
+    assert(sqlite3_step(associated) == SQLITE_ROW && sqlite3_column_int(associated, 0) == 2);
     sqlite3_finalize(associated);
     assert(r2_vision_watch_stop() == 0);
     r2_eyes_shutdown(eyes);

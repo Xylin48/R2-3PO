@@ -119,6 +119,26 @@ static void *reconcile(void *data)
     return NULL;
 }
 
+static void verify_turn_extra_sources(const R2TurnSources *snapshot,
+                                      char names[12][1024], int excluded)
+{
+    unsigned seen = 0;
+    size_t count = 0;
+    for (const R2TurnExtraSource *entry = snapshot->extra_desktop; entry; entry = entry->next) {
+        int matched = 0;
+        for (int i = 0; i < 12; ++i) {
+            if (strcmp(entry->monitor, names[i])) continue;
+            assert(i != excluded && !(seen & (1U << i)));
+            seen |= 1U << i;
+            matched = 1;
+            break;
+        }
+        assert(matched);
+        ++count;
+    }
+    assert(count == (excluded < 0 ? 12U : 11U));
+}
+
 int main(void)
 {
     R2AudioDiscovery audio = {0};
@@ -157,6 +177,9 @@ int main(void)
     assert(pthread_mutex_trylock(&extra_desktop_lock) == 0);
     pthread_mutex_unlock(&extra_desktop_lock);
     assert(r2_ears_extra_source_count() == 11);
+    R2TurnSources while_opening = r2_capture_turn_sources();
+    verify_turn_extra_sources(&while_opening, names, 0);
+    r2_release_turn_sources(&while_opening);
     wait_for_pcm(names[3], 19);
     FILE *during_open = tmpfile();
     assert(during_open);
@@ -166,6 +189,14 @@ int main(void)
     release_gate();
     assert(pthread_join(update, NULL) == 0);
     assert(r2_ears_extra_source_count() == 12);
+    R2TurnSources before_retirement = r2_capture_turn_sources();
+    verify_turn_extra_sources(&before_retirement, names, -1);
+    R2TurnSources overlapping = {0};
+    overlapping.desktop_event.source_name = strdup(names[0]);
+    assert(overlapping.desktop_event.source_name);
+    assert(r2_capture_turn_extra_sources(&overlapping) == 0);
+    verify_turn_extra_sources(&overlapping, names, 0);
+    r2_release_turn_sources(&overlapping);
 
     /* Retire that receiver while its worker is still inside its last read.
      * Its old history must disappear while the other workers remain readable. */
@@ -189,6 +220,10 @@ int main(void)
         nanosleep(&pause, NULL);
     }
     assert(r2_ears_extra_source_count() == 11);
+    R2TurnSources during_retirement = r2_capture_turn_sources();
+    verify_turn_extra_sources(&during_retirement, names, 0);
+    r2_release_turn_sources(&during_retirement);
+    verify_turn_extra_sources(&before_retirement, names, -1);
     assert(r2_ears_extra_copy_recent(names[0], 1920, (unsigned char[1920]){0}) < 0);
     wait_for_pcm(names[3], 19);
     pthread_mutex_lock(&fake_lock);
@@ -254,6 +289,13 @@ int main(void)
     assert(r2_ears_extra_source_count() == 11);
     r2_ears_extra_stop_all();
     assert(r2_ears_extra_source_count() == 0);
+    R2TurnSources after_stop = r2_capture_turn_sources();
+    assert(!after_stop.extra_desktop);
+    r2_release_turn_sources(&after_stop);
+    /* All original owned names remain intact even after every receiver was freed. */
+    verify_turn_extra_sources(&before_retirement, names, -1);
+    r2_release_turn_sources(&before_retirement);
+    assert(!before_retirement.extra_desktop);
 
     for (size_t i = 0; i < opened_count; ++i) free(opened[i].source);
     puts("All independently routed playback outputs retain full identity, isolated PCM and safe teardown.");

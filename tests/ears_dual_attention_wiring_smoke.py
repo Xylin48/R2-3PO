@@ -64,6 +64,15 @@ for api in ("r2_ears_start_for_watch", "r2_ears_start_desktop_for_watch",
 assert "r2_ears_watch_input_snapshot(desktop, input)" in watch
 assert "known && (!wanted || strcmp(input->source, wanted))" in watch
 assert "audio_known &&" in watch and "r2_audio_discovery_free(&audio)" in watch
-assert "audio_origin=desktop_playback" in core
+source_start = core.index("static void r2_publish_turn_audio_source(")
+source_end = core.index("static char *r2_talk_impl(", source_start)
+sources = core[source_start:source_end]
+assert "audio_origin=%s" in sources and "audio_route=%s" in sources
+assert '"desktop_playback", "primary_desktop"' in sources
+assert '"desktop_playback", "additional_desktop"' in sources
+assert '"live_recording"' in sources and '"primary_ears"' in sources
+assert "r2_log_conversation_source(turn_event_id" in sources
+assert "sources->extra_desktop" in sources
+assert "transcription and interpretation are not established" in sources
 assert "No automatic transcription or semantic interpretation." in core
 print("Independent desktop/mic PCM workers, deliberate source-specific listening and persistence links passed.")
