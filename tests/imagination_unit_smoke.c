@@ -227,6 +227,22 @@ int main(void)
     review_calls = 0;
     review_note_length = 0;
     model_context = 8192;
+    shutdown_requested = 1;
+    trace = (char *)(uintptr_t)1;
+    result = r2_review_context("review", "already fits", 100, &trace);
+    if (!check(!result && !trace && review_calls == 0,
+               "shared review does not publish even fitting evidence after shutdown")) goto done;
+    shutdown_requested = 0;
+    stop_after_review = 1;
+    char single_fragment[501];
+    memset(single_fragment, 'e', sizeof(single_fragment) - 1);
+    single_fragment[sizeof(single_fragment) - 1] = '\0';
+    result = r2_review_context("review", single_fragment, 240, &trace);
+    if (!check(!result && !trace && review_calls == 1 && shutdown_requested,
+               "shutdown on final review cannot return otherwise fitting notes")) goto done;
+    stop_after_review = shutdown_requested = 0;
+    free(reviewed_original); reviewed_original = NULL; reviewed_length = 0;
+    review_calls = 0;
     if (!check(boundary_ok, "exact review framing preserves all evidence for a long cue")) goto done;
     result = r2_imagination_create("Imagine the first movie in the CRT room.");
     if (!check(result && strstr(result, "hypothetical imagination") && strstr(result, "remembered CRT room"),
@@ -255,7 +271,8 @@ int main(void)
     if (!check(r2_imagination_feedback(41, "incorrect", "The later observation contradicted it.") == 0,
                "incorrect imagination can be recorded without punishment")) goto done;
     if (!check(rewards_applied == 0, "incorrect imagination applies no reward or penalty")) goto done;
-    if (!check(r2_imagination_feedback(41, "accurate", "") == -2,
+    if (!check(r2_imagination_feedback(41, "accurate", "") == -2 &&
+               r2_imagination_feedback(41, "accurate", " \t\r\n") == -2,
                "positive feedback requires evidence notes")) goto done;
     if (!check(rewards_applied == 0, "missing evidence does not reward")) goto done;
     if (!check(r2_imagination_feedback(43, "accurate", "Wrong branch type.") == -1 &&

@@ -478,6 +478,12 @@ static int as_set_status(int64_t id, const char *status)
     if (id <= 0) return -1;
     pthread_mutex_lock(&as_lock);
     if (!as_ready || !as_db) { pthread_mutex_unlock(&as_lock); return -1; }
+    /* Verify the stored state inside the same write transaction. A trigger
+       may accept UPDATE yet restore the old status before returning DONE. */
+    if (!sqlite3_get_autocommit(as_db) || as_exec("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "UPDATE r2_alternate_self_branches SET status=?,updated_utc=CURRENT_TIMESTAMP "
@@ -485,15 +491,31 @@ static int as_set_status(int64_t id, const char *status)
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, status, -1, SQLITE_STATIC);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    int changed = rc == SQLITE_DONE ? sqlite3_changes(as_db) : 0;
+    int changed = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1;
     sqlite3_finalize(st);
+    if (changed) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(as_db,
+            "SELECT 1 FROM r2_alternate_self_branches WHERE id=? AND status=? COLLATE BINARY;",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, status, -1, SQLITE_STATIC);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        changed = rc == SQLITE_ROW;
+        sqlite3_finalize(st);
+    }
+    if (!changed || as_exec("COMMIT;") != 0) {
+        if (!sqlite3_get_autocommit(as_db)) (void)as_exec("ROLLBACK;");
+        changed = 0;
+    }
     pthread_mutex_unlock(&as_lock);
     if (changed) {
         char details[256];
         snprintf(details,sizeof(details),"Branch ID: %lld; new status: %s. The branch remains hypothetical.",
                  (long long)id,status);
-        r2_log_event(R2_LOG_HYPOTHETICAL,"alternate_self_branch_status",
-                     "Alternate-Self branch status changed.",details,"AlternateSelf.c");
+        if (r2_log_event(R2_LOG_HYPOTHETICAL,"alternate_self_branch_status",
+                         "Alternate-Self branch status changed.",details,"AlternateSelf.c") <= 0)
+            fprintf(stderr, "[R2 Alternate-Self Lab] Branch status committed but its Life Log notice could not be recorded.\n");
         return 0;
     }
     return -1;
@@ -511,6 +533,10 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
         return -1;
     }
 
+    if (!sqlite3_get_autocommit(as_db) || as_exec("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_event_links"
@@ -526,8 +552,27 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, branch_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 6, event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    if (st) sqlite3_finalize(st);
-    int linked = rc == SQLITE_DONE && sqlite3_changes(as_db) > 0;
+    int linked = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1;
+    sqlite3_finalize(st);
+    if (linked) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(as_db,
+            "SELECT 1 FROM r2_alternate_self_event_links "
+            "WHERE branch_id=? AND event_id=? AND relation=? COLLATE BINARY "
+            "AND details IS ? COLLATE BINARY;",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, branch_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, relation, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = details ? sqlite3_bind_text(st, 4, details, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        linked = rc == SQLITE_ROW;
+        sqlite3_finalize(st);
+    }
+    if (!linked || as_exec("COMMIT;") != 0) {
+        if (!sqlite3_get_autocommit(as_db)) (void)as_exec("ROLLBACK;");
+        linked = 0;
+    }
     pthread_mutex_unlock(&as_lock);
     return linked ? 0 : -1;
 }
@@ -535,7 +580,7 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
 int r2_altself_discard(int64_t id) { return as_set_status(id,"discarded"); }
 int r2_altself_retain_hypothesis(int64_t id) { return as_set_status(id,"retained_hypothesis"); }
 
-static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
+static char *as_query(const char *sql, int64_t first, int64_t second, int required_rows)
 {
     pthread_mutex_lock(&as_lock);
     if (!as_ready || !as_db) { pthread_mutex_unlock(&as_lock); return NULL; }
@@ -547,7 +592,7 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
     int bind_rc = SQLITE_OK;
     if (param_count >= 1) bind_rc = sqlite3_bind_int64(st, 1, first);
     if (bind_rc == SQLITE_OK && param_count >= 2) bind_rc = sqlite3_bind_int64(st, 2, second);
-    if (bind_rc == SQLITE_OK && param_count >= 3) bind_rc = sqlite3_bind_int(st, 3, limit);
+    if (param_count > 2) bind_rc = SQLITE_MISUSE;
     if (bind_rc != SQLITE_OK) {
         sqlite3_finalize(st);
         pthread_mutex_unlock(&as_lock);
@@ -561,12 +606,14 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
         return NULL;
     }
     out[0] = '\0';
-    int rc;
+    int rc, rows = 0;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        const char *fields[10] = {0};
+        const char *fields[12] = {0};
         const int count = sqlite3_column_count(st);
+        if (count != 12) goto failed;
+        ++rows;
         for (int i = 1; i < count; ++i) {
-            if (i == 7) continue; /* evidence event ID */
+            if (i == 7 || i == 11) continue; /* evidence and Life Log IDs */
             fields[i] = (const char *)sqlite3_column_text(st, i);
             if ((!fields[i] && sqlite3_column_type(st, i) != SQLITE_NULL) ||
                 (fields[i] && strlen(fields[i]) != (size_t)sqlite3_column_bytes(st, i)))
@@ -576,12 +623,14 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
         int n = asprintf(&row,
             "Branch #%lld [%s] %s\n  Scenario: %s\n  Assumptions: %s\n"
             "  Predicted outcome: %s\n  Tentative conclusion: %s\n"
-            "  Evidence event ID: %lld\n  Created UTC: %s\n%s%s%s\n",
+            "  Evidence event ID: %lld\n  Created UTC: %s\n"
+            "  Branch kind: %s (hypothetical only)\n  Life Log event ID: %lld\n%s%s%s\n",
             (long long)sqlite3_column_int64(st, 0),
             fields[6] ? fields[6] : "unknown", fields[1] ? fields[1] : "unnamed",
             fields[2] ? fields[2] : "", fields[3] ? fields[3] : "(none)",
             fields[4] ? fields[4] : "(not specified)", fields[5] ? fields[5] : "(not specified)",
             (long long)sqlite3_column_int64(st, 7), fields[8] ? fields[8] : "unknown",
+            fields[10] ? fields[10] : "unknown", (long long)sqlite3_column_int64(st, 11),
             fields[9] ? "  Archived imagination context (input evidence):\n" : "",
             fields[9] ? fields[9] : "", fields[9] ? "\n" : "");
         if (n < 0) goto failed;
@@ -603,7 +652,7 @@ static char *as_query(const char *sql, int64_t first, int64_t second, int limit)
         used += (size_t)n;
         free(row);
     }
-    if (rc != SQLITE_DONE) goto failed;
+    if (rc != SQLITE_DONE || (required_rows && rows != required_rows)) goto failed;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
     if (!used) strcpy(out, "No Alternate-Self branches found.\n");
@@ -620,16 +669,18 @@ char *r2_altself_list(int limit)
 {
     if (limit < 1) limit = 25;
     if (limit > 200) limit = 200;
-    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc "
+    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc,NULL,branch_kind,log_event_id "
                     "FROM r2_alternate_self_branches ORDER BY id DESC LIMIT ?;",limit,0,0);
 }
 char *r2_altself_show(int64_t id)
 {
-    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc,imagination_context "
+    if (id <= 0) return NULL;
+    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc,imagination_context,branch_kind,log_event_id "
                     "FROM r2_alternate_self_branches WHERE id=?;",id,0,0);
 }
 char *r2_altself_compare(int64_t a, int64_t b)
 {
-    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc "
-                    "FROM r2_alternate_self_branches WHERE id IN (?,?) ORDER BY id;",a,b,0);
+    if (a <= 0 || b <= 0 || a == b) return NULL;
+    return as_query("SELECT id,name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,created_utc,NULL,branch_kind,log_event_id "
+                    "FROM r2_alternate_self_branches WHERE id IN (?,?) ORDER BY id;",a,b,2);
 }

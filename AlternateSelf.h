@@ -33,6 +33,7 @@ int r2_altself_link_event(int64_t branch_id, int64_t event_id,
 int r2_altself_retain_hypothesis(int64_t branch_id);
 char *r2_altself_list(int limit);
 char *r2_altself_show(int64_t branch_id);
+/* Compare two distinct existing branches; NULL if either is missing. */
 char *r2_altself_compare(int64_t first_id, int64_t second_id);
 
 #ifdef __cplusplus

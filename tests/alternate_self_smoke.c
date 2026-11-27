@@ -246,6 +246,45 @@ int main(void)
                "compare arbitrary branches")) goto done;
     free(view); view = NULL;
 
+    if (!check(r2_altself_compare(first, INT64_MAX) == NULL &&
+               r2_altself_compare(INT64_MAX, second) == NULL &&
+               r2_altself_compare(first, first) == NULL,
+               "comparison requires both distinct branch IDs")) goto done;
+    fixture = NULL;
+    if (!check(sqlite3_open(database, &fixture) == SQLITE_OK, "open status rollback fixture")) goto done;
+    int reverted_status = sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_status AFTER UPDATE OF status ON r2_alternate_self_branches "
+        "WHEN NEW.status='retained_hypothesis' BEGIN "
+        "UPDATE r2_alternate_self_branches SET status='discarded' WHERE id=NEW.id; END;",
+        NULL, NULL, NULL);
+    if (!check(reverted_status == SQLITE_OK, "install status rewrite fixture")) {
+        sqlite3_close(fixture); goto done;
+    }
+    int status_result = r2_altself_retain_hypothesis(first);
+    reverted_status = sqlite3_exec(fixture, "DROP TRIGGER rewrite_status;", NULL, NULL, NULL);
+    sqlite3_close(fixture);
+    view = r2_altself_show(first);
+    if (!check(status_result < 0 && reverted_status == SQLITE_OK &&
+               view && strstr(view, "[active]") && !strstr(view, "[discarded]"),
+               "rewritten status rolls back instead of acknowledging a different choice")) goto done;
+    free(view); view = NULL;
+    fixture = NULL;
+    if (!check(sqlite3_open(database, &fixture) == SQLITE_OK, "open link rollback fixture")) goto done;
+    int rewritten_link = sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_feedback AFTER INSERT ON r2_alternate_self_event_links "
+        "WHEN NEW.relation='feedback_test' BEGIN "
+        "UPDATE r2_alternate_self_event_links SET details='different' "
+        "WHERE branch_id=NEW.branch_id AND event_id=NEW.event_id AND relation=NEW.relation; END;",
+        NULL, NULL, NULL);
+    if (!check(rewritten_link == SQLITE_OK, "install feedback rewrite fixture")) {
+        sqlite3_close(fixture); goto done;
+    }
+    int link_result = r2_altself_link_event(first, evidence_id, "feedback_test", "original evidence");
+    rewritten_link = sqlite3_exec(fixture, "DROP TRIGGER rewrite_feedback;", NULL, NULL, NULL);
+    sqlite3_close(fixture);
+    if (!check(link_result < 0 && rewritten_link == SQLITE_OK &&
+               r2_altself_link_event(first, evidence_id, "feedback_test", "original evidence") == 0,
+               "rewritten evidence link rolls back and does not block the exact original link")) goto done;
     if (!check(r2_altself_retain_hypothesis(first) == 0,
                "retain branch as a hypothesis")) goto done;
     view = r2_altself_show(first);
@@ -339,11 +378,16 @@ int main(void)
     r2_altself_shutdown();
     int reopened = r2_altself_init() == 0;
     view = reopened && imagined > 0 ? r2_altself_show(imagined) : NULL;
-    int archived = view && strstr(view, archive);
+    int archived = view && strstr(view, archive) &&
+        strstr(view, "Branch kind: imagination (hypothetical only)") &&
+        strstr(view, "Life Log event ID: ");
     free(view); view = NULL;
     if (reopened) view = r2_altself_list(20);
     int listed = view && large > 0 && strstr(view, archive) &&
-        strstr(view, "Legacy branch") && !strstr(view, "Archived imagination context");
+        strstr(view, "Legacy branch") &&
+        strstr(view, "Branch kind: counterfactual (hypothetical only)") &&
+        strstr(view, "Branch kind: imagination (hypothetical only)") &&
+        !strstr(view, "Archived imagination context");
     free(archive);
     if (!check(archived && listed && r2_altself_is_imagination(imagined) == 1 &&
                r2_altself_is_imagination(ordinary) == 0,

@@ -13,7 +13,8 @@ void r2_imagination_shutdown(void);
 
 /* Review complete context until the returned notes fit max_note_bytes.
  * Both outputs are caller-owned. processing_notes contains every review pass.
- * Context that already fits is copied without inference. Failure returns NULL. */
+ * Context that already fits is copied without inference. Failure or shutdown
+ * returns NULL and no processing notes. */
 char *r2_review_context(const char *request, const char *context,
                          size_t max_note_bytes, char **processing_notes);
 
