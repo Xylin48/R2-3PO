@@ -15584,12 +15584,14 @@ static void *post_turn_scheduler(void *opaque)
     return NULL;
 }
 
-/* Takes ownership of the recorded result, when a tool was run. */
+/* Takes ownership of an owned recorded result. A result shared with the
+   returned reply remains borrowed until a complete worker copy is allocated. */
 static void schedule_post_turn_processing(const char *user, const char *reply,
-                                          int64_t event_id, char *tool_result)
+                                          int64_t event_id, char *tool_result,
+                                          int borrowed_result)
 {
     if (!user || !reply || event_id <= 0 || shutting_down) {
-        free(tool_result);
+        if (!borrowed_result) free(tool_result);
         return;
     }
     /* The exchange is staged in SQLite before this call. Keep one live
@@ -15598,7 +15600,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     if (post_turn_active || atomic_load(&post_turn_replay_requested)) {
         atomic_store(&post_turn_replay_requested, 1);
         pthread_mutex_unlock(&post_turn_lock);
-        free(tool_result);
+        if (!borrowed_result) free(tool_result);
         return;
     }
     post_turn_active++;
@@ -15606,7 +15608,7 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
 
     R2PostTurnJob *job = calloc(1, sizeof(*job));
     if (!job) {
-        free(tool_result);
+        if (!borrowed_result) free(tool_result);
         finish_post_turn_worker();
         atomic_store(&post_turn_replay_requested, 1);
         log_post_turn_start_failure("job allocation", event_id);
@@ -15617,8 +15619,8 @@ static void schedule_post_turn_processing(const char *user, const char *reply,
     job->event_id = event_id;
     job->self_report_pending = *reply != '\0';
     job->memory_pending = 1;
-    job->tool_result = tool_result;
-    if (!job->user || !job->reply) {
+    job->tool_result = borrowed_result && tool_result ? strdup(tool_result) : tool_result;
+    if (!job->user || !job->reply || (tool_result && !job->tool_result)) {
         free(job->user); free(job->reply); free(job->tool_result); free(job);
         finish_post_turn_worker();
         atomic_store(&post_turn_replay_requested, 1);
@@ -16173,7 +16175,7 @@ finalize_reply:
     /* Deliver the generated answer immediately; model-assisted bookkeeping
        continues independently and yields if a new foreground turn arrives. */
     schedule_post_turn_processing(message, generated_reply ? reply : "", turn_event_id,
-                                  tool_evidence == reply ? strdup(reply) : tool_evidence);
+                                  tool_evidence, tool_evidence && tool_evidence == reply);
 
     if (turn_event_id <= 0) {
         char *with_storage_status = NULL;

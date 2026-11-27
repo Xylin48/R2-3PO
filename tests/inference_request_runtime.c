@@ -35,11 +35,17 @@ static int foreground_after_response;
 static int completed_turn_after_response;
 static const char retry_copy_user[] = "Replay this evidence after an allocation failure.";
 static atomic_int fail_replay_copy = ATOMIC_VAR_INIT(0);
+static char borrowed_tool_fixture[] = "Exact borrowed action result fixture.";
+static atomic_int fail_borrowed_tool_copy = ATOMIC_VAR_INIT(0);
 
 char *__real_strdup(const char *value);
 char *__wrap_strdup(const char *value)
 {
     if (!strcmp(value, retry_copy_user) && atomic_exchange(&fail_replay_copy, 0)) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (!strcmp(value, borrowed_tool_fixture) && atomic_exchange(&fail_borrowed_tool_copy, 0)) {
         errno = ENOMEM;
         return NULL;
     }
@@ -1139,7 +1145,7 @@ static void check_post_turn_retry(void)
         int64_t event = r2_log_conversation_turn_for_learning(
             burst_user, burst_reply, NULL, 0, NULL, 0, "Recorded result.");
         assert(event > source && r2_log_ack_self_report(event) == 0);
-        schedule_post_turn_processing(burst_user, burst_reply, event, strdup("Recorded result."));
+        schedule_post_turn_processing(burst_user, burst_reply, event, strdup("Recorded result."), 0);
     }
     assert(post_turn_active == 1 && atomic_load(&post_turn_replay_requested));
     assert(perform_count == before);
@@ -1157,6 +1163,31 @@ static void check_post_turn_retry(void)
     assert(!atomic_load(&post_turn_replay_requested) && burst_learning_requests == 3);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
                                 "WHERE user_text='Queued during active post-turn processing.'") == 0);
+
+    /* A returned receipt can alias the original tool evidence when its
+       formatting allocation fails. A failed copy must not consume the
+       staged row by learning from a request without the action result. */
+    const char *borrowed_user = "Preserve the borrowed tool result.";
+    int64_t borrowed_event = r2_log_conversation_turn_with_fallback(
+        borrowed_user, borrowed_tool_fixture, NULL, 0, NULL, 0, borrowed_tool_fixture);
+    assert(borrowed_event > source);
+    atomic_store(&fail_borrowed_tool_copy, 1);
+    before = perform_count;
+    schedule_post_turn_processing(borrowed_user, "", borrowed_event, borrowed_tool_fixture, 1);
+    assert(post_turn_active == 0 && atomic_load(&post_turn_replay_requested));
+    assert(perform_count == before && !atomic_load(&fail_borrowed_tool_copy));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Preserve the borrowed tool result.' "
+                                "AND tool_result='Exact borrowed action result fixture.'") == 1);
+    set_response("NONE", "stop", 1);
+    resume_post_turn_learning();
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(perform_count == before + 1 && !atomic_load(&post_turn_replay_requested));
+    assert(captured && strstr(json_object_to_json_string(captured), borrowed_tool_fixture));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
+                                "WHERE user_text='Preserve the borrowed tool result.'") == 0);
 
     int64_t orphan = r2_log_event(R2_LOG_MEMORY, "legacy_queue_fixture", "Legacy queue fixture.", NULL, "fixture");
     assert(orphan > source);
