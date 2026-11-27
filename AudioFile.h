@@ -11,6 +11,8 @@ typedef struct R2AudioFile R2AudioFile;
 
 R2AudioFile *r2_audio_file_open(const char *path, uint32_t sample_rate,
                                 unsigned channels);
+/* Deliver only complete sample frames. A malformed trailing frame reports
+ * persistent EPROTO after all complete preceding frames have been delivered. */
 ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes);
 void r2_audio_file_cancel(R2AudioFile *file);
 void r2_audio_file_close(R2AudioFile *file);
