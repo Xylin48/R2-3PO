@@ -399,6 +399,14 @@ int main(void)
     read_mode = 1; encoded = 999; assert(!read_file(probe_path, &encoded) && encoded == 0);
     read_mode = 2; assert(!read_file(probe_path, &encoded));
     fail_close = 1; read_fd = -1; assert(!read_file(probe_path, &encoded)); fail_close = 0;
+    char nonregular[PATH_MAX];
+    assert(snprintf(nonregular, sizeof(nonregular), "%s/probe-fifo", R2_HOME) < (int)sizeof(nonregular));
+    assert(mkfifo(nonregular, 0600) == 0);
+    assert(!read_file(nonregular, &encoded) && encoded == 0);
+    assert(unlink(nonregular) == 0);
+    assert(symlink(probe_path, nonregular) == 0);
+    assert(!read_file(nonregular, &encoded) && encoded == 0);
+    assert(unlink(nonregular) == 0);
 
     response("{\"description\":\"one actual observation\",\"focus\":null}", "stop");
     int before_perform = perform_count, before_gate = gate_begin_count;

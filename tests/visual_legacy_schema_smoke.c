@@ -101,6 +101,16 @@ int main(void)
         -1, &migration, NULL) == SQLITE_ERROR);
     sqlite3_finalize(migration);
     assert(sqlite3_exec(legacy_db, "DROP TRIGGER deny_backfill", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(legacy_db, "CREATE TRIGGER ignore_backfill "
+        "BEFORE UPDATE ON r2_visual_experiences BEGIN SELECT RAISE(IGNORE); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_close(legacy_db) == SQLITE_OK);
+    assert(r2_visual_init(path, library) == -1 && !r2_visual_is_initialized());
+    assert(sqlite3_open(path, &legacy_db) == SQLITE_OK);
+    assert(visual_column_exists(legacy_db, "created_utc") == 0);
+    assert(visual_column_exists(NULL, "created_at") == -1);
+    assert(visual_column_exists(legacy_db, "created_at") == 1);
+    assert(sqlite3_exec(legacy_db, "DROP TRIGGER ignore_backfill", NULL, NULL, NULL) == SQLITE_OK);
     assert(sqlite3_close(legacy_db) == SQLITE_OK);
     assert(r2_visual_init(path, path) == -1 && !r2_visual_is_initialized());
     assert(r2_visual_init(path, library) == 0);

@@ -430,7 +430,7 @@ static unsigned char *read_file(const char *path, size_t *length)
 {
     if (!path || !length) return NULL;
     *length = 0;
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return NULL;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
@@ -497,7 +497,10 @@ static int visual_wait_encoder(pid_t pid)
     for (;;) {
         pid_t rc = waitpid(pid, &status, WNOHANG);
         if (rc == pid) return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
-        if (rc < 0 && errno != EINTR) return -1;
+        if (rc < 0 && errno != EINTR) {
+            if (errno == ECHILD) return -1;
+            goto terminate;
+        }
         if (r2_ollama_vision_request_should_abort()) { errno = ECANCELED; goto terminate; }
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) goto terminate;
         time_t elapsed = now.tv_sec - start.tv_sec;
@@ -835,23 +838,25 @@ static int visual_column_exists(sqlite3 *db, const char *column)
 {
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(db, "PRAGMA table_info(r2_visual_experiences)",
-                           -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    if (!db || !column) return -1;
+    int rc = sqlite3_prepare_v2(db, "PRAGMA table_info(r2_visual_experiences)",
+                                -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) {
-                found = 1;
-                break;
-            }
+            if (!name) { rc = SQLITE_ERROR; break; }
+            if (!strcasecmp((const char *)name, column)) found = 1;
         }
     }
-    if (st) sqlite3_finalize(st);
-    return found;
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? found : -1;
 }
 
 static int visual_ensure_column(const char *column, const char *definition)
 {
-    if (visual_column_exists(visual_db, column)) return SQLITE_OK;
+    int exists = visual_column_exists(visual_db, column);
+    if (exists < 0) return SQLITE_ERROR;
+    if (exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
                      "ALTER TABLE r2_visual_experiences ADD COLUMN %s %s;",
@@ -862,14 +867,27 @@ static int visual_ensure_column(const char *column, const char *definition)
 
 static int visual_backfill(const char *target, const char *source)
 {
-    if (!visual_column_exists(visual_db, source)) return SQLITE_OK;
+    int exists = visual_column_exists(visual_db, source);
+    if (exists < 0) return SQLITE_ERROR;
+    if (!exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
         "UPDATE r2_visual_experiences SET %s=%s WHERE (%s IS NULL OR %s='') "
         "AND %s IS NOT NULL AND %s<>'';",
         target, source, target, target, source, source);
     if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_TOOBIG;
-    return sqlite3_exec(visual_db, sql, NULL, NULL, NULL);
+    int rc = sqlite3_exec(visual_db, sql, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+    n = snprintf(sql, sizeof(sql),
+        "SELECT 1 FROM r2_visual_experiences WHERE (%s IS NULL OR %s='') "
+        "AND %s IS NOT NULL AND %s<>'' LIMIT 1;",
+        target, target, source, source);
+    if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_TOOBIG;
+    sqlite3_stmt *st = NULL;
+    rc = sqlite3_prepare_v2(visual_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc == SQLITE_ROW ? SQLITE_CONSTRAINT : rc;
 }
 
 /* Older pending tables remain writable and retain every original payload. */
@@ -882,7 +900,8 @@ static int visual_migrate_pending_schema(void)
     if (rc == SQLITE_OK) {
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *name = (const char *)sqlite3_column_text(st, 1);
-            if (name && !strcasecmp(name, "withdrawn")) found = 1;
+            if (!name) { rc = SQLITE_ERROR; break; }
+            if (!strcasecmp(name, "withdrawn")) found = 1;
         }
     }
     sqlite3_finalize(st);
@@ -977,10 +996,12 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
     else ADD_NULL("life_log_event_id");
     if (archive_key) ADD_TEXT("life_log_archive_key", archive_key);
 
-    if (visual_column_exists(db, "created_at")) ADD_TEXT("created_at", created);
-    if (visual_column_exists(db, "timestamp")) ADD_TEXT("timestamp", created);
-    if (visual_column_exists(db, "file_path")) ADD_TEXT("file_path", image_path);
-    if (visual_column_exists(db, "path")) ADD_TEXT("path", image_path);
+    const char *aliases[] = {"created_at", "timestamp", "file_path", "path"};
+    for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
+        int exists = visual_column_exists(db, aliases[i]);
+        if (exists < 0) return SQLITE_ERROR;
+        if (exists) ADD_TEXT(aliases[i], i < 2 ? created : image_path);
+    }
 #undef ADD_TEXT
 #undef ADD_INTEGER
 #undef ADD_NULL
@@ -1052,7 +1073,15 @@ static int visual_drop_pending(sqlite3 *db, const char *path, int withdrawn)
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
-    return rc;
+    if (rc != SQLITE_DONE) return rc;
+    st = NULL;
+    rc = sqlite3_prepare_v2(db,
+        "SELECT 1 FROM r2_visual_pending_archives WHERE image_path=? LIMIT 1",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? SQLITE_CONSTRAINT : rc;
 }
 
 static int visual_finish_transaction(sqlite3 *db, int rc)
@@ -1127,6 +1156,20 @@ static int visual_withdraw_archive(sqlite3 *db, const char *path)
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "SELECT withdrawn FROM r2_visual_pending_archives WHERE image_path=?",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW && sqlite3_column_type(st, 0) == SQLITE_INTEGER &&
+            sqlite3_column_int(st, 0) == 1)
+            rc = sqlite3_step(st);
+        else if (rc == SQLITE_ROW || rc == SQLITE_DONE) rc = SQLITE_CONSTRAINT;
+        if (rc == SQLITE_ROW) rc = SQLITE_CONSTRAINT;
+        sqlite3_finalize(st);
+    }
     rc = visual_finish_transaction(db, rc);
     if (rc != SQLITE_DONE) return rc;
 
