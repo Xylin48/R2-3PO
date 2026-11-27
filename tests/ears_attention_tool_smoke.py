@@ -40,13 +40,14 @@ assert "r2_ears_status_desktop()" in core
 assert "That source was left untouched" in ears_helper
 assert "Do not infer what was said." in ears_helper
 assert "r2_process_ears_listen_request(request)" in tool
-assert "r2_process_ears_listen_request(ears_request)" in core
+assert "r2_process_ears_listen_request(request)" in core
 reflection = core[core.index("static void *autonomous_thinking(void *arg)"):
                   core.index("   MEMORY DECISION")]
 assert "r2_diary_build_reflection_context(10)" in reflection
 assert "prompt, review_task, ctx, followup, &followup_archive" in reflection
 assert "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:" in core
-assert 'extract_marker(reflection, "[EARS_SOURCES]"' in core
+assert 'extract_marker(reflection, marker, "\\n", &position)' in reflection
+assert 'else if (!strcmp(marker, "[EARS_SOURCES]"))' in reflection
 assert 'RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:' in core
 assert 'action_result = r2_ears_desktop_available_sources();' in core
 assert "reflection_repeated_hearing_request" in core

@@ -1568,6 +1568,41 @@ static void check_reflection_waits_for_existing_request(void)
     atomic_store(&diary_running, old_diary);
 }
 
+static void check_reflection_publication_claim(void)
+{
+    int previous_running = atomic_exchange(&diary_running, 1);
+    uint_fast64_t previous_activity = atomic_exchange(&last_conversation_activity_ms, 123);
+    assert(!shutting_down);
+    assert(r2_reflection_try_claim(123));
+    assert(pthread_mutex_trylock(&conversation_turn_lock) == EBUSY);
+    pthread_mutex_unlock(&conversation_turn_lock);
+    pthread_mutex_lock(&conversation_turn_lock);
+    assert(!r2_reflection_try_claim(123));
+    pthread_mutex_unlock(&conversation_turn_lock);
+    assert(!r2_reflection_try_claim(122));
+    atomic_store(&foreground_conversation_waiting, 1);
+    assert(!r2_reflection_try_claim(123));
+    atomic_store(&foreground_conversation_waiting, 0);
+    atomic_store(&foreground_ollama_waiting, 1);
+    assert(!r2_reflection_try_claim(123));
+    atomic_store(&foreground_ollama_waiting, 0);
+    atomic_store(&diary_running, 0);
+    assert(!r2_reflection_try_claim(123));
+    atomic_store(&diary_running, 1);
+    atomic_store(&shutting_down, 1);
+    assert(!r2_reflection_try_claim(123));
+    atomic_store(&shutting_down, 0);
+    assert(r2_reflection_try_claim(123));
+    pthread_mutex_unlock(&conversation_turn_lock);
+    assert(!r2_reflection_sensory_marker(NULL));
+    assert(!r2_reflection_sensory_marker("I considered listening to a tape."));
+    assert(!r2_reflection_sensory_marker("```text\n[EARS_LISTEN] live|5\n```"));
+    assert(!strcmp(r2_reflection_sensory_marker("[EARS_SOURCES]\n"), "[EARS_SOURCES]"));
+    assert(!strcmp(r2_reflection_sensory_marker("[EARS_LISTEN] live|5\n[SENSE] eyes|close"), "[SENSE]"));
+    atomic_store(&last_conversation_activity_ms, previous_activity);
+    atomic_store(&diary_running, previous_running);
+}
+
 static void check_reflection_stop_and_long_visual_query(void)
 {
     ollama_reflection_worker = 1;
@@ -3163,6 +3198,7 @@ int main(void)
     check_history_slots_count_only_complete_exchanges();
     check_malformed_conversation_input();
     check_reflection_waits_for_existing_request();
+    check_reflection_publication_claim();
     check_reflection_stop_and_long_visual_query();
     check_context_and_isolated_inputs();
     check_foreground_context_review();

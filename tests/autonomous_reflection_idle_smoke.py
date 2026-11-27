@@ -47,6 +47,13 @@ if "for (\n            int i = 0;\n            i < THINK_INTERVAL" in worker:
     raise SystemExit("Reflection still uses a fixed 900-second sleep that ignores recent conversation.")
 if worker.count("reflection_activity_ms") < 3:
     raise SystemExit("Reflection must compare the activity snapshot before and after inference to reject stale context.")
+claim = core[core.index("static int r2_reflection_try_claim("):start]
+assert "pthread_mutex_trylock(&conversation_turn_lock)" in claim
+assert "atomic_load(&last_conversation_activity_ms) != activity_ms" in claim
+assert worker.count("r2_reflection_try_claim(reflection_activity_ms)") == 2
+commit = worker.index("int diary_saved = r2_store_reflection(")
+assert worker.rfind("r2_reflection_try_claim(reflection_activity_ms)", 0, commit) >= 0
+assert worker.index("pthread_mutex_unlock(&conversation_turn_lock)", commit) < worker.index("publish_structured_self_report", commit)
 if "THINK_INTERVAL 900" not in core:
     raise SystemExit("The established 900-second idle interval was changed.")
 

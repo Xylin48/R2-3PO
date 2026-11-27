@@ -10901,6 +10901,36 @@ static void record_conversation_activity(uint_fast64_t activity_ms)
     }
 }
 
+/* Foreground intent is announced before acquiring the turn lock. Claim
+ * that same lock for a reflection's actual sensory decision or diary
+ * commit, then recheck the snapshot. Never hold it during reflection
+ * generation or subsequent model-assisted bookkeeping. */
+static int r2_reflection_try_claim(uint64_t activity_ms)
+{
+    if (pthread_mutex_trylock(&conversation_turn_lock) != 0) return 0;
+    if (shutting_down || !atomic_load(&diary_running) ||
+        atomic_load(&last_conversation_activity_ms) != activity_ms ||
+        atomic_load(&foreground_conversation_waiting) > 0 ||
+        atomic_load(&foreground_ollama_waiting) > 0) {
+        pthread_mutex_unlock(&conversation_turn_lock);
+        return 0;
+    }
+    return 1;
+}
+
+/* Choose the same marker priority as the existing reflection dispatcher.
+ * Classifying the marker independently of allocating its argument ensures
+ * that allocation failure cannot turn a tool request into diary prose. */
+static const char *r2_reflection_sensory_marker(const char *reflection)
+{
+    static const char *const markers[] = {
+        "[SENSE]", "[MEDIA_FOCUS]", "[MEDIA_SEE]", "[EARS_LISTEN]", "[EARS_SOURCES]"
+    };
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i)
+        if (find_control_marker_line(reflection, markers[i], 0)) return markers[i];
+    return NULL;
+}
+
 static void *autonomous_thinking(void *arg)
 {
     (void)arg;
@@ -11039,75 +11069,64 @@ static void *autonomous_thinking(void *arg)
         /* Autonomous reflection can deliberately use the SAME sensor decision,
            media attention or listening tools as the conversation brain. Raw
            variation alone never forces a visual description or transcription. */
-        if (reflection && !shutting_down && atomic_load(&diary_running) &&
-            atomic_load(&last_conversation_activity_ms) == reflection_activity_ms &&
-            atomic_load(&foreground_conversation_waiting) == 0 &&
-            atomic_load(&foreground_ollama_waiting) == 0) {
-            size_t sense_pos = 0, focus_pos = 0, media_pos = 0, ears_pos = 0, sources_pos = 0;
-            char *sense_request = extract_marker(reflection, "[SENSE]", "\n", &sense_pos);
-            char *focus_request = extract_marker(reflection, "[MEDIA_FOCUS]", "\n", &focus_pos);
-            char *media_request = extract_marker(reflection, "[MEDIA_SEE]", "\n", &media_pos);
-            char *ears_request = extract_marker(reflection, "[EARS_LISTEN]", "\n", &ears_pos);
-            char *sources_request = extract_marker(reflection, "[EARS_SOURCES]", "\n", &sources_pos);
+        const char *marker = r2_reflection_sensory_marker(reflection);
+        if (marker) {
             const char *heading = NULL;
             char *action_result = NULL;
-            if (sense_request) {
-                heading = "RESULT OF YOUR DELIBERATE SENSE DECISION:";
-                action_result = r2_process_sense_request(trim(sense_request));
-            } else if (focus_request) {
-                heading = "RESULT OF YOUR CHOSEN MEDIA ATTENTION:";
-                action_result = r2_process_media_focus_request(trim(focus_request));
-            } else if (media_request) {
-                heading = "RESULT OF YOUR DELIBERATE MEDIA OBSERVATION:";
-                action_result = r2_process_media_see_request(trim(media_request));
-            } else if (ears_request) {
-                heading = "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:";
-                R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
-                r2_audio_turn_evidence = &speech_evidence;
-                action_result = r2_process_ears_listen_request(ears_request);
-                r2_audio_turn_evidence = previous_evidence;
-            } else if (sources_request) {
-                heading = "RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:";
-                action_result = r2_ears_desktop_available_sources();
-            }
-            free(sense_request);
-            free(focus_request);
-            free(media_request);
-            free(ears_request);
-            free(sources_request);
-            if (heading) {
-                char *followup = NULL;
-                if (action_result &&
-                    asprintf(&followup,
-                        "INITIAL DRAFT (not final, might contain a sensory decision):\n%s\n\n"
-                        "%s\n%s\n\n"
-                        "Write a final private diary reflection about this real outcome. "
-                        "Do not emit tool markers. Failed or unavailable observations are "
-                        "unknown; do not invent speech, images or action success.",
-                        reflection, heading, action_result) < 0)
-                    followup = NULL;
-                reflection_tool_result = action_result;
-                free(reflection);
-                reflection = NULL;
-                if (followup) {
-                    reflection = generate_with_private_evidence(
-                        prompt, review_task, ctx, followup, &followup_archive);
-                    free(followup);
-                    int repeated_hearing = find_control_marker_line(reflection, "[EARS_LISTEN]", 0) != NULL;
-                    if (reflection &&
-                        (repeated_hearing || find_control_marker_line(reflection, "[EARS_SOURCES]", 0) ||
-                         find_control_marker_line(reflection, "[MEDIA_FOCUS]", 0) ||
-                         find_control_marker_line(reflection, "[MEDIA_SEE]", 0) ||
-                         find_control_marker_line(reflection, "[SENSE]", 0))) {
-                        free(reflection);
-                        reflection = NULL;
-                        r2_log_event(R2_LOG_ERROR,
-                                     repeated_hearing ? "reflection_repeated_hearing_request" :
-                                         "reflection_repeated_sensory_request",
-                                     "Autonomous reflection emitted another sensory tool marker instead of a final diary entry.",
-                                     "No tool marker was written to the diary.",
-                                     "autonomous_thinking");
+            if (r2_reflection_try_claim(reflection_activity_ms)) {
+                size_t position = 0;
+                char *request = extract_marker(reflection, marker, "\n", &position);
+                if (request) {
+                    if (!strcmp(marker, "[SENSE]")) {
+                        heading = "RESULT OF YOUR DELIBERATE SENSE DECISION:";
+                        action_result = r2_process_sense_request(trim(request));
+                    } else if (!strcmp(marker, "[MEDIA_FOCUS]")) {
+                        heading = "RESULT OF YOUR CHOSEN MEDIA ATTENTION:";
+                        action_result = r2_process_media_focus_request(trim(request));
+                    } else if (!strcmp(marker, "[MEDIA_SEE]")) {
+                        heading = "RESULT OF YOUR DELIBERATE MEDIA OBSERVATION:";
+                        action_result = r2_process_media_see_request(trim(request));
+                    } else if (!strcmp(marker, "[EARS_LISTEN]")) {
+                        heading = "RESULT OF YOUR DELIBERATE EARS LISTEN ACTION:";
+                        R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
+                        r2_audio_turn_evidence = &speech_evidence;
+                        action_result = r2_process_ears_listen_request(request);
+                        r2_audio_turn_evidence = previous_evidence;
+                    } else if (!strcmp(marker, "[EARS_SOURCES]")) {
+                        heading = "RESULT OF YOUR READ-ONLY AUDIO SOURCE DISCOVERY:";
+                        action_result = r2_ears_desktop_available_sources();
                     }
+                }
+                free(request);
+                pthread_mutex_unlock(&conversation_turn_lock);
+            }
+            char *followup = NULL;
+            if (heading && action_result &&
+                asprintf(&followup,
+                    "INITIAL DRAFT (not final, might contain a sensory decision):\n%s\n\n"
+                    "%s\n%s\n\n"
+                    "Write a final private diary reflection about this real outcome. "
+                    "Do not emit tool markers. Failed or unavailable observations are "
+                    "unknown; do not invent speech, images or action success.",
+                    reflection, heading, action_result) < 0)
+                followup = NULL;
+            reflection_tool_result = action_result;
+            free(reflection);
+            reflection = NULL;
+            if (followup) {
+                reflection = generate_with_private_evidence(
+                    prompt, review_task, ctx, followup, &followup_archive);
+                free(followup);
+                const char *repeated = r2_reflection_sensory_marker(reflection);
+                if (repeated) {
+                    free(reflection);
+                    reflection = NULL;
+                    r2_log_event(R2_LOG_ERROR,
+                                 !strcmp(repeated, "[EARS_LISTEN]") ? "reflection_repeated_hearing_request" :
+                                     "reflection_repeated_sensory_request",
+                                 "Autonomous reflection emitted another sensory tool marker instead of a final diary entry.",
+                                 "No tool marker was written to the diary.",
+                                 "autonomous_thinking");
                 }
             }
         }
@@ -11148,10 +11167,23 @@ static void *autonomous_thinking(void *arg)
 
         int64_t reflection_event_id = 0;
         const int64_t reviews[] = {initial_archive, followup_archive};
-        /* Claim live publication before the event enters the replay queue. */
+        /* The earlier activity check is only a snapshot. Serialize the
+           actual diary commit against foreground turns, and reserve live
+           publication before the event enters the replay queue. */
+        if (!r2_reflection_try_claim(reflection_activity_ms)) {
+            free(reflection);
+            free(reflection_tool_result);
+            free(speech_evidence.events);
+            last_reflection_ms = r2_log_elapsed_ms();
+            r2_log_event(R2_LOG_SYSTEM, "reflection_discarded_after_user_activity",
+                         "Autonomous reflection publication yielded to foreground activity or shutdown.",
+                         NULL, "autonomous_thinking");
+            continue;
+        }
         begin_post_turn_work();
         int diary_saved = r2_store_reflection(reflection, &speech_evidence, reviews,
                                              reflection_tool_result, &reflection_event_id);
+        pthread_mutex_unlock(&conversation_turn_lock);
         if (diary_saved == 0 && reflection_event_id > 0) {
             publish_structured_self_report(reflection, reflection_event_id, NULL, 1);
             if (reflection_tool_result && *reflection_tool_result)
