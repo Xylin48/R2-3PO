@@ -318,6 +318,12 @@ int main(void)
         "import os, sys, time\n"
         "source = sys.argv[sys.argv.index('-i') + 1]\n"
         "value = {'fixture-camera': 17, 'fixture-media-a': 29, 'fixture-media-b': 41}[source]\n"
+        "if 'framecrc' in sys.argv:\n"
+        "    assert sys.argv[sys.argv.index('-map') + 1] == '0:v:0'\n"
+        "    assert sys.argv[sys.argv.index('-frames:v') + 1] == '1'\n"
+        "    print('#dimensions 0: 16x16')\n"
+        "    print('0, 0, 0, 1, 768, 0x00000000')\n"
+        "    sys.exit(0)\n"
         "while True:\n"
         "    os.write(1, bytes([value]) * (16 * 16 * 3))\n"
         "    time.sleep(.01)\n");
