@@ -834,8 +834,7 @@ static void shell_talk_inner(const char *message, int64_t speech_event_id)
             "[R2] Conversation backend returned no visible answer; the shell is showing a fallback instead of silently dropping the turn.\n"
         );
         printf(
-            "\nR2-3PO: I'm sorry—the conversation backend didn't return a usable reply. "
-            "Your message reached me, but I couldn't answer it this time. Please try again.\n\n"
+            "\n[R2 Runtime] Conversation backend returned no generated reply.\n\n"
         );
         free(reply);
         return;
@@ -843,9 +842,9 @@ static void shell_talk_inner(const char *message, int64_t speech_event_id)
 
     printf(
         "\n"
-        "R2-3PO: %s\n"
+        "%s %s\n"
         "\n",
-        reply
+        r2_talk_last_reply_generated() ? "R2-3PO:" : "[R2 Runtime]", reply
     );
 
     free(reply);

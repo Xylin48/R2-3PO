@@ -334,7 +334,7 @@ require(
 require(
     'if (!reply || !*reply)' in shell
     and "Conversation backend returned no visible answer" in shell
-    and "Your message reached me, but I couldn't answer it this time." in shell,
+    and "[R2 Runtime] Conversation backend returned no generated reply." in shell,
     "the shell prints a visible fallback if the conversation API returns an empty answer",
 )
 

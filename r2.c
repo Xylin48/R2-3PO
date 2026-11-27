@@ -776,6 +776,10 @@ typedef struct {
 } Message;
 
 
+/* A terminal result is exact runtime evidence even when the full
+ * assistant-request/tool-result pair could not be admitted. */
+enum { R2_INTERNAL_RECORDED_ACTION_RESULT = 3 };
+
 typedef struct {
     Message *items;
     size_t count;
@@ -4248,10 +4252,12 @@ static R2HistoryExchange r2_select_history_exchange(const Message *msgs,
         /* An unrecognized or incomplete handoff cannot safely be split.
            Preserve the original all-or-nothing exchange rule for it. */
         if (r2_is_internal_tool_result(m)) {
-            if (index == 0 || !r2_history_internal_request(&msgs[index - 1]))
+            if (m->internal_tool_result != R2_INTERNAL_RECORDED_ACTION_RESULT &&
+                (index == 0 || !r2_history_internal_request(&msgs[index - 1])))
                 pairs_verified = 0;
         } else if (r2_history_internal_request(m)) {
-            if (index + 1 >= end || !r2_is_internal_tool_result(&msgs[index + 1]))
+            if (index + 1 >= end || !r2_is_internal_tool_result(&msgs[index + 1]) ||
+                msgs[index + 1].internal_tool_result == R2_INTERNAL_RECORDED_ACTION_RESULT)
                 pairs_verified = 0;
         }
 
@@ -15769,10 +15775,17 @@ static char *clean_final_reply(const char *reply)
 static char *recorded_action_reply(char *evidence)
 {
     char *reply = NULL;
-    if (asprintf(&reply, "I processed the action request. Here is the recorded result:\n%s",
+    if (asprintf(&reply, "Action request processed. Here is the recorded result:\n%s",
                  evidence) < 0)
         return evidence;
     return reply;
+}
+
+static _Thread_local int last_talk_reply_generated;
+
+int r2_talk_last_reply_generated(void)
+{
+    return last_talk_reply_generated;
 }
 
 static char *r2_talk_impl(const char *message)
@@ -15991,11 +16004,18 @@ finalize_reply:
        not consume space while admitting the final visible reply. */
     remove_pending_hands_result_locked();
 
-    /* A program diagnostic without action evidence is not model dialogue.
-       The unanswered user message remains in live history. Completed action
-       evidence still uses its existing visible-result continuity path. */
-    int assistant_context_rc = (!shutting_down && (generated_reply || tool_evidence))
-        ? message_add("assistant", reply) : 0;
+    /* Only generated dialogue belongs to the assistant role. A completed
+       action with no generated answer already has a protected evidence pair,
+       or needs one exact standalone runtime result if that pair did not fit. */
+    int assistant_context_rc = 0;
+    if (!shutting_down && generated_reply) {
+        assistant_context_rc = message_add("assistant", reply);
+    } else if (!shutting_down && tool_evidence && !active_turn_history.action_result) {
+        assistant_context_rc = message_add("user", tool_evidence);
+        if (assistant_context_rc == 0)
+            messages.items[messages.count - 1].internal_tool_result =
+                R2_INTERNAL_RECORDED_ACTION_RESULT;
+    }
     if (assistant_context_rc != 0)
         fprintf(stderr,
                 "[R2] Failed to add assistant response "
@@ -16157,13 +16177,14 @@ finalize_reply:
 
     if (turn_event_id <= 0) {
         char *with_storage_status = NULL;
-        if (asprintf(&with_storage_status, "%s\n\nI couldn't save this exchange to my Life Log.",
+        if (asprintf(&with_storage_status, "%s\n\n[R2 Runtime] This exchange could not be saved to the Life Log.",
                      reply) >= 0) {
             free(reply);
             reply = with_storage_status;
         }
     }
 
+    last_talk_reply_generated = generated_reply;
     return reply;
 }
 
@@ -16174,6 +16195,7 @@ finalize_reply:
  */
 char *r2_talk(const char *message)
 {
+    last_talk_reply_generated = 0;
     if (message && !r2_input_is_utf8(message)) {
         fprintf(stderr, "[R2 Input Audit] Rejected a conversation turn with invalid UTF-8.\n");
         return xstrdup("I couldn't read that message because it contains invalid UTF-8. "
@@ -16211,6 +16233,7 @@ char *r2_talk(const char *message)
         size_t input_chars = message ? strlen(message) : 0;
         free(reply);
         reply = NULL;
+        last_talk_reply_generated = 0;
         fprintf(stderr,
                 "[R2] Public conversation API received a %s reply from the turn implementation "
                 "(input_chars=%zu); returning an explicit failure message.\n",
@@ -16310,13 +16333,12 @@ int r2_conversation(void)
             fprintf(stderr,
                     "[R2] Direct conversation API returned no usable reply; displaying fallback.\n");
             free(reply);
-            printf("\nR2-3PO: I'm sorry—I couldn't process that turn successfully. "
-                   "Please try again in a moment.\n\n");
+            printf("\n[R2 Runtime] Conversation processing failed; no generated reply.\n\n");
             fflush(stdout);
             continue;
         }
 
-        printf("\nR2-3PO: %s\n\n", reply);
+        printf("\n%s %s\n\n", r2_talk_last_reply_generated() ? "R2-3PO:" : "[R2 Runtime]", reply);
         free(reply);
     }
 

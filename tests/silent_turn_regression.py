@@ -57,7 +57,7 @@ require(
 require(
     "if (!reply || !*reply)" in shell_talk
     and "the shell is showing a fallback instead of silently dropping the turn" in shell_talk
-    and "Your message reached me, but I couldn't answer it this time." in shell_talk,
+    and "[R2 Runtime] Conversation backend returned no generated reply." in shell_talk,
     "shell talk displays a user-facing fallback if the API returns no usable text",
 )
 require(

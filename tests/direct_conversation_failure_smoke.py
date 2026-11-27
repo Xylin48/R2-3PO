@@ -22,7 +22,7 @@ require("if (!reply || !*reply)" in body,
 null_start = body.find("if (!reply || !*reply)")
 null_end = body.find("\n        }", null_start)
 null_path = body[null_start:null_end + 10] if null_start >= 0 and null_end >= 0 else ""
-require("printf(" in null_path and "R2-3PO:" in null_path,
+require("printf(" in null_path and "[R2 Runtime]" in null_path,
         "failed turn produces a visible user-facing stdout fallback")
 require("fflush(stdout);" in null_path,
         "fallback is flushed immediately rather than waiting for another turn")

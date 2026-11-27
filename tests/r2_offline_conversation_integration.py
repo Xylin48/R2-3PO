@@ -508,7 +508,8 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
         text=True, capture_output=True, timeout=100, check=True,
     )
     assert FOLLOWUP_RECOVERY_ANSWER not in output.stdout, output.stdout + output.stderr
-    assert output.stdout.count("Here is the recorded result:") == 2, output.stdout + output.stderr
+    assert output.stdout.count("[R2 Runtime] Action request processed. Here is the recorded result:") == 2, output.stdout + output.stderr
+    assert "R2-3PO: Action request processed." not in output.stdout
     assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
     assert sentinel.read_bytes() == b"private planned action must remain inert"
     assert PRIVATE_GREETING_REASONING not in output.stdout
@@ -1521,7 +1522,8 @@ def recover_completed_hands_result(binary: Path, workspace: Path, url: str) -> N
             input=f"talk {HANDS_REJECTED_REPLY_REQUEST}\nexit\n",
             text=True, capture_output=True, timeout=30, check=True,
         )
-        assert "I couldn't produce a reply to this turn." in rejected.stdout, rejected
+        assert "[R2 Runtime] I couldn't produce a reply to this turn." in rejected.stdout, rejected
+        assert "R2-3PO: I couldn't produce a reply" not in rejected.stdout, rejected
         assert rejected.stderr.count("[R2 Prompt Audit] stage=conversation-answer ") == 1, rejected
         assert db.execute(
             "SELECT delivered_to FROM r2_log_hands_results WHERE outcome_id=?", (outcome,),

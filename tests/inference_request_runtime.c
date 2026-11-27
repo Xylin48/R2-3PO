@@ -544,7 +544,7 @@ static void check_malformed_conversation_input(void)
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         assert(!r2_input_is_utf8(invalid[i]));
         char *reply = r2_talk(invalid[i]);
-        assert(reply && strstr(reply, "invalid UTF-8"));
+        assert(reply && strstr(reply, "invalid UTF-8") && !r2_talk_last_reply_generated());
         free(reply);
     }
     assert(perform_count == before && messages.count == history_count);
@@ -1599,13 +1599,29 @@ static void check_action_result_under_history_pressure(void)
     char *expected = NULL;
     assert(asprintf(&expected, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n",
                     filename, file_text) >= 0);
-    assert(reply && !strncmp(reply, "I processed the action request. Here is the recorded result:\n",
-                            strlen("I processed the action request. Here is the recorded result:\n")));
+    assert(reply && !r2_talk_last_reply_generated() &&
+           !strncmp(reply, "Action request processed. Here is the recorded result:\n",
+                    strlen("Action request processed. Here is the recorded result:\n")));
     assert(strstr(reply, expected));
     assert(messages.count == 3 && !strcmp(messages.items[1].role, "user") &&
            !strcmp(messages.items[1].content, user) && !messages.items[1].pinned);
-    assert(!strcmp(messages.items[2].role, "assistant") &&
-           !strcmp(messages.items[2].content, reply));
+    assert(!strcmp(messages.items[2].role, "user") &&
+           messages.items[2].internal_tool_result == R2_INTERNAL_RECORDED_ACTION_RESULT &&
+           !strcmp(messages.items[2].content, expected));
+    const char *pressure_followup = "What did the document say?";
+    Message pressure_turn[] = {
+        {.role = "user", .content = user},
+        messages.items[2],
+        {.role = "user", .content = (char *)pressure_followup}
+    };
+    set_response("The document had a recorded result.", "stop", 1);
+    ollama_authoritative_user_query = pressure_followup;
+    char *pressure_answer = ollama_chat_with_limit(pressure_turn, 3,
+        "Answer from the recorded action.", 512, 60);
+    assert(pressure_answer && captured_contains(expected) &&
+           captured_contains(pressure_followup) && !captured_contains(reply));
+    free(pressure_answer);
+    ollama_authoritative_user_query = NULL;
     assert(!active_turn_history.user && !active_turn_history.action_request &&
            !active_turn_history.action_result && !active_turn_history.hands_request &&
            !active_turn_history.hands_result);
@@ -1644,14 +1660,32 @@ static void check_action_result_under_history_pressure(void)
        tool result without showing the marker or executing another action. */
     assert(reply && strstr(reply, "MEDIA OBSERVATION ERROR: no visible media frame"));
     assert(!strstr(reply, "[MEDIA_SEE]"));
+    assert(!r2_talk_last_reply_generated());
     assert(messages.count > 0 &&
-           !strcmp(messages.items[messages.count - 1].role, "assistant") &&
-           !strcmp(messages.items[messages.count - 1].content, reply));
+           r2_is_internal_tool_result(&messages.items[messages.count - 1]) &&
+           strstr(messages.items[messages.count - 1].content,
+                  "MEDIA OBSERVATION ERROR: no visible media frame"));
     const char *followup = "Why wasn't a frame available?";
     assert(message_add("user", followup) == 0);
     set_response("The display had no visible frame.", "stop", 1);
     char *answer = chat_with_relevant_memories(followup);
-    assert(answer && captured_contains(followup) && captured_contains(reply));
+    assert(answer && captured_contains(followup) &&
+           captured_contains("MEDIA OBSERVATION ERROR: no visible media frame"));
+    struct json_object *media_history = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &media_history));
+    int found_tool = 0;
+    for (size_t i = 0; i < json_object_array_length(media_history); ++i) {
+        struct json_object *entry = json_object_array_get_idx(media_history, i);
+        struct json_object *role = NULL, *content = NULL;
+        assert(json_object_object_get_ex(entry, "role", &role));
+        assert(json_object_object_get_ex(entry, "content", &content));
+        if (!strcmp(json_object_get_string(role), "assistant"))
+            assert(strcmp(json_object_get_string(content), reply));
+        if (!strcmp(json_object_get_string(role), "tool") &&
+            strstr(json_object_get_string(content), "MEDIA OBSERVATION ERROR: no visible media frame"))
+            found_tool = 1;
+    }
+    assert(found_tool);
     free(answer);
     free(reply);
     message_free_all();
@@ -1712,8 +1746,9 @@ static void check_action_result_under_history_pressure(void)
     pthread_mutex_lock(&post_turn_lock);
     while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
     pthread_mutex_unlock(&post_turn_lock);
-    assert(reply && !strcmp(reply, "I received your words.\n\n"
-                                  "I couldn't save this exchange to my Life Log."));
+    assert(reply && r2_talk_last_reply_generated() &&
+           !strcmp(reply, "I received your words.\n\n"
+                         "[R2 Runtime] This exchange could not be saved to the Life Log."));
     assert(memory_fixture_count(decision_failures) == failures_before);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_pending_learning "
                                 "WHERE user_text='This exchange must not produce unsourced learning.'") == 0);

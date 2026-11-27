@@ -119,6 +119,9 @@ int r2_ollama_vision_request_should_abort(void);
  * by the caller with free().
  */
 char *r2_talk(const char *message);
+/* Thread-local provenance of the most recent talk result on this caller.
+ * False means runtime status/evidence, not generated R2 dialogue. */
+int r2_talk_last_reply_generated(void);
 /* Same serialized conversation path, with an exact persisted speech-event link. */
 char *r2_talk_with_speech_event(const char *message, int64_t speech_event_id);
 /* Caller frees. Bounded display preview of recent human-facing turns. */
