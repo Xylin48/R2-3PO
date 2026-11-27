@@ -54,7 +54,7 @@ learning = reflection.index("publish_structured_self_report(")
 if not background < generation < learning or reflection.count("ollama_background_mode =") != 1:
     raise SystemExit("Reflection generation and derived learning must share the worker's background mode.")
 
-talk_start = core.find("static char *r2_talk_impl(const char *message)")
+talk_start = core.find("static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)")
 talk_end = core.find("\nchar *r2_talk(const char *message)", talk_start)
 if talk_start < 0 or talk_end < 0:
     raise SystemExit("Could not locate the serialized conversation-turn implementation.")
