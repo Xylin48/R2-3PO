@@ -172,6 +172,10 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
             errno = ECANCELED;
             return -1;
         }
+        if (file->eof_error) {
+            errno = file->eof_error;
+            return -1;
+        }
         /* The caller's ring history relies on complete sample frames. */
         if (copied > 0 && copied % file->frame_bytes == 0)
             return (ssize_t)copied;
@@ -203,7 +207,15 @@ ssize_t r2_audio_file_read(R2AudioFile *file, void *buffer, size_t bytes)
             continue;
         }
         if (got == 0) {
-            if (copied % file->frame_bytes != 0) { errno = EPROTO; return -1; }
+            size_t remainder = copied % file->frame_bytes;
+            if (remainder != 0) {
+                /* Publish the complete prefix before reporting the malformed
+                 * tail. The next read must not turn this failure into EOF. */
+                file->eof_error = EPROTO;
+                if (copied > remainder) return (ssize_t)(copied - remainder);
+                errno = EPROTO;
+                return -1;
+            }
             if (copied == 0 && r2_file_check_eof(file) < 0) return -1;
             return (ssize_t)copied;
         }
