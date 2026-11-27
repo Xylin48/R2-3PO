@@ -116,6 +116,15 @@ int main(void)
         "CREATE TABLE r2_log_links(id INTEGER PRIMARY KEY,event_id INTEGER,related_event_id INTEGER,relationship TEXT);"
         "INSERT INTO r2_log_links VALUES(1,7,8,'related');",
         NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(legacy,
+        "CREATE TRIGGER reject_legacy_links BEFORE UPDATE ON r2_log_links "
+        "BEGIN SELECT RAISE(ABORT,'fixture migration failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_init() == -1 && !r2_log_is_initialized());
+    assert(scalar(legacy, "SELECT COUNT(*) FROM pragma_table_info('r2_log_links') "
+                          "WHERE name='from_event_id';") == 0);
+    assert(scalar(legacy, "SELECT COUNT(*) FROM r2_log_links WHERE event_id=7 AND related_event_id=8;") == 1);
+    assert(sqlite3_exec(legacy, "DROP TRIGGER reject_legacy_links;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(legacy);
 
     assert(r2_log_init() == 0);
@@ -304,6 +313,23 @@ int main(void)
                         NULL, NULL, NULL) == SQLITE_OK);
     assert(r2_log_init() == 0 && r2_log_is_initialized());
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_location_state WHERE id=1;") == 1);
+    r2_log_shutdown();
+    assert(sqlite3_exec(writer,
+        "INSERT INTO r2_log_conversations(id,user_text,assistant_text,event_id) "
+        "VALUES(9876,'legacy pending user','legacy pending answer',0);"
+        "CREATE TRIGGER revert_legacy_event AFTER UPDATE OF event_id ON r2_log_conversations "
+        "WHEN NEW.id=9876 AND NEW.event_id>0 BEGIN "
+        "UPDATE r2_log_conversations SET event_id=0 WHERE id=NEW.id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_init() == -1 && !r2_log_is_initialized());
+    assert(scalar(writer, "SELECT event_id FROM r2_log_conversations WHERE id=9876;") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE "
+                          "source='LogMigration:r2_log_conversations:9876';") == 0);
+    assert(sqlite3_exec(writer, "DROP TRIGGER revert_legacy_event;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_init() == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_conversations c "
+                          "JOIN r2_log_events e ON e.id=c.event_id WHERE c.id=9876 "
+                          "AND e.source='LogMigration:r2_log_conversations:9876';") == 1);
     r2_log_shutdown();
     sqlite3_close(writer);
     puts("Life Log legacy schema migration preserved old events and accepted new writable events.");

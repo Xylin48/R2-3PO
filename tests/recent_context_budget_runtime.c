@@ -97,6 +97,12 @@ int main(void)
     assert(!find_control_marker_line("[WRITE] note.txt\n[WORLD] look", "[WORLD]", 0));
     assert(!reply_has_visible_text("[DIARY]\n[WORLD] look\n[END DIARY]"));
     assert(reply_has_visible_text("Ordinary conversational text."));
+    const char *tag_prefix = "<preference>ordinary text</preference>\n[WORLD] look";
+    assert(find_control_marker_line(tag_prefix, "[WORLD]", 0) ==
+           strstr(tag_prefix, "[WORLD]"));
+    const char *tag_close = "<pre>\n</preference>\n[WORLD] hidden\n</pre>\n[WORLD] look";
+    assert(find_control_marker_line(tag_close, "[WORLD]", 0) ==
+           strstr(tag_close, "[WORLD] look"));
 
     /* Model-generated Alternate-Self IDs must reject scanf-style overflow. */
     long long parsed_id = 0, first_id = 0, second_id = 0;
@@ -106,6 +112,9 @@ int main(void)
         " 999999999999999999999999999999999999\n", &parsed_id) != 0);
     assert(r2_parse_control_positive_id(" 12junk\n", &parsed_id) != 0);
     assert(r2_parse_control_positive_id(" -1\n", &parsed_id) != 0);
+    assert(r2_parse_control_positive_id("\n123", &parsed_id) != 0);
+    assert(r2_parse_control_positive_id(" \r\n123", &parsed_id) != 0);
+    assert(r2_parse_control_positive_id("\v123", &parsed_id) != 0);
     assert(r2_parse_control_positive_id_pair(" 12 34\nnext marker",
         &first_id, &second_id) == 0);
     assert(first_id == 12 && second_id == 34);
@@ -115,6 +124,10 @@ int main(void)
     assert(r2_parse_control_positive_id_pair(" 12 34 extra\n",
         &first_id, &second_id) != 0);
     assert(r2_parse_control_positive_id_pair(" 12\n",
+        &first_id, &second_id) != 0);
+    assert(r2_parse_control_positive_id_pair("\n12 34",
+        &first_id, &second_id) != 0);
+    assert(r2_parse_control_positive_id_pair("12 \v34",
         &first_id, &second_id) != 0);
 
     /* Executable control turns are history metadata, not human-facing dialogue. */

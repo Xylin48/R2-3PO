@@ -8528,14 +8528,25 @@ static int r2_line_contains_token(const char *line, const char *line_end,
 {
     if (!line || !line_end || !token) return 0;
     size_t token_len = strlen(token);
-    if ((size_t)(line_end - line) < token_len) return 0;
-    for (const char *p = line; p + token_len <= line_end; ++p) {
+    size_t line_len = (size_t)(line_end - line);
+    if (!token_len || line_len < token_len) return 0;
+    for (size_t offset = 0; offset <= line_len - token_len; ++offset) {
+        const char *p = line + offset;
         size_t i = 0;
         while (i < token_len &&
                tolower((unsigned char)p[i]) ==
                    tolower((unsigned char)token[i]))
             ++i;
-        if (i == token_len) return 1;
+        if (i == token_len) {
+            /* A tag name must end here, not merely prefix another tag. */
+            if (token[0] == '<' && token[1] != '!' &&
+                offset + token_len < line_len) {
+                unsigned char next = (unsigned char)p[token_len];
+                if (next != '>' && next != '/' && !isspace(next))
+                    continue;
+            }
+            return 1;
+        }
     }
     return 0;
 }
@@ -9160,6 +9171,8 @@ static int r2_parse_control_positive_id(const char *text, long long *id_out)
     const char *start = text;
     while (*start == ' ' || *start == '\t' || *start == '\r')
         ++start;
+    if (!isdigit((unsigned char)*start) && *start != '+')
+        return -1;
 
     errno = 0;
     char *end = NULL;
@@ -9185,6 +9198,8 @@ static int r2_parse_control_positive_id_pair(const char *text,
     const char *cursor = text;
     while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r')
         ++cursor;
+    if (!isdigit((unsigned char)*cursor) && *cursor != '+')
+        return -1;
 
     errno = 0;
     char *end = NULL;
@@ -9196,7 +9211,7 @@ static int r2_parse_control_positive_id_pair(const char *text,
     cursor = end;
     while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r')
         ++cursor;
-    if (*cursor == '\n' || *cursor == '\0')
+    if (!isdigit((unsigned char)*cursor) && *cursor != '+')
         return -1;
 
     errno = 0;

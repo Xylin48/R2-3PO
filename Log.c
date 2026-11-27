@@ -255,26 +255,31 @@ static int log_column_exists(const char *table, const char *column)
 {
     char sql[256];
     int n = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
-    if (n < 0 || (size_t)n >= sizeof(sql)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(log_db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(log_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) {
-                found = 1;
+            if (!name) {
+                rc = SQLITE_NOMEM;
                 break;
             }
+            if (!strcasecmp((const char *)name, column))
+                found = 1;
         }
     }
-    if (st) sqlite3_finalize(st);
-    return found;
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? found : -1;
 }
 
 static int log_ensure_column(const char *table, const char *column,
                              const char *definition)
 {
-    if (log_column_exists(table, column)) return SQLITE_OK;
+    int exists = log_column_exists(table, column);
+    if (exists < 0) return SQLITE_ERROR;
+    if (exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;",
                      table, column, definition);
@@ -404,13 +409,16 @@ static int migrate_legacy_log_schema(void)
 
     /* Older beta tables used event_id/related_event_id for links. Preserve
        those actual endpoints when upgrading to the current column names. */
-    if (log_column_exists("r2_log_links", "event_id") &&
+    int old_from = log_column_exists("r2_log_links", "event_id");
+    int old_to = log_column_exists("r2_log_links", "related_event_id");
+    if (old_from < 0 || old_to < 0) return -1;
+    if (old_from &&
         exec_sql("UPDATE r2_log_links SET from_event_id=event_id "
-                 "WHERE from_event_id<=0 AND event_id>0;") != 0)
+                 "WHERE (from_event_id IS NULL OR from_event_id<=0) AND event_id>0;") != 0)
         return -1;
-    if (log_column_exists("r2_log_links", "related_event_id") &&
+    if (old_to &&
         exec_sql("UPDATE r2_log_links SET to_event_id=related_event_id "
-                 "WHERE to_event_id<=0 AND related_event_id>0;") != 0)
+                 "WHERE (to_event_id IS NULL OR to_event_id<=0) AND related_event_id>0;") != 0)
         return -1;
 
     /* Existing tables are upgraded before indexes are created, so a missing
@@ -426,7 +434,6 @@ static int migrate_legacy_log_schema(void)
 static int ensure_tables(void)
 {
     static const char *schema =
-        "PRAGMA foreign_keys=ON;"
         "CREATE TABLE IF NOT EXISTS r2_log_sessions ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " started_utc TEXT NOT NULL,"
@@ -665,6 +672,11 @@ static char *log_legacy_text(sqlite3_stmt *st, int column)
     return encoded;
 }
 
+static int64_t log_insert_event_locked(R2LogCategory category,
+                                       const char *event_type, const char *summary,
+                                       const char *details, const char *source);
+
+/* Startup owns log_lock and the schema migration transaction. */
 static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
 {
     if (!spec || !spec->table || !spec->link_column ||
@@ -730,8 +742,8 @@ static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
         if (rc == SQLITE_DONE && legacy_summary && legacy_details &&
             asprintf(&details, "table=%s; legacy_id=%lld; legacy_summary=%s; legacy_details=%s",
                      spec->table, (long long)row_id, legacy_summary, legacy_details) >= 0)
-            event_id = r2_log_event(R2_LOG_THINKING, "legacy_log_link_restored",
-                                    summary, details, source);
+            event_id = log_insert_event_locked(R2_LOG_THINKING, "legacy_log_link_restored",
+                                               summary, details, source);
         free(details);
         free(legacy_summary);
         free(legacy_details);
@@ -762,6 +774,25 @@ static int log_backfill_one_legacy_link(const R2LegacyLogLinkBackfill *spec)
         sqlite3_finalize(st);
         if (rc != SQLITE_DONE || changed != 1) {
             fprintf(stderr, "[R2 Log] Could not repair Life Log relationship for %s row %lld.\n",
+                    spec->table, (long long)row_id);
+            return -1;
+        }
+
+        /* UPDATE's row count does not prove the final value after triggers. */
+        n = snprintf(update_sql, sizeof(update_sql),
+            "SELECT 1 FROM %s t JOIN r2_log_events e ON e.id=t.%s "
+            "WHERE t.id=? AND t.%s=?;",
+            spec->table, spec->link_column, spec->link_column);
+        if (n < 0 || (size_t)n >= sizeof(update_sql))
+            return -1;
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db, update_sql, -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, row_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "[R2 Log] Repaired Life Log relationship did not persist for %s row %lld.\n",
                     spec->table, (long long)row_id);
             return -1;
         }
@@ -889,11 +920,17 @@ int r2_log_init(void)
         return -1;
     }
 
-    if (sqlite3_busy_timeout(log_db, 5000) != SQLITE_OK ||
-        exec_sql("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") != 0 ||
-        ensure_tables() != 0 ||
-        log_ensure_location_baseline() != 0) {
-        fprintf(stderr, "[R2 Life Log] Could not initialize durable storage or location state.\n");
+    int initialized = sqlite3_busy_timeout(log_db, 5000) == SQLITE_OK &&
+        exec_sql("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;") == 0 &&
+        exec_sql("BEGIN IMMEDIATE;") == 0;
+    if (initialized) {
+        int saved = ensure_tables() == 0 &&
+                    log_ensure_location_baseline() == 0 &&
+                    log_restore_missing_event_links() == 0;
+        initialized = log_finish_write(saved) == 0;
+    }
+    if (!initialized) {
+        fprintf(stderr, "[R2 Life Log] Could not initialize durable storage, legacy relationships or location state.\n");
         sqlite3_close(log_db);
         log_db = NULL;
         pthread_mutex_unlock(&log_lock);
@@ -903,11 +940,8 @@ int r2_log_init(void)
     log_initialized = 1;
     pthread_mutex_unlock(&log_lock);
 
-    if (log_restore_missing_event_links() != 0) {
-        fprintf(stderr, "[R2 Life Log] Required legacy event links could not be restored; refusing to initialize with disconnected records.\n");
-        r2_log_shutdown();
-        return -1;
-    }
+    /* Legacy restoration committed with the schema. The Sensory Journal
+       derives its index from the authoritative events at its own startup. */
     (void)r2_log_replay_conversation_archives();
 
     if (r2_log_session_start() != 0) {
