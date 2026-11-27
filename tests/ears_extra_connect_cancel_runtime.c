@@ -331,6 +331,46 @@ int main(void)
     pthread_mutex_unlock(&gate);
     assert(r2_ears_stop() == 0);
     assert(pthread_join(opening, NULL) == 0);
+    /* Open a real Ears receiver against the fixture transport. A listing
+     * is metadata-only, even while another operation owns the lifecycle
+     * mutex. A failed read must withdraw active status but preserve custody
+     * so Watch can clean up precisely its own generation. */
+    connect_succeeds = 1;
+    transport_cancelled = read_entered = 0;
+    uint64_t desktop_token = r2_ears_start_desktop_for_watch("test.primary.monitor");
+    assert(desktop_token);
+    pthread_mutex_lock(&gate);
+    await_flag(&read_entered);
+    pthread_mutex_unlock(&gate);
+    R2EarsWatchInput desktop_input = {0};
+    assert(r2_ears_watch_input_snapshot(1, &desktop_input) == 0);
+    assert(desktop_input.active && desktop_input.owner == desktop_token &&
+           desktop_input.source && !strcmp(desktop_input.source, "test.primary.monitor"));
+    free(desktop_input.source);
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    char *desktop_list = r2_ears_desktop_available_sources();
+    assert(desktop_list && strstr(desktop_list, "PRIMARY DESKTOP AUDIO SOURCE: test.primary.monitor"));
+    free(desktop_list);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    r2_ears_cancel(ears_desktop);
+    start = seconds();
+    while (atomic_load(&ears_desktop_capture_running)) {
+        assert(seconds() - start < 1.0);
+        const struct timespec pause = {0, 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    assert(r2_ears_watch_input_snapshot(1, &desktop_input) == 0);
+    assert(!desktop_input.active && !desktop_input.source && desktop_input.owner == desktop_token);
+    assert(!r2_ears_status_desktop() && !r2_ears_status_desktop_source("test.primary.monitor"));
+    assert(!r2_ears_current_desktop_source());
+    desktop_list = r2_ears_desktop_available_sources();
+    assert(desktop_list && strstr(desktop_list, "PRIMARY DESKTOP AUDIO SOURCE: (not active)") &&
+           !strstr(desktop_list, "test.primary.monitor"));
+    free(desktop_list);
+    assert(r2_ears_stop_desktop_if_watch_owned(desktop_token) == 0);
+    assert(r2_ears_watch_input_snapshot(1, &desktop_input) == 0);
+    assert(!desktop_input.active && !desktop_input.owner && !desktop_input.source);
+
     /* Shutdown reaches an already blocked direct one-shot PCM read. */
     connect_succeeds = 1;
     transport_cancelled = read_entered = 0;
