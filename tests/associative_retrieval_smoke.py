@@ -59,7 +59,7 @@ require(
     and "r2_associative_query_cache_store(query, combined)" in helper,
     "semantic retrieval cues are reused across retries instead of repeating planner inference",
 )
-impl_start = core.find("static char *r2_talk_impl(const char *message)")
+impl_start = core.find("static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)")
 impl_end = core.find("char *r2_talk(const char *message)", impl_start)
 turn_impl = core[impl_start:impl_end]
 require(

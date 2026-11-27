@@ -23,7 +23,7 @@ def function_slice(start_marker: str, end_marker: str) -> str:
 
 
 impl = function_slice(
-    "static char *r2_talk_impl(const char *message)",
+    "static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)",
     "char *r2_talk(const char *message)",
 )
 public = function_slice(
@@ -131,7 +131,7 @@ require(
 # before waiting so autonomous background work can yield to queued user input.
 lock = public.find("pthread_mutex_lock(&conversation_turn_lock)")
 intent = public.find("atomic_fetch_add(&foreground_conversation_waiting, 1)")
-call = public.find("r2_talk_impl(message)")
+call = public.find("r2_talk_impl(message, &turn_event_id)")
 unlock = public.rfind("pthread_mutex_unlock(&conversation_turn_lock)")
 decrement = public.rfind("atomic_fetch_sub(&foreground_conversation_waiting, 1)")
 require(

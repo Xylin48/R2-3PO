@@ -1134,6 +1134,28 @@ static void check_learning_dispatch_without_diary(void)
     db = NULL;
 }
 
+static void *inspect_post_turn_thread(void *opaque)
+{
+    int *detached = opaque;
+    pthread_attr_t actual;
+    assert(pthread_getattr_np(pthread_self(), &actual) == 0);
+    assert(pthread_attr_getdetachstate(&actual, detached) == 0);
+    assert(pthread_attr_destroy(&actual) == 0);
+    finish_post_turn_worker();
+    return NULL;
+}
+
+static void check_post_turn_thread_ownership(void)
+{
+    int detached = PTHREAD_CREATE_JOINABLE;
+    begin_post_turn_work();
+    assert(start_post_turn_worker(inspect_post_turn_thread, &detached) == 0);
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(detached == PTHREAD_CREATE_DETACHED);
+}
+
 static void check_post_turn_retry(void)
 {
     assert(init_db() == 0);
@@ -3182,6 +3204,7 @@ int main(void)
     check_evaluated_memory_atomicity();
     check_conversation_learning_record_boundaries();
     check_learning_dispatch_without_diary();
+    check_post_turn_thread_ownership();
     check_post_turn_retry();
     check_tool_capture_failure_preserves_evidence();
     check_staged_imagination();

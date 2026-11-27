@@ -15529,11 +15529,19 @@ static void begin_post_turn_work(void)
 static int start_post_turn_worker(void *(*worker)(void *), void *context)
 {
     pthread_t thread;
-    if (pthread_create(&thread, NULL, worker, context) != 0) {
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    if (rc == 0) {
+        /* Establish detached ownership before the worker can start. */
+        rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (rc == 0)
+            rc = pthread_create(&thread, &attr, worker, context);
+        pthread_attr_destroy(&attr);
+    }
+    if (rc != 0) {
         finish_post_turn_worker();
         return -1;
     }
-    pthread_detach(thread);
     return 0;
 }
 
