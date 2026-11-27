@@ -677,8 +677,11 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
 {
     if (!ears ||
         !buffer ||
-        buffer_size == 0)
+        buffer_size == 0 ||
+        buffer_size > SSIZE_MAX ||
+        buffer_size % (R2_EARS_CHANNELS * (R2_EARS_BITS_PER_SAMPLE / 8U)) != 0)
     {
+        /* An invalid caller request must not consume PCM or retire a source. */
         errno = EINVAL;
         return -1;
     }

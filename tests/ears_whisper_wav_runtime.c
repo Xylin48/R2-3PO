@@ -89,6 +89,26 @@ int main(void)
     fclose(raw);
     fclose(whisper);
 
+    /* Every field of the canonical header must describe the actual bytes.
+     * A correct sample rate alone is insufficient. */
+    const long offsets[] = {4, 16, 28, 32};
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+        raw = source_wav(3);
+        whisper = tmpfile();
+        assert(whisper && fseek(raw, offsets[i], SEEK_SET) == 0);
+        assert(fputc(0xff, raw) != EOF && fflush(raw) == 0);
+        assert(r2_ears_write_whisper_wav(raw, whisper, 12, NULL, NULL) != 0);
+        fclose(raw);
+        fclose(whisper);
+    }
+    raw = source_wav(3);
+    whisper = tmpfile();
+    assert(whisper && fseek(raw, 0, SEEK_END) == 0);
+    assert(fputc(0x42, raw) != EOF && fflush(raw) == 0);
+    assert(r2_ears_write_whisper_wav(raw, whisper, 12, NULL, NULL) != 0);
+    fclose(raw);
+    fclose(whisper);
+
     puts("Whisper-compatible 16 kHz mono audio conversion and duration regression passed.");
     return 0;
 }

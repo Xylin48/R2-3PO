@@ -14244,8 +14244,16 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
         ((uint32_t)h[25] << 8) | ((uint32_t)h[26] << 16) | ((uint32_t)h[27] << 24);
     uint32_t source_size = (uint32_t)h[40] |
         ((uint32_t)h[41] << 8) | ((uint32_t)h[42] << 16) | ((uint32_t)h[43] << 24);
-    if (h[20] != 1 || h[21] != 0 || h[22] != 2 || h[23] != 0 ||
-        source_rate != 48000U || h[34] != 16 || h[35] != 0 ||
+    uint32_t riff_size = (uint32_t)h[4] |
+        ((uint32_t)h[5] << 8) | ((uint32_t)h[6] << 16) | ((uint32_t)h[7] << 24);
+    uint32_t fmt_size = (uint32_t)h[16] |
+        ((uint32_t)h[17] << 8) | ((uint32_t)h[18] << 16) | ((uint32_t)h[19] << 24);
+    uint32_t byte_rate = (uint32_t)h[28] |
+        ((uint32_t)h[29] << 8) | ((uint32_t)h[30] << 16) | ((uint32_t)h[31] << 24);
+    if (riff_size != raw_pcm_bytes + 36U || fmt_size != 16U ||
+        h[20] != 1 || h[21] != 0 || h[22] != 2 || h[23] != 0 ||
+        source_rate != 48000U || byte_rate != 192000U ||
+        h[32] != 4 || h[33] != 0 || h[34] != 16 || h[35] != 0 ||
         source_size != raw_pcm_bytes)
         return -1;
 
@@ -14289,7 +14297,8 @@ static int r2_ears_write_whisper_wav(FILE *raw, FILE *normalized,
         if (fwrite(output, 2U, count, normalized) != count) return -1;
         remaining -= (uint32_t)count;
     }
-    return ferror(raw) || fflush(normalized) != 0 ? -1 : 0;
+    /* The private writer promises exactly one canonical PCM chunk. */
+    return fgetc(raw) != EOF || ferror(raw) || fflush(normalized) != 0 ? -1 : 0;
 }
 
 /*
@@ -14378,7 +14387,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
         if (primary_locked) {
             R2HearingEvent primary = {0};
             named_primary = ears_desktop && atomic_load(&ears_desktop_capture_running) &&
-                r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name &&
+                r2_ears_get_open_event(ears_desktop, &primary) == 0 && primary.source_name &&
                 !strcmp(primary.source_name, r2_ears_extra_requested);
             r2_ears_release_event(&primary);
             pthread_mutex_unlock(&ears_desktop_capture_lock);
@@ -14403,7 +14412,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No active desktop audio stream to inspect.\n");
             goto cleanup;
         }
-        if (r2_ears_get_event(ears_desktop, &captured_event) != 0 ||
+        if (r2_ears_get_open_event(ears_desktop, &captured_event) != 0 ||
             !captured_event.source_name ||
             (r2_ears_extra_requested &&
              strcmp(captured_event.source_name, r2_ears_extra_requested))) {
@@ -14438,7 +14447,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
         goto cleanup;
     }
     if (atomic_load(&ears_capture_running)) {
-        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+        if (r2_ears_get_open_event(ears, &captured_event) != 0 || !captured_event.source_name) {
             pthread_mutex_unlock(&ears_capture_lock);
             goto cleanup;
         }
@@ -14478,7 +14487,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] Could not open the default microphone. Check the input device and permissions.\n");
             goto cleanup;
         }
-        if (r2_ears_get_event(ears, &captured_event) != 0 || !captured_event.source_name) {
+        if (r2_ears_get_open_event(ears, &captured_event) != 0 || !captured_event.source_name) {
             r2_ears_close(ears);
             pthread_mutex_unlock(&ears_capture_lock);
             goto cleanup;
@@ -14600,11 +14609,23 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
     {
         FILE *text_fp = fopen(transcript_path, "rb");
         if (!text_fp) goto cleanup;
+        struct stat before, after;
+        if (fstat(fileno(text_fp), &before) != 0 ||
+            !S_ISREG(before.st_mode) || before.st_size < 0) {
+            fclose(text_fp);
+            goto cleanup;
+        }
         size_t capacity = 0;
         ssize_t n = getdelim(&transcript, &capacity, '\0', text_fp);
-        int read_error = ferror(text_fp);
+        /* Never turn a partial, malformed or concurrently changed transcript
+         * into a user message or a durable sensory event. */
+        int read_error = ferror(text_fp) || !feof(text_fp) || n < 0 ||
+            (uintmax_t)n != (uintmax_t)before.st_size ||
+            fstat(fileno(text_fp), &after) != 0 ||
+            !original_archive_unchanged(&before, &after);
         if (fclose(text_fp) != 0) read_error = 1;
-        if (n < 0 || read_error || memchr(transcript, '\0', (size_t)n) != NULL) {
+        if (read_error || memchr(transcript, '\0', (size_t)n) != NULL ||
+            !r2_input_is_utf8(transcript)) {
             free(transcript); transcript = NULL; goto cleanup;
         }
         char *start = transcript;

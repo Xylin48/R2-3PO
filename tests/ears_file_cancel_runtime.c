@@ -131,6 +131,10 @@ int main(void)
     errno = 0;
     assert(r2_audio_file_read(ears->file_stream, out, 3) == -1);
     assert(errno == EINVAL);
+    assert(r2_ears_read(ears, out, 3) == -1 && errno == EINVAL);
+    assert(r2_ears_read(ears, out, 0) == -1 && errno == EINVAL);
+    assert(r2_ears_read(ears, out, SIZE_MAX) == -1 && errno == EINVAL);
+    assert(r2_ears_is_open(ears));
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
     assert(memcmp(out, "ABCD", 4) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);

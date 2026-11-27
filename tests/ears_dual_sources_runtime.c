@@ -114,6 +114,12 @@ int main(void)
     assert(r2_ears_get_event(desktop, &event_desktop) == 0);
     assert(!strcmp(event_mic.source_name, microphone_name));
     assert(!strcmp(event_desktop.source_name, monitor_name));
+    unsigned char invalid[4] = {1, 2, 3, 4};
+    assert(r2_ears_read(mic, invalid, 3) == -1 && errno == EINVAL);
+    assert(r2_ears_read(desktop, invalid, SIZE_MAX) == -1 && errno == EINVAL);
+    assert(r2_ears_read(mic, invalid, 0) == -1 && errno == EINVAL);
+    assert(invalid[0] == 1 && invalid[3] == 4);
+    assert(r2_ears_is_open(mic) && r2_ears_is_open(desktop));
     check_pcm(mic, 0xa5);
     check_pcm(desktop, 0x5a);
     /* A source event describes when this capture opened, not the

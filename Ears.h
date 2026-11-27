@@ -250,6 +250,9 @@ void r2_ears_cancel(R2Ears *ears);
 
 /*
  * Read raw PCM audio from R2's current hearing source.
+ * Request a positive whole number of interleaved stereo S16LE frames
+ * (four bytes each), no larger than SSIZE_MAX. Invalid requests do not
+ * consume samples or retire the source.
  *
  * Returns:
  *   > 0  = number of bytes received

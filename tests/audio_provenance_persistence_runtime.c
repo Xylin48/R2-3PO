@@ -84,6 +84,7 @@ static void verify_visual_sources(sqlite3 *connection)
 }
 
 static char names[2][1024];
+static int fixture_primary_open[2];
 static R2Ears *fixture_extra_receiver;
 int __real_r2_ears_is_open(R2Ears *receiver);
 int __wrap_r2_ears_is_open(R2Ears *receiver)
@@ -112,6 +113,14 @@ int __wrap_r2_ears_get_event(R2Ears *receiver, R2HearingEvent *event)
     memset(event, 0, sizeof(*event));
     event->source_name = strdup(names[receiver == ears_desktop]);
     return event->source_name ? 0 : -1;
+}
+int __real_r2_ears_get_open_event(R2Ears *receiver, R2HearingEvent *event);
+int __wrap_r2_ears_get_open_event(R2Ears *receiver, R2HearingEvent *event)
+{
+    if (receiver && (receiver == ears || receiver == ears_desktop) &&
+        fixture_primary_open[receiver == ears_desktop])
+        return __wrap_r2_ears_get_event(receiver, event);
+    return __real_r2_ears_get_open_event(receiver, event);
 }
 pid_t __real_waitpid(pid_t child, int *status, int flags);
 pid_t __wrap_waitpid(pid_t child, int *status, int flags)
@@ -291,6 +300,19 @@ int main(void)
     ears_desktop_recent_length = ears_desktop_recent_write_position = 192000;
     atomic_store(&ears_capture_running, 1);
     atomic_store(&ears_desktop_capture_running, 1);
+    /* Both workers can be unwinding after a failed transport. Historical
+     * PCM and source identity must not be mistaken for active listening. */
+    for (int slot = 0; slot < 2; ++slot) {
+        strcpy(names[slot], slot ? "retired.desktop" : "retired.microphone");
+        r2_ears_desktop_requested = slot;
+        r2_ears_recent_requested = 1;
+        char *stale_source = (char *)(uintptr_t)1;
+        int64_t stale_id = -1;
+        long count = r2_sj_count();
+        assert(!r2_ears_listen_source_cancelable(1, NULL, NULL, &stale_source, &stale_id));
+        assert(!stale_source && stale_id == 0 && r2_sj_count() == count);
+    }
+    fixture_primary_open[0] = fixture_primary_open[1] = 1;
     int64_t speech_ids[3];
     char original_sources[3][1024];
     for (int mode = 0; mode < 3; ++mode) {
@@ -313,6 +335,7 @@ int main(void)
         verify_event(connection, speech_ids[mode], source, expected);
         free(transcript); free(source); free(wanted);
     }
+    fixture_primary_open[0] = fixture_primary_open[1] = 0;
     /* Real separate capture workers consume deterministic RGB pipes while
      * the exact independent audio route is being transcribed and stored. */
     const char *prior_path = getenv("PATH");
@@ -510,6 +533,7 @@ int main(void)
     verify_visual_sources(connection);
 
     /* Tool result must include captured identity, with no 8/16/32/64 KiB cut. */
+    fixture_primary_open[1] = 1;
     memset(names[1], 'z', 900); names[1][900] = '\0';
     char *request = NULL;
     assert(asprintf(&request, "desktop_source_recent|%s|1", names[1]) > 0);
@@ -616,6 +640,16 @@ int main(void)
     assert(sqlite3_bind_int64(st, 1, turn) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
     assert(sqlite3_column_int(st, 0) == 2);
     sqlite3_finalize(st);
+    r2_ears_desktop_requested = r2_ears_recent_requested = 1;
+    for (int fault = 1; fault <= 2; ++fault) {
+        char *source = (char *)(uintptr_t)1;
+        int64_t id = -1;
+        long count = r2_sj_count();
+        read_fault = fault;
+        assert(!r2_ears_listen_source_cancelable(1, NULL, NULL, &source, &id));
+        read_fault = 0;
+        assert(!source && id == 0 && r2_sj_count() == count);
+    }
     FILE *bad = fopen(text_path, "wb");
     assert(bad && fwrite("bad\0hidden", 1, 10, bad) == 10 && fclose(bad) == 0);
     r2_ears_desktop_requested = r2_ears_recent_requested = 1;
@@ -624,6 +658,11 @@ int main(void)
     int64_t no_event = -99;
     assert(r2_ears_listen_source_cancelable(1, NULL, NULL, &no_source, &no_event) == NULL);
     assert(no_source == NULL && no_event == 0 && r2_sj_count() == prior_count);
+    bad = fopen(text_path, "wb");
+    assert(bad && fwrite("\xc0\xaf", 1, 2, bad) == 2 && fclose(bad) == 0);
+    assert(!r2_ears_listen_source_cancelable(1, NULL, NULL, &no_source, &no_event));
+    assert(!no_source && no_event == 0 && r2_sj_count() == prior_count);
+    fixture_primary_open[1] = 0;
     r2_ears_desktop_requested = r2_ears_recent_requested = 0;
     sqlite3_close(connection);
     atomic_store(&ears_capture_running, 0); atomic_store(&ears_desktop_capture_running, 0);
