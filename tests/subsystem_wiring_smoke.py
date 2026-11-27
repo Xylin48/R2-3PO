@@ -224,10 +224,13 @@ if activity_end_start < 0 or activity_end_end < 0:
 activity_end_body = log[activity_end_start:activity_end_end]
 for bind in (
     "rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT)",
-    "rc = sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT)",
+    "rc = sqlite3_bind_int64(statement, 8, activity_id)",
 ):
     if bind not in activity_end_body:
         raise SystemExit(f"Life Log activity-end persistence ignores a binding result: {bind}")
+if '"WHERE id=? AND status=\'active\'"' not in activity_end_body or "sqlite3_changes(log_db) == 1" not in activity_end_body:
+    raise SystemExit("Life Log activity-end must update exactly the selected session.")
 
 location_start = log.find("static int log_stage_location_transition(")
 location_end = log.find("\nint64_t r2_log_", location_start + 1)
