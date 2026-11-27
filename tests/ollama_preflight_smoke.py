@@ -36,6 +36,45 @@ class OllamaPreflightSmoke(unittest.TestCase):
         with patch("builtins.open", side_effect=fake_open):
             self.assertEqual(probe._adaptive_context_tokens(), 2048)
 
+    def test_unlimited_v2_takes_precedence_over_v1(self) -> None:
+        def fake_open(path, mode="r", encoding="ascii"):
+            values = {
+                "/proc/meminfo": "MemAvailable: 16777216 kB\n",
+                "/sys/fs/cgroup/memory.max": "max\n",
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes": str(2 * 1024 ** 3),
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes": "0",
+            }
+            if path not in values:
+                raise OSError("path unavailable")
+            return io.StringIO(values[path])
+        with patch("builtins.open", side_effect=fake_open) as opened:
+            self.assertEqual(probe._adaptive_context_tokens(), 16384)
+            self.assertNotIn("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                             [call.args[0] for call in opened.call_args_list])
+
+    def test_runtime_decimal_policy_matches_actual_c_request(self) -> None:
+        tags = {"models": [{"name": probe.MODEL}, {"name": probe.VISION_MODEL}]}
+        text = {"done": True, "message": {"role": "assistant", "content": "R2_READY"}}
+        image = {"done": True, "message": {"role": "assistant", "content": '{"color":"blue"}'}}
+        for malformed in ("8_192", "8192 ", "８１９２"):
+            with self.subTest(context=malformed), patch.dict(probe.os.environ, {
+                "R2_OLLAMA_NUM_CTX": malformed, "R2_OLLAMA_NUM_GPU": "0",
+            }), patch.object(probe, "_adaptive_context_tokens", return_value=4096), \
+                 patch.object(probe, "_read_json", side_effect=[tags, text, image, {}]) as read, \
+                 patch.object(probe.subprocess, "run", side_effect=FileNotFoundError):
+                self.assertTrue(probe.preflight(timeout=1))
+                for call in read.call_args_list[1:3]:
+                    self.assertEqual(call.kwargs["payload"]["options"]["num_ctx"], 4096)
+        for malformed in ("2_0", "20 ", "２０"):
+            with self.subTest(gpu=malformed), patch.dict(probe.os.environ, {
+                "R2_OLLAMA_NUM_GPU": malformed,
+            }), patch.object(probe, "_read_json", return_value=tags) as read, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertFalse(probe.preflight(timeout=1))
+                self.assertEqual(read.call_count, 1)
+        self.assertEqual(probe._runtime_decimal(" \t+20"), 20)
+        self.assertEqual(probe._runtime_decimal("-1"), -1)
+
     def test_model_and_real_chat_completion_are_required(self) -> None:
         replies = [
             {"models": [{"name": "llama3.1:8b"}, {"name": "qwen3-vl:4b-instruct-q4_K_M"}]},

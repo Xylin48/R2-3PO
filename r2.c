@@ -3319,28 +3319,43 @@ int r2_ollama_vision_request_should_abort(void)
 /* Estimate safe Ollama context from host and container memory headroom.
    Context size controls KV-cache allocation; blindly asking for a huge window
    on a constrained host can evict other work or trigger OOM. */
-static unsigned long long read_uint_file(const char *path, int *valid)
+static int parse_cgroup_uint(const char *text, int allow_max, unsigned long long *value)
+{
+    if (!text || !value) return 0;
+    while (isspace((unsigned char)*text)) ++text;
+    const char *tail = text;
+    if (allow_max && !strncmp(text, "max", 3)) {
+        tail += 3;
+        while (isspace((unsigned char)*tail)) ++tail;
+        if (*tail) return 0;
+        *value = 0; /* valid unlimited v2 limit, not an unavailable file */
+        return 1;
+    }
+    /* Kernel counters are unsigned decimal tokens, not signed or partial
+     * strtoull conversions. In particular -1 must not become ULLONG_MAX. */
+    if (*text < '0' || *text > '9') return 0;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno || end == text) return 0;
+    tail = end;
+    while (isspace((unsigned char)*tail)) ++tail;
+    if (*tail) return 0;
+    *value = parsed;
+    return 1;
+}
+
+static unsigned long long read_uint_file(const char *path, int *valid, int allow_max)
 {
     if (valid) *valid = 0;
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char buffer[128];
-    if (!fgets(buffer, sizeof(buffer), f)) {
-        fclose(f);
-        return 0;
-    }
+    int complete = fgets(buffer, sizeof(buffer), f) != NULL &&
+                   fgetc(f) == EOF && !ferror(f);
     fclose(f);
-
-    /* cgroup v2 uses the literal "max" for an unlimited limit. */
-    if (!strncmp(buffer, "max", 3)) {
-        if (valid) *valid = 1;
-        return 0;
-    }
-
-    errno = 0;
-    char *end = NULL;
-    unsigned long long value = strtoull(buffer, &end, 10);
-    if (errno || end == buffer) return 0;
+    unsigned long long value = 0;
+    if (!complete || !parse_cgroup_uint(buffer, allow_max, &value)) return 0;
     if (valid) *valid = 1;
     return value;
 }
@@ -3364,9 +3379,9 @@ static unsigned long long available_memory_bytes(void)
     int cgroup_max_valid = 0;
     int cgroup_used_valid = 0;
     unsigned long long cgroup_max =
-        read_uint_file("/sys/fs/cgroup/memory.max", &cgroup_max_valid);
+        read_uint_file("/sys/fs/cgroup/memory.max", &cgroup_max_valid, 1);
     unsigned long long cgroup_used =
-        read_uint_file("/sys/fs/cgroup/memory.current", &cgroup_used_valid);
+        read_uint_file("/sys/fs/cgroup/memory.current", &cgroup_used_valid, 0);
 
     if (cgroup_max_valid && cgroup_max > 0) {
         /*
@@ -3386,9 +3401,9 @@ static unsigned long long available_memory_bytes(void)
         int v1_max_valid = 0;
         int v1_used_valid = 0;
         unsigned long long v1_max = read_uint_file(
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes", &v1_max_valid);
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes", &v1_max_valid, 0);
         unsigned long long v1_used = read_uint_file(
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes", &v1_used_valid);
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes", &v1_used_valid, 0);
         /*
          * cgroup v1 commonly represents an unlimited limit with a near-UINT64_MAX
          * sentinel. Do not treat that sentinel as enormous real headroom when

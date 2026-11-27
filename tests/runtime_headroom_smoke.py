@@ -23,7 +23,7 @@ required = {
     "Live history has a byte ceiling": "#define MAX_LIVE_MESSAGE_BYTES (32U * 1024U * 1024U)",
     "Autonomous reflection uses the background scheduler":
         "ollama_background_mode = 1;\n    ollama_reflection_worker = 1;",
-    "cgroup RAM reads distinguish zero from unreadable": "static unsigned long long read_uint_file(const char *path, int *valid)",
+    "cgroup RAM reads distinguish zero from unreadable": "static unsigned long long read_uint_file(const char *path, int *valid, int allow_max)",
     "cgroup RAM exhaustion forces minimal headroom": "(!cgroup_used_valid || cgroup_used >= cgroup_max)",
     "unlimited cgroup v1 sentinel is not treated as real headroom": "v1_max < (1ULL << 60)",
     "foreground timeout is configurable for long local inference": "R2_OLLAMA_TIMEOUT_SECONDS",

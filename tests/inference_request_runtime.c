@@ -2805,8 +2805,24 @@ static void check_shutdown_drain_and_rollback(void)
     puts("Shutdown waited for the active turn and rolled back an unfinished memory write.");
 }
 
+static void check_cgroup_counter_spelling(void)
+{
+    unsigned long long value = 99;
+    assert(parse_cgroup_uint("max\n", 1, &value) && value == 0);
+    assert(!parse_cgroup_uint("max\n", 0, &value));
+    assert(parse_cgroup_uint("0\n", 0, &value) && value == 0);
+    assert(parse_cgroup_uint("18446744073709551615\n", 0, &value) &&
+           value == ULLONG_MAX);
+    assert(!parse_cgroup_uint("18446744073709551616\n", 0, &value));
+    const char *invalid[] = {"-1", "1junk", "maxjunk", "+1", "1_024",
+                             "1\n2", "", "   "};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+        assert(!parse_cgroup_uint(invalid[i], 1, &value));
+}
+
 int main(void)
 {
+    check_cgroup_counter_spelling();
     assert(curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK);
     assert(mkdir(R2_HOME, 0700) == 0 || errno == EEXIST);
     assert(r2_log_init() == 0);

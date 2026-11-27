@@ -6,6 +6,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import struct
 import zlib
 import subprocess
@@ -38,6 +39,13 @@ def _is_required_model(item: Any, model: str = MODEL) -> bool:
 
 
 
+def _runtime_decimal(raw: str) -> int:
+    """Use the same decimal spelling accepted by C's complete strtol parse."""
+    if re.fullmatch(r"[ \t\r\n\v\f]*[+-]?[0-9]+", raw) is None:
+        raise ValueError("not a complete ASCII decimal")
+    return int(raw, 10)
+
+
 def _adaptive_context_tokens() -> int:
     """Mirror r2_ollama_context_tokens() when no explicit context is set."""
     gib = 1024 ** 3
@@ -51,19 +59,22 @@ def _adaptive_context_tokens() -> int:
     except (OSError, ValueError, IndexError):
         available = 0
 
-    def read_uint(path: str) -> int | None:
+    def read_uint(path: str, allow_max: bool = False) -> int | None:
         try:
             with open(path, "r", encoding="ascii") as stream:
-                raw = stream.read().strip()
+                raw = stream.read().strip(" \t\r\n\v\f")
+            if allow_max and raw == "max":
+                return 0
+            if re.fullmatch(r"[0-9]+", raw) is None:
+                return None
             value = int(raw, 10)
-            return value if value >= 0 else None
+            return value if value <= (1 << 64) - 1 else None
         except (OSError, ValueError):
             return None
 
-    # Match the core's cgroup precedence: use v2 when its limit is numeric;
-    # otherwise try v1. A known limit with unreadable usage means headroom is
-    # unknown, so the core deliberately selects the smallest positive tier.
-    cgroup_max = read_uint("/sys/fs/cgroup/memory.max")
+    # A valid unlimited v2 limit ("max") also takes precedence over v1.
+    # A known finite limit with unreadable usage means headroom is unknown.
+    cgroup_max = read_uint("/sys/fs/cgroup/memory.max", allow_max=True)
     if cgroup_max is not None:
         if cgroup_max > 0:
             cgroup_used = read_uint("/sys/fs/cgroup/memory.current")
@@ -220,9 +231,9 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
             return False
         time.sleep(min(1, remaining))
 
-    gpu_layers_raw = os.environ.get("R2_OLLAMA_NUM_GPU", "0").strip() or "0"
+    gpu_layers_raw = os.environ.get("R2_OLLAMA_NUM_GPU", "") or "0"
     try:
-        gpu_layers = int(gpu_layers_raw)
+        gpu_layers = _runtime_decimal(gpu_layers_raw)
     except ValueError:
         print(f"ERROR: Invalid R2_OLLAMA_NUM_GPU={gpu_layers_raw!r}; use -1, 0, or a positive layer count.", file=sys.stderr)
         return False
@@ -239,11 +250,11 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
         "repeat_penalty": 1.0,
         "num_batch": 128,
     }
-    configured_context = os.environ.get("R2_OLLAMA_NUM_CTX", "").strip()
+    configured_context = os.environ.get("R2_OLLAMA_NUM_CTX", "")
     context_tokens = _adaptive_context_tokens()
     if configured_context:
         try:
-            requested_context = int(configured_context, 10)
+            requested_context = _runtime_decimal(configured_context)
         except ValueError:
             requested_context = 0
         # Mirror r2_ollama_context_tokens(): only accepted explicit overrides
@@ -255,8 +266,7 @@ def _preflight(wait_seconds: float = 0, timeout: float = 180, require_gpu_offloa
     options["num_predict"] = 512 if context_tokens < 4096 else 1024
     # Match r2.c exactly: unset and explicit zero both use Ollama's automatic
     # placement. Only a nonzero explicit layer count becomes a num_gpu option.
-    if ("R2_OLLAMA_NUM_GPU" in os.environ and
-            os.environ["R2_OLLAMA_NUM_GPU"].strip() and gpu_layers != 0):
+    if gpu_layers != 0:
         options["num_gpu"] = gpu_layers
 
     # Keep the expected answer in an earlier turn so the probe checks
