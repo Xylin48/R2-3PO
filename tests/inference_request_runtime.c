@@ -2389,7 +2389,7 @@ static void check_associative_planner_retains_previous_exchange(void)
     free(plan);
     r2_associative_query_cache_clear();
 
-    /* A planner which returns malformed JSON twice still has the preceding
+    /* A planner which returns malformed JSON once still has the preceding
        visible exchange in hand. Search with that antecedent, not an isolated
        pronoun from the latest turn, and do not repeat planning on reuse. */
     free(response_body);
@@ -2397,12 +2397,12 @@ static void check_associative_planner_retains_previous_exchange(void)
     assert(response_body);
     before = perform_count;
     plan = r2_build_associative_search_query(query);
-    assert(plan && perform_count == before + 2);
+    assert(plan && perform_count == before + 1);
     assert(!strncmp(plan, query, strlen(query)) &&
            strstr(plan, first) && strstr(plan, reply));
     assert(!strstr(plan, "Fixture request"));
     cached = r2_build_associative_search_query(query);
-    assert(cached && !strcmp(cached, plan) && perform_count == before + 2);
+    assert(cached && !strcmp(cached, plan) && perform_count == before + 1);
     const char *fallback_keywords[MAX_MEMORY_KEYWORDS];
     size_t fallback_count = extract_memory_keywords(plan, fallback_keywords);
     int found_antecedent = 0;
