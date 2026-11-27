@@ -1426,30 +1426,35 @@ static int db_exec(const char *sql)
 
 static int db_column_exists(sqlite3 *connection, const char *table, const char *column)
 {
-    if (!table || !column) return 0;
+    if (!connection || !table || !column) return -1;
     char sql[256];
     int n = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s);", table);
-    if (n < 0 || (size_t)n >= sizeof(sql)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
 
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(connection, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(connection, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) {
-                found = 1;
+            if (!name) {
+                rc = SQLITE_NOMEM;
                 break;
             }
+            if (!strcasecmp((const char *)name, column))
+                found = 1;
         }
     }
-    if (st) sqlite3_finalize(st);
-    return found;
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? found : -1;
 }
 
 static int db_ensure_column(const char *table, const char *column,
                             const char *definition)
 {
-    if (db_column_exists(db, table, column)) return 0;
+    int exists = db_column_exists(db, table, column);
+    if (exists < 0) return -1;
+    if (exists) return 0;
     char sql[512];
     int n = snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;",
                      table, column, definition);
@@ -1472,7 +1477,9 @@ static int db_backfill_memory_column(const char *target,
     used = (size_t)n;
 
     for (size_t i = 0; i < alias_count; ++i) {
-        if (!db_column_exists(db, "memories", aliases[i])) continue;
+        int exists = db_column_exists(db, "memories", aliases[i]);
+        if (exists < 0) return -1;
+        if (!exists) continue;
         n = snprintf(expression + used, sizeof(expression) - used,
                      "NULLIF(%s,''),", aliases[i]);
         if (n < 0 || (size_t)n >= sizeof(expression) - used) return -1;
@@ -1487,7 +1494,23 @@ static int db_backfill_memory_column(const char *target,
                  "UPDATE memories SET %s=%s WHERE %s IS NULL OR %s='';",
                  target, expression, target, target);
     if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
-    return db_exec(sql);
+    if (db_exec(sql) != 0) return -1;
+
+    /* An ignored UPDATE is SQLITE_OK even if the original alias has not
+       reached the canonical column. Verify the same expression for every
+       still-empty target, allowing genuinely empty legacy memory text. */
+    n = snprintf(sql, sizeof(sql),
+                 "SELECT 1 FROM memories WHERE (%s IS NULL OR %s='') "
+                 "AND NOT (%s IS %s) LIMIT 1;",
+                 target, target, target, expression);
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "[R2 memory] Canonical memory backfill incomplete for %s.\n", target);
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
 static int migrate_memory_schema(void)
@@ -1550,7 +1573,9 @@ static int db_insert_memory_compat(sqlite3 *connection, const char *memory, cons
 
 #define ADD_LEGACY_COLUMNS(names, value) do { \
     for (size_t alias_i = 0; alias_i < sizeof(names) / sizeof((names)[0]); ++alias_i) { \
-        if (db_column_exists(connection, "memories", (names)[alias_i])) { \
+        int exists = db_column_exists(connection, "memories", (names)[alias_i]); \
+        if (exists < 0) return SQLITE_ERROR; \
+        if (exists) { \
             if (count >= sizeof(columns) / sizeof(columns[0])) return SQLITE_TOOBIG; \
             columns[count] = (names)[alias_i]; \
             values[count++] = (value); \
@@ -2411,7 +2436,7 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
         free(candidates);
     } else {
         const char *sql =
-            "SELECT memory,category FROM memories ORDER BY updated_at DESC LIMIT ?";
+            "SELECT memory,category FROM memories ORDER BY updated_at DESC,id DESC LIMIT ?";
         rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
         if (rc != SQLITE_OK) {
             fprintf(stderr, "[R2 memory] Could not prepare recent-memory context: %s\n",
@@ -2419,13 +2444,16 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
             failed = 1;
         }
         if (!failed) {
-            rc = sqlite3_bind_int(st, 1, limit);
+            /* One lookahead row distinguishes a bounded recent window
+               from a complete result without increasing returned records. */
+            rc = sqlite3_bind_int(st, 1, limit + (partial != NULL));
             if (rc != SQLITE_OK) {
                 fprintf(stderr, "[R2 memory] Could not bind recent-memory limit: %s\n",
                         sqlite3_errmsg(db));
                 failed = 1;
             }
         }
+        int seen = 0;
         while (!failed) {
             rc = sqlite3_step(st);
             if (rc == SQLITE_DONE)
@@ -2434,6 +2462,10 @@ static char *get_relevant_memories(const char *query, int limit, size_t byte_bud
                 fprintf(stderr, "[R2 memory] Recent-memory query failed while reading rows: %s\n",
                         sqlite3_errmsg(db));
                 failed = 1;
+                break;
+            }
+            if (seen++ == limit) {
+                if (partial) *partial = 1;
                 break;
             }
             const char *fields[2];
@@ -4723,7 +4755,9 @@ static char *ollama_chat_with_limit(
     /* Finalize the generation reservation against the complete preceding
        exchange as well as the active turn. This also covers explicit recall
        and the final answer after a staged historical-evidence review. */
-    if (ollama_audit_stage && !strcmp(ollama_audit_stage, "conversation-answer")) {
+    if (ollama_audit_stage &&
+        (!strcmp(ollama_audit_stage, "conversation-answer") ||
+         !strcmp(ollama_audit_stage, "association-planner"))) {
         size_t prior = r2_prior_exchange_bytes(msgs, count, current_user_index);
         if (prior &&
             r2_required_inference_bytes(msgs, count, current_user_index,

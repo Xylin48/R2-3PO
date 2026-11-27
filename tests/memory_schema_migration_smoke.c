@@ -46,6 +46,20 @@ int main(void)
         sqlite3_close(legacy);
         return 1;
     }
+    /* SQLite reports success for a BEFORE UPDATE RAISE(IGNORE). The
+       migration must not commit empty canonical columns over real history. */
+    assert(sqlite3_exec(legacy,
+        "CREATE TRIGGER ignore_legacy_backfill BEFORE UPDATE ON memories "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_close(legacy);
+    assert(init_db() == -1);
+    assert(db_column_exists(db, "memories", "memory") == 0);
+    assert(db_column_exists(NULL, "memories", "memory") == -1);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    db = NULL;
+    assert(sqlite3_open(DB_PATH, &legacy) == SQLITE_OK);
+    assert(sqlite3_exec(legacy, "DROP TRIGGER ignore_legacy_backfill;",
+                        NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(legacy);
 
     assert(init_db() == 0);

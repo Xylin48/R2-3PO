@@ -2351,6 +2351,24 @@ static void check_associative_planner_retains_previous_exchange(void)
     r2_associative_query_cache_clear();
     set_response("Fixture answer.", "stop", 1);
     message_free_all();
+
+    /* The planner must retain the previous exchange when it fits only
+       after the existing generation reserve is adjusted. */
+    const char *policy = "Fixture associative planner policy.";
+    size_t required = r2_text_input_bytes(2048, 96);
+    size_t fixed = strlen(policy) + strlen(first) + strlen(query);
+    assert(required > fixed);
+    char *long_reply = text(required - fixed, 'z', "Long astronomy antecedent ");
+    Message probe[] = {
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = long_reply},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_stage = ollama_audit_stage;
+    ollama_audit_stage = "association-planner";
+    check_request(probe, 3, policy, 2048, 128, 1);
+    ollama_audit_stage = old_stage;
+    free(long_reply);
 }
 
 static void check_missing_live_frame_is_current_evidence(void)

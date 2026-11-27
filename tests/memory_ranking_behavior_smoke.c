@@ -83,6 +83,20 @@ int main(void)
     printf("PASS: bounded memory ranking orders by score, timestamp, and stable ID; excludes weaker matches.\n");
     free(result);
 
+    assert(db_exec("UPDATE memories SET updated_at='2025-01-01T00:00:00';") == 0);
+    ranked_partial = 0;
+    result = get_relevant_memories("", 2, SIZE_MAX, &ranked_partial);
+    assert(result && ranked_partial && strstr(result, "nebula quiet"));
+    const char *recent_first = strstr(result, "nebula quiet");
+    const char *recent_second = strstr(result, "nebula telescope satellite observation");
+    assert(recent_second && recent_first < recent_second &&
+           !strstr(result, "nebula spaceship telescope observation"));
+    free(result);
+    ranked_partial = 0;
+    result = get_relevant_memories("", 4, SIZE_MAX, &ranked_partial);
+    assert(result && !ranked_partial && strstr(result, "nebula spaceship telescope satellite overview"));
+    free(result);
+
     char exact_cue[257];
     memset(exact_cue, 'q', sizeof(exact_cue) - 1);
     memcpy(exact_cue + 240, "exactIdentifier", sizeof("exactIdentifier"));
