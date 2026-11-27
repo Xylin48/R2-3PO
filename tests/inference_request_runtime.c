@@ -1815,6 +1815,12 @@ static void check_action_result_under_history_pressure(void)
     pthread_mutex_unlock(&post_turn_lock);
     assert(!atomic_load(&fail_runtime_notice_copy));
     assert(reply && !r2_talk_last_reply_generated());
+    assert(!strcmp(reply, "Your message was saved, but I couldn't prepare the reply for display."));
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_events "
+        "WHERE event_type='conversation_public_api_fallback' "
+        "AND instr(details,'turn_saved=yes')>0 "
+        "AND instr(details,'conversation_event_id=' || (SELECT event_id FROM r2_log_conversations "
+        "WHERE user_text='Inspect the screen once more.'))>0;") == 1);
     assert(memory_fixture_count("SELECT count(*) FROM r2_log_conversations "
         "WHERE user_text='Inspect the screen once more.' AND assistant_text="
         "'I couldn''t produce a reply to this turn. Your message is still here.';") == 1);
