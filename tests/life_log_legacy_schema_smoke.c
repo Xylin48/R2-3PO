@@ -330,6 +330,41 @@ int main(void)
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_conversations c "
                           "JOIN r2_log_events e ON e.id=c.event_id WHERE c.id=9876 "
                           "AND e.source='LogMigration:r2_log_conversations:9876';") == 1);
+
+    int active = scalar(writer, "SELECT MAX(id) FROM r2_log_sessions;");
+    int count_before = scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;");
+    assert(r2_log_session_start() == -1);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER reject_session_end BEFORE INSERT ON r2_log_events "
+        "WHEN NEW.event_type='session_ended' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_session_end("fixture") == -1);
+    assert(scalar(writer, "SELECT ended_utc IS NULL FROM r2_log_sessions WHERE id="
+                          "(SELECT MAX(id) FROM r2_log_sessions);") == 1);
+    assert(r2_log_event(R2_LOG_MEMORY,"session_atomic_fixture","still in active session",NULL,"fixture") > 0);
+    assert(scalar(writer, "SELECT session_id FROM r2_log_events "
+                          "WHERE event_type='session_atomic_fixture';") == active);
+    assert(sqlite3_exec(writer, "DROP TRIGGER reject_session_end;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_session_end("fixture") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='session_ended' "
+                          "AND session_id=(SELECT MAX(id) FROM r2_log_sessions);") == 1);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER reject_session_start BEFORE INSERT ON r2_log_events "
+        "WHEN NEW.event_type='session_started' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_session_start() == -1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;") == count_before);
+    assert(sqlite3_exec(writer, "DROP TRIGGER reject_session_start;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER reject_session_row BEFORE INSERT ON r2_log_sessions "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_session_start() == -1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;") == count_before);
+    assert(sqlite3_exec(writer, "DROP TRIGGER reject_session_row;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_session_start() == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_sessions;") == count_before + 1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='session_started' "
+                          "AND session_id=(SELECT MAX(id) FROM r2_log_sessions);") == 1);
     r2_log_shutdown();
     sqlite3_close(writer);
     puts("Life Log legacy schema migration preserved old events and accepted new writable events.");

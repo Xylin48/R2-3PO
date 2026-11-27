@@ -183,6 +183,22 @@ int main(void)
     if (st) sqlite3_finalize(st);
     sqlite3_close(fixture);
     if (!check(evidence_id > 0, "fixture evidence ID exists")) goto done;
+    fixture = NULL;
+    if (!check(sqlite3_open(database, &fixture) == SQLITE_OK, "open migration fixture")) goto done;
+    int migration_trigger = sqlite3_exec(fixture,
+        "CREATE TRIGGER revert_branch_link AFTER UPDATE OF log_event_id ON r2_alternate_self_branches "
+        "WHEN NEW.id=2 AND NEW.log_event_id>0 BEGIN "
+        "UPDATE r2_alternate_self_branches SET log_event_id=0 WHERE id=2; END;",
+        NULL, NULL, NULL);
+    if (!check(migration_trigger == SQLITE_OK, "install reverted-link fixture")) {
+        sqlite3_close(fixture);
+        goto done;
+    }
+    int bad_migration = r2_altself_init();
+    migration_trigger = sqlite3_exec(fixture, "DROP TRIGGER revert_branch_link;", NULL, NULL, NULL);
+    sqlite3_close(fixture);
+    if (!check(bad_migration < 0 && migration_trigger == SQLITE_OK,
+               "reverted legacy link must fail rather than repeat forever")) goto done;
     if (!check(r2_altself_init() == 0, "initialize Alternate-Self Lab schema")) goto done;
 
     sqlite3 *link_check = NULL;
@@ -254,6 +270,22 @@ int main(void)
         "My preference might change.", "Prediction only.", imported_event, evidence_id);
     if (!check(imported1 > 0 && imported1 == imported2,
                "importing the same hypothetical is idempotent")) goto done;
+    fixture = NULL;
+    if (!check(sqlite3_open(database, &fixture) == SQLITE_OK, "open ignored import fixture")) goto done;
+    int trigger_rc = sqlite3_exec(fixture,
+        "CREATE TRIGGER ignore_different_hypothesis BEFORE INSERT ON r2_alternate_self_branches "
+        "WHEN NEW.scenario='Different hypothesis' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL);
+    if (!check(trigger_rc == SQLITE_OK, "install ignored import fixture")) {
+        sqlite3_close(fixture);
+        goto done;
+    }
+    int64_t wrong = r2_altself_import_hypothesis("Different hypothesis", NULL, NULL,
+                                                NULL, imported_event, evidence_id);
+    trigger_rc = sqlite3_exec(fixture, "DROP TRIGGER ignore_different_hypothesis;", NULL, NULL, NULL);
+    sqlite3_close(fixture);
+    if (!check(wrong < 0 && trigger_rc == SQLITE_OK,
+               "an ignored import cannot acknowledge an unrelated branch with the same event")) goto done;
     if (!check(r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",
                "My preference might change.", "Prediction only.", INT64_MAX, 0) < 0 &&
                r2_altself_import_hypothesis("Would I still like X if I knew Y?", "Y is hypothetical.",

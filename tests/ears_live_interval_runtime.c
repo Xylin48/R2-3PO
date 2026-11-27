@@ -103,6 +103,13 @@ static int cancel_now(void *unused) { (void)unused; return 1; }
 int main(void)
 {
     assert(R2_EARS_MAX_WAV_SECONDS > 30);
+    /* strtoul accepts a leading minus and wraps -ULONG_MAX to one.
+       The actual tool must reject that text before starting any capture. */
+    char invalid_duration[128];
+    snprintf(invalid_duration, sizeof(invalid_duration), "live|-%lu", ULONG_MAX);
+    char *invalid_result = r2_process_ears_listen_request(invalid_duration);
+    assert(invalid_result && strstr(invalid_result, "No capture was started."));
+    free(invalid_result);
     exercise_source(0);
     exercise_source(1);
     FILE *sink = tmpfile(); assert(sink);

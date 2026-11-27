@@ -35,23 +35,25 @@ static int altself_column_exists(const char *column)
 {
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(as_db, "PRAGMA table_info(r2_alternate_self_branches)",
-                           -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(as_db, "PRAGMA table_info(r2_alternate_self_branches)",
+                               -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) {
+            if (!name) { rc = SQLITE_NOMEM; break; }
+            if (!strcasecmp((const char *)name, column))
                 found = 1;
-                break;
-            }
         }
     }
-    if (st) sqlite3_finalize(st);
-    return found;
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? found : -1;
 }
 
 static int altself_ensure_column(const char *column, const char *definition)
 {
-    if (altself_column_exists(column)) return SQLITE_OK;
+    int exists = altself_column_exists(column);
+    if (exists < 0) return SQLITE_ERROR;
+    if (exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql),
                      "ALTER TABLE r2_alternate_self_branches ADD COLUMN %s %s;",
@@ -131,10 +133,10 @@ static int altself_restore_missing_log_links(void)
             free(details);
             return -1;
         }
-        sqlite3_bind_text(st, 1, "alternate_self_legacy_link_restored",
-                          -1, SQLITE_STATIC);
-        sqlite3_bind_text(st, 2, summary, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(st);
+        rc = sqlite3_bind_text(st, 1, "alternate_self_legacy_link_restored",
+                               -1, SQLITE_STATIC);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 2, summary, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         if (rc == SQLITE_ROW)
             event_id = sqlite3_column_int64(st, 0);
         else if (rc != SQLITE_DONE) {
@@ -164,13 +166,27 @@ static int altself_restore_missing_log_links(void)
             if (st) sqlite3_finalize(st);
             return -1;
         }
-        sqlite3_bind_int64(st, 1, event_id);
-        sqlite3_bind_int64(st, 2, branch_id);
-        rc = sqlite3_step(st);
+        rc = sqlite3_bind_int64(st, 1, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, branch_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
         int changed = sqlite3_changes(as_db);
         sqlite3_finalize(st);
         if (rc != SQLITE_DONE || changed != 1) {
             fprintf(stderr, "[R2 Alternate-Self Lab] Could not restore branch #%lld Life Log relationship.\n",
+                    (long long)branch_id);
+            return -1;
+        }
+        st = NULL;
+        rc = sqlite3_prepare_v2(as_db,
+            "SELECT 1 FROM r2_alternate_self_branches b "
+            "JOIN r2_log_events e ON e.id=b.log_event_id "
+            "WHERE b.id=? AND b.log_event_id=?;", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, branch_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_ROW) {
+            fprintf(stderr, "[R2 Alternate-Self Lab] Branch #%lld Life Log relationship did not persist.\n",
                     (long long)branch_id);
             return -1;
         }
@@ -447,26 +463,11 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     if (rc == SQLITE_OK) rc = evidence_event_id > 0 ? sqlite3_bind_int64(st, 6, evidence_event_id) : sqlite3_bind_null(st, 6);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, hypothetical_event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    int64_t id = rc == SQLITE_DONE ? sqlite3_last_insert_rowid(as_db) : -1;
-    if (rc == SQLITE_DONE && sqlite3_changes(as_db) == 0) {
-        sqlite3_stmt *existing = NULL;
-        int existing_rc = sqlite3_prepare_v2(as_db,
-            "SELECT id FROM r2_alternate_self_branches "
-            "WHERE log_event_id=?1 AND branch_kind='counterfactual' "
-            "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?1) "
-            "AND (?2<=0 OR EXISTS(SELECT 1 FROM r2_log_events WHERE id=?2));",
-            -1, &existing, NULL);
-        if (existing_rc == SQLITE_OK)
-            existing_rc = sqlite3_bind_int64(existing, 1, hypothetical_event_id);
-        if (existing_rc == SQLITE_OK)
-            existing_rc = sqlite3_bind_int64(existing, 2, evidence_event_id);
-        if (existing_rc == SQLITE_OK) existing_rc = sqlite3_step(existing);
-        if (existing_rc == SQLITE_ROW)
-            id = sqlite3_column_int64(existing, 0);
-        else
-            id = -1;
-        sqlite3_finalize(existing);
-    }
+    /* The exact active-content lookup above is the idempotent path. An
+       ignored insert is not proof that another branch with the same source
+       event represents this scenario or remains active. */
+    int64_t id = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1
+        ? sqlite3_last_insert_rowid(as_db) : -1;
     sqlite3_finalize(st);
     pthread_mutex_unlock(&as_lock);
     return id;

@@ -9363,7 +9363,8 @@ static char *r2_process_ears_listen_request(const char *request)
     }
     errno = 0;
     seconds = strtoul(seconds_text, &end, 10);
-    valid = valid && !errno && end != seconds_text && end && *end == '\0' &&
+    valid = valid && *seconds_text != '-' && !errno &&
+            end != seconds_text && end && *end == '\0' &&
             seconds >= 1UL && seconds <= R2_EARS_MAX_WAV_SECONDS;
     if (!valid) {
         free(copy);

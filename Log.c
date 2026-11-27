@@ -66,6 +66,7 @@ static int process_clock_ready = 0;
 static int log_link_locked(int64_t from_event_id, int64_t to_event_id,
                            const char *relationship, const char *notes);
 static int log_link_context_review_locked(int64_t archive_id, int64_t conversation_id);
+static int log_session_end_locked(const char *reason);
 
 /* ------------------------------------------------------------
  * SMALL INTERNAL HELPERS
@@ -974,12 +975,13 @@ void r2_log_shutdown(void)
 {
     sqlite3 *to_close = NULL;
 
-    if (!r2_log_is_initialized())
-        return;
-
-    r2_log_session_end("normal_shutdown");
-
     pthread_mutex_lock(&log_lock);
+    if (!log_initialized) {
+        pthread_mutex_unlock(&log_lock);
+        return;
+    }
+    if (log_session_end_locked("normal_shutdown") != 0)
+        fprintf(stderr, "[R2 Life Log] Could not commit session end before shutdown.\n");
 
     if (log_db) {
         sqlite3_wal_checkpoint_v2(log_db, NULL,
@@ -1678,7 +1680,8 @@ int r2_log_session_start(void)
 
     pthread_mutex_lock(&log_lock);
 
-    if (!log_initialized || !log_db) {
+    if (!log_initialized || !log_db || current_session_id > 0 ||
+        exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
         return -1;
     }
@@ -1702,22 +1705,21 @@ int r2_log_session_start(void)
 
     sqlite3_finalize(statement);
 
-    if (id > 0)
+    int saved = id > 0;
+    if (saved) {
         current_session_id = id;
-
-    pthread_mutex_unlock(&log_lock);
-
-    if (id > 0) {
-        r2_log_event(R2_LOG_LIFECYCLE, "session_started",
+        saved = log_insert_event_locked(R2_LOG_LIFECYCLE, "session_started",
                      "R2 process session started.",
-                     "A new session record was created.", "Log.c");
-        return 0;
+                     "A new session record was created.", "Log.c") > 0;
     }
-
-    return -1;
+    int result = log_finish_write(saved);
+    if (result != 0) current_session_id = 0;
+    pthread_mutex_unlock(&log_lock);
+    return result;
 }
 
-int r2_log_session_end(const char *reason)
+/* The caller owns log_lock until both the row and final event are committed. */
+static int log_session_end_locked(const char *reason)
 {
     sqlite3_stmt *statement = NULL;
     char utc[40];
@@ -1727,12 +1729,10 @@ int r2_log_session_end(const char *reason)
 
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
 
-    pthread_mutex_lock(&log_lock);
-
-    if (!log_initialized || !log_db || current_session_id <= 0) {
-        pthread_mutex_unlock(&log_lock);
+    if (!log_initialized || !log_db || current_session_id <= 0)
         return 0;
-    }
+    if (exec_sql("BEGIN IMMEDIATE;") != 0)
+        return -1;
 
     session_id = current_session_id;
 
@@ -1753,22 +1753,23 @@ int r2_log_session_end(const char *reason)
     if (rc == SQLITE_DONE && sqlite3_changes(log_db) != 1) rc = SQLITE_NOTFOUND;
 
     sqlite3_finalize(statement);
-    pthread_mutex_unlock(&log_lock);
-
-    if (rc != SQLITE_DONE)
-        return -1;
-
-    /* Keep the active session ID until its final event is written. */
-    r2_log_event(R2_LOG_LIFECYCLE, "session_ended",
+    int saved = rc == SQLITE_DONE;
+    if (saved)
+        saved = log_insert_event_locked(R2_LOG_LIFECYCLE, "session_ended",
                  "R2 process session ended.",
                  reason ? reason : "No shutdown reason supplied.",
-                 "Log.c");
+                 "Log.c") > 0;
+    int result = log_finish_write(saved);
+    if (result == 0) current_session_id = 0;
+    return result;
+}
 
+int r2_log_session_end(const char *reason)
+{
     pthread_mutex_lock(&log_lock);
-    current_session_id = 0;
+    int result = log_session_end_locked(reason);
     pthread_mutex_unlock(&log_lock);
-
-    return 0;
+    return result;
 }
 
 int64_t r2_log_milestone(
