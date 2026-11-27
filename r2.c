@@ -15889,8 +15889,9 @@ int r2_talk_last_reply_generated(void)
     return last_talk_reply_generated;
 }
 
-static char *r2_talk_impl(const char *message)
+static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)
 {
+    *turn_event_id_out = 0; /* No accepted turn has been finalized yet. */
     if (!core_initialized || shutting_down || !message)
         return NULL;
 
@@ -16127,6 +16128,7 @@ finalize_reply:
                                                r2_log_conversation_turn_with_fallback)(message, reply_text,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
+    *turn_event_id_out = turn_event_id;
     if (!shutting_down && hands_result_id > 0 && generated_reply && turn_event_id > 0 &&
         r2_log_deliver_hands_result(hands_result_id, turn_event_id) != 0)
         fprintf(stderr, "[R2] Hands result remains pending after the conversation write.\n");
@@ -16320,7 +16322,8 @@ char *r2_talk(const char *message)
     R2AudioTurnEvidence *previous_evidence = r2_audio_turn_evidence;
     r2_audio_turn_evidence = &speech_evidence;
     r2_audio_turn_record(r2_input_speech_event);
-    char *reply = r2_talk_impl(message);
+    int64_t turn_event_id = 0;
+    char *reply = r2_talk_impl(message, &turn_event_id);
     r2_turn_reality_stale = 0;
     pthread_mutex_lock(&messages_lock);
     remove_pending_hands_result_locked();
@@ -16337,17 +16340,20 @@ char *r2_talk(const char *message)
                 "(input_chars=%zu); returning an explicit failure message.\n",
                 failure_kind, input_chars);
         if (r2_log_is_initialized()) {
-            char details[160];
+            char details[256];
             snprintf(details, sizeof(details),
-                     "implementation_reply=%s; input_chars=%zu; user_text_logged=no",
-                     failure_kind, input_chars);
+                     "implementation_reply=%s; input_chars=%zu; user_text_logged=no; "
+                     "conversation_event_id=%lld; turn_saved=%s",
+                     failure_kind, input_chars, (long long)turn_event_id,
+                     turn_event_id > 0 ? "yes" : turn_event_id < 0 ? "unconfirmed" : "not_finalized");
             r2_log_event(R2_LOG_ERROR, "conversation_public_api_fallback",
                          "The conversation implementation returned no usable reply; the public API supplied a visible fallback.",
                          details, "r2_talk");
         }
-        reply = xstrdup(
-            "I'm sorry—I couldn't process that turn successfully. "
-            "The message may not have been saved to conversation history; please try again.");
+        reply = xstrdup(turn_event_id > 0
+            ? "Your message was saved, but I couldn't prepare the reply for display."
+            : "I'm sorry—I couldn't process that turn successfully. "
+              "The message may not have been saved to conversation history; please try again.");
     }
     r2_turn_context_reviews = previous_reviews;
     free(context_reviews.archives);
