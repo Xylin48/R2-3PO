@@ -1461,6 +1461,21 @@ static void check_reflection_stop_and_long_visual_query(void)
     assert(query_requested_live_sources("Look at me, then look at the screen.") ==
            (R2_LIVE_CAMERA | R2_LIVE_DISPLAY));
     assert(query_requested_live_sources("Look at my notebook.") == R2_LIVE_CAMERA);
+    assert(query_requested_live_sources("R2, could you please look at my notebook?") ==
+           R2_LIVE_CAMERA);
+    assert(query_requested_live_sources("Hello! Look at my notebook.") == R2_LIVE_CAMERA);
+    assert(query_requested_live_sources("Please look at the screen.") == R2_LIVE_DISPLAY);
+    assert(query_requested_live_sources("Look at me, then look at the TV.") ==
+           (R2_LIVE_CAMERA | R2_LIVE_DISPLAY));
+    assert(!query_requested_live_sources("I look at my notebook every day."));
+    assert(!query_requested_live_sources("People look at me in the hallway."));
+    assert(!query_requested_live_sources("I look at the screen every day."));
+    assert(!query_requested_live_sources("My outlook at work has changed."));
+    assert(!query_requested_live_sources("What is this error?"));
+    assert(!query_requested_live_sources("What's this function called?"));
+    assert(!query_requested_live_sources("Describe this function."));
+    assert(!query_requested_live_sources("What is this?"));
+    assert(query_requests_visual_context("What is this?"));
 
     r2_associative_query_cache_clear();
     set_response("present visual view", "stop", 1);

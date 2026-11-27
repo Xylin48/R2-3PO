@@ -291,7 +291,11 @@ class LocalOllama(BaseHTTPRequestHandler):
                     f"{FOLLOWUP_FILE_CONTENT}[END WRITE]"
                 )
         if current_index >= 0 and foreground:
-            if user_messages[current_index] == IDENTITY_RECALL_REQUEST:
+            if user_messages[current_index] == STALLED_LEARNING_FIRST:
+                message["content"] = STALLED_LEARNING_FIRST_REPLY
+            elif user_messages[current_index] == STALLED_LEARNING_SECOND:
+                message["content"] = STALLED_LEARNING_SECOND_REPLY
+            elif user_messages[current_index] == IDENTITY_RECALL_REQUEST:
                 message["content"] = IDENTITY_REPLY if IDENTITY_MEMORY in system else ""
             elif user_messages[current_index] == IDENTITY_REPEAT_REQUEST:
                 message["content"] = "Good afternoon. I'm glad you stopped by."
@@ -1022,11 +1026,16 @@ def interrupt_partial_terminal_line(binary: Path, workspace: Path, url: str) -> 
 
 
 INTERRUPTED_LEARNING_MEMORY = "The user reported seeing a blue notebook during the stalled-learning test."
+STALLED_LEARNING_FIRST = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
+STALLED_LEARNING_SECOND = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
+STALLED_LEARNING_FIRST_REPLY = "We need to make sure we remember the blue notebook."
+STALLED_LEARNING_SECOND_REPLY = "I will respond to your next message with that in mind."
 
 
 def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
-    first = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
-    second = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
+    first = STALLED_LEARNING_FIRST
+    second = STALLED_LEARNING_SECOND
+    start = len(LocalOllama.requests)
     log_file = workspace.parent / "second-turn-learning.log"
     LocalOllama.stalled_learning_started.clear()
     LocalOllama.stalled_learning_release.clear()
@@ -1044,7 +1053,9 @@ def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: st
             process.stdin.flush()
             deadline = time.monotonic() + 10
             while process.poll() is None and time.monotonic() < deadline:
-                if log_file.read_text(errors="replace").count("R2-3PO: " + REPLY) == 2:
+                visible = log_file.read_text(errors="replace")
+                if (visible.count("R2-3PO: " + STALLED_LEARNING_FIRST_REPLY) == 1
+                        and visible.count("R2-3PO: " + STALLED_LEARNING_SECOND_REPLY) == 1):
                     break
                 time.sleep(0.05)
             else:
@@ -1077,9 +1088,22 @@ def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: st
         assert db.execute(
             "SELECT user_text,assistant_text FROM r2_log_conversations "
             "WHERE user_text IN (?,?) ORDER BY event_id", (first, second),
-        ).fetchall() == [(first, REPLY), (second, REPLY)]
+        ).fetchall() == [(first, STALLED_LEARNING_FIRST_REPLY),
+                         (second, STALLED_LEARNING_SECOND_REPLY)]
+    answer_requests = [
+        request for request in LocalOllama.requests[start:]
+        if request["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
+        and request["messages"][-1]["role"] == "user"
+        and request["messages"][-1]["content"] in (first, second)
+    ]
+    assert [request["messages"][-1]["content"] for request in answer_requests] == [first, second]
+    second_dialogue = [(item["role"], item["content"])
+                       for item in answer_requests[1]["messages"] if item["role"] != "system"]
+    assert second_dialogue[-3:] == [
+        ("user", first), ("assistant", STALLED_LEARNING_FIRST_REPLY), ("user", second),
+    ], second_dialogue
     print("PASS: a stalled post-turn model request yielded, resumed learning exactly once, "
-          "and preserved both replies.")
+          "and preserved both ordinary first-person replies and the exact preceding exchange.")
 
 
 def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:

@@ -11797,6 +11797,40 @@ void r2_stop_thinking(void)
    VISUAL PERCEPTION BRIDGE
    ============================================================ */
 
+/* A request to look/describe is distinct from mentioning the same verb in
+ * a statement. Search the complete text, but require the imperative to
+ * start a clause or follow a direct request prefix. */
+static int query_has_visual_directive(const char *query, const char *phrase)
+{
+    static const char *const prefixes[] = {
+        "please", "then", "and", "then please", "and please",
+        "can you", "could you", "would you", "will you",
+        "can you please", "could you please", "would you please",
+        "will you please", "i want you to", "i'd like you to"
+    };
+    size_t length = strlen(phrase);
+    for (const char *p = query; (p = strcasestr(p, phrase)) != NULL; ++p) {
+        if ((p != query && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) ||
+            isalnum((unsigned char)p[length]) || p[length] == '_')
+            continue;
+        const char *lead = p;
+        while (lead > query && isspace((unsigned char)lead[-1]) &&
+               lead[-1] != '\n' && lead[-1] != '\r')
+            --lead;
+        const char *clause = lead;
+        while (clause > query && !strchr(".?!;:,\n\r", clause[-1]))
+            --clause;
+        while (clause < lead && isspace((unsigned char)*clause)) ++clause;
+        size_t prefix_length = (size_t)(lead - clause);
+        if (!prefix_length) return 1;
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i)
+            if (strlen(prefixes[i]) == prefix_length &&
+                !strncasecmp(clause, prefixes[i], prefix_length))
+                return 1;
+    }
+    return 0;
+}
+
 /* Historical visual search has a broader vocabulary than live perception.
  * A display question can use the already selected media source without
  * opening the independent physical camera. */
@@ -11804,35 +11838,46 @@ static int query_requested_live_sources(const char *query)
 {
     if (!query) return 0;
     static const char *const camera_terms[] = {
-        "what do you see", "what can you see", "look at me",
+        "what do you see", "what can you see",
         "what am i showing you", "what am i looking at",
-        "describe the image", "in this picture", "in this image"
+        "in this picture", "in this image"
     };
     static const char *const display_terms[] = {
         "what are we watching", "what is on the screen", "what's on the screen",
-        "what is playing", "what's playing", "describe the video", "look at the screen",
-        "look at the display", "look at the tv", "look on the screen",
+        "what is playing", "what's playing",
         "what is this on the screen", "what's this on the screen"
+    };
+    static const char *const camera_directives[] = {
+        "look at me", "describe the image"
+    };
+    static const char *const display_directives[] = {
+        "describe the video", "look at the screen", "look at the display",
+        "look at the tv", "look on the screen"
     };
     int sources = 0;
     for (size_t i = 0; i < sizeof(camera_terms) / sizeof(camera_terms[0]); ++i)
-        if (strcasestr(query, camera_terms[i])) {
+        if (query_has_phrase(query, camera_terms[i])) {
             sources |= R2_LIVE_CAMERA;
             break;
         }
     for (size_t i = 0; i < sizeof(display_terms) / sizeof(display_terms[0]); ++i)
-        if (strcasestr(query, display_terms[i])) {
+        if (query_has_phrase(query, display_terms[i])) {
             sources |= R2_LIVE_DISPLAY;
             break;
         }
-    /* An unqualified look request can use Eyes. Display-directed requests
-     * should not open Eyes just because they contain the same verb. */
-    static const char *const unqualified_terms[] = {
-        "look at", "look on", "what is this", "what's this", "describe this"
-    };
-    if (!sources)
-        for (size_t i = 0; i < sizeof(unqualified_terms) / sizeof(unqualified_terms[0]); ++i)
-            if (strcasestr(query, unqualified_terms[i])) return R2_LIVE_CAMERA;
+    for (size_t i = 0; i < sizeof(camera_directives) / sizeof(camera_directives[0]); ++i)
+        if (query_has_visual_directive(query, camera_directives[i]))
+            sources |= R2_LIVE_CAMERA;
+    for (size_t i = 0; i < sizeof(display_directives) / sizeof(display_directives[0]); ++i)
+        if (query_has_visual_directive(query, display_directives[i]))
+            sources |= R2_LIVE_DISPLAY;
+    /* An actual unqualified look command can use Eyes. A deictic question
+     * such as "what is this error?" or "describe this function" does not
+     * establish a visual referent. Leave ambiguous requests to the existing
+     * conversation and deliberate-sensory-action path. */
+    if (!sources && (query_has_visual_directive(query, "look at") ||
+                     query_has_visual_directive(query, "look on")))
+        return R2_LIVE_CAMERA;
     return sources;
 }
 
@@ -15885,7 +15930,7 @@ finalize_reply:
                 details = NULL;
             int64_t association_id = r2_log_event(
                 R2_LOG_CONVERSATION, "conversation_during_visual_media",
-                "A conversation turn occurred while R2 was observing media.",
+                "A conversation turn occurred while a visual media source was active.",
                 details, visual_source);
             if (association_id > 0)
                 r2_log_link(turn_event_id, association_id,
@@ -15905,7 +15950,7 @@ finalize_reply:
         if (display_source) {
             char *details = NULL;
             if (asprintf(&details,
-                         "conversation_event_id=%lld\\nmedia_display=%s\\n"
+                         "conversation_event_id=%lld\nmedia_display=%s\n"
                          "display_available=1; attended=not_established; interpreted=not_established",
                          (long long)turn_event_id, display_source) < 0)
                 details = NULL;
