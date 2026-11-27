@@ -293,6 +293,63 @@ static void check_durable_receipts(void)
     r2_log_shutdown();
 }
 
+static void check_hands_exact_transactions(void)
+{
+    assert(r2_log_init() == 0);
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_hands_accept AFTER INSERT ON r2_log_pending_hands "
+        "BEGIN UPDATE r2_log_pending_hands SET archive_path='wrong' WHERE event_id=NEW.event_id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_accept_hands("rewrite-accept", "fixture only") < 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER rewrite_hands_accept;", NULL, NULL, NULL) == SQLITE_OK);
+    int64_t receipt = r2_log_accept_hands("exact-transaction", "fixture only");
+    assert(receipt > 0);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_hands_arm AFTER UPDATE OF archive_path ON r2_log_pending_hands "
+        "WHEN NEW.archive_path IS NOT NULL BEGIN "
+        "UPDATE r2_log_pending_hands SET archive_path='wrong' WHERE event_id=NEW.event_id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_arm_hands(receipt, "/tmp/exact-hands-archive") < 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER rewrite_hands_arm;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_arm_hands(receipt, "/tmp/exact-hands-archive") == 0);
+    int before = count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;");
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_hands_result AFTER INSERT ON r2_log_hands_results "
+        "BEGIN UPDATE r2_log_hands_results SET result='wrong' WHERE outcome_id=NEW.outcome_id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_finish_hands(receipt, 1, 0, "complete exact fixture outcome") < 0);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 1);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;") == before);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER rewrite_hands_result;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_finish_hands(receipt, 1, 0, "complete exact fixture outcome") == 0);
+    /* Other fixtures may have pending outbox rows. Resolve this exact receipt. */
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(fixture,
+        "SELECT outcome_id FROM r2_log_hands_results WHERE result='complete exact fixture outcome';",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+    int64_t outcome = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    assert(r2_log_deliver_hands_result(outcome, receipt) < 0);
+    int64_t turn = r2_log_event(R2_LOG_CONVERSATION, "conversation_turn",
+                                "Fixture accepted conversation", NULL, "fixture");
+    assert(turn > 0);
+    assert(sqlite3_exec(fixture,
+        "CREATE TRIGGER undo_hands_delivery AFTER UPDATE OF delivered_to ON r2_log_hands_results "
+        "WHEN NEW.delivered_to IS NOT NULL BEGIN "
+        "UPDATE r2_log_hands_results SET delivered_to=NULL WHERE outcome_id=NEW.outcome_id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_deliver_hands_result(outcome, turn) < 0);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_links WHERE relationship='hands_result_in_context';") == 0);
+    assert(sqlite3_exec(fixture, "DROP TRIGGER undo_hands_delivery;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_deliver_hands_result(outcome, turn) == 0);
+    assert(r2_log_deliver_hands_result(outcome, turn) < 0);
+    assert(count_rows(fixture, "SELECT count(*) FROM r2_log_links WHERE relationship='hands_result_in_context';") == 1);
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+    r2_log_shutdown();
+}
+
 static void check_completion_persistence_retry(void)
 {
     assert(r2_log_init() == 0);
@@ -365,6 +422,7 @@ int main(void)
     atomic_store(&shutting_down, 0);
     check_durable_receipts();
     check_completion_persistence_retry();
+    check_hands_exact_transactions();
     puts("R2 active task shutdown, exact output archive and durable receipt smoke passed.");
     return 0;
 }

@@ -1911,6 +1911,22 @@ int64_t r2_log_thinking(const char *thought_kind, const char *summary,
                         details, "internal_thinking");
 }
 
+/* Called under log_lock inside an owned write transaction. Match the
+ * authoritative receipt, not a successful-looking UPDATE/INSERT. */
+static int log_hands_receipt_matches(int64_t event, const char *archive_path)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_pending_hands p JOIN r2_log_events e ON e.id=p.event_id "
+        "WHERE p.event_id=? AND p.archive_path IS ? COLLATE BINARY "
+        "AND e.event_type='hands_task_queued';", -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 2, archive_path);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW;
+}
+
 int64_t r2_log_accept_hands(const char *task_id, const char *command)
 {
     if (!valid_text(task_id) || !valid_text(command)) return -1;
@@ -1929,7 +1945,7 @@ int64_t r2_log_accept_hands(const char *task_id, const char *command)
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
         int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
         sqlite3_finalize(st);
-        if (log_finish_write(saved) != 0) event = -1;
+        if (log_finish_write(saved && log_hands_receipt_matches(event, NULL)) != 0) event = -1;
     }
     pthread_mutex_unlock(&log_lock);
     return event;
@@ -1939,17 +1955,22 @@ int r2_log_arm_hands(int64_t event, const char *archive_path)
 {
     if (event <= 0 || !valid_text(archive_path)) return -1;
     pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
     sqlite3_stmt *st = NULL;
-    int rc = log_initialized && log_db ? sqlite3_prepare_v2(log_db,
+    int rc = sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_pending_hands SET archive_path=? WHERE event_id=? AND archive_path IS NULL;",
-        -1, &st, NULL) : SQLITE_ERROR;
+        -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 1, archive_path, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(st);
+    int result = log_finish_write(saved && log_hands_receipt_matches(event, archive_path));
     pthread_mutex_unlock(&log_lock);
-    return saved ? 0 : -1;
+    return result;
 }
 
 /* The outcome and removal of its pending receipt commit together. */
@@ -1964,8 +1985,8 @@ static int log_finish_hands(int64_t event, int recovered, int launched, int retu
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(log_db,
         "SELECT p.archive_path,e.source FROM r2_log_pending_hands p "
-        "JOIN r2_log_events e ON e.id=p.event_id WHERE p.event_id=?;",
-        -1, &st, NULL);
+        "JOIN r2_log_events e ON e.id=p.event_id WHERE p.event_id=? "
+        "AND e.event_type='hands_task_queued';", -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     int64_t outcome = -1;
@@ -2009,6 +2030,27 @@ static int log_finish_hands(int64_t event, int recovered, int launched, int retu
         if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
         if (rc == SQLITE_OK) rc = sqlite3_step(st);
         saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+        sqlite3_finalize(st);
+    }
+    if (saved) {
+        /* The final state must contain the exact outbox payload (if any),
+           the outcome link and no pending receipt. Check after DELETE too. */
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM r2_log_pending_hands WHERE event_id=?1) "
+            "AND EXISTS(SELECT 1 FROM r2_log_links WHERE from_event_id=?2 AND to_event_id=?1 "
+            "AND relationship='hands_outcome_for') "
+            "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?2 AND event_type='hands_task_outcome') "
+            "AND ((?3 IS NULL AND NOT EXISTS(SELECT 1 FROM r2_log_hands_results WHERE outcome_id=?2)) "
+            "OR EXISTS(SELECT 1 FROM r2_log_hands_results WHERE outcome_id=?2 "
+            "AND result=?3 COLLATE BINARY AND delivered_to IS NULL));", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, outcome);
+        if (rc == SQLITE_OK) rc = handoff
+            ? sqlite3_bind_text64(st, 3, handoff, strlen(handoff), SQLITE_TRANSIENT, SQLITE_UTF8)
+            : sqlite3_bind_null(st, 3);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_ROW;
         sqlite3_finalize(st);
     }
     int result = log_finish_write(saved);
@@ -2073,7 +2115,9 @@ int r2_log_deliver_hands_result(int64_t outcome, int64_t turn)
     }
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(log_db,
-        "UPDATE r2_log_hands_results SET delivered_to=? WHERE outcome_id=? AND delivered_to IS NULL;",
+        "UPDATE r2_log_hands_results SET delivered_to=?1 WHERE outcome_id=?2 AND delivered_to IS NULL "
+        "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?1 AND event_type='conversation_turn') "
+        "AND EXISTS(SELECT 1 FROM r2_log_events WHERE id=?2 AND event_type='hands_task_outcome');",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, turn);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, outcome);
@@ -2081,6 +2125,17 @@ int r2_log_deliver_hands_result(int64_t outcome, int64_t turn)
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(st);
     saved = saved && log_link_locked(turn, outcome, "hands_result_in_context", NULL) == 0;
+    if (saved) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT 1 FROM r2_log_hands_results WHERE outcome_id=? AND delivered_to=?;",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, outcome);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, turn);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        saved = rc == SQLITE_ROW;
+        sqlite3_finalize(st);
+    }
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
     return result;
