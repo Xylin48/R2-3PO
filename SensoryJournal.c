@@ -335,21 +335,24 @@ static char *sj_query(const char *query, int limit)
     }
 
     const char *sql_select =
-        "SELECT e.id,e.utc_time,e.local_time,j.journal_kind,e.event_type,e.summary,"
+        "SELECT e.id,e.utc_time,e.local_time,e.category,e.event_type,e.summary,"
         "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
         "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
         "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
         "THEN NULL ELSE d.diary_entry_id END)";
+    /* The Life Log event is the authoritative Journal record. Its materialized
+       index is maintained for compatibility and metadata, but a separate
+       index write must not determine whether a committed event is visible. */
     const char *from =
-        " FROM r2_sensory_journal j "
-        "JOIN r2_log_events e ON e.id=j.event_id "
+        " FROM r2_log_events e "
         "LEFT JOIN r2_sensory_journal_diary_links d ON d.event_id=e.id "
         "LEFT JOIN r2_sensory_journal_reflection_links r ON r.event_id=e.id ";
+    const char *categories = " WHERE e.category IN ('sensory','thinking','conversation') ";
     const char *search =
-        "WHERE (instr(lower(e.summary),lower(?1))>0 OR instr(lower(e.details),lower(?1))>0 "
-        "OR instr(lower(e.event_type),lower(?1))>0 OR instr(lower(j.journal_kind),lower(?1))>0 "
+        "AND (instr(lower(e.summary),lower(?1))>0 OR instr(lower(e.details),lower(?1))>0 "
+        "OR instr(lower(e.event_type),lower(?1))>0 OR instr(lower(e.category),lower(?1))>0 "
         "OR instr(lower(e.source),lower(?1))>0";
     int event_id = sj_column_exists("r2_log_conversations", "event_id");
     int user_text = sj_column_exists("r2_log_conversations", "user_text");
@@ -359,10 +362,10 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
     int archive_available = event_id && user_text && assistant_text;
-    char *sql = sqlite3_mprintf("%s%s%s%s%s%s%s ORDER BY e.id DESC LIMIT %s;",
+    char *sql = sqlite3_mprintf("%s%s%s%s%s%s%s%s ORDER BY e.id DESC LIMIT %s;",
         sql_select, archive_available ? ",c.user_text,c.assistant_text" : ",NULL,NULL", from,
         archive_available ? "LEFT JOIN r2_log_conversations c ON c.event_id=e.id " : "",
-        query ? search : "",
+        categories, query ? search : "",
         query && archive_available ? " OR instr(lower(c.user_text),lower(?1))>0 "
                                       "OR instr(lower(c.assistant_text),lower(?1))>0" : "",
         query ? ")" : "", query ? "?2" : "?1");
@@ -490,7 +493,8 @@ long r2_sj_count(void)
     sqlite3_stmt *st = NULL;
     long count = -1;
     int rc = sqlite3_prepare_v2(sj_db,
-        "SELECT COUNT(*) FROM r2_sensory_journal;", -1, &st, NULL);
+        "SELECT COUNT(*) FROM r2_log_events "
+        "WHERE category IN ('sensory','thinking','conversation');", -1, &st, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_step(st);
         if (rc == SQLITE_ROW)

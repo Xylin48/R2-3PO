@@ -239,7 +239,53 @@ int main(void)
     assert(found && strstr(found, "Diary link: 100"));
     free(found);
 
+    /* A committed Life Log event is visible immediately even if a separate
+       derived-index insertion fails. Unrelated categories cannot enter the
+       Journal through a stale or incorrectly labeled projection. */
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db,
+        "CREATE TRIGGER reject_live_index BEFORE INSERT ON r2_sensory_journal "
+        "BEGIN SELECT RAISE(IGNORE); END;") == 0);
+    assert(insert_event(db, "Live journal index failure fixture", "Exact committed sensory evidence") == 0);
+    int64_t unindexed = sqlite3_last_insert_rowid(db);
+    assert(unindexed > 0 && sqlite3_close(db) == SQLITE_OK);
+    r2_sj_index_event(unindexed, "sensory", "observation", "smoke-test");
+    assert(r2_sj_count() == 8);
+    found = r2_sj_search("Live journal index failure fixture", 20);
+    assert(found && strstr(found, "Exact committed sensory evidence"));
+    free(found);
+
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    sqlite3_stmt *projection = NULL;
+    assert(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM r2_sensory_journal WHERE event_id=?",
+        -1, &projection, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(projection, 1, unindexed) == SQLITE_OK);
+    assert(sqlite3_step(projection) == SQLITE_ROW && sqlite3_column_int(projection, 0) == 0);
+    sqlite3_finalize(projection);
+    assert(exec_sql(db, "DROP TRIGGER reject_live_index;"
+        "INSERT INTO r2_log_events(utc_time,local_time,category,event_type,summary,details,source) "
+        "VALUES('now','now','world','tick','Unrelated world fixture','state','test');"
+        "INSERT INTO r2_sensory_journal(event_id,journal_kind,indexed_utc) "
+        "VALUES(last_insert_rowid(),'sensory',CURRENT_TIMESTAMP);") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(r2_sj_count() == 8);
+    found = r2_sj_search("Unrelated world fixture", 20);
+    assert(found && strstr(found, "No Sensory Journal entries matched."));
+    free(found);
+    found = r2_sj_recent(20);
+    assert(found && strstr(found, "Live journal index failure fixture") &&
+           !strstr(found, "Unrelated world fixture"));
+    free(found);
+    r2_sj_shutdown();
+    assert(r2_sj_init() == 0 && r2_sj_count() == 8);
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db,
+        "SELECT count(*) FROM r2_sensory_journal WHERE event_id=?",
+        -1, &projection, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(projection, 1, unindexed) == SQLITE_OK);
+    assert(sqlite3_step(projection) == SQLITE_ROW && sqlite3_column_int(projection, 0) == 1);
+    sqlite3_finalize(projection);
     assert(exec_sql(db, "UPDATE r2_log_events SET details=CAST(X'61620063' AS TEXT) "
                        "WHERE summary='Saw 100% battery';") == 0);
     assert(sqlite3_close(db) == SQLITE_OK);
