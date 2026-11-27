@@ -723,6 +723,9 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
             return bytes_read;
         }
         int read_error = errno;
+        /* Retire availability before a potentially blocking journal write.
+         * The lifecycle owner still retains the exact identity and decoder. */
+        atomic_store(&ears->open, 0);
         if (bytes_read < 0 && read_error != ECANCELED)
             r2_log_sensory("audio_read_failed",
                            "R2 Ears encountered an error reading audio-file samples.",
@@ -732,7 +735,6 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
                            ears->event.source_name);
         /* Do not free the decoder here: the lifecycle owner must first
          * establish that the reader has exited, then close and reap FFmpeg. */
-        atomic_store(&ears->open, 0);
         if (bytes_read < 0) errno = read_error;
         return bytes_read;
     }
@@ -750,6 +752,9 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
             : r2_audio_capture_read(ears->pulse_stream, buffer, buffer_size);
         if (bytes_read < 0) {
             int read_errno = errno;
+            /* Source failure is already known. A blocked journal cannot
+             * leave it advertised as open while this reader is retiring. */
+            atomic_store(&ears->open, 0);
             if (read_errno != ECANCELED) {
                 r2_log_sensory("audio_read_failed",
                                "R2 Ears encountered a live audio capture error.",
@@ -758,7 +763,6 @@ ssize_t r2_ears_read_live_cancelable(R2Ears *ears, void *buffer,
                                ears->event.source_name);
             }
             /* The reader never releases this handle. Stop joins before close. */
-            atomic_store(&ears->open, 0);
             errno = read_errno;
             return -1;
         }
