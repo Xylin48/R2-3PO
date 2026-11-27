@@ -5714,6 +5714,29 @@ static char *r2_review_current_turn(const char *query, size_t capacity)
         "cannot replace exact quoted bytes, paths, or authorization when the notes leave them uncertain.\n%s");
 }
 
+/* Distribute a fixed byte budget across independently archived inputs.
+ * Preserve each complete input that fits the common ceiling; only larger
+ * units require review. The unused remainder is not borrowed from the
+ * immutable current turn or its required instructions. */
+static size_t r2_review_shared_ceiling(const size_t *lengths, size_t count,
+                                       size_t available)
+{
+    size_t low = 0, high = available;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2 + 1;
+        size_t remaining = available;
+        int fits = 1;
+        for (size_t i = 0; i < count; ++i) {
+            size_t used = lengths[i] < mid ? lengths[i] : mid;
+            if (used > remaining) { fits = 0; break; }
+            remaining -= used;
+        }
+        if (fits) low = mid;
+        else high = mid - 1;
+    }
+    return low;
+}
+
 /* Select complete policies and a narrowly scoped Reality view for model
    contexts that cannot hold the general conversation prompt and full world. */
 static char *r2_compact_foreground_chat(Message *messages, size_t count,
@@ -5750,7 +5773,8 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     char *tv_state = tv ? r2_reality_tv_status() : NULL;
     char *state = NULL;
     char *answer = NULL;
-    char *reviewed_result = NULL;
+    char **reviewed_results = NULL;
+    size_t *review_lengths = NULL;
     char *reviewed_query = NULL;
     char *focused_retrieval = NULL;
     if ((room || pockets || fridge || self || age || money || tv) &&
@@ -5787,46 +5811,47 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
             goto cleanup;
         policy_length += total - before;
     }
-    size_t result_index = SIZE_MAX, result_length = 0;
     for (size_t i = user; i < count; ++i) {
         if (messages[i].role && strcmp(messages[i].role, "system")) {
             size_t length = strlen(messages[i].content ? messages[i].content : "");
             if (length > SIZE_MAX - total) goto cleanup;
             total += length;
-            if (i > user && messages[i].internal_tool_result && length > result_length) {
-                result_index = i;
-                result_length = length;
-            }
         }
     }
-    if (total > capacity && result_index != SIZE_MAX && total - result_length < capacity) {
-        reviewed_result = r2_review_completed_action(query, messages[result_index].content,
-                                                      capacity - (total - result_length));
-        if (reviewed_result)
-            total = total - result_length + strlen(reviewed_result);
-    }
     size_t query_length = strlen(query);
-    /* Context from a state view or tool result must never turn a normal
-       current message into a model paraphrase. Reserve review for input
-       that cannot fit alongside the compact policy and required instructions. */
+    /* A normal user message is immutable even when several same-turn
+       results together exhaust the window. Review the user only if its
+       own size exceeds the policy's available input. */
     int query_requires_review = policy_length < capacity && query_length > capacity - policy_length;
-    if (query_requires_review && total > capacity && total - query_length < capacity) {
-        reviewed_query = r2_review_current_turn(query, capacity - (total - query_length));
-        if (reviewed_query)
-            total = total - query_length + strlen(reviewed_query);
-    }
-    /* Both a long user message and a long result may need review on the same
-       follow-up. Allocate their notes together while keeping both sources distinct. */
-    if (query_requires_review && total > capacity && !reviewed_result &&
-        !reviewed_query && result_index != SIZE_MAX) {
-        size_t other = total - query_length - result_length;
-        if (other < capacity && capacity - other >= 1024) {
-            size_t shared = (capacity - other) / 2;
-            reviewed_query = r2_review_current_turn(query, shared);
-            reviewed_result = r2_review_completed_action(query, messages[result_index].content,
-                                                          capacity - other - shared);
-            if (reviewed_query && reviewed_result)
-                total = other + strlen(reviewed_query) + strlen(reviewed_result);
+    if (total > capacity) {
+        review_lengths = calloc(count, sizeof(*review_lengths));
+        reviewed_results = calloc(count, sizeof(*reviewed_results));
+        if (!review_lengths || !reviewed_results) goto cleanup;
+        size_t flexible = 0;
+        for (size_t i = user; i < count; ++i) {
+            if (i == user && query_requires_review)
+                review_lengths[i] = query_length;
+            else if (i > user && messages[i].internal_tool_result && messages[i].content)
+                review_lengths[i] = strlen(messages[i].content);
+            flexible += review_lengths[i]; /* A subset of already measured total. */
+        }
+        size_t fixed = total - flexible;
+        if (flexible && fixed < capacity) {
+            size_t ceiling = r2_review_shared_ceiling(review_lengths, count, capacity - fixed);
+            /* A review never replaces a complete unit that fits. Each
+               oversized result has its own verbatim archive and attribution. */
+            for (size_t i = user; i < count; ++i) {
+                if (review_lengths[i] <= ceiling) continue;
+                char *replacement = i == user
+                    ? r2_review_current_turn(query, ceiling)
+                    : r2_review_completed_action(query, messages[i].content, ceiling);
+                if (!replacement) goto cleanup;
+                if (i == user) reviewed_query = replacement;
+                else reviewed_results[i] = replacement;
+                size_t replacement_length = strlen(replacement);
+                if (replacement_length > ceiling) { errno = E2BIG; goto cleanup; }
+                total = total - review_lengths[i] + replacement_length;
+            }
         }
     }
     if (total > capacity) {
@@ -5863,7 +5888,7 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     for (size_t i = 0; i < count; ++i) {
         Message m = messages[i];
         if (i == user && reviewed_query) m.content = reviewed_query;
-        if (i == result_index && reviewed_result) m.content = reviewed_result;
+        if (reviewed_results && reviewed_results[i]) m.content = reviewed_results[i];
         if (!m.role || strcmp(m.role, "system")) {
             selected[selected_count++] = m;
             continue;
@@ -5959,7 +5984,11 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
 cleanup:
     free(focused_retrieval);
     free(reviewed_query);
-    free(reviewed_result);
+    if (reviewed_results) {
+        for (size_t i = 0; i < count; ++i) free(reviewed_results[i]);
+    }
+    free(reviewed_results);
+    free(review_lengths);
     free(selected);
     free(state);
     free(room_state); free(pocket_state); free(fridge_state); free(self_state); free(age_state); free(money_state); free(tv_state);

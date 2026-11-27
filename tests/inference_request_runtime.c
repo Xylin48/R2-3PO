@@ -2472,6 +2472,56 @@ static void check_second_turn_explicit_recall_retains_dialogue(void)
     free(history);
 }
 
+static void check_multiple_required_result_reviews(void)
+{
+    const size_t lengths[] = {0, 10, 90, 100, 1000};
+    assert(r2_review_shared_ceiling(lengths, 5, 70) == 20);
+    assert(r2_review_shared_ceiling(lengths, 5, 210) == 66);
+    assert(r2_review_shared_ceiling(lengths, 5, 0) == 0);
+    assert(setenv("R2_OLLAMA_NUM_CTX", "4096", 1) == 0);
+    const char *query = "Explain these recorded results.";
+    char *first = text(24000, 'a', "[R2_INTERNAL_TOOL_RESULT]\nFirst complete result.");
+    char *second = text(27000, 'b', "[R2_INTERNAL_TOOL_RESULT]\nSecond complete result.");
+    const char *small = "[R2_INTERNAL_TOOL_RESULT]\nSmall exact result.";
+    Message turn[] = {
+        {.role="user", .content=(char *)query},
+        {.role="assistant", .content="[R2_INTERNAL_TOOL_REQUEST]\nFirst"},
+        {.role="user", .content=first, .internal_tool_result=2},
+        {.role="assistant", .content="[R2_INTERNAL_TOOL_REQUEST]\nSecond"},
+        {.role="user", .content=second, .internal_tool_result=1},
+        {.role="assistant", .content="[R2_INTERNAL_TOOL_REQUEST]\nThird"},
+        {.role="user", .content=(char *)small, .internal_tool_result=1},
+    };
+    R2TurnContextReviews scope = {0};
+    R2TurnContextReviews *old_scope = r2_turn_context_reviews;
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    r2_turn_context_reviews = &scope;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    set_response("Reviewed evidence or final answer.", "stop", 1);
+    size_t capacity = r2_text_input_bytes(4096, R2_TEXT_MIN_GENERATION);
+    int before = perform_count;
+    char *answer = r2_compact_foreground_chat(turn, 7, 0, query, 1024, 60, capacity);
+    assert(answer && perform_count > before + 2 && scope.count == 2);
+    assert(captured_contains(query) && captured_contains(small));
+    assert(!captured_contains(first) && !captured_contains(second));
+    assert(!captured_contains("MODEL REVIEW OF THE EXACT CURRENT USER TURN"));
+    char *archive = r2_log_read_context_review(scope.archives[0]);
+    assert(archive && strstr(archive, first) && !strstr(archive, second));
+    free(archive);
+    archive = r2_log_read_context_review(scope.archives[1]);
+    assert(archive && strstr(archive, second) && !strstr(archive, first));
+    free(archive);
+    free(answer);
+    free(scope.archives);
+    free(first);
+    free(second);
+    r2_turn_context_reviews = old_scope;
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+}
+
 static void check_context_pressure_does_not_rewrite_short_turn(void)
 {
     const char *query = "hello R2, my darling. this is your mother speaking. it has been quite some time "
@@ -3117,6 +3167,7 @@ int main(void)
     check_context_and_isolated_inputs();
     check_foreground_context_review();
     check_failed_optional_history_review();
+    check_multiple_required_result_reviews();
     check_compact_ranked_memory();
     check_context_cache_write_overlap();
     check_first_answer_with_unavailable_source();
