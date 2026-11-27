@@ -4179,6 +4179,77 @@ static int r2_required_inference_bytes(const Message *msgs, size_t count,
     return 0;
 }
 
+/* Historical action handoffs are separate from the visible exchange. A
+ * result is tagged by the runtime, and only its assistant-side request is
+ * internal; never classify a human's quoted marker as internal evidence. */
+static int r2_history_internal_message(const Message *message)
+{
+    return r2_is_internal_tool_result(message) ||
+        (message->role && !strcmp(message->role, "assistant") &&
+         message->content &&
+         !strncmp(message->content, "[R2_INTERNAL_TOOL_REQUEST]\n",
+                  sizeof("[R2_INTERNAL_TOOL_REQUEST]\n") - 1U));
+}
+
+typedef struct {
+    size_t start;
+    size_t bytes;
+    size_t slots;
+    int keep;
+    int include_actions;
+} R2HistoryExchange;
+
+/* Measure the same historical unit for policy selection, generation
+ * reservation, and final serialization. Prefer the complete exchange with
+ * its action evidence; if that cannot fit, retain the exact visible turns
+ * without a partial tool pair. Current-turn handoffs are never optional. */
+static R2HistoryExchange r2_select_history_exchange(const Message *msgs,
+    size_t end, size_t current_user, const unsigned char *include,
+    size_t available_bytes, size_t available_slots)
+{
+    R2HistoryExchange selected = {.start = end};
+    size_t full_bytes = 0, visible_bytes = 0;
+    size_t full_slots = 0, visible_slots = 0;
+    int full_fits = 1, visible_fits = 1, anchored = 0;
+    while (selected.start > 0) {
+        size_t index = --selected.start;
+        const Message *m = &msgs[index];
+        if (m->role && !strcmp(m->role, "system")) continue;
+        size_t n = strlen(m->content ? m->content : "");
+        int eligible = n && (!include || include[index]);
+        ++full_slots;
+        if (!eligible || n > available_bytes - full_bytes)
+            full_fits = 0;
+        else
+            full_bytes += n;
+
+        if (current_user == SIZE_MAX || !r2_history_internal_message(m)) {
+            ++visible_slots;
+            if (!eligible || n > available_bytes - visible_bytes)
+                visible_fits = 0;
+            else
+                visible_bytes += n;
+        }
+        if ((m->role && !strcmp(m->role, "user") && !m->internal_tool_result) ||
+            current_user == SIZE_MAX) {
+            anchored = 1;
+            break;
+        }
+    }
+    if (anchored && full_fits && full_slots <= available_slots) {
+        selected.bytes = full_bytes;
+        selected.slots = full_slots;
+        selected.keep = 1;
+        selected.include_actions = 1;
+    } else if (anchored && visible_fits && visible_slots <= available_slots &&
+               visible_slots) {
+        selected.bytes = visible_bytes;
+        selected.slots = visible_slots;
+        selected.keep = 1;
+    }
+    return selected;
+}
+
 /* Final allocation is in whole messages. Provisional category budgets may
  * suggest optional context, but cannot shorten instructions or selected recall. */
 static int r2_preserve_inference_units(const Message *msgs, size_t count,
@@ -4213,46 +4284,24 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
         if (message_slots) --message_slots;
     }
 
-    /* Reserve one slot for each message in a retained exchange. An exchange
-     * that cannot fit the byte budget leaves its slots available to the next
-     * candidate. Serialize the survivors later in their original order. */
+    /* Retain complete historical exchanges in newest-first order. If the
+     * historical action evidence alone exceeds the window, preserve the
+     * actual dialogue rather than discarding the entire exchange. */
     for (size_t end = history_end; end > 0;) {
-        size_t start = end;
-        size_t bytes = 0;
-        size_t exchange_messages = 0;
-        int complete = 1;
-        int anchored = 0;
-        while (start > 0) {
-            const Message *message = &msgs[--start];
-            if (message->role && !strcmp(message->role, "system")) continue;
-            ++exchange_messages;
-            size_t n = strlen(message->content ? message->content : "");
-            if (!include[start] || n > input_budget - used - bytes)
-                complete = 0;
-            else
-                bytes += n;
-            if (message->role && !strcmp(message->role, "user") &&
-                !message->internal_tool_result) {
-                anchored = 1;
-                break;
-            }
-            /* Non-conversational helpers can send standalone messages. */
-            if (current_user == SIZE_MAX) {
-                anchored = 1;
-                break;
-            }
-        }
-        int keep = complete && anchored && exchange_messages <= message_slots;
-        for (size_t i = start; i < end; ++i) {
+        R2HistoryExchange exchange = r2_select_history_exchange(msgs, end,
+            current_user, include, input_budget - used, message_slots);
+        for (size_t i = exchange.start; i < end; ++i) {
             if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
+            int keep = exchange.keep &&
+                (exchange.include_actions || !r2_history_internal_message(&msgs[i]));
             include[i] = keep;
             limits[i] = keep ? strlen(msgs[i].content ? msgs[i].content : "") : 0;
         }
-        if (keep) {
-            used += bytes;
-            message_slots -= exchange_messages;
+        if (exchange.keep) {
+            used += exchange.bytes;
+            message_slots -= exchange.slots;
         }
-        end = start;
+        end = exchange.start;
     }
     /* Keep startup and learning snapshots ahead of the optional archive.
      * The preliminary system-category pass is not an eligibility boundary:
@@ -4333,10 +4382,11 @@ static int r2_ollama_predict_budget(int num_ctx, int num_predict,
     return num_predict;
 }
 
-/* Measure the most recent complete exchange using the same slot accounting
- * as the final whole-message allocator, including any recorded action pair. */
+/* Measure the most recent historical exchange using the final allocator's
+ * exact byte/slot rules, including the distinction between dialogue and
+ * historical (not active) action evidence. */
 static size_t r2_prior_exchange_bytes(const Message *msgs, size_t count,
-                                      size_t current_user)
+                                      size_t current_user, size_t available_bytes)
 {
     if (current_user == SIZE_MAX || current_user >= count) return 0;
     size_t slots = OLLAMA_MAX_RECENT_MESSAGES;
@@ -4344,18 +4394,9 @@ static size_t r2_prior_exchange_bytes(const Message *msgs, size_t count,
         if (msgs[i].role && !strcmp(msgs[i].role, "system")) continue;
         if (slots) --slots;
     }
-    size_t bytes = 0;
-    for (size_t i = current_user; i > 0;) {
-        const Message *m = &msgs[--i];
-        if (m->role && !strcmp(m->role, "system")) continue;
-        size_t n = strlen(m->content ? m->content : "");
-        if (!n || !slots || n > SIZE_MAX - bytes) return 0;
-        --slots;
-        bytes += n;
-        if (m->role && !strcmp(m->role, "user") && !m->internal_tool_result)
-            return bytes;
-    }
-    return 0;
+    R2HistoryExchange exchange = r2_select_history_exchange(msgs, current_user,
+        current_user, NULL, available_bytes, slots);
+    return exchange.keep ? exchange.bytes : 0;
 }
 
 static char *ollama_chat_with_limit(
@@ -4758,11 +4799,14 @@ static char *ollama_chat_with_limit(
     if (ollama_audit_stage &&
         (!strcmp(ollama_audit_stage, "conversation-answer") ||
          !strcmp(ollama_audit_stage, "association-planner"))) {
-        size_t prior = r2_prior_exchange_bytes(msgs, count, current_user_index);
-        if (prior &&
-            r2_required_inference_bytes(msgs, count, current_user_index,
-                                        complete_override_length, &required_context_chars) == 0 &&
-            prior <= SIZE_MAX - required_context_chars) {
+        size_t maximum = r2_text_input_bytes(num_ctx, R2_TEXT_MIN_GENERATION);
+        size_t prior = 0;
+        if (r2_required_inference_bytes(msgs, count, current_user_index,
+                                       complete_override_length, &required_context_chars) == 0 &&
+            required_context_chars <= maximum)
+            prior = r2_prior_exchange_bytes(msgs, count, current_user_index,
+                                           maximum - required_context_chars);
+        if (prior) {
             int fitted = num_predict;
             if (r2_fit_complete_input(required_context_chars + prior, num_ctx, &fitted) == 0 &&
                 fitted < num_predict) {
@@ -5729,9 +5773,8 @@ static char *r2_compact_foreground_chat(Message *messages, size_t count,
     if (ctx > R2_TEXT_TEMPLATE_RESERVE + R2_TEXT_MIN_GENERATION) {
         num_predict = r2_ollama_predict_budget(ctx, num_predict,
                                               r2_compact_conversation_policy);
-        size_t previous = r2_prior_exchange_bytes(messages, count, user);
-        if (previous <= capacity - total)
-            recent_reserve = previous;
+        recent_reserve = r2_prior_exchange_bytes(messages, count, user,
+                                                capacity - total);
         /* Prefer the complete previous exchange over optional evidence. If
            needed, use the existing output reallocation, not a smaller reply
            history or a second model call. */
@@ -5926,14 +5969,16 @@ static char *r2_foreground_chat(Message *messages, size_t count,
     /* Budget the immediately preceding complete exchange before deciding
        whether the full conversation policy fits. Historical retrieval must
        not consume the space needed to understand a direct follow-up. */
-    size_t recent_exchange = r2_prior_exchange_bytes(messages, count, user);
+    size_t recent_exchange = r2_prior_exchange_bytes(messages, count, user,
+        immutable <= capacity ? capacity - immutable : 0);
+    size_t possible_exchange = r2_prior_exchange_bytes(messages, count, user, capacity);
     int wire_predict = r2_ollama_predict_budget(ctx, num_predict, system);
     size_t dialogue_capacity = r2_text_input_bytes(ctx, wire_predict);
     if (conversation_policy &&
         ((required > capacity &&
           (immutable >= capacity || capacity - immutable < 384)) ||
-         (recent_exchange &&
-          (required > dialogue_capacity ||
+         (possible_exchange &&
+          (!recent_exchange || required > dialogue_capacity ||
            recent_exchange > dialogue_capacity - required))))
         return r2_compact_foreground_chat(messages, count, user, query,
                                           num_predict, timeout, capacity);

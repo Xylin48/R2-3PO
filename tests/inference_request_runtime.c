@@ -2099,6 +2099,70 @@ static void check_second_turn_uses_actual_wire_budget(void)
     free(history);
 }
 
+/* A completed action can have more evidence than the next context window
+ * holds. Retain its human-facing exchange even when the internal handoff
+ * cannot fit; small action pairs still travel in full. */
+static void check_second_turn_after_large_historical_action(void)
+{
+    assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
+    const char *first = "What did you read from my notebook?";
+    const char *previous = "I read your astronomy notes.";
+    const char *query = "What did I say about it just now?";
+    const char *source = "CURRENT USER INPUT: typed keyboard text.";
+    const char *request = "[R2_INTERNAL_TOOL_REQUEST]\nAlready processed.";
+    char *large = text(6000, 'z', "[R2_INTERNAL_TOOL_RESULT]\nExact long notebook evidence: ");
+    const char *small = "[R2_INTERNAL_TOOL_RESULT]\nExact short notebook evidence.";
+    Message turn[] = {
+        {.role = "system", .content = (char *)source},
+        {.role = "user", .content = (char *)first},
+        {.role = "assistant", .content = (char *)request},
+        {.role = "user", .content = large, .internal_tool_result = 1},
+        {.role = "assistant", .content = (char *)previous},
+        {.role = "user", .content = (char *)query},
+    };
+    const char *old_query = ollama_authoritative_user_query;
+    const char *old_stage = ollama_audit_stage;
+    ollama_authoritative_user_query = query;
+    ollama_audit_stage = "conversation-answer";
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass) turn[3].content = (char *)small;
+        set_response("Your astronomy notes.", "stop", 1);
+        int before = perform_count;
+        char *reply = r2_foreground_chat(turn, 6, r2_conversation_system_prompt,
+                                          query, 1024, 60);
+        assert(reply && perform_count == before + 1);
+        assert(captured_contains(first) && captured_contains(previous) &&
+               captured_contains(query) && captured_contains(source));
+        assert(captured_contains(request) == pass);
+        assert(captured_contains(small) == pass);
+        assert(!captured_contains(large));
+        assert(turn[3].internal_tool_result == 1);
+        struct json_object *array = NULL, *field = NULL;
+        assert(json_object_object_get_ex(captured, "messages", &array));
+        size_t count = json_object_array_length(array);
+        assert(count >= (size_t)(pass ? 5 : 3));
+        size_t visible_start = count - (pass ? 5U : 3U);
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, visible_start),
+                                         "content", &field));
+        assert(!strcmp(json_object_get_string(field), first));
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, count - 2U),
+                                         "content", &field));
+        assert(!strcmp(json_object_get_string(field), previous));
+        assert(json_object_object_get_ex(json_object_array_get_idx(array, count - 1U),
+                                         "content", &field));
+        assert(!strcmp(json_object_get_string(field), query));
+        if (pass) {
+            assert(json_object_object_get_ex(json_object_array_get_idx(array, count - 3U),
+                                             "role", &field));
+            assert(!strcmp(json_object_get_string(field), "tool"));
+        }
+        free(reply);
+    }
+    ollama_authoritative_user_query = old_query;
+    ollama_audit_stage = old_stage;
+    free(large);
+}
+
 /* Explicit recall is not permission to omit the conversation that just
  * happened. Retain the entire selected historical record and both live turns
  * by fitting the actual generation reservation to the complete wire input. */
@@ -2834,6 +2898,7 @@ int main(void)
     check_context_pressure_does_not_rewrite_short_turn();
     check_compact_reserves_current_instructions_before_history();
     check_second_turn_uses_actual_wire_budget();
+    check_second_turn_after_large_historical_action();
     check_second_turn_explicit_recall_retains_dialogue();
     check_foreground_input_provenance();
     set_response("Valid JSON prefix", "stop", 1);

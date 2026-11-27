@@ -65,8 +65,9 @@ require(
     "include[i] = 1;" in history_candidates
     and "input_budget" not in history_candidates
     and "OLLAMA_MAX_RECENT_MESSAGES" not in history_candidates
-    and "exchange_messages <= message_slots" in allocator
-    and "message_slots -= exchange_messages;" in allocator,
+    and "r2_select_history_exchange(msgs, end," in allocator
+    and "input_budget - used, message_slots" in allocator
+    and "message_slots -= exchange.slots;" in allocator,
     "only the final whole-exchange allocator charges the history limits",
 )
 require(
