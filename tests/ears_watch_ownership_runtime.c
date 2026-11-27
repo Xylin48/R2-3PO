@@ -16,6 +16,8 @@ static atomic_int mic_closes = ATOMIC_VAR_INIT(0);
 static atomic_int desktop_closes = ATOMIC_VAR_INIT(0);
 static atomic_int synthetic_reads = ATOMIC_VAR_INIT(0);
 static atomic_int microphone_eof = ATOMIC_VAR_INIT(0);
+static atomic_int synthetic_mic_open = ATOMIC_VAR_INIT(0);
+static atomic_int synthetic_desktop_open = ATOMIC_VAR_INIT(0);
 static char current_microphone[256] = {0}, current_desktop[256] = {0};
 static void remember_source(char *destination, size_t capacity, const char *source)
 {
@@ -34,6 +36,20 @@ int __wrap_r2_ears_get_event(R2Ears *receiver, R2HearingEvent *event)
     return 0;
 }
 
+// The fixture wraps Ears rather than its lower transport. Reproduce the
+// open/closed metadata contract as well as the raw read and close contracts.
+int __wrap_r2_ears_is_open(R2Ears *receiver)
+{
+    if (!receiver) return 0;
+    assert(receiver == ears || receiver == ears_desktop);
+    return atomic_load(receiver == ears ? &synthetic_mic_open : &synthetic_desktop_open);
+}
+
+int __wrap_r2_ears_get_open_event(R2Ears *receiver, R2HearingEvent *event)
+{
+    if (!__wrap_r2_ears_is_open(receiver)) { errno = ENODATA; return -1; }
+    return __wrap_r2_ears_get_event(receiver, event);
+}
 
 static void *direct_listen_worker(void *unused)
 {
@@ -62,6 +78,7 @@ int __wrap_r2_ears_open_microphone(R2Ears *receiver)
 {
     assert(receiver == ears);
     remember_source(current_microphone, sizeof(current_microphone), "alsa_input.default");
+    atomic_store(&synthetic_mic_open, 1);
     return 0;
 }
 
@@ -69,6 +86,7 @@ int __wrap_r2_ears_open_desktop(R2Ears *receiver)
 {
     assert(receiver == ears_desktop);
     remember_source(current_desktop, sizeof(current_desktop), "alsa_output.default.monitor");
+    atomic_store(&synthetic_desktop_open, 1);
     return 0;
 }
 
@@ -76,6 +94,7 @@ int __wrap_r2_ears_open_microphone_source(R2Ears *receiver, const char *source)
 {
     assert(receiver == ears && source && *source);
     remember_source(current_microphone, sizeof(current_microphone), source);
+    atomic_store(&synthetic_mic_open, 1);
     return 0;
 }
 
@@ -83,6 +102,7 @@ int __wrap_r2_ears_open_desktop_source(R2Ears *receiver, const char *source)
 {
     assert(receiver == ears_desktop && source && *source);
     remember_source(current_desktop, sizeof(current_desktop), source);
+    atomic_store(&synthetic_desktop_open, 1);
     return 0;
 }
 
@@ -107,7 +127,10 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *samples, size_t bytes)
 {
     assert(receiver == ears || receiver == ears_desktop);
     assert(bytes == 1920U);
-    if (receiver == ears && atomic_load(&microphone_eof)) return 0;
+    if (receiver == ears && atomic_load(&microphone_eof)) {
+        atomic_store(&synthetic_mic_open, 0);
+        return 0;
+    }
     memset(samples, 0, bytes);
     atomic_fetch_add(&synthetic_reads, 1);
     struct timespec short_sample = {.tv_sec = 0, .tv_nsec = 2000000L};
@@ -125,11 +148,13 @@ ssize_t __wrap_r2_ears_read_live_cancelable(R2Ears *receiver, void *samples,
 
 void __wrap_r2_ears_close(R2Ears *receiver)
 {
-    if (receiver == ears)
+    if (receiver == ears) {
+        atomic_store(&synthetic_mic_open, 0);
         atomic_fetch_add(&mic_closes, 1);
-    else if (receiver == ears_desktop)
+    } else if (receiver == ears_desktop) {
+        atomic_store(&synthetic_desktop_open, 0);
         atomic_fetch_add(&desktop_closes, 1);
-    else
+    } else
         assert(!"Unknown Ears receiver closed");
 }
 
