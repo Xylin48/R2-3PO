@@ -1664,7 +1664,38 @@ static void check_action_result_under_history_pressure(void)
     while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
     pthread_mutex_unlock(&post_turn_lock);
     assert(reply && !strcmp(reply, "I couldn't produce a reply to this turn. Your message is still here."));
+    assert(messages.count > 0 &&
+           !strcmp(messages.items[messages.count - 1].role, "user") &&
+           !strcmp(messages.items[messages.count - 1].content, "Inspect the screen again."));
+    for (size_t i = 0; i < messages.count; ++i)
+        assert(strcmp(messages.items[i].role, "assistant") ||
+               strcmp(messages.items[i].content, reply));
+    const char *unanswered_followup = "Could you elaborate on that?";
+    assert(message_add("user", unanswered_followup) == 0);
+    r2_associative_query_cache_clear();
+    set_response("screen\ninspection", "stop", 1);
+    char *unanswered_plan = r2_build_associative_search_query(unanswered_followup);
+    assert(unanswered_plan && strstr(unanswered_plan, "Inspect the screen again."));
+    assert(captured_contains("Inspect the screen again.") &&
+           captured_contains(unanswered_followup) && !captured_contains(reply));
+    free(unanswered_plan);
+    set_response("The display still has no frame.", "stop", 1);
+    answer = chat_with_relevant_memories(unanswered_followup);
+    assert(answer && captured_contains(unanswered_followup) &&
+           captured_contains("Inspect the screen again."));
+    struct json_object *unanswered_messages = NULL;
+    assert(json_object_object_get_ex(captured, "messages", &unanswered_messages));
+    for (size_t i = 0; i < json_object_array_length(unanswered_messages); ++i) {
+        struct json_object *entry = json_object_array_get_idx(unanswered_messages, i);
+        struct json_object *role = NULL, *content = NULL;
+        assert(json_object_object_get_ex(entry, "role", &role));
+        assert(json_object_object_get_ex(entry, "content", &content));
+        if (!strcmp(json_object_get_string(role), "assistant"))
+            assert(strcmp(json_object_get_string(content), reply));
+    }
+    free(answer);
     free(reply);
+    r2_associative_query_cache_clear();
     message_free_all();
 
     const char *unsaved = "This exchange must not produce unsourced learning.";
@@ -2414,6 +2445,31 @@ static void check_associative_planner_retains_previous_exchange(void)
     r2_associative_query_cache_clear();
     set_response("Fixture answer.", "stop", 1);
     message_free_all();
+
+    /* A failed turn leaves only the real previous user message. Both
+       semantic planning and its non-generative search path preserve it. */
+    assert(message_add("user", first) == 0);
+    assert(message_add("user", query) == 0);
+    set_response("astronomy\nfolder", "stop", 1);
+    before = perform_count;
+    plan = r2_build_associative_search_query(query);
+    assert(plan && perform_count == before + 1 && strstr(plan, first));
+    assert(captured_contains(first) && captured_contains(query) && !captured_contains(reply));
+    assert(json_object_object_get_ex(captured, "messages", &array));
+    assert(json_object_array_length(array) == 3);
+    free(plan);
+    r2_associative_query_cache_clear();
+    free(response_body);
+    response_body = strdup("{invalid planner JSON");
+    assert(response_body);
+    before = perform_count;
+    plan = r2_build_associative_search_query(query);
+    assert(plan && perform_count == before + 1 && strstr(plan, first));
+    assert(!strstr(plan, reply));
+    free(plan);
+    r2_associative_query_cache_clear();
+    message_free_all();
+    set_response("Fixture answer.", "stop", 1);
 
     /* The planner must retain the previous exchange when it fits only
        after the existing generation reserve is adjusted. */

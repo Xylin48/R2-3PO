@@ -6840,8 +6840,9 @@ static int r2_query_is_simple_social_turn(const char *query)
 static int r2_recent_message_is_tool_payload(const char *content);
 
 /* A follow-up's search concepts depend on the exchange it refers to. Copy
- * the previous complete human-facing pair, never a synthetic tool request
- * or the currently executing action handoff. The caller owns the copies. */
+ * the previous exact user message and its genuine available answer, if any;
+ * never a synthetic tool request or the currently executing action handoff.
+ * An unanswered user turn remains evidence. The caller owns the copies. */
 static void r2_associative_previous_exchange(const char *query,
                                              char **previous_user,
                                              char **previous_reply)
@@ -6861,9 +6862,13 @@ static void r2_associative_previous_exchange(const char *query,
                 found_current = 1;
                 continue;
             }
+            *previous_user = strdup(m->content);
             if (reply) {
-                *previous_user = strdup(m->content);
                 *previous_reply = strdup(reply);
+                if (!*previous_reply) {
+                    free(*previous_user);
+                    *previous_user = NULL;
+                }
             }
             break;
         }
@@ -6874,10 +6879,8 @@ static void r2_associative_previous_exchange(const char *query,
             reply = m->content;
     }
     pthread_mutex_unlock(&messages_lock);
-    if (!*previous_user || !*previous_reply) {
-        free(*previous_user);
+    if (!*previous_user) {
         free(*previous_reply);
-        *previous_user = NULL;
         *previous_reply = NULL;
     }
 }
@@ -6890,8 +6893,9 @@ static char *r2_associative_fallback_query(const char *query,
                                            const char *previous_reply)
 {
     char *fallback = NULL;
-    if (previous_user && previous_reply &&
-        asprintf(&fallback, "%s\n\n%s\n%s", query, previous_user, previous_reply) < 0)
+    if (previous_user &&
+        asprintf(&fallback, "%s\n\n%s%s%s", query, previous_user,
+                 previous_reply ? "\n" : "", previous_reply ? previous_reply : "") < 0)
         fallback = NULL;
     if (!fallback) fallback = xstrdup(query);
     if (fallback) r2_associative_query_cache_store(query, fallback);
@@ -6919,7 +6923,7 @@ static char *r2_build_associative_search_query(const char *query)
         "You are R2's internal associative-memory retrieval planner. "
         "Do NOT answer the user, roleplay, or claim that a memory exists. "
         "Interpret the meaning of the latest user's complete message. "
-        "The preceding user/assistant exchange, when present, is dialogue evidence "
+        "The preceding user message and any available assistant reply are dialogue evidence "
         "for resolving references in that latest message, not another request. Output "
         "only 6 to 10 short search concepts or paraphrases that could help "
         "find related past experiences in a database. Preserve named people, "
@@ -6936,9 +6940,10 @@ static char *r2_build_associative_search_query(const char *query)
     size_t probe_count = 0;
     char *previous_user = NULL, *previous_reply = NULL;
     r2_associative_previous_exchange(query, &previous_user, &previous_reply);
-    if (previous_user && previous_reply) {
+    if (previous_user) {
         probe[probe_count++] = (Message){.role = "user", .content = previous_user};
-        probe[probe_count++] = (Message){.role = "assistant", .content = previous_reply};
+        if (previous_reply)
+            probe[probe_count++] = (Message){.role = "assistant", .content = previous_reply};
     }
     probe[probe_count++] = (Message){.role = "user", .content = (char *)query};
 
@@ -6974,16 +6979,17 @@ static char *r2_build_associative_search_query(const char *query)
     size_t query_length = strlen(query);
     size_t concepts_length = strlen(clean);
     size_t previous_length = 0;
-    if (previous_user && previous_reply) {
+    if (previous_user) {
         size_t user_length = strlen(previous_user);
-        size_t reply_length = strlen(previous_reply);
-        if (reply_length > SIZE_MAX - 3 ||
-            user_length > SIZE_MAX - reply_length - 3) {
+        size_t reply_length = previous_reply ? strlen(previous_reply) : 0;
+        size_t delimiters = previous_reply ? 3U : 2U;
+        if (reply_length > SIZE_MAX - delimiters ||
+            user_length > SIZE_MAX - reply_length - delimiters) {
             free(clean); free(previous_user); free(previous_reply);
             errno = EOVERFLOW;
             return NULL;
         }
-        previous_length = user_length + reply_length + 3;
+        previous_length = user_length + reply_length + delimiters;
     }
     /* Search consumers use a bounded prefix of the keyword list. Give the
      * user's own words those slots first, then the exact previous exchange.
@@ -7005,8 +7011,9 @@ static char *r2_build_associative_search_query(const char *query)
         return fallback;
     }
     if (previous_length)
-        snprintf(combined, total, "%s%s%s\n%s%s%s", query, separator,
-                 previous_user, previous_reply, separator, clean);
+        snprintf(combined, total, "%s%s%s%s%s%s%s", query, separator,
+                 previous_user, previous_reply ? "\n" : "",
+                 previous_reply ? previous_reply : "", separator, clean);
     else
         snprintf(combined, total, "%s%s%s", query, separator, clean);
     fprintf(stderr,
@@ -15984,9 +15991,11 @@ finalize_reply:
        not consume space while admitting the final visible reply. */
     remove_pending_hands_result_locked();
 
-    /* Keep the reply the user saw available to the next turn. Whether
-       the model generated it controls learning, not dialogue history. */
-    int assistant_context_rc = shutting_down ? 0 : message_add("assistant", reply);
+    /* A program diagnostic without action evidence is not model dialogue.
+       The unanswered user message remains in live history. Completed action
+       evidence still uses its existing visible-result continuity path. */
+    int assistant_context_rc = (!shutting_down && (generated_reply || tool_evidence))
+        ? message_add("assistant", reply) : 0;
     if (assistant_context_rc != 0)
         fprintf(stderr,
                 "[R2] Failed to add assistant response "
