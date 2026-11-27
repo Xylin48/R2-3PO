@@ -95,8 +95,13 @@ priority_end = core.find("\nstatic size_t r2_order_inference_messages", priority
 if priority_start < 0 or priority_end < 0:
     raise SystemExit("Could not locate inference system-context priority ordering.")
 priority = core[priority_start:priority_end]
-if 'strstr(content, "R2 PERSISTENT MEMORY - STARTUP CONTEXT")' not in priority or "return 5;" not in priority:
+if "r2_is_startup_memory_context(content)" not in priority or "return 5;" not in priority:
     raise SystemExit("Startup persistent memory is not explicitly prioritized.")
+if "strncmp(content, R2_STARTUP_MEMORY_HEADING," not in core or \
+        'R2_STARTUP_MEMORY_HEADING\n        "\\n"' not in core:
+    raise SystemExit("Startup memory classification must use the producer's exact leading heading.")
+if "if (r2_is_startup_memory_context(content))\n                audit_startup_memory = 1;" not in core:
+    raise SystemExit("Prompt audit must identify startup memory using the same section boundary.")
 if "for (int priority = 0; priority < 8" not in core:
     raise SystemExit("Inference serialization does not iterate all six context priorities.")
 if "int message_priority = r2_inference_system_priority(" not in core or "if (message_priority != priority) continue;" not in core:
