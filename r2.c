@@ -11420,8 +11420,12 @@ int r2_write_diary(void)
         "Write naturally in first person as R2.\n"
         "Return ONLY the private diary reflection.";
 
+    /* This entry point is a synchronous, explicit diary/think operation.
+       Use the existing blocking foreground gate instead of the opportunistic
+       post-turn gate, which returns EBUSY whenever another request owns it.
+       Autonomous reflection has its own background worker and is unchanged. */
     int previous_mode = ollama_background_mode;
-    ollama_background_mode = 1;
+    ollama_background_mode = 0;
     int64_t archive_id = 0;
     char *reflection = generate_with_private_evidence(prompt,
         "Review private evidence for R2's diary reflection, preserving provenance and uncertainty.",
@@ -11434,6 +11438,10 @@ int r2_write_diary(void)
     const int64_t reviews[] = {archive_id, 0};
     int rc = r2_store_reflection(reflection, NULL, reviews, NULL, NULL);
     free(reflection);
+    /* The manual path has no live reflection publisher. Dispatch its
+       already-staged self-report using the same durable queue as chat. */
+    if (rc == 0)
+        atomic_store(&post_turn_replay_requested, 1);
     return rc;
 }
 

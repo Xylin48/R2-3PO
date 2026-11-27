@@ -245,6 +245,14 @@ class LocalOllama(BaseHTTPRequestHandler):
                     self.stalled_learning_release.wait(timeout=25)
                     return
                 reply = "knowledge | " + INTERRUPTED_LEARNING_MEMORY
+            if any(MANUAL_DIARY_STALL_FIRST in m for m in user_messages):
+                if not self.stalled_learning_started.is_set():
+                    self.stalled_learning_started.set()
+                    self.stalled_learning_release.wait(timeout=25)
+                    return
+                reply = "NONE"
+        elif "private autonomous reflection process" in system:
+            reply = MANUAL_DIARY_ENTRY
         elif "private first-person diary reflection" in system:
             reply = (REFLECTION if any(SENSE_RESULT in message for message in user_messages)
                      else "[SENSE] eyes|close")
@@ -1030,6 +1038,8 @@ STALLED_LEARNING_FIRST = "R2_STALLED_LEARNING_FIRST: I saw a blue notebook."
 STALLED_LEARNING_SECOND = "R2_STALLED_LEARNING_SECOND: That notebook is mine."
 STALLED_LEARNING_FIRST_REPLY = "We need to make sure we remember the blue notebook."
 STALLED_LEARNING_SECOND_REPLY = "I will respond to your next message with that in mind."
+MANUAL_DIARY_STALL_FIRST = "R2_MANUAL_DIARY_STALL_FIRST: A white notebook is nearby."
+MANUAL_DIARY_ENTRY = "I reviewed the reported white notebook and distinguished that report from my own observations."
 
 
 def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
@@ -1104,6 +1114,75 @@ def second_turn_during_post_turn_learning(binary: Path, workspace: Path, url: st
     ], second_dialogue
     print("PASS: a stalled post-turn model request yielded, resumed learning exactly once, "
           "and preserved both ordinary first-person replies and the exact preceding exchange.")
+
+
+def manual_diary_during_post_turn_learning(binary: Path, workspace: Path, url: str) -> None:
+    start = len(LocalOllama.requests)
+    log_file = workspace.parent / "manual-diary-learning.log"
+    LocalOllama.stalled_learning_started.clear()
+    LocalOllama.stalled_learning_release.clear()
+    with log_file.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [str(binary)], cwd=workspace, env=runtime_environment(workspace, url, 8192),
+            stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, text=True,
+        )
+        assert process.stdin is not None
+        try:
+            process.stdin.write(f"talk {MANUAL_DIARY_STALL_FIRST}\n")
+            process.stdin.flush()
+            assert LocalOllama.stalled_learning_started.wait(20), log_file.read_text(errors="replace")
+            process.stdin.write("diary\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 15
+            while process.poll() is None and time.monotonic() < deadline:
+                visible = log_file.read_text(errors="replace")
+                assert "Diary operation failed." not in visible, visible
+                if visible.count("Diary operation completed.") == 1:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(log_file.read_text(errors="replace"))
+            LocalOllama.stalled_learning_release.set()
+            # The explicit diary is saved and its staged self-report is
+            # dispatched immediately, independently of the 900-second timer.
+            deadline = time.monotonic() + 12
+            with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+                while process.poll() is None and time.monotonic() < deadline:
+                    events = db.execute(
+                        "SELECT e.id FROM diary_entries d "
+                        "JOIN r2_sensory_journal_reflection_links l ON l.diary_entry_id=d.id "
+                        "JOIN r2_log_events e ON e.id=l.event_id "
+                        "WHERE d.entry=? AND e.event_type='reflection_completed'",
+                        (MANUAL_DIARY_ENTRY,),
+                    ).fetchall()
+                    if len(events) == 1 and db.execute(
+                        "SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?",
+                        (events[0][0],),
+                    ).fetchone() is None:
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError(log_file.read_text(errors="replace"))
+            process.stdin.write("exit\n")
+            process.stdin.flush()
+            assert process.wait(timeout=8) == 0
+        finally:
+            LocalOllama.stalled_learning_release.set()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+    requests = [
+        request for request in LocalOllama.requests[start:]
+        if request["messages"][0]["content"].startswith(
+            "You are R2-3PO's private autonomous reflection process.")
+    ]
+    assert len(requests) == 1, requests
+    with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
+        assert db.execute("SELECT count(*) FROM diary_entries WHERE entry=?",
+                          (MANUAL_DIARY_ENTRY,)).fetchone() == (1,)
+    print("PASS: explicit diary generation acquired the shared model slot, saved one exact "
+          "reflection, and dispatched its self-report without waiting for the idle timer.")
 
 
 def interrupt_foreground_reply(binary: Path, workspace: Path, url: str) -> None:
@@ -1799,6 +1878,7 @@ def main() -> int:
             sentinel.write_bytes(b"private planned action must remain inert")
             send_reported_greeting(binary, workspace, url)
             second_turn_during_post_turn_learning(binary, workspace, url)
+            manual_diary_during_post_turn_learning(binary, workspace, url)
             generate_first_greeting(binary, workspace, url)
             complete_post_action_response(binary, workspace, url)
             preserve_robot_identity(binary, workspace, url)
