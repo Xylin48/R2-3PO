@@ -6,6 +6,12 @@
 
 static char source_names[2][1024];
 static int source_reads[2], level_notices[2], ended_notices[2];
+static atomic_int fixture_open[2];
+int __wrap_r2_ears_is_open(R2Ears *receiver)
+{
+    assert(receiver == ears || receiver == ears_desktop);
+    return atomic_load(&fixture_open[receiver == ears_desktop]);
+}
 int __wrap_r2_ears_get_event(R2Ears *receiver, R2HearingEvent *event)
 {
     memset(event, 0, sizeof(*event));
@@ -56,6 +62,8 @@ static void *copy_live(void *userdata)
 
 int main(void)
 {
+    ears = (R2Ears *)(uintptr_t)1;
+    ears_desktop = (R2Ears *)(uintptr_t)2;
     for (int desktop = 0; desktop <= 1; ++desktop) {
         pthread_mutex_t *lock = desktop ? &ears_desktop_recent_lock : &ears_recent_lock;
         uint64_t *generation = desktop ? &ears_desktop_recent_generation : &ears_recent_generation;
@@ -64,6 +72,7 @@ int main(void)
         unsigned char *pcm = desktop ? ears_desktop_recent_audio : ears_recent_audio;
         atomic_int *running = desktop ? &ears_desktop_capture_running : &ears_capture_running;
         atomic_store(running, 1);
+        atomic_store(&fixture_open[desktop], 1);
         Live request = {.desktop = desktop, .generation = *generation, .wav = tmpfile()};
         assert(request.wav);
         pthread_t thread;
@@ -94,6 +103,24 @@ int main(void)
         unsigned char actual[1920];
         assert(fread(actual, 1, sizeof(actual), request.wav) == sizeof(actual));
         for (size_t i = 0; i < sizeof(actual); ++i) assert(actual[i] == 0x55);
+        fclose(request.wav);
+        /* Transport can retire before a blocked failure-journal callback
+         * releases the worker. Drain a complete retained interval, but do
+         * not wait for new bytes from that failed transport. */
+        atomic_store(&fixture_open[desktop], 0);
+        request.wav = tmpfile();
+        assert(request.wav);
+        copy_live(&request);
+        assert(request.result == 0 && ftell(request.wav) == 1920);
+        fclose(request.wav);
+        pthread_mutex_lock(lock);
+        *total = *length = 0;
+        pthread_mutex_unlock(lock);
+        request.wav = tmpfile();
+        assert(request.wav);
+        copy_live(&request);
+        assert(request.result == -1 && request.error == ECANCELED);
+        assert(ftell(request.wav) == 0 && atomic_load(running));
         fclose(request.wav);
         atomic_store(running, 0);
     }

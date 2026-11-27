@@ -86,6 +86,7 @@ assert re.search(
 assert 'strncasecmp(argument, "listen", 6)' in shell
 assert "ears listen [seconds]" in shell
 assert "parsed > R2_EARS_MAX_WAV_SECONDS" in shell
+assert "*duration == '-'" in shell
 assert 'R2_WHISPER_MODEL="${R2_WHISPER_MODEL:-}"' in launcher
 assert 'R2_WHISPER_CLI="${R2_WHISPER_CLI:-}"' in launcher
 assert "Local Whisper is not configured" in launcher

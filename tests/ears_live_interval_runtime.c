@@ -4,6 +4,14 @@
 #undef main
 #include <assert.h>
 
+/* This fixture feeds the real history ring without a hardware server.
+ * Its synthetic open state follows the corresponding producer lifetime. */
+int __wrap_r2_ears_is_open(R2Ears *receiver)
+{
+    assert(receiver == ears || receiver == ears_desktop);
+    return atomic_load(receiver == ears_desktop
+                       ? &ears_desktop_capture_running : &ears_capture_running);
+}
 typedef struct {
     int desktop;
     uint32_t length;
@@ -110,6 +118,8 @@ int main(void)
     char *invalid_result = r2_process_ears_listen_request(invalid_duration);
     assert(invalid_result && strstr(invalid_result, "No capture was started."));
     free(invalid_result);
+    ears = (R2Ears *)(uintptr_t)1;
+    ears_desktop = (R2Ears *)(uintptr_t)2;
     exercise_source(0);
     exercise_source(1);
     FILE *sink = tmpfile(); assert(sink);
@@ -128,6 +138,7 @@ int main(void)
     atomic_store(&ears_capture_running, 0);
     assert(r2_ears_write_recent_audio(128, 0, 42, sink, NULL, NULL) < 0);
     fclose(sink);
+    ears = ears_desktop = NULL;
     puts("Complete 30-second live PCM intervals, source isolation, wrap, restart identity and cancellation passed.");
     return 0;
 }

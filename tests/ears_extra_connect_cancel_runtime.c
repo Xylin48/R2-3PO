@@ -382,6 +382,11 @@ int main(void)
      * must preserve a separately opened non-continuous recording route. */
     assert(r2_ears_open_source(ears, "test.explicit.input") == 0);
     int connections_before = connect_calls;
+    assert(!r2_ears_start_for_watch("test.watch.would.replace") && errno == EBUSY);
+    atomic_store(&owner_cancelled, 1);
+    assert(!r2_ears_start_for_watch_cancelable("test.watch.cancelled", owner_stopped, NULL)
+           && errno == ECANCELED);
+    atomic_store(&owner_cancelled, 0);
     assert(!r2_ears_listen_cancelable(1, NULL, NULL));
     assert(connect_calls == connections_before && r2_ears_is_open(ears));
     R2HearingEvent explicit_source = {0};

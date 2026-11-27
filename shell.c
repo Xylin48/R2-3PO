@@ -1364,7 +1364,8 @@ static void shell_ears(const char *argument)
             errno = 0;
             unsigned long parsed = strtoul(duration, &end, 10);
             while (end && *end && isspace((unsigned char)*end)) ++end;
-            if (errno || !end || end == duration || *end || parsed < 1UL || parsed > R2_EARS_MAX_WAV_SECONDS) {
+            if (*duration == '-' || errno || !end || end == duration || *end ||
+                parsed < 1UL || parsed > R2_EARS_MAX_WAV_SECONDS) {
                 printf("Usage: ears listen [seconds]\n");
                 return;
             }

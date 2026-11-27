@@ -14130,6 +14130,16 @@ static int r2_ears_write_live_interval(uint32_t bytes, uint64_t cursor,
         if (count > sizeof(chunk)) count = sizeof(chunk);
         if (count > available) count = (size_t)available;
         int active = atomic_load(running);
+        if (!count && active) {
+            /* Ears retires its transport before potentially blocking failure
+             * journaling. Do not wait for the worker's later exit to notice
+             * that no additional PCM can arrive. A complete retained span
+             * may still be drained. The accepted caller retains primary
+             * Ears lifetime; the short pointer lock retains lazy desktop. */
+            if (desktop) pthread_mutex_lock(&ears_desktop_pointer_lock);
+            active = r2_ears_is_open(desktop ? ears_desktop : ears);
+            if (desktop) pthread_mutex_unlock(&ears_desktop_pointer_lock);
+        }
         if (count) r2_ears_copy_ring_span(chunk, ring, cursor, count);
         pthread_mutex_unlock(lock);
         if (!count) {
@@ -14743,6 +14753,18 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
     int lock_result = watch_token_out ? pthread_mutex_trylock(&ears_capture_lock)
                                       : pthread_mutex_lock(&ears_capture_lock);
     if (lock_result != 0) { errno = lock_result; return -1; }
+    if (r2_ears_open_cancelled(&request)) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        errno = ECANCELED;
+        return -1;
+    }
+    /* An explicit source can open between Watch's read-only snapshot and
+     * this acquisition. Watch cannot replace that non-worker session. */
+    if (watch_token_out && !ears_capture_thread_started && r2_ears_is_open(ears)) {
+        pthread_mutex_unlock(&ears_capture_lock);
+        errno = EBUSY;
+        return -1;
+    }
     if (atomic_load(&ears_capture_running) && ears_capture_thread_started &&
         r2_ears_is_open(ears)) {
         /* An explicit start takes over an existing Watch-owned stream. */
@@ -14772,7 +14794,7 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
     }
     pthread_mutex_unlock(&ears_capture_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_started" : "ears_start_failed",
-                 rc == 0 ? "R2 Ears is continuously receiving raw microphone PCM."
+                 rc == 0 ? "R2 Ears opened the continuous microphone capture worker."
                          : "R2 Ears could not start microphone capture.",
                  rc == 0 ? "No transcription or semantic interpretation is performed by the capture worker."
                          : NULL, "r2_ears_start");
@@ -14809,6 +14831,17 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
     int lock_result = watch_token_out ? pthread_mutex_trylock(&ears_desktop_capture_lock)
                                       : pthread_mutex_lock(&ears_desktop_capture_lock);
     if (lock_result != 0) { errno = lock_result; return -1; }
+    if (r2_ears_open_cancelled(&request)) {
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        errno = ECANCELED;
+        return -1;
+    }
+    if (watch_token_out && !ears_desktop_capture_thread_started &&
+        r2_ears_is_open(ears_desktop)) {
+        pthread_mutex_unlock(&ears_desktop_capture_lock);
+        errno = EBUSY;
+        return -1;
+    }
     if (atomic_load(&ears_desktop_capture_running) &&
         ears_desktop_capture_thread_started && r2_ears_is_open(ears_desktop)) {
         if (!watch_token_out) ears_desktop_watch_token = 0;
@@ -14844,7 +14877,7 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
     }
     pthread_mutex_unlock(&ears_desktop_capture_lock);
     r2_log_event(R2_LOG_SENSORY, rc == 0 ? "ears_desktop_started" : "ears_desktop_start_failed",
-                 rc == 0 ? "R2 Ears is continuously receiving real desktop playback PCM."
+                 rc == 0 ? "R2 Ears opened the continuous desktop playback capture worker."
                          : "R2 Ears could not open desktop monitor audio.",
                  rc == 0 ? "No automatic transcription or semantic interpretation."
                          : NULL, "r2_ears_start_desktop");
