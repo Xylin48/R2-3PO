@@ -52,6 +52,28 @@ char *__wrap_strdup(const char *value)
     return __real_strdup(value);
 }
 
+/* The failure formatter must use only the reserved tail and preserve every
+ * byte of already captured evidence, including the terminating NUL. */
+static void check_tool_capture_failure_preserves_evidence(void)
+{
+    const char prior[] = "first action completed\nsecond action completed\n";
+    const size_t prefix = sizeof(tool_capture_failure_notice) - 1;
+    for (size_t len = 0; len < sizeof(prior); ++len) {
+        size_t cap = len + sizeof(tool_capture_failure_notice);
+        char *buffer = malloc(cap + 1);
+        assert(buffer);
+        memcpy(buffer, prior, len);
+        buffer[len] = '\0';
+        buffer[cap] = 'Z';
+        assert(tool_capture_failure(buffer, len) == buffer);
+        assert(!memcmp(buffer, tool_capture_failure_notice, prefix));
+        assert(!memcmp(buffer + prefix, prior, len));
+        assert(buffer[prefix + len] == '\0');
+        assert(buffer[cap] == 'Z');
+        free(buffer);
+    }
+}
+
 static int defer_post_turn_request;
 
 int __real_json_object_object_add(struct json_object *, const char *, struct json_object *);
@@ -3116,6 +3138,7 @@ int main(void)
     check_conversation_learning_record_boundaries();
     check_learning_dispatch_without_diary();
     check_post_turn_retry();
+    check_tool_capture_failure_preserves_evidence();
     check_staged_imagination();
     check_stale_needs_decision();
     check_action_result_under_history_pressure();
