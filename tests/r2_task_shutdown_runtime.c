@@ -14,6 +14,7 @@
 /* Linker wrapping happens after optimization, so keep these observations
  * visible across calls compiled as ordinary libc calls. */
 static volatile int fail_result_format, fail_result_growth, growth_armed;
+static volatile int fail_completion_format;
 static volatile uintptr_t read_path_address, read_data_address;
 
 void __real_free(void *value);
@@ -38,6 +39,13 @@ void *__wrap_realloc(void *value, size_t size)
 
 static int format_tool_fixture(char **answer, const char *format, va_list args)
 {
+    if (fail_completion_format &&
+        !strncmp(format, "REAL HAND TASK COMPLETED.", sizeof("REAL HAND TASK COMPLETED.") - 1)) {
+        fail_completion_format = 0;
+        *answer = NULL;
+        errno = ENOMEM;
+        return -1;
+    }
     int read_result = (fail_result_format || fail_result_growth) &&
         !strcmp(format, "REAL READ RESULT:\nPath: %s\nContent:\n%s\n");
     if (read_result) {
@@ -285,6 +293,64 @@ static void check_durable_receipts(void)
     r2_log_shutdown();
 }
 
+static void check_completion_persistence_retry(void)
+{
+    assert(r2_log_init() == 0);
+    sqlite3 *fixture = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &fixture) == SQLITE_OK);
+    for (int failure = 0; failure < 2; ++failure) {
+        const char *id = failure ? "sqlfail" : "fmtfail";
+        const char *command = failure ? "printf sql-exact-output" : "printf format-exact-output";
+        int64_t receipt = r2_log_accept_hands(id, command);
+        assert(receipt > 0);
+        int before = count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;");
+        if (failure)
+            assert(sqlite3_exec(fixture,
+                "CREATE TRIGGER block_completion BEFORE INSERT ON r2_log_hands_results "
+                "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+        else
+            fail_completion_format = 1;
+        execute_task(id, command, receipt);
+        assert(!fail_completion_format && completed_head &&
+               completed_head->receipt == receipt && !completed_head->durable_handoff);
+        assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 1);
+        assert(count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;") == before);
+        char archive[PATH_MAX];
+        memcpy(archive, completed_head->archive_path, sizeof(archive));
+        assert(access(archive, F_OK) == 0);
+        if (failure) {
+            char *blocked = collect_completed();
+            assert(blocked && !*blocked && completed_head && completed_head->receipt == receipt);
+            free(blocked);
+            assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 1);
+            assert(sqlite3_exec(fixture, "DROP TRIGGER block_completion;", NULL, NULL, NULL) == SQLITE_OK);
+        }
+        char *retried = collect_completed();
+        assert(retried && !*retried && !completed_head && !completed_tail);
+        free(retried);
+        assert(count_rows(fixture, "SELECT count(*) FROM r2_log_pending_hands;") == 0);
+        assert(count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;") == before + 1);
+        sqlite3_stmt *st = NULL;
+        assert(sqlite3_prepare_v2(fixture,
+            "SELECT r.result FROM r2_log_hands_results r JOIN r2_log_links l "
+            "ON l.from_event_id=r.outcome_id WHERE l.to_event_id=? AND l.relationship='hands_outcome_for';",
+            -1, &st, NULL) == SQLITE_OK);
+        assert(sqlite3_bind_int64(st, 1, receipt) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+        const char *stored = (const char *)sqlite3_column_text(st, 0);
+        assert(stored && strstr(stored, command) && strstr(stored, archive) &&
+               strstr(stored, failure ? "Output:\nsql-exact-output" : "Output:\nformat-exact-output"));
+        assert(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_finalize(st);
+        retried = collect_completed();
+        assert(retried && !*retried);
+        free(retried);
+        assert(count_rows(fixture, "SELECT count(*) FROM r2_log_hands_results;") == before + 1);
+        assert(unlink(archive) == 0);
+    }
+    assert(sqlite3_close(fixture) == SQLITE_OK);
+    r2_log_shutdown();
+}
+
 int main(void)
 {
     check_shutdown("printf started; sleep 30 & wait");
@@ -298,6 +364,7 @@ int main(void)
     check_console_shutdown("exec >/dev/null; exec sleep 30");
     atomic_store(&shutting_down, 0);
     check_durable_receipts();
+    check_completion_persistence_retry();
     puts("R2 active task shutdown, exact output archive and durable receipt smoke passed.");
     return 0;
 }

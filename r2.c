@@ -7893,17 +7893,24 @@ static char *format_completed_task(const CompletedTask *task)
     return result;
 }
 
+/* A real accepted task owns its receipt until the outcome AND its exact
+ * handoff commit. Formatting failure must not acknowledge an empty result. */
+static int persist_completed_task(CompletedTask *c)
+{
+    if (c->receipt <= 0 || c->durable_handoff) return 0;
+    char *handoff = format_completed_task(c);
+    if (!handoff) return -1;
+    int result = r2_log_finish_hands(c->receipt, c->launched, c->return_code, handoff);
+    free(handoff);
+    if (result == 0) c->durable_handoff = 1;
+    return result;
+}
+
 static void completed_push(
     CompletedTask *c)
 {
-    if (c->receipt > 0) {
-        char *handoff = format_completed_task(c);
-        if (r2_log_finish_hands(c->receipt, c->launched, c->return_code, handoff) != 0)
-            fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
-        else
-            c->durable_handoff = handoff != NULL;
-        free(handoff);
-    }
+    if (persist_completed_task(c) != 0)
+        fprintf(stderr, "[HAND %s] Could not record the durable task outcome.\n", c->id);
 
     pthread_mutex_lock(
         &tasks_lock
@@ -8491,6 +8498,12 @@ static char *collect_completed(void)
         c;
     ) {
 
+        if (c->receipt > 0 && persist_completed_task(c) != 0) {
+            /* Keep the actual completed node and receipt. No command is
+               repeated, and no transient handoff replaces its durable row. */
+            completed_requeue_front(c);
+            break;
+        }
         if (c->durable_handoff) {
             CompletedTask *next = c->next;
             free(c->command);
@@ -15843,7 +15856,6 @@ static char *r2_talk_impl(const char *message)
     r2_associative_query_cache_clear();
 
     fprintf(stderr, "[R2 Input Audit] r2_talk_received_chars=%zu\n", strlen(message));
-    handle_completed_messages();
 
     /* Replace the previous snapshot so every turn sees current Reality state. */
     r2_turn_reality_stale = refresh_reality_context_message() != 0;
@@ -15860,6 +15872,10 @@ static char *r2_talk_impl(const char *message)
     active_turn_history.user = messages.items[messages.count - 1].content;
     pthread_mutex_unlock(&messages_lock);
 
+    /* Publish any volatile completion only after the authoritative user
+       turn is admitted, so it cannot become unanchored historical context.
+       Real accepted tasks are persisted and attached through the outbox. */
+    handle_completed_messages();
     int64_t hands_result_id = attach_pending_hands_result();
     char *tool_evidence = NULL;
     const char *runtime_notice = NULL;
@@ -16321,8 +16337,6 @@ int r2_conversation(void)
     size_t line_capacity = 0;
 
     while (!shutting_down) {
-        handle_completed_messages();
-
         printf("You: ");
         fflush(stdout);
 
@@ -17089,6 +17103,9 @@ void r2_shutdown(void)
     pthread_mutex_unlock(&tasks_lock);
     while (completed_tasks) {
         CompletedTask *next = completed_tasks->next;
+        if (persist_completed_task(completed_tasks) != 0)
+            fprintf(stderr, "[HAND %s] Completion still not committed at shutdown; receipt and output archive retained.\n",
+                    completed_tasks->id);
         free(completed_tasks->command);
         free(completed_tasks->output);
         free(completed_tasks);
