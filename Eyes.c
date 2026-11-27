@@ -360,7 +360,7 @@ static uint64_t r2_eyes_timestamp(void)
            ((uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
-/* Read-only discovery must not wait indefinitely for ffprobe or X11. The
+/* Read-only discovery must not wait indefinitely for FFmpeg or X11. The
  * five-second read budget applies to an entire metadata operation, including
  * all candidates in one window lookup, followed by bounded child cleanup. */
 #define R2_EYES_PROBE_MS 5000U
@@ -401,6 +401,69 @@ static int r2_eyes_probe_check(R2EyesProbe probe)
     return 0;
 }
 
+static void r2_eyes_file_filter(char filter[64])
+{
+    snprintf(filter, 64, "fps=%d,format=rgb24", R2_EYES_FPS);
+}
+
+/* Inspect an actual decoded first-frame packet, rather than coded stream
+ * metadata. Autorotation, including near-quarter-turn display matrices,
+ * can change the raster dimensions without changing the pixel byte count.
+ * FFmpeg's framecrc muxer reports the output geometry and packet length. */
+static int r2_eyes_parse_decoded_geometry(char *output,
+                                         uint32_t *width, uint32_t *height)
+{
+    static const char dimensions_prefix[] = "#dimensions 0: ";
+    uint32_t w = 0, h = 0;
+    unsigned long long frame_bytes = 0;
+    int have_frame = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(output, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        if (!strncmp(line, dimensions_prefix, sizeof(dimensions_prefix) - 1)) {
+            if (w || h) return -1;
+            const char *p = line + sizeof(dimensions_prefix) - 1;
+            char *tail = NULL;
+            if (*p < '0' || *p > '9') return -1;
+            errno = 0;
+            unsigned long a = strtoul(p, &tail, 10);
+            if (errno || !a || a > UINT32_MAX || *tail != 'x') return -1;
+            p = tail + 1;
+            if (*p < '0' || *p > '9') return -1;
+            errno = 0;
+            unsigned long b = strtoul(p, &tail, 10);
+            while (*tail && isspace((unsigned char)*tail)) ++tail;
+            if (errno || !b || b > UINT32_MAX || *tail) return -1;
+            w = (uint32_t)a;
+            h = (uint32_t)b;
+        } else if (line[0] == '0' && line[1] == ',') {
+            if (have_frame) return -1;
+            const char *p = line;
+            /* stream, dts, pts, duration, size, checksum */
+            for (int field = 0; field < 4; ++field) {
+                p = strchr(p, ',');
+                if (!p) return -1;
+                ++p;
+            }
+            while (isspace((unsigned char)*p)) ++p;
+            if (*p < '0' || *p > '9') return -1;
+            errno = 0;
+            char *tail = NULL;
+            frame_bytes = strtoull(p, &tail, 10);
+            while (*tail && isspace((unsigned char)*tail)) ++tail;
+            if (errno || *tail != ',') return -1;
+            have_frame = 1;
+        }
+    }
+    if (!w || !h || !have_frame ||
+        (size_t)w > R2_EYES_MAX_FRAME_BYTES / 3U / (size_t)h ||
+        frame_bytes != (size_t)w * (size_t)h * 3U)
+        return -1;
+    *width = w;
+    *height = h;
+    return 0;
+}
+
 static int r2_eyes_probe_dimensions(
     const char *source,
     int live_device,
@@ -418,36 +481,18 @@ static int r2_eyes_probe_dimensions(
         return 0;
     }
 
-    char *argv[] = {"ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
-        (char *)source, NULL};
-    char *dimensions = r2_eyes_query(argv, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}, 0);
-    if (!dimensions) return -1;
-
-    char *separator = strchr(dimensions, 'x');
-    uint32_t w = 0, h = 0;
-    int valid = 0;
-    if (separator) {
-        *separator = '\0';
-        errno = 0;
-        char *end;
-        unsigned long a = strtoul(dimensions, &end, 10);
-        while (*end && isspace((unsigned char)*end)) ++end;
-        if (!errno && end != dimensions && !*end && a && a <= UINT32_MAX) {
-            w = (uint32_t)a;
-            const char *height_text = separator + 1;
-            unsigned long b = strtoul(height_text, &end, 10);
-            while (*end && isspace((unsigned char)*end)) ++end;
-            if (!errno && end != height_text && !*end && b && b <= UINT32_MAX)
-                h = (uint32_t)b;
-        }
-        valid = w && h && (size_t)w <= R2_EYES_MAX_FRAME_BYTES / 3U / (size_t)h;
-    }
-    free(dimensions);
-    if (!valid) { errno = EINVAL; return -1; }
-    *width = w;
-    *height = h;
-    return 0;
+    char filter[64];
+    r2_eyes_file_filter(filter);
+    char *argv[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", (char *)source, "-map", "0:v:0", "-vf", filter,
+        "-frames:v", "1", "-c:v", "rawvideo", "-pix_fmt", "rgb24",
+        "-f", "framecrc", "pipe:1", NULL};
+    char *output = r2_eyes_query(argv, (R2EyesProbe){.deadline = r2_eyes_probe_deadline()}, 0);
+    if (!output) return -1;
+    int result = r2_eyes_parse_decoded_geometry(output, width, height);
+    free(output);
+    if (result != 0) errno = EINVAL;
+    return result;
 }
 
 static int r2_eyes_allocate_native_buffer(
@@ -804,17 +849,16 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
     if (!input) return NULL;
     char fps[32], filter[64];
     snprintf(fps, sizeof(fps), "%d", R2_EYES_FPS);
-    snprintf(filter, sizeof(filter), "fps=%d,format=rgb24", R2_EYES_FPS);
+    r2_eyes_file_filter(filter);
     char *camera[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-f", "v4l2", "-framerate", fps, "-video_size", "640x480", "-i", (char *)input,
         "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-r", fps,
         "pipe:1", NULL};
-    /* The dimension probe selects v:0. Without an explicit map, FFmpeg
-     * can automatically select a different (e.g. larger) video track and
-     * the fixed-size RGB reader would split its pixels at wrong boundaries. */
+    /* Match the decoded first-frame probe's track, filter and pixel
+     * format exactly. Only the live playback rate and output muxer differ. */
     char *file[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-re", "-i", (char *)input, "-map", "0:v:0", "-vf", filter,
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL};
+        "-c:v", "rawvideo", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1", NULL};
     return r2_eyes_spawn_stream(live_device ? camera : file, child_out, R2_EYES_STDERR_INHERIT);
 }
 

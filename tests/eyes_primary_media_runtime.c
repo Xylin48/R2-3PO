@@ -31,6 +31,7 @@ int main(void)
     assert(fputs(
         "#!/bin/sh\n"
         "case \"$*\" in\n"
+        "  *framecrc*) printf '#dimensions 0: 32x24\\n0, 0, 0, 1, 2304, 0x00000000\\n' ;;\n"
         "  *secondary*) python3 -c 'import sys; sys.stdout.buffer.write(bytes([90])*4608)' ;;\n"
         "  *) python3 -c 'import sys; sys.stdout.buffer.write(bytes([65])*4608)' ;;\n"
         "esac\n", file) >= 0);

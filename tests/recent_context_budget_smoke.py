@@ -59,7 +59,7 @@ history_start = core.index("/* Mark historical candidates only.")
 history_end = core.index("size_t complete_override_length", history_start)
 history_candidates = core[history_start:history_end]
 allocator_start = core.index("static int r2_preserve_inference_units(")
-allocator_end = core.index("typedef enum", allocator_start)
+allocator_end = core.index("static char *ollama_submit_chat(", allocator_start)
 allocator = core[allocator_start:allocator_end]
 require(
     "include[i] = 1;" in history_candidates

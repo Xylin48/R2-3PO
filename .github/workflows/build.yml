@@ -44,7 +44,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libcurl4-openssl-dev libsqlite3-dev libjson-c-dev libpulse-dev python3-tk libfaketime
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libsqlite3-dev libjson-c-dev libpulse-dev python3-tk libfaketime ffmpeg
 
       - name: Check consistent strict build configuration
         run: |
@@ -307,6 +307,16 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_capture_lifecycle_runtime.c shell.c r2_diary.c Log.c SensoryJournal.c Reality.c Addiction.c Reward.c AlternateSelf.c Visual.c Ears.c AudioDiscovery.c AudioCapture.c AudioFile.c Eyes.c R2Sounds.c R2Reply.c Imagination.c -o /tmp/r2-eyes-capture-lifecycle -lcurl -lsqlite3 -lpthread -ljson-c -lpulse-simple -lpulse -lm -Wl,--wrap=r2_visual_is_initialized -Wl,--wrap=r2_visual_analyze_frame -Wl,--wrap=pthread_cond_clockwait
           timeout -k 2s 35s /tmp/r2-eyes-capture-lifecycle
 
+      - name: Verify real decoded file geometry and exact track selection
+        run: |
+          ROOT="$(mktemp -d /tmp/r2-eyes-geometry.XXXXXX)"
+          trap 'rm -rf "$ROOT"' EXIT
+          ffmpeg -v error -f lavfi -i color=c=red:s=16x32:r=10 -f lavfi -i color=c=blue:s=64x32:r=10 -t 0.3 -map 0:v:0 -map 1:v:0 -c:v mpeg4 -threads 1 -disposition:v:0 0 -disposition:v:1 0 "$ROOT/base.mp4"
+          if ! ffmpeg -v error -display_rotation:v:0 90 -i "$ROOT/base.mp4" -map 0:v -c copy "$ROOT/rotated.mp4"; then
+            ffmpeg -v error -y -i "$ROOT/base.mp4" -map 0:v -c copy -metadata:s:v:0 rotate=90 "$ROOT/rotated.mp4"
+          fi
+          cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_file_geometry_runtime.c Eyes.c -o "$ROOT/eyes-file-geometry" -lpthread -lm
+          timeout 15s "$ROOT/eyes-file-geometry" "$ROOT/base.mp4" "$ROOT/rotated.mp4"
       - name: Exercise independent raw camera and auxiliary media frames
         run: |
           cc -std=c11 -Wall -Wextra -Werror -O2 -I. tests/eyes_primary_media_runtime.c Eyes.c -o /tmp/r2-eyes-primary-media-test -lpthread -lm

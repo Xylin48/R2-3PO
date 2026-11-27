@@ -225,14 +225,29 @@ int main(void)
         "#!/usr/bin/python3\n"
         "import os, signal, sys, time\n"
         "mode = sys.argv[sys.argv.index('-i') + 1]\n"
-        "if '-re' in sys.argv:\n"
+        "if '-re' in sys.argv or 'framecrc' in sys.argv:\n"
         "    assert sys.argv[sys.argv.index('-map') + 1] == '0:v:0'\n"
+        "    assert sys.argv[sys.argv.index('-vf') + 1] == 'fps=10,format=rgb24'\n"
+        "    assert sys.argv[sys.argv.index('-c:v') + 1] == 'rawvideo'\n"
+        "if 'framecrc' in sys.argv:\n"
+        "    assert '-re' not in sys.argv and sys.argv[sys.argv.index('-frames:v') + 1] == '1'\n"
+        "    if mode == 'probe-stalled':\n"
+        "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "        with open(os.environ['R2_EYES_TEST_PID_FILE'], 'w') as f: f.write(str(os.getpid()))\n"
+        "        while True: signal.pause()\n"
+        "    print('#dimensions 0: 3x2' if mode == 'rotated' else '#dimensions 0: 2x2')\n"
+        "    if mode != 'probe-no-frame':\n"
+        "        size = 18 if mode == 'rotated' else (13 if mode == 'probe-wrong-size' else 12)\n"
+        "        print(f'0, 0, 0, 1, {size}, 0x00000000')\n"
+        "    sys.exit(7 if mode == 'probe-failed' else 0)\n"
         "if '-window_id' in sys.argv:\n"
         "    assert sys.argv[sys.argv.index('-video_size') + 1] == '2x2'\n"
         "    window = sys.argv[sys.argv.index('-window_id') + 1]\n"
         "    assert window == os.getenv('R2_TEST_EXPECTED_WINDOW', '123')\n"
         "if mode == 'finite':\n"
         "    os.write(1, bytes(range(24)))\n"
+        "elif mode == 'rotated':\n"
+        "    os.write(1, bytes(range(36)))\n"
         "elif mode == 'partial':\n"
         "    os.write(1, b'12345')\n"
         "elif mode == 'failed':\n"
@@ -275,6 +290,24 @@ int main(void)
     assert_reaped(child);
     assert(unlink(ready) == 0);
     assert(r2_eyes_open_file(eyes, "probe-failed") == -1);
+    assert(r2_eyes_open_file(eyes, "probe-no-frame") == -1);
+    assert(r2_eyes_open_file(eyes, "probe-wrong-size") == -1);
+
+    /* The actual decoded geometry can differ from coded metadata. */
+    assert(r2_eyes_open_file(eyes, "rotated") == 0);
+    R2VideoFormat rotated_format = {0};
+    assert(r2_eyes_get_format(eyes, &rotated_format) == 0);
+    assert(rotated_format.width == 3 && rotated_format.height == 2 &&
+           rotated_format.stride == 9);
+    for (size_t i = 0; i < 2; ++i) {
+        R2VisionFrame rotated_frame = {0};
+        assert(r2_eyes_capture(eyes) == 1);
+        assert(r2_eyes_get_frame(eyes, &rotated_frame) == 0 &&
+               rotated_frame.size == 18 && rotated_frame.format.width == 3);
+        for (size_t j = 0; j < 18; ++j)
+            assert(rotated_frame.data[j] == i * 18 + j);
+    }
+    assert(r2_eyes_capture(eyes) == 0 && !r2_eyes_is_open(eyes));
 
     /* Closing Eyes also cancels a deliberate direct read with no Watch worker. */
     assert(r2_eyes_open_file(eyes, "stalled") == 0);
