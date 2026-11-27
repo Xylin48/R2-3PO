@@ -9448,8 +9448,10 @@ static char *tool_capture_failure(char *results, size_t len)
 
 static char *process_tools_with_status(
     const char *reply,
-    int *world_action_succeeded)
+    int *world_action_succeeded,
+    int *capture_failed)
 {
+    if (capture_failed) *capture_failed = 0;
     if (world_action_succeeded)
         *world_action_succeeded = 0;
     size_t cap = 1024;
@@ -9472,6 +9474,7 @@ static char *process_tools_with_status(
         if (_n < 0 || !_part ||                                            \
             (size_t)_n > SIZE_MAX - len - sizeof(tool_capture_failure_notice)) { \
             free(_part);                                                   \
+            if (capture_failed) *capture_failed = 1; \
             return tool_capture_failure(results, len);                     \
         }                                                                  \
         size_t _needed = len + (size_t)_n + sizeof(tool_capture_failure_notice); \
@@ -9487,6 +9490,7 @@ static char *process_tools_with_status(
             char *_grown = realloc(results, _new_cap);                     \
             if (!_grown) {                                                 \
                 free(_part);                                               \
+                if (capture_failed) *capture_failed = 1; \
                 return tool_capture_failure(results, len);                 \
             }                                                              \
             results = _grown;                                              \
@@ -10643,7 +10647,7 @@ static char *process_tools_with_status(
 /* Preserve the existing result-only interface for ordinary callers. */
 static char *process_tools(const char *reply)
 {
-    return process_tools_with_status(reply, NULL);
+    return process_tools_with_status(reply, NULL, NULL);
 }
 
 
@@ -11863,7 +11867,7 @@ static void autonomous_needs_check(void)
                 pthread_mutex_unlock(&conversation_turn_lock);
             } else {
                 int action_succeeded = 0;
-                char *result = process_tools_with_status(safe_action, &action_succeeded);
+                char *result = process_tools_with_status(safe_action, &action_succeeded, NULL);
                 /* The action handler reports its actual persistence result. Do
                    not infer success by searching user-facing output prose: that
                    text may change or fail to allocate after the world changed. */
@@ -15860,7 +15864,8 @@ static char *r2_talk_impl(const char *message)
         free(stripped_reply);
         goto interrupted_reply;
     }
-    char *tools = process_tools(stripped_reply);
+    int capture_failed = 0;
+    char *tools = process_tools_with_status(stripped_reply, NULL, &capture_failed);
     if (!tools) {
         free(reply);
         free(stripped_reply);
@@ -15880,10 +15885,7 @@ static char *r2_talk_impl(const char *message)
         /* If result capture failed after an action began, expose the no-retry
            warning directly. A model follow-up could otherwise paraphrase it
            away or incorrectly claim the action definitely succeeded. */
-        static const char tool_capture_failure_prefix[] =
-            "I ran out of memory while recording an action result.";
-        if (strncmp(tools, tool_capture_failure_prefix,
-                    sizeof(tool_capture_failure_prefix) - 1) == 0) {
+        if (capture_failed) {
             free(reply);
             free(stripped_reply);
             stripped_reply = NULL;

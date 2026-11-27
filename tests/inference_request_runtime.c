@@ -56,6 +56,10 @@ char *__wrap_strdup(const char *value)
  * byte of already captured evidence, including the terminating NUL. */
 static void check_tool_capture_failure_preserves_evidence(void)
 {
+    int failed = 1;
+    char *empty = process_tools_with_status("ordinary dialogue", NULL, &failed);
+    assert(empty && !*empty && failed == 0);
+    free(empty);
     const char prior[] = "first action completed\nsecond action completed\n";
     const size_t prefix = sizeof(tool_capture_failure_notice) - 1;
     for (size_t len = 0; len < sizeof(prior); ++len) {

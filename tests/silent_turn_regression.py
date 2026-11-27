@@ -46,7 +46,7 @@ require(
 require(
     implementation.count("chat_with_relevant_memories(message)") == 2
     and "reply = recorded_action_reply(tool_evidence);" in implementation
-    and implementation.count("process_tools(stripped_reply)") == 1,
+    and implementation.count("process_tools_with_status(stripped_reply, NULL, &capture_failed)") == 1,
     "failed post-action generation preserves the completed action result without replaying the action",
 )
 require(

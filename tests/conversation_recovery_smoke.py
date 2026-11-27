@@ -81,7 +81,7 @@ require(
     "action-control blocks and lines do not count as visible user-facing text",
 )
 visible_gate = impl.find("if (!reply_has_visible_text(stripped_reply) &&")
-tool_execution = impl.find("char *tools = process_tools(stripped_reply)")
+tool_execution = impl.find("char *tools = process_tools_with_status(stripped_reply, NULL, &capture_failed)")
 require(
     visible_gate >= 0 and tool_execution > visible_gate
     and "!reply_is_standalone_media_inspection(stripped_reply)" in impl[visible_gate:tool_execution]
@@ -104,21 +104,24 @@ growth_end = tool_processor.find("results = _grown;", growth_start)
 growth_failure = tool_processor[growth_start:growth_end] if growth_start >= 0 and growth_end >= 0 else ""
 growth_commit = tool_processor[growth_end:growth_end + 120] if growth_end >= 0 else ""
 require(
-    "An action may already have completed" in growth_failure
-    and "Verify the current state " in growth_failure
-    and "before retrying the request." in growth_failure
-    and "return results;" in growth_failure
+    "An action may already have completed" in core
+    and "Verify the current state " in core
+    and "before retrying the request." in core
+    and "return tool_capture_failure(results, len);" in growth_failure
+    and "if (capture_failed) *capture_failed = 1;" in growth_failure
     and "free(results);" not in growth_failure
-    and "snprintf(results, cap, \"%s\", _capture_failure)" in growth_failure
+    and "sizeof(tool_capture_failure_notice)" in tool_processor
+    and "memmove(results + prefix, results, len + 1)" in core
     and "cap = _new_cap;" not in growth_failure
     and "cap = _new_cap;" in growth_commit,
     "tool-result allocation failure keeps warning bounded by the original allocation",
 )
-direct_tool_oom = impl.find("if (strncmp(tools, tool_capture_failure_prefix")
+direct_tool_oom = impl.find("if (capture_failed)")
 require(
     direct_tool_oom >= 0
-    and "I ran out of memory while recording an action result." in impl
-    and "reply = tools; /* Transfer the existing buffer" in impl[direct_tool_oom:]
+    and "I ran out of memory while recording an action result." in core
+    and "reply = tools;" in impl[direct_tool_oom:]
+    and "tool_evidence = tools;" in impl[direct_tool_oom:]
     and "xstrdup(" not in impl[direct_tool_oom:impl.find("/* Tool-routing replies", direct_tool_oom)]
     and "goto finalize_reply;" in impl[direct_tool_oom:],
     "tool-result OOM warning is shown directly instead of being paraphrased by another model call",
