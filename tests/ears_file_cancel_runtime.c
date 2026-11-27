@@ -20,11 +20,27 @@
 #include <unistd.h>
 
 static int source_closes = 0;
+static R2Ears *observed_receiver;
+static int failure_notices = 0;
 int64_t r2_log_sensory(const char *type, const char *text,
                       const char *details, const char *source)
 {
     (void)text; (void)details; (void)source;
     if (type && strcmp(type, "audio_source_closed") == 0) ++source_closes;
+    if (type && strcmp(type, "audio_read_failed") == 0) {
+        /* A journal operation may block. Check the actual source state at
+         * entry, not merely after the reader has returned to its caller. */
+        assert(observed_receiver && !r2_ears_is_open(observed_receiver));
+        R2HearingEvent active = {0}, retained = {0};
+        int saved = errno;
+        assert(r2_ears_get_open_event(observed_receiver, &active) == -1 && errno == ENODATA);
+        assert(!active.source_name);
+        assert(r2_ears_get_event(observed_receiver, &retained) == 0);
+        assert(source && retained.source_name && !strcmp(retained.source_name, source));
+        r2_ears_release_event(&retained);
+        ++failure_notices;
+        errno = saved;
+    }
     return 1;
 }
 
@@ -103,6 +119,7 @@ int main(void)
     assert(setenv("R2_TEST_FILE_NAME", unusual_filename, 1) == 0);
     R2Ears *ears = NULL;
     assert(r2_ears_init(&ears) == 0);
+    observed_receiver = ears;
     assert(setenv("R2_TEST_FILE_MODE", "complete", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
     R2HearingEvent original = {0};
@@ -203,7 +220,9 @@ int main(void)
     errno = 0;
     assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
+    assert(failure_notices == 3); /* failed, unconfirmed and malformed decoders */
     r2_ears_shutdown(ears);
+    observed_receiver = NULL;
     /* A successful event snapshot belongs to its caller, not the receiver. */
     assert(!strcmp(original.source_name, unusual_filename));
     r2_ears_release_event(&original);
