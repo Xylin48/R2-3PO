@@ -159,6 +159,57 @@ class TVDisplaySmoke(unittest.TestCase):
             self.assertEqual(display.read_vcr_state(), (None, "stop", 0.0))
         self.assertEqual(unusual.read_bytes(), before)
 
+    def test_display_snapshot_keeps_tv_and_tape_in_one_read_transaction(self) -> None:
+        self.set_state(1, "input", 1)
+        media = "/tmp/snapshot.mp4"
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("INSERT INTO r2_tv_vcr_tapes VALUES(?,?)", (media, 42.0))
+            db.execute("UPDATE r2_tv_vcr_state SET cassette_path=?,transport='play' WHERE id=1", (media,))
+        display = object.__new__(TV.CRTDisplay)
+        read_state = display._read_state
+        def update_after_tv_read(db):
+            result = read_state(db)
+            with sqlite3.connect(self.db_path) as writer:
+                writer.execute("UPDATE r2_tv_state SET power=0 WHERE id=1")
+                writer.execute("UPDATE r2_tv_vcr_state SET transport='pause' WHERE id=1")
+                writer.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=90 WHERE media_path=?", (media,))
+            return result
+        with patch.object(display, "_read_state", side_effect=update_after_tv_read):
+            self.assertEqual(display.read_display_snapshot(),
+                             ((1, "input", 1, None), (media, "play", 42.0)))
+        self.assertEqual(display.read_display_snapshot(),
+                         ((0, "input", 1, None), (media, "pause", 90.0)))
+
+    def test_refresh_keeps_pending_tape_silent_and_hidden(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Mock()
+        display._loaded_path = "/tmp/new.mp4"
+        display._last_transport = None
+        display._pending_vcr_seek = object()
+        display._last_logged_vlc_state = None
+        display.picture = Mock()
+        display.video_surface = Mock()
+        display.status = Mock()
+        display.sync_vcr_player = Mock()
+        display._record_playback_state = Mock()
+        display._publish_renderer = Mock()
+        display.read_display_snapshot = lambda: ((1, "input", 1, None),
+                                                 ("/tmp/new.mp4", "play", 80.0))
+        display.refresh(schedule=False)
+        self.assertTrue(display._player.audio_set_mute.call_args_list)
+        self.assertTrue(all(c == call(True) for c in display._player.audio_set_mute.call_args_list))
+        display.video_surface.lift.assert_not_called()
+        display.picture.lift.assert_called_once()
+        display._publish_renderer.assert_called_once_with(None)
+        display._record_playback_state.assert_not_called()
+        display._pending_vcr_seek = None
+        display._last_transport = "play"
+        display.refresh(schedule=False)
+        display.video_surface.lift.assert_called_once()
+        display._player.audio_set_mute.assert_called_with(False)
+        display._publish_renderer.assert_called_with("/tmp/new.mp4")
+
     def test_reader_does_not_mutate_reality_database(self) -> None:
         self.set_state(0, "input", 1)
         before = self.db_path.read_bytes()
@@ -314,8 +365,7 @@ class TVDisplaySmoke(unittest.TestCase):
         display._renderer_published = False
         display.picture = Widget()
         display.status = Widget()
-        display.read_state = lambda: (1, "input", 1, None)
-        display.read_vcr_state = lambda: (_ for _ in ()).throw(
+        display.read_display_snapshot = lambda: (_ for _ in ()).throw(
             ValueError("Saved VCR position is not finite"))
         display._publish_renderer = lambda path: None
         display.refresh(schedule=False)
@@ -419,8 +469,8 @@ class TVDisplaySmoke(unittest.TestCase):
         display._loaded_path = None
         display._last_transport = None
         display.root = FakeRoot()
-        display.read_vcr_state = lambda: ("/tmp/movie.mp4", "stop", 42.5)
-        display.read_state = lambda: (0, "input", 1, None)
+        display.read_display_snapshot = lambda: ((0, "input", 1, None),
+                                                 ("/tmp/movie.mp4", "stop", 42.5))
 
         display._prepare_media("/tmp/movie.mp4", 42.5, "stop", audible=False)
 
@@ -450,12 +500,13 @@ class TVDisplaySmoke(unittest.TestCase):
         display._loaded_path = None
         display._last_transport = None
         display.root = FakeRoot()
-        display.read_vcr_state = lambda: ("/tmp/movie.mp4", "play", 42.5)
-        display.read_state = lambda: (1, "input", 1, None)
+        display.read_display_snapshot = lambda: ((1, "input", 1, None),
+                                                 ("/tmp/movie.mp4", "play", 42.5))
 
         display._prepare_media("/tmp/movie.mp4", 42.5, "play", audible=True)
 
-        self.assertLess(events.index(("mute", False)), events.index(("play",)))
+        self.assertLess(events.index(("mute", True)), events.index(("play",)))
+        self.assertLess(events.index(("seek", 42500)), events.index(("mute", False)))
         self.assertLess(events.index(("seek", 42500)), events.index(("pause", 0)))
         self.assertEqual(events[-1], ("pause", 0))
 
@@ -482,8 +533,8 @@ class TVDisplaySmoke(unittest.TestCase):
         display._loaded_path = None
         display._last_transport = None
         display.root = FakeRoot()
-        display.read_vcr_state = lambda: ("/tmp/movie.mp4", "play", 80.0)
-        display.read_state = lambda: (0, "input", 1, None)
+        display.read_display_snapshot = lambda: ((0, "input", 1, None),
+                                                 ("/tmp/movie.mp4", "play", 80.0))
 
         display._prepare_media("/tmp/movie.mp4", 0.0, "stop", audible=True)
         self.assertIsNotNone(display.root.callback)
@@ -511,16 +562,15 @@ class TVDisplaySmoke(unittest.TestCase):
         display._last_transport = None
         display.root = type("Root", (), {"after": lambda self, delay, callback: callbacks.append(callback)})()
         first, second = "/tmp/first.mp4", "/tmp/second.mp4"
-        display.read_state = lambda: (1, "input", 1, None)
-
         display._prepare_media(first, 0, "play", True)
         stale = callbacks[-1]
         display._prepare_media(second, 0, "stop", True)
         display._prepare_media(first, 0, "play", True)
         active = callbacks[-1]
         events.clear()
-        with patch.object(display, "read_vcr_state",
-                          side_effect=[sqlite3.OperationalError("busy"), (first, "play", 70.5)]):
+        with patch.object(display, "read_display_snapshot",
+                          side_effect=[sqlite3.OperationalError("busy"),
+                                       ((1, "input", 1, None), (first, "play", 70.5))]):
             stale()
             self.assertEqual(events, [])
             active()

@@ -234,58 +234,76 @@ class CRTDisplay:
     def read_state(self) -> tuple[int, str, int, str | None]:
         uri = DB_PATH.resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
-            row = db.execute(
-                "SELECT power, source_kind, source_value FROM r2_tv_state WHERE id=1"
+            db.execute("BEGIN")
+            return self._read_state(db)
+
+    @staticmethod
+    def _read_state(db: sqlite3.Connection) -> tuple[int, str, int, str | None]:
+        row = db.execute(
+            "SELECT power, source_kind, source_value FROM r2_tv_state WHERE id=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("TV state row is missing")
+        power, kind, value = int(row[0]), str(row[1]), int(row[2])
+        device = None
+        if kind == "rf":
+            match = db.execute(
+                "SELECT name FROM r2_tv_devices "
+                "WHERE connected=1 AND connection_kind='rf' AND port=? LIMIT 1",
+                (value,),
             ).fetchone()
-            if row is None:
-                raise RuntimeError("TV state row is missing")
-            power, kind, value = int(row[0]), str(row[1]), int(row[2])
-            device = None
-            if kind == "rf":
-                match = db.execute(
-                    "SELECT name FROM r2_tv_devices "
-                    "WHERE connected=1 AND connection_kind='rf' AND port=? LIMIT 1",
-                    (value,),
-                ).fetchone()
-                device = str(match[0]) if match else None
-            elif kind == "input" and value > 1:
-                match = db.execute(
-                    "SELECT name FROM r2_tv_devices "
-                    "WHERE connected=1 AND connection_kind='input' AND port=? LIMIT 1",
-                    (value,),
-                ).fetchone()
-                device = str(match[0]) if match else None
-            return power, kind, value, device
+            device = str(match[0]) if match else None
+        elif kind == "input" and value > 1:
+            match = db.execute(
+                "SELECT name FROM r2_tv_devices "
+                "WHERE connected=1 AND connection_kind='input' AND port=? LIMIT 1",
+                (value,),
+            ).fetchone()
+            device = str(match[0]) if match else None
+        return power, kind, value, device
 
     def read_vcr_state(self) -> tuple[str | None, str, float]:
         uri = DB_PATH.resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
-            row = db.execute(
-                "SELECT cassette_path, transport FROM r2_tv_vcr_state WHERE id=1"
+            db.execute("BEGIN")
+            return self._read_vcr_state(db)
+
+    @staticmethod
+    def _read_vcr_state(db: sqlite3.Connection) -> tuple[str | None, str, float]:
+        row = db.execute(
+            "SELECT cassette_path, transport FROM r2_tv_vcr_state WHERE id=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("VCR state row is missing")
+        path = str(row[0]) if row[0] else None
+        transport = str(row[1])
+        position = 0.0
+        if path:
+            tape = db.execute(
+                "SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=?",
+                (path,),
             ).fetchone()
-            if row is None:
-                raise RuntimeError("VCR state row is missing")
-            path = str(row[0]) if row[0] else None
-            transport = str(row[1])
-            position = 0.0
-            if path:
-                tape = db.execute(
-                    "SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=?",
-                    (path,),
-                ).fetchone()
-                if tape:
-                    try:
-                        saved_position = float(tape[0])
-                    except (TypeError, ValueError, OverflowError) as exc:
-                        raise ValueError("Saved VCR position is invalid") from exc
-                    if not math.isfinite(saved_position):
-                        raise ValueError("Saved VCR position is not finite")
-                    # Match the validated control protocol: malformed legacy
-                    # values must not overflow VLC's millisecond seek.
-                    if saved_position > 604800:
-                        raise ValueError("Saved VCR position exceeds the supported range")
-                    position = max(0.0, saved_position)
-            return path, transport, position
+            if tape:
+                try:
+                    saved_position = float(tape[0])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("Saved VCR position is invalid") from exc
+                if not math.isfinite(saved_position):
+                    raise ValueError("Saved VCR position is not finite")
+                # Match the validated control protocol: malformed legacy
+                # values must not overflow VLC's millisecond seek.
+                if saved_position > 604800:
+                    raise ValueError("Saved VCR position exceeds the supported range")
+                position = max(0.0, saved_position)
+        return path, transport, position
+
+    def read_display_snapshot(self) -> tuple[tuple[int, str, int, str | None],
+                                             tuple[str | None, str, float]]:
+        uri = DB_PATH.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.5)) as db:
+            # One SQLite read transaction: source, tape, and position must agree.
+            db.execute("BEGIN")
+            return self._read_state(db), self._read_vcr_state(db)
 
     def _ensure_player(self) -> bool:
         if self._player is not None:
@@ -327,13 +345,13 @@ class CRTDisplay:
         if media is None:
             raise RuntimeError("VLC could not open the selected tape")
         try:
+            self._player.audio_set_mute(True)
             self._player.set_media(media)
         finally:
             # The player retains its own reference to the selected media.
             media.release()
-        # Apply the modeled TV's audio state before starting VLC. Pause immediately
-        # while VLC initializes so a stopped/paused tape cannot briefly play from 0.
-        self._player.audio_set_mute(not audible)
+        # Initialize silently; the selected source must not become audible
+        # until its saved position has been submitted to the player.
         self._loaded_path = path
         self._last_transport = None
         seek_request = object()
@@ -347,8 +365,9 @@ class CRTDisplay:
             # The transport may have changed while VLC initialized. Re-read
             # Reality at callback time instead of applying stale captured state.
             try:
-                current_path, current_transport, current_position = self.read_vcr_state()
-                power, kind, value, _device = self.read_state()
+                tv_state, vcr_state = self.read_display_snapshot()
+                power, kind, value, _device = tv_state
+                current_path, current_transport, current_position = vcr_state
             except (sqlite3.Error, OSError, RuntimeError, ValueError, OverflowError):
                 self._player.audio_set_mute(True)
                 self._player.set_pause(1)
@@ -358,8 +377,8 @@ class CRTDisplay:
                 self.root.after(500, seek_and_apply)
                 return
             audible_now = bool(power and kind == "input" and value == 1)
-            self._player.audio_set_mute(not audible_now)
             self._player.set_time(int(current_position * 1000))
+            self._player.audio_set_mute(not (audible_now and current_transport == "play"))
             self._player.set_pause(0 if current_transport == "play" else 1)
             self._last_transport = current_transport
             self._pending_vcr_seek = None
@@ -395,7 +414,7 @@ class CRTDisplay:
         elif (path and self._player and self._pending_vcr_seek is None
               and transport != self._last_transport):
             self._save_vcr_position(force=True)
-            self._player.audio_set_mute(not audible)
+            self._player.audio_set_mute(not (audible and transport == "play"))
             if transport == "play":
                 if self._player.play() < 0:
                     self._player.set_pause(0)
@@ -511,17 +530,24 @@ class CRTDisplay:
 
     def refresh(self, schedule: bool = True) -> None:
         try:
-            power, kind, value, device = self.read_state()
-            tape_path, transport, position = self.read_vcr_state()
+            tv_state, vcr_state = self.read_display_snapshot()
+            power, kind, value, device = tv_state
+            tape_path, transport, position = vcr_state
             audible = bool(power and kind == "input" and value == 1)
-            if self._player:
-                self._player.audio_set_mute(not audible)
+            if self._player and not (audible and tape_path == self._loaded_path
+                                     and transport == self._last_transport == "play"
+                                     and self._pending_vcr_seek is None):
+                self._player.audio_set_mute(True)
             self.sync_vcr_player(tape_path, transport, position, audible)
             if self._pending_vcr_seek is None:
                 self._record_playback_state(self._loaded_path)
             elif self._last_logged_vlc_state and self._last_logged_vlc_state[0] != self._loaded_path:
                 self._record_playback_state(None)
 
+            ready_to_play = bool(tape_path and tape_path == self._loaded_path
+                                 and transport == self._last_transport == "play"
+                                 and self._pending_vcr_seek is None
+                                 and self._player is not None)
             if not power:
                 headline = "TV OFF"
                 source = "Standby"
@@ -533,7 +559,9 @@ class CRTDisplay:
                 if not tape_path:
                     headline = "VCR EMPTY\nNO TAPE INSERTED"
                 elif transport == "play":
-                    headline = "" if self._player is not None else "VLC PLAYBACK UNAVAILABLE"
+                    headline = ("" if ready_to_play else
+                                "VCR LOADING" if self._player is not None else
+                                "VLC PLAYBACK UNAVAILABLE")
                 elif transport == "pause":
                     headline = "VCR PAUSED"
                 else:
@@ -542,10 +570,9 @@ class CRTDisplay:
                 source = f"AV INPUT {value}"
                 headline = device or "NO SIGNAL"
 
-            showing_vcr = bool(power and kind == "input" and value == 1 and tape_path
-                               and transport == "play" and self._player is not None)
+            showing_vcr = audible and ready_to_play
             if self._player:
-                self._player.audio_set_mute(not bool(power and kind == "input" and value == 1))
+                self._player.audio_set_mute(not showing_vcr)
             if showing_vcr:
                 self.video_surface.lift()
             else:
