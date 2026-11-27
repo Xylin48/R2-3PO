@@ -210,6 +210,22 @@ int main(void)
         "DROP TRIGGER ignore_activity; DROP TRIGGER ignore_milestone; "
         "DROP TRIGGER ignore_location; DROP TRIGGER ignore_pending_turn;",
         NULL, NULL, NULL) == SQLITE_OK);
+    int snapshot_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_system_snapshots;");
+    event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
+    assert(sqlite3_exec(writer,
+        "CREATE TRIGGER ignore_snapshot BEFORE INSERT ON r2_log_system_snapshots "
+        "BEGIN SELECT RAISE(IGNORE); END;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_system_snapshot("ignored snapshot") < 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events;") == event_count);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_system_snapshots;") == snapshot_count);
+    assert(sqlite3_exec(writer, "DROP TRIGGER ignore_snapshot;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_system_snapshot("actual snapshot") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_system_snapshots;") == snapshot_count + 1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events e "
+                          "JOIN r2_log_system_snapshots s ON s.event_id=e.id "
+                          "WHERE e.summary='R2 system state snapshot: actual snapshot' "
+                          "AND instr(e.details,'process_elapsed_ms=' || "
+                          "s.process_elapsed_ms || char(10))>0;") == 1);
     assert(r2_log_milestone("test-first", "Milestone fixture", NULL) > 0);
     assert(r2_log_milestone("test-first", "Milestone fixture", NULL) == 0);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE source='test-first';") == 1);

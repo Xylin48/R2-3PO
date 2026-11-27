@@ -3137,10 +3137,17 @@ done:
 
 char *r2_log_status_report(void)
 {
-    static const char *const tables[] = {
-        "r2_log_events", "r2_log_sessions", "r2_log_conversations",
-        "r2_log_inner_states", "r2_log_beliefs", "r2_log_continuity",
-        "r2_log_links", "r2_log_hypotheticals"
+    static const char *const queries[] = {
+        "SELECT COUNT(*) FROM r2_log_events;",
+        "SELECT COUNT(*) FROM r2_log_sessions;",
+        /* An accepted turn may still await archive publication. */
+        "SELECT COUNT(*) FROM (SELECT event_id FROM r2_log_conversations "
+        "UNION SELECT event_id FROM r2_log_pending_conversations);",
+        "SELECT COUNT(*) FROM r2_log_inner_states;",
+        "SELECT COUNT(*) FROM r2_log_beliefs;",
+        "SELECT COUNT(*) FROM r2_log_continuity;",
+        "SELECT COUNT(*) FROM r2_log_links;",
+        "SELECT COUNT(*) FROM r2_log_hypotheticals;"
     };
     static const char *const labels[] = {
         "Events", "Sessions", "Conversation turns", "Inner-state records",
@@ -3149,7 +3156,7 @@ char *r2_log_status_report(void)
     char *output = NULL;
     size_t length = 0, capacity = 0;
     sqlite3_stmt *st = NULL;
-    int64_t counts[sizeof(tables) / sizeof(tables[0])] = {0};
+    int64_t counts[sizeof(queries) / sizeof(queries[0])] = {0};
     int rc = SQLITE_OK;
 
     pthread_mutex_lock(&log_lock);
@@ -3158,10 +3165,8 @@ char *r2_log_status_report(void)
         return NULL;
     }
 
-    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); ++i) {
-        char sql[96];
-        snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s;", tables[i]);
-        rc = sqlite3_prepare_v2(log_db, sql, -1, &st, NULL);
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+        rc = sqlite3_prepare_v2(log_db, queries[i], -1, &st, NULL);
         if (rc != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) {
             sqlite3_finalize(st);
             st = NULL;
@@ -3183,7 +3188,7 @@ char *r2_log_status_report(void)
         free(output);
         return NULL;
     }
-    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); ++i) {
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); ++i) {
         if (append_text(&output, &length, &capacity,
                         "%s: %" PRId64 "\n", labels[i], counts[i]) != 0) {
             pthread_mutex_unlock(&log_lock);
@@ -3257,6 +3262,7 @@ int r2_log_system_snapshot(const char *reason)
     int have_load_average = 0;
     int have_uts = 0;
     int have_fs = 0;
+    int have_mem = 0;
     int64_t event_id;
 
     if (uname(&uts) == 0) {
@@ -3274,6 +3280,7 @@ int r2_log_system_snapshot(const char *reason)
     {
         struct sysinfo info;
         if (sysinfo(&info) == 0) {
+            have_mem = 1;
             system_uptime = (int64_t)info.uptime;
             total_ram = (uint64_t)info.totalram * info.mem_unit;
             free_ram = (uint64_t)info.freeram * info.mem_unit;
@@ -3290,12 +3297,13 @@ int r2_log_system_snapshot(const char *reason)
         disk_free = (uint64_t)fs.f_bavail * fs.f_frsize;
     }
 
-    snprintf(summary, sizeof(summary),
+    uint64_t elapsed = r2_log_elapsed_ms();
+    int summary_len = snprintf(summary, sizeof(summary),
              "R2 system state snapshot%s%s",
              reason && *reason ? ": " : "",
              reason && *reason ? reason : "");
 
-    snprintf(details, sizeof(details),
+    int details_len = snprintf(details, sizeof(details),
              "hostname=%s\n"
              "os=%s\n"
              "kernel=%s\n"
@@ -3305,6 +3313,7 @@ int r2_log_system_snapshot(const char *reason)
              "system_uptime_seconds=%" PRId64 "\n"
              "total_ram_bytes=%" PRIu64 "\n"
              "free_ram_bytes=%" PRIu64 "\n"
+             "ram_available=%s\n"
              "load_average_1m=%.2f\n"
              "load_average_5m=%.2f\n"
              "load_average_15m=%.2f\n"
@@ -3315,65 +3324,65 @@ int r2_log_system_snapshot(const char *reason)
              "uname_available=%s\n"
              "workspace_statvfs_available=%s\n",
              hostname, os_name, kernel, machine, (long)getpid(),
-             r2_log_elapsed_ms(), system_uptime, total_ram, free_ram,
+             elapsed, system_uptime, total_ram, free_ram,
+             have_mem ? "yes" : "no",
              load_average[0], load_average[1], load_average[2],
              have_load_average ? "yes" : "no",
              R2_ROOT, disk_total, disk_free,
              have_uts ? "yes" : "no", have_fs ? "yes" : "no");
 
-    event_id = r2_log_event(R2_LOG_SYSTEM, "system_snapshot",
-                            summary, details, "system_self_awareness");
-
-    if (event_id < 0)
+    if (summary_len < 0 || (size_t)summary_len >= sizeof(summary) ||
+        details_len < 0 || (size_t)details_len >= sizeof(details))
         return -1;
 
     pthread_mutex_lock(&log_lock);
-
-    if (log_initialized && log_db) {
-        sqlite3_stmt *statement = NULL;
-
-        int rc = sqlite3_prepare_v2(
-            log_db,
-            "INSERT INTO r2_log_system_snapshots "
-            "(event_id, hostname, operating_system, kernel_release, machine, "
-            "process_id, process_elapsed_ms, system_uptime_seconds, "
-            "total_ram_bytes, free_ram_bytes, workspace_total_bytes, "
-            "workspace_free_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            -1, &statement, NULL
-        );
-
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, hostname, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, os_name, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, kernel, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, machine, -1, SQLITE_TRANSIENT);
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 6, (int)getpid());
-        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)r2_log_elapsed_ms());
-        if (rc == SQLITE_OK) rc = system_uptime >= 0
-            ? sqlite3_bind_int64(statement, 8, system_uptime)
-            : sqlite3_bind_null(statement, 8);
-        if (rc == SQLITE_OK) rc = total_ram
-            ? sqlite3_bind_int64(statement, 9, (sqlite3_int64)total_ram)
-            : sqlite3_bind_null(statement, 9);
-        if (rc == SQLITE_OK) rc = free_ram
-            ? sqlite3_bind_int64(statement, 10, (sqlite3_int64)free_ram)
-            : sqlite3_bind_null(statement, 10);
-        if (rc == SQLITE_OK) rc = have_fs
-            ? sqlite3_bind_int64(statement, 11, (sqlite3_int64)disk_total)
-            : sqlite3_bind_null(statement, 11);
-        if (rc == SQLITE_OK) rc = have_fs
-            ? sqlite3_bind_int64(statement, 12, (sqlite3_int64)disk_free)
-            : sqlite3_bind_null(statement, 12);
-        if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-
-        sqlite3_finalize(statement);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
         pthread_mutex_unlock(&log_lock);
-
-        return rc == SQLITE_DONE ? 0 : -1;
+        return -1;
     }
 
+    event_id = log_insert_event_locked(R2_LOG_SYSTEM, "system_snapshot",
+                                       summary, details, "system_self_awareness");
+    sqlite3_stmt *statement = NULL;
+    int rc = event_id > 0 ? sqlite3_prepare_v2(
+        log_db,
+        "INSERT INTO r2_log_system_snapshots "
+        "(event_id, hostname, operating_system, kernel_release, machine, "
+        "process_id, process_elapsed_ms, system_uptime_seconds, "
+        "total_ram_bytes, free_ram_bytes, workspace_total_bytes, "
+        "workspace_free_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        -1, &statement, NULL
+    ) : SQLITE_ERROR;
+
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 1, event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, hostname, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, os_name, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, kernel, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, machine, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(statement, 6, (int)getpid());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)elapsed);
+    if (rc == SQLITE_OK) rc = system_uptime >= 0
+        ? sqlite3_bind_int64(statement, 8, system_uptime)
+        : sqlite3_bind_null(statement, 8);
+    if (rc == SQLITE_OK) rc = have_mem
+        ? sqlite3_bind_int64(statement, 9, (sqlite3_int64)total_ram)
+        : sqlite3_bind_null(statement, 9);
+    if (rc == SQLITE_OK) rc = have_mem
+        ? sqlite3_bind_int64(statement, 10, (sqlite3_int64)free_ram)
+        : sqlite3_bind_null(statement, 10);
+    if (rc == SQLITE_OK) rc = have_fs
+        ? sqlite3_bind_int64(statement, 11, (sqlite3_int64)disk_total)
+        : sqlite3_bind_null(statement, 11);
+    if (rc == SQLITE_OK) rc = have_fs
+        ? sqlite3_bind_int64(statement, 12, (sqlite3_int64)disk_free)
+        : sqlite3_bind_null(statement, 12);
+    if (rc == SQLITE_OK) rc = sqlite3_step(statement);
+
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
+    sqlite3_finalize(statement);
+    int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
-    return -1;
+    return result;
 }
 
 /* ------------------------------------------------------------

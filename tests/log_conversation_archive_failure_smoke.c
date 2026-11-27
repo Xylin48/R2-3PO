@@ -47,6 +47,19 @@ static void sql(sqlite3 *db, const char *statement)
     }
 }
 
+static void require_conversation_count(int64_t expected)
+{
+    char line[96];
+    snprintf(line, sizeof(line), "Conversation turns: %lld\n", (long long)expected);
+    char *report = r2_log_status_report();
+    if (!report || !strstr(report, line)) {
+        fprintf(stderr, "FAIL: Life Log status should contain %s", line);
+        free(report);
+        exit(1);
+    }
+    free(report);
+}
+
 int main(void)
 {
     const char *user = "USER_EXACT_PENDING_TURN_é_73628";
@@ -60,6 +73,17 @@ int main(void)
         fputs("FAIL: could not connect to fixture SQLite store\n", stderr);
         return 1;
     }
+    sqlite3_stmt *count = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM (SELECT event_id FROM "
+            "r2_log_conversations UNION SELECT event_id FROM "
+            "r2_log_pending_conversations);", -1, &count, NULL) != SQLITE_OK ||
+        sqlite3_step(count) != SQLITE_ROW) {
+        sqlite3_finalize(count);
+        return 1;
+    }
+    int64_t initial_count = sqlite3_column_int64(count, 0);
+    sqlite3_finalize(count);
+    require_conversation_count(initial_count);
     sql(db, "CREATE TRIGGER block_archive BEFORE INSERT ON r2_log_conversations "
             "BEGIN SELECT RAISE(ABORT, 'injected archive write failure'); END;");
     int64_t event_id = r2_log_conversation_turn(user, reply);
@@ -74,6 +98,7 @@ int main(void)
                   event_id, user, reply, 1);
     require_query(db, "SELECT count(*) FROM r2_log_conversations WHERE event_id=?1",
                   event_id, NULL, NULL, 0);
+    require_conversation_count(initial_count + 1);
 
     if (r2_log_replay_conversation_archives() != -1) {
         fputs("FAIL: live replay reported success while archive writes remained blocked.\n", stderr);
@@ -90,6 +115,7 @@ int main(void)
                   event_id, user, reply, 1);
     require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
                   event_id, NULL, NULL, 0);
+    require_conversation_count(initial_count + 1);
 
     /* Exercise startup recovery separately with another accepted turn. */
     sql(db, "CREATE TRIGGER block_archive BEFORE INSERT ON r2_log_conversations "
@@ -101,6 +127,7 @@ int main(void)
     }
     require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
                   pending_after_reopen, NULL, NULL, 1);
+    require_conversation_count(initial_count + 2);
     sql(db, "DROP TRIGGER block_archive;");
     sqlite3_close(db);
     r2_log_shutdown();
@@ -124,6 +151,7 @@ int main(void)
                   pending_after_reopen, user, reply, 1);
     require_query(db, "SELECT count(*) FROM r2_log_pending_conversations WHERE event_id=?1",
                   pending_after_reopen, NULL, NULL, 0);
+    require_conversation_count(initial_count + 2);
     sqlite3_close(db);
     r2_log_shutdown();
     puts("PASS: accepted conversations survived failed archive writes and replayed exactly once during service and after restart.");
