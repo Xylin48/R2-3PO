@@ -88,6 +88,17 @@ int main(void)
     assert(scalar_int(db, "SELECT enjoyment FROM addiction_targets WHERE target='old target'") == 73);
     assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_events WHERE event_kind='enjoyment'") == 0);
     assert(sqlite3_exec(db, "DROP TRIGGER fail_addiction_enjoyment_event;", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(db,
+        "CREATE TRIGGER ignore_preference_update BEFORE UPDATE OF enjoyment ON addiction_targets "
+        "WHEN OLD.target='old target' BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_addiction_rate_enjoyment("old target", "activity", 11,
+                                      "ignored-preference", "must not record") == -1);
+    assert(r2_addiction_record_choice("old target", "activity", 11,
+                                      "ignored-preference", "must not record") == -1);
+    assert(scalar_int(db, "SELECT enjoyment FROM addiction_targets WHERE target='old target'") == 73);
+    assert(scalar_int(db, "SELECT COUNT(*) FROM addiction_events WHERE source='ignored-preference'") == 0);
+    assert(sqlite3_exec(db, "DROP TRIGGER ignore_preference_update;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(db);
 
     assert(r2_addiction_record_choice("old target", "activity", 73,

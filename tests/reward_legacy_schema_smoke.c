@@ -81,6 +81,16 @@ int main(void)
         "CREATE TABLE reward_once_keys (target TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(target,source));"
         "INSERT INTO reward_once_keys(target,source) VALUES('old target','old key');",
         NULL, NULL, NULL) == SQLITE_OK);
+    /* A suppressed migration update must not publish an incomplete ledger. */
+    assert(sqlite3_exec(legacy,
+        "CREATE TRIGGER ignore_total_migration BEFORE UPDATE ON reward_totals "
+        "BEGIN SELECT RAISE(IGNORE); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_reward_init() == -1);
+    assert(reward_db == NULL);
+    assert(scalar(legacy, "SELECT COUNT(*) FROM pragma_table_info('reward_totals') WHERE name='updated_at'") == 0);
+    assert(scalar(legacy, "SELECT points FROM reward_totals WHERE id=1") == 4);
+    assert(sqlite3_exec(legacy, "DROP TRIGGER ignore_total_migration;", NULL, NULL, NULL) == SQLITE_OK);
     sqlite3_close(legacy);
 
     /* A missing Life Log is an unavailable connection, not evidence that a

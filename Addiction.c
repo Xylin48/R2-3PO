@@ -28,26 +28,26 @@ static int addiction_column_exists(const char *table, const char *column)
 {
     char sql[256];
     int n = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
-    if (n < 0 || (size_t)n >= sizeof(sql)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(addiction_db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(addiction_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && !strcasecmp((const char *)name, column)) {
-                found = 1;
-                break;
-            }
+            if (!name) { rc = SQLITE_NOMEM; break; }
+            if (!strcasecmp((const char *)name, column)) found = 1;
         }
     }
     if (st) sqlite3_finalize(st);
-    return found;
+    return rc == SQLITE_DONE ? found : -1;
 }
-
 static int addiction_ensure_column(const char *table, const char *column,
                                    const char *definition)
 {
-    if (addiction_column_exists(table, column)) return SQLITE_OK;
+    int exists = addiction_column_exists(table, column);
+    if (exists < 0) return SQLITE_ERROR;
+    if (exists) return SQLITE_OK;
     char sql[512];
     int n = snprintf(sql, sizeof(sql), "ALTER TABLE %s ADD COLUMN %s %s;",
                      table, column, definition);
@@ -99,9 +99,12 @@ static int ensure_db_locked(void)
         addiction_db = NULL;
         return -1;
     }
-    sqlite3_busy_timeout(addiction_db, 5000);
+    if (sqlite3_busy_timeout(addiction_db, 5000) != SQLITE_OK ||
+        sqlite3_exec(addiction_db,
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;",
+            NULL, NULL, NULL) != SQLITE_OK)
+        goto schema_failed;
     if (sqlite3_exec(addiction_db,
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
         "CREATE TABLE IF NOT EXISTS addiction_targets ("
         " target TEXT PRIMARY KEY COLLATE NOCASE,"
         " target_type TEXT NOT NULL DEFAULT 'activity',"
@@ -121,16 +124,19 @@ static int ensure_db_locked(void)
         NULL, NULL, NULL) != SQLITE_OK) {
         fprintf(stderr, "[R2 Addiction] Could not create schema: %s\n",
                 sqlite3_errmsg(addiction_db));
-        sqlite3_close(addiction_db);
-        addiction_db = NULL;
-        return -1;
+        goto schema_failed;
     }
-    if (migrate_addiction_schema() != 0) {
-        sqlite3_close(addiction_db);
-        addiction_db = NULL;
-        return -1;
-    }
+    if (migrate_addiction_schema() != 0 ||
+        sqlite3_exec(addiction_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK)
+        goto schema_failed;
     return 0;
+
+schema_failed:
+    if (!sqlite3_get_autocommit(addiction_db))
+        (void)sqlite3_exec(addiction_db, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_close(addiction_db);
+    addiction_db = NULL;
+    return -1;
 }
 
 int r2_addiction_init(void)
@@ -169,7 +175,7 @@ static int upsert_target_locked(const char *target, const char *target_type,
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 5, now);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (st) sqlite3_finalize(st);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return rc == SQLITE_DONE && sqlite3_changes(addiction_db) == 1 ? 0 : -1;
 }
 
 static int update_status_locked(const char *target, const char *target_type,

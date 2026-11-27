@@ -39,20 +39,26 @@ static int reward_column_exists(const char *table, const char *column)
 {
     char sql[256];
     int n = snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
-    if (n < 0 || (size_t)n >= sizeof(sql)) return 0;
+    if (n < 0 || (size_t)n >= sizeof(sql)) return -1;
     sqlite3_stmt *st = NULL;
     int found = 0;
-    if (sqlite3_prepare_v2(reward_db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
+    int rc = sqlite3_prepare_v2(reward_db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const unsigned char *name = sqlite3_column_text(st, 1);
-            if (name && strcmp((const char *)name, column) == 0) {
-                found = 1;
-                break;
-            }
+            if (!name) { rc = SQLITE_NOMEM; break; }
+            if (!strcasecmp((const char *)name, column)) found = 1;
         }
     }
     if (st) sqlite3_finalize(st);
-    return found;
+    return rc == SQLITE_DONE ? found : -1;
+}
+static int reward_ensure_column(const char *table, const char *column,
+                                const char *alter)
+{
+    int exists = reward_column_exists(table, column);
+    if (exists < 0) return SQLITE_ERROR;
+    return exists ? SQLITE_OK : sqlite3_exec(reward_db, alter, NULL, NULL, NULL);
 }
 
 static int ensure_db_locked(void)
@@ -67,9 +73,12 @@ static int ensure_db_locked(void)
         reward_db = NULL;
         return -1;
     }
-    sqlite3_busy_timeout(reward_db, 5000);
+    if (sqlite3_busy_timeout(reward_db, 5000) != SQLITE_OK ||
+        sqlite3_exec(reward_db,
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;",
+            NULL, NULL, NULL) != SQLITE_OK)
+        goto schema_failed;
     if (sqlite3_exec(reward_db,
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
         "CREATE TABLE IF NOT EXISTS reward_totals ("
         " id INTEGER PRIMARY KEY CHECK(id=1), points INTEGER NOT NULL DEFAULT 0,"
         " updated_at INTEGER NOT NULL);"
@@ -83,32 +92,22 @@ static int ensure_db_locked(void)
         "CREATE INDEX IF NOT EXISTS reward_events_target_time ON reward_events(target,occurred_at);",
         NULL, NULL, NULL) != SQLITE_OK) {
         fprintf(stderr, "[R2 Reward] Schema error: %s\n", sqlite3_errmsg(reward_db));
-        sqlite3_close(reward_db);
-        reward_db = NULL;
-        return -1;
+        goto schema_failed;
     }
 
     /* Upgrade the totals row before any statement assumes updated_at exists.
        CREATE TABLE IF NOT EXISTS does not add columns to an older ledger. */
-    if (!reward_column_exists("reward_totals", "points") &&
-        sqlite3_exec(reward_db,
-            "ALTER TABLE reward_totals ADD COLUMN points INTEGER NOT NULL DEFAULT 0",
-            NULL, NULL, NULL) != SQLITE_OK) {
+    if (reward_ensure_column("reward_totals", "points",
+            "ALTER TABLE reward_totals ADD COLUMN points INTEGER NOT NULL DEFAULT 0") != SQLITE_OK) {
         fprintf(stderr, "[R2 Reward] Could not migrate reward totals points: %s\n",
                 sqlite3_errmsg(reward_db));
-        sqlite3_close(reward_db);
-        reward_db = NULL;
-        return -1;
+        goto schema_failed;
     }
-    if (!reward_column_exists("reward_totals", "updated_at") &&
-        sqlite3_exec(reward_db,
-            "ALTER TABLE reward_totals ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
-            NULL, NULL, NULL) != SQLITE_OK) {
+    if (reward_ensure_column("reward_totals", "updated_at",
+            "ALTER TABLE reward_totals ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0") != SQLITE_OK) {
         fprintf(stderr, "[R2 Reward] Could not migrate reward totals timestamp: %s\n",
                 sqlite3_errmsg(reward_db));
-        sqlite3_close(reward_db);
-        reward_db = NULL;
-        return -1;
+        goto schema_failed;
     }
     if (sqlite3_exec(reward_db,
         "UPDATE reward_totals SET updated_at=CAST(strftime('%s','now') AS INTEGER) "
@@ -118,9 +117,7 @@ static int ensure_db_locked(void)
         NULL, NULL, NULL) != SQLITE_OK) {
         fprintf(stderr, "[R2 Reward] Could not initialize reward totals: %s\n",
                 sqlite3_errmsg(reward_db));
-        sqlite3_close(reward_db);
-        reward_db = NULL;
-        return -1;
+        goto schema_failed;
     }
 
     /* Additive, in-place migration: old reward rows are never replayed as
@@ -136,41 +133,30 @@ static int ensure_db_locked(void)
         "ALTER TABLE reward_events ADD COLUMN addiction_choice_indexed INTEGER NOT NULL DEFAULT 0"
     };
     for (size_t i = 0; i < sizeof(required_columns) / sizeof(required_columns[0]); ++i) {
-        sqlite3_stmt *columns = NULL;
-        int found = 0;
-        int column_rc = sqlite3_prepare_v2(reward_db,
-            "PRAGMA table_info(reward_events)", -1, &columns, NULL);
-        if (column_rc != SQLITE_OK) {
-            fprintf(stderr, "[R2 Reward] Could not inspect reward schema: %s\n",
-                    sqlite3_errmsg(reward_db));
-            if (columns) sqlite3_finalize(columns);
-            sqlite3_close(reward_db);
-            reward_db = NULL;
-            return -1;
-        }
-        while ((column_rc = sqlite3_step(columns)) == SQLITE_ROW) {
-            const unsigned char *name = sqlite3_column_text(columns, 1);
-            if (name && strcmp((const char *)name, required_columns[i]) == 0)
-                found = 1;
-        }
-        sqlite3_finalize(columns);
-        if (column_rc != SQLITE_DONE) {
-            fprintf(stderr, "[R2 Reward] Could not read reward schema: %s\n",
-                    sqlite3_errmsg(reward_db));
-            sqlite3_close(reward_db);
-            reward_db = NULL;
-            return -1;
-        }
-        if (!found && sqlite3_exec(reward_db, alter_statements[i],
-                                    NULL, NULL, NULL) != SQLITE_OK) {
+        if (reward_ensure_column("reward_events", required_columns[i],
+                                 alter_statements[i]) != SQLITE_OK) {
             fprintf(stderr, "[R2 Reward] Could not migrate reward schema: %s\n",
                     sqlite3_errmsg(reward_db));
-            sqlite3_close(reward_db);
-            reward_db = NULL;
-            return -1;
+            goto schema_failed;
         }
     }
+    sqlite3_stmt *totals = NULL;
+    int rc = sqlite3_prepare_v2(reward_db,
+        "SELECT 1 FROM reward_totals WHERE id=1 AND updated_at IS NOT NULL AND updated_at<>0",
+        -1, &totals, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(totals);
+    if (totals) sqlite3_finalize(totals);
+    if (rc != SQLITE_ROW ||
+        sqlite3_exec(reward_db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK)
+        goto schema_failed;
     return 0;
+
+schema_failed:
+    if (!sqlite3_get_autocommit(reward_db))
+        (void)sqlite3_exec(reward_db, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_close(reward_db);
+    reward_db = NULL;
+    return -1;
 }
 
 int r2_reward_init(void)
@@ -430,14 +416,10 @@ static int reward_apply_internal(const char *target, const char *source, int poi
     /* Earlier idempotency-key tables had only target/source. Add the timestamp
        in place before any INSERT assumes it exists; retain every existing key. */
     if (apply_once &&
-        ((!reward_column_exists("reward_once_keys", "created_at") &&
-          sqlite3_exec(reward_db,
-              "ALTER TABLE reward_once_keys ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
-              NULL, NULL, NULL) != SQLITE_OK) ||
-         (!reward_column_exists("reward_once_keys", "reward_event_id") &&
-          sqlite3_exec(reward_db,
-              "ALTER TABLE reward_once_keys ADD COLUMN reward_event_id INTEGER",
-              NULL, NULL, NULL) != SQLITE_OK))) {
+        ((reward_ensure_column("reward_once_keys", "created_at",
+              "ALTER TABLE reward_once_keys ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0") != SQLITE_OK) ||
+         (reward_ensure_column("reward_once_keys", "reward_event_id",
+              "ALTER TABLE reward_once_keys ADD COLUMN reward_event_id INTEGER") != SQLITE_OK))) {
         fprintf(stderr, "[R2 Reward] Could not migrate reward idempotency keys: %s\n",
                 sqlite3_errmsg(reward_db));
         pthread_mutex_unlock(&reward_lock);
