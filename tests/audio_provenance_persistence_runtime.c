@@ -374,11 +374,40 @@ int main(void)
     pthread_mutex_destroy(&extra.history_lock);
     free(extra.recent);
 
+    /* Freeze the completion-boundary identities before the durable write.
+       Changing display sources during publication must not relabel the turn. */
+    R2TurnSources turn_sources = r2_capture_turn_sources();
+    assert(turn_sources.visual_source && !strcmp(turn_sources.visual_source, "fixture-camera"));
+    assert(turn_sources.visual_origin == R2_VISION_FILE);
+    assert(turn_sources.display_source && !strcmp(turn_sources.display_source, "fixture-media-a"));
     assert(r2_vision_open_file("fixture-media-b") == 0);
     assert(!r2_vision_media_attention_status());
     verify_model_images(NULL, 1);
     assert(r2_vision_media_set_attention(1) == 0);
     verify_model_images("MEDIA_B", 1);
+    int64_t associated_turn = r2_log_conversation_turn("Fixture source changed after completion.",
+                                                      "The source snapshot belongs to that turn.");
+    assert(associated_turn > 0);
+    r2_publish_turn_sources(associated_turn, &turn_sources);
+    r2_release_turn_sources(&turn_sources);
+    assert(!turn_sources.visual_source && !turn_sources.display_source);
+    sqlite3_stmt *associated = NULL;
+    assert(sqlite3_prepare_v2(connection,
+        "SELECT e.source,e.details,l.relationship FROM r2_log_links l "
+        "JOIN r2_log_events e ON e.id=l.to_event_id WHERE l.from_event_id=? "
+        "AND l.relationship IN ('conversation_occurred_during_media','media_display_was_available') "
+        "ORDER BY e.id", -1, &associated, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(associated, 1, associated_turn) == SQLITE_OK);
+    assert(sqlite3_step(associated) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(associated, 0), "fixture-camera"));
+    assert(strstr((const char *)sqlite3_column_text(associated, 1), "sampled_at=turn_finalization"));
+    assert(!strcmp((const char *)sqlite3_column_text(associated, 2), "conversation_occurred_during_media"));
+    assert(sqlite3_step(associated) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(associated, 0), "fixture-media-a"));
+    assert(strstr((const char *)sqlite3_column_text(associated, 1), "attended=not_established"));
+    assert(!strcmp((const char *)sqlite3_column_text(associated, 2), "media_display_was_available"));
+    assert(sqlite3_step(associated) == SQLITE_DONE);
+    sqlite3_finalize(associated);
     assert(r2_vision_watch_stop() == 0);
     r2_eyes_shutdown(eyes);
     eyes = NULL;
@@ -386,6 +415,9 @@ int main(void)
     assert(r2_vision_media_set_attention(0) == 0);
     verify_model_images(NULL, 0);
     assert(r2_vision_media_stop() == 0);
+    R2TurnSources stopped_sources = r2_capture_turn_sources();
+    assert(!stopped_sources.visual_source && !stopped_sources.display_source);
+    r2_release_turn_sources(&stopped_sources);
     r2_eyes_shutdown(media_eyes);
     media_eyes = NULL;
     r2_visual_shutdown();

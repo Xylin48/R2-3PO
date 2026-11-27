@@ -15918,6 +15918,136 @@ int r2_talk_last_reply_generated(void)
     return last_talk_reply_generated;
 }
 
+/* Snapshot availability at the turn boundary, before the database write can
+ * block or the capture sources can change. Each source is sampled under its
+ * own lock; availability is not attention, interpretation or a transcript. */
+typedef struct {
+    char *visual_source;
+    R2VisionOrigin visual_origin;
+    char *display_source;
+    R2HearingEvent hearing_event;
+    R2HearingEvent desktop_event;
+} R2TurnSources;
+
+static R2TurnSources r2_capture_turn_sources(void)
+{
+    R2TurnSources sources = {0};
+    if (atomic_load(&vision_watch_running)) {
+        pthread_mutex_lock(&vision_watch_frame_lock);
+        if (atomic_load(&vision_watch_running) &&
+            !vision_watch_capture_done && vision_watch_frame_generation > 0 &&
+            vision_watch_latest_frame.data && vision_watch_latest_frame.size &&
+            vision_watch_latest_source) {
+            sources.visual_origin = vision_watch_latest_origin;
+            if (sources.visual_origin != R2_VISION_WORLD)
+                sources.visual_source = strdup(vision_watch_latest_source);
+        }
+        pthread_mutex_unlock(&vision_watch_frame_lock);
+    } else if (pthread_mutex_trylock(&visual_capture_lock) == 0) {
+        if (eyes && r2_eyes_is_open(eyes)) {
+            sources.visual_origin = r2_eyes_get_origin(eyes);
+            if (sources.visual_origin != R2_VISION_WORLD)
+                sources.visual_source = r2_eyes_copy_source(eyes);
+        }
+        pthread_mutex_unlock(&visual_capture_lock);
+    }
+
+    pthread_mutex_lock(&media_frame_lock);
+    if (atomic_load(&media_capture_running) && media_latest_frame.data &&
+        media_latest_frame.size && media_latest_source)
+        sources.display_source = strdup(media_latest_source);
+    pthread_mutex_unlock(&media_frame_lock);
+
+    pthread_mutex_lock(&ears_capture_lock);
+    if (ears && r2_ears_is_open(ears))
+        (void)r2_ears_get_event(ears, &sources.hearing_event);
+    pthread_mutex_unlock(&ears_capture_lock);
+
+    pthread_mutex_lock(&ears_desktop_capture_lock);
+    if (ears_desktop && atomic_load(&ears_desktop_capture_running) &&
+        r2_ears_is_open(ears_desktop))
+        (void)r2_ears_get_event(ears_desktop, &sources.desktop_event);
+    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    return sources;
+}
+
+static void r2_release_turn_sources(R2TurnSources *sources)
+{
+    free(sources->visual_source);
+    free(sources->display_source);
+    r2_ears_release_event(&sources->hearing_event);
+    r2_ears_release_event(&sources->desktop_event);
+    *sources = (R2TurnSources){0};
+}
+
+/* Retain the existing event/relationship kinds for historical consumers.
+ * The details describe only what the sampled state actually establishes. */
+static void r2_publish_turn_sources(int64_t turn_event_id, const R2TurnSources *sources)
+{
+    if (turn_event_id <= 0) return;
+    if (sources->visual_source &&
+        (sources->visual_origin == R2_VISION_FILE || sources->visual_origin == R2_VISION_VLC ||
+         sources->visual_origin == R2_VISION_WINDOW)) {
+        char *details = NULL;
+        if (asprintf(&details,
+                     "conversation_event_id=%lld\nvisual_source=%s\n"
+                     "visual_origin=%s\nsampled_at=turn_finalization\n"
+                     "A visual media source was open at turn finalization; "
+                     "attention and interpretation are not established.",
+                     (long long)turn_event_id, sources->visual_source,
+                     sources->visual_origin == R2_VISION_VLC ? "VLC window" :
+                     sources->visual_origin == R2_VISION_WINDOW ? "active video window" : "file") >= 0) {
+            int64_t association_id = r2_log_event(
+                R2_LOG_CONVERSATION, "conversation_during_visual_media",
+                "A visual media source was open at conversation turn finalization.",
+                details, sources->visual_source);
+            if (association_id > 0)
+                r2_log_link(turn_event_id, association_id,
+                            "conversation_occurred_during_media", sources->visual_source);
+            free(details);
+        }
+    }
+
+    if (sources->display_source) {
+        char *details = NULL;
+        if (asprintf(&details,
+                     "conversation_event_id=%lld\nmedia_display=%s\n"
+                     "sampled_at=turn_finalization\n"
+                     "display_available=1; attended=not_established; interpreted=not_established",
+                     (long long)turn_event_id, sources->display_source) >= 0) {
+            int64_t association_id = r2_log_event(
+                R2_LOG_CONVERSATION, "conversation_with_media_display_available",
+                "A separate video display was available at conversation turn finalization.",
+                details, sources->display_source);
+            if (association_id > 0)
+                r2_log_link(turn_event_id, association_id,
+                            "media_display_was_available", sources->display_source);
+            free(details);
+        }
+    }
+
+    const R2HearingEvent *audio[] = {&sources->hearing_event, &sources->desktop_event};
+    for (size_t i = 0; i < sizeof(audio) / sizeof(audio[0]); ++i) {
+        if (!audio[i]->source_name || !*audio[i]->source_name) continue;
+        char details[320];
+        snprintf(details, sizeof(details),
+                 "conversation_event_id=%lld\naudio_origin=%s\n"
+                 "sampled_at=turn_finalization\n"
+                 "Ears source was open; transcription and interpretation are not established.",
+                 (long long)turn_event_id, i == 1 ? "desktop_playback" :
+                 audio[i]->origin == R2_HEARING_FILE ? "file" :
+                 audio[i]->origin == R2_HEARING_WORLD ? "world/desktop" : "unknown");
+        int64_t association_id = r2_log_event(
+            R2_LOG_CONVERSATION, "conversation_during_audio_input",
+            i == 1 ? "A desktop audio source was open at conversation turn finalization." :
+                     "An Ears source was open at conversation turn finalization.",
+            details, audio[i]->source_name);
+        if (association_id > 0)
+            r2_log_link(turn_event_id, association_id,
+                        "conversation_occurred_during_audio", audio[i]->source_name);
+    }
+}
+
 static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)
 {
     *turn_event_id_out = 0; /* No accepted turn has been finalized yet. */
@@ -16149,6 +16279,7 @@ finalize_reply:
 
     pthread_mutex_unlock(&messages_lock);
 
+    R2TurnSources turn_sources = r2_capture_turn_sources();
     const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
     const R2TurnContextReviews *reviews = r2_turn_context_reviews;
     int64_t turn_event_id = (shutting_down && !generated_reply ? r2_log_conversation_turn_with_notice :
@@ -16175,127 +16306,8 @@ finalize_reply:
                      "Could not persist a conversation turn in the Life Log.",
                      NULL, "r2_talk");
 
-    /*
-     * Associate this turn with the media inputs that were actually open
-     * while the user and R2 were talking. These are source relationships,
-     * not claims that Ears has transcribed or understood the audio.
-     */
-    if (turn_event_id > 0) {
-        char *visual_source = NULL;
-        R2VisionOrigin visual_origin = R2_VISION_NONE;
-        if (atomic_load(&vision_watch_running)) {
-            pthread_mutex_lock(&vision_watch_frame_lock);
-            if (vision_watch_latest_source && !vision_watch_capture_done) {
-                visual_origin = vision_watch_latest_origin;
-                if (visual_origin != R2_VISION_WORLD)
-                    visual_source = strdup(vision_watch_latest_source);
-            }
-            pthread_mutex_unlock(&vision_watch_frame_lock);
-        } else if (pthread_mutex_trylock(&visual_capture_lock) == 0) {
-            if (eyes && r2_eyes_is_open(eyes)) {
-                visual_origin = r2_eyes_get_origin(eyes);
-                if (visual_origin != R2_VISION_WORLD)
-                    visual_source = r2_eyes_copy_source(eyes);
-            }
-            pthread_mutex_unlock(&visual_capture_lock);
-        }
-        if (visual_source &&
-            (visual_origin == R2_VISION_FILE || visual_origin == R2_VISION_VLC ||
-             visual_origin == R2_VISION_WINDOW)) {
-            char *details = NULL;
-            if (asprintf(&details,
-                         "conversation_event_id=%lld\nvisual_source=%s\n"
-                         "visual_origin=%s\nThe media source was active during this conversation; "
-                         "this association does not assert that its contents were fully understood.",
-                         (long long)turn_event_id, visual_source,
-                         visual_origin == R2_VISION_VLC ? "VLC window" :
-                         visual_origin == R2_VISION_WINDOW ? "active video window" : "file") < 0)
-                details = NULL;
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_during_visual_media",
-                "A conversation turn occurred while a visual media source was active.",
-                details, visual_source);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "conversation_occurred_during_media", visual_source);
-            free(details);
-        }
-        free(visual_source);
-
-        /* Media is a display present in R2's world, not another pair of eyes.
-           Being available never proves he watched or understood its content. */
-        char *display_source = NULL;
-        pthread_mutex_lock(&media_frame_lock);
-        if (atomic_load(&media_capture_running) && media_latest_frame.data &&
-            media_latest_frame.size && media_latest_source)
-            display_source = strdup(media_latest_source);
-        pthread_mutex_unlock(&media_frame_lock);
-        if (display_source) {
-            char *details = NULL;
-            if (asprintf(&details,
-                         "conversation_event_id=%lld\nmedia_display=%s\n"
-                         "display_available=1; attended=not_established; interpreted=not_established",
-                         (long long)turn_event_id, display_source) < 0)
-                details = NULL;
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_with_media_display_available",
-                "A separate video display was available during this conversation.",
-                details, display_source);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "media_display_was_available", display_source);
-            free(details);
-            free(display_source);
-        }
-
-        R2HearingEvent hearing_event = {0};
-        pthread_mutex_lock(&ears_capture_lock);
-        int microphone_connected = ears && r2_ears_is_open(ears) &&
-            r2_ears_get_event(ears, &hearing_event) == 0;
-        pthread_mutex_unlock(&ears_capture_lock);
-        if (microphone_connected) {
-            char details[1200];
-            snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\naudio_origin=%s\n"
-                     "Ears source was active during this conversation; PCM input is not "
-                     "automatically transcribed or semantically interpreted by Ears.",
-                     (long long)turn_event_id,
-                     hearing_event.origin == R2_HEARING_FILE ? "file" :
-                     hearing_event.origin == R2_HEARING_WORLD ? "world/desktop" : "unknown");
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_during_audio_input",
-                "A conversation turn occurred while R2's audio input was active.",
-                details, hearing_event.source_name);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "conversation_occurred_during_audio", hearing_event.source_name);
-            r2_ears_release_event(&hearing_event);
-        }
-        /* Preserve the desktop playback event independently of microphone
-           audio, without claiming either stream was interpreted. */
-        R2HearingEvent desktop_event = {0};
-        pthread_mutex_lock(&ears_desktop_capture_lock);
-        int desktop_connected = ears_desktop &&
-            atomic_load(&ears_desktop_capture_running) &&
-            r2_ears_is_open(ears_desktop) &&
-            r2_ears_get_event(ears_desktop, &desktop_event) == 0;
-        pthread_mutex_unlock(&ears_desktop_capture_lock);
-        if (desktop_connected) {
-            char details[1200];
-            snprintf(details, sizeof(details),
-                     "conversation_event_id=%lld\naudio_origin=desktop_playback\n"
-                     "An independent desktop PCM source was active, without automatic transcription.",
-                     (long long)turn_event_id);
-            int64_t association_id = r2_log_event(
-                R2_LOG_CONVERSATION, "conversation_during_audio_input",
-                "A conversation occurred while desktop playback audio was active.",
-                details, desktop_event.source_name);
-            if (association_id > 0)
-                r2_log_link(turn_event_id, association_id,
-                            "conversation_occurred_during_audio", desktop_event.source_name);
-            r2_ears_release_event(&desktop_event);
-        }
-    }
+    r2_publish_turn_sources(turn_event_id, &turn_sources);
+    r2_release_turn_sources(&turn_sources);
 
     /* Deliver the generated answer immediately; model-assisted bookkeeping
        continues independently and yields if a new foreground turn arrives. */
