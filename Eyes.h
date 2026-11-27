@@ -14,8 +14,8 @@
  *     VLC -> visible VLC media window
  *
  * Eyes does NOT interpret the image. Visual.c passes selected frames to
- * R2's unified Qwen 3.5 multimodal model; this capture layer does not call
- * Ollama directly, so camera/video acquisition stays independent of inference.
+ * R2's configured vision model; this capture layer does not call Ollama
+ * directly, so camera/video acquisition stays independent of inference.
  *
  * It does not:
  *     - recognize faces

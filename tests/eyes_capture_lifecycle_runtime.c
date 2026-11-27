@@ -225,6 +225,8 @@ int main(void)
         "#!/usr/bin/python3\n"
         "import os, signal, sys, time\n"
         "mode = sys.argv[sys.argv.index('-i') + 1]\n"
+        "if '-re' in sys.argv:\n"
+        "    assert sys.argv[sys.argv.index('-map') + 1] == '0:v:0'\n"
         "if '-window_id' in sys.argv:\n"
         "    assert sys.argv[sys.argv.index('-video_size') + 1] == '2x2'\n"
         "    window = sys.argv[sys.argv.index('-window_id') + 1]\n"

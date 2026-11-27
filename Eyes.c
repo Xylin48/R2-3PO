@@ -809,9 +809,12 @@ static FILE *r2_eyes_start_ffmpeg(const char *input, int live_device, pid_t *chi
         "-f", "v4l2", "-framerate", fps, "-video_size", "640x480", "-i", (char *)input,
         "-vf", "format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-r", fps,
         "pipe:1", NULL};
+    /* The dimension probe selects v:0. Without an explicit map, FFmpeg
+     * can automatically select a different (e.g. larger) video track and
+     * the fixed-size RGB reader would split its pixels at wrong boundaries. */
     char *file[] = {"ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-re", "-i", (char *)input, "-vf", filter, "-f", "rawvideo", "-pix_fmt",
-        "rgb24", "pipe:1", NULL};
+        "-re", "-i", (char *)input, "-map", "0:v:0", "-vf", filter,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1", NULL};
     return r2_eyes_spawn_stream(live_device ? camera : file, child_out, R2_EYES_STDERR_INHERIT);
 }
 
