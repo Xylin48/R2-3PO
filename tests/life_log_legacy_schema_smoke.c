@@ -267,6 +267,40 @@ int main(void)
     assert(r2_log_activity_end("restart-fixture", "ready", "fixture", NULL) > 0);
     assert(scalar(writer, "SELECT duration_ms FROM r2_log_activity_sessions "
                           "WHERE activity_key='restart-fixture';") >= 3600000);
+    /* Old beta databases can contain multiple active rows for one key.
+       The newest selected row must not close the older row using its timing. */
+    assert(r2_log_activity_start("duplicate-fixture", "Older session", NULL) > 0);
+    assert(sqlite3_exec(writer,
+        "INSERT INTO r2_log_activity_sessions(activity_key,activity_name,started_utc,"
+        "started_local,started_epoch,start_monotonic_ms,start_event_id,status) "
+        "SELECT activity_key,'Newer session',started_utc,started_local,started_epoch,"
+        "start_monotonic_ms,start_event_id,'active' FROM r2_log_activity_sessions "
+        "WHERE activity_key='duplicate-fixture';", NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_activity_end("duplicate-fixture", "newer state", "fixture", NULL) > 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key='duplicate-fixture' AND activity_name='Older session' "
+                          "AND status='active' AND end_event_id IS NULL;") == 1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions a "
+                          "JOIN r2_log_events e ON e.id=a.end_event_id "
+                          "WHERE a.activity_name='Newer session' AND a.status='ended' "
+                          "AND e.summary LIKE '%Newer session%';") == 1);
+    assert(r2_log_activity_end("duplicate-fixture", "older state", "fixture", NULL) > 0);
+    assert(scalar(writer, "SELECT COUNT(DISTINCT end_event_id) FROM r2_log_activity_sessions "
+                          "WHERE activity_key='duplicate-fixture' AND status='ended';") == 2);
+
+    char long_result[4096];
+    memset(long_result, 'w', sizeof(long_result) - 1);
+    memcpy(long_result + sizeof(long_result) - sizeof("WORLD-EXACT-END"),
+           "WORLD-EXACT-END", sizeof("WORLD-EXACT-END"));
+    assert(r2_log_world_event("fixture", "world_exact", long_result, NULL) > 0);
+    char *world = r2_log_search("WORLD-EXACT-END", 10);
+    assert(world && strstr(world, long_result));
+    free(world);
+    char oversized_world[8193];
+    memset(oversized_world, 'x', sizeof(oversized_world) - 1);
+    oversized_world[sizeof(oversized_world) - 1] = '\0';
+    assert(r2_log_world_event("fixture", "world_oversized", oversized_world, NULL) < 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events WHERE event_type='world_oversized';") == 0);
     sqlite3_close(writer);
 
     sqlite3 *db = NULL;

@@ -2077,17 +2077,16 @@ int64_t r2_log_world_event(const char *object_or_device,
                            const char *event, const char *result,
                            const char *details)
 {
-    char summary[2048];
-
     if (!valid_text(object_or_device) || !valid_text(event) ||
         !valid_text(result))
         return -1;
 
-    snprintf(summary, sizeof(summary), "%s: %s — %s",
-             object_or_device, event, result);
-
-    return r2_log_event(R2_LOG_WORLD, event, summary,
-                        details, "world");
+    char *summary = NULL;
+    if (asprintf(&summary, "%s: %s — %s", object_or_device, event, result) < 0)
+        return -1;
+    int64_t id = r2_log_event(R2_LOG_WORLD, event, summary, details, "world");
+    free(summary);
+    return id;
 }
 
 
@@ -2177,6 +2176,7 @@ int64_t r2_log_activity_end(const char *activity_key,
     char *event_details = NULL, *summary = NULL;
     const char *state_text = valid_text(last_verified_state) ? last_verified_state : "unknown";
     const char *reason_text = valid_text(stop_reason) ? stop_reason : "unknown";
+    sqlite3_int64 activity_id = 0;
     sqlite3_int64 started_epoch = 0, started_monotonic = 0, start_session = 0;
     sqlite3_int64 ended_epoch = (sqlite3_int64)time(NULL);
     sqlite3_int64 duration_ms = -1;
@@ -2191,7 +2191,7 @@ int64_t r2_log_activity_end(const char *activity_key,
         return -1;
     }
     rc = sqlite3_prepare_v2(log_db,
-        "SELECT a.activity_name,a.started_local,a.started_epoch,a.start_monotonic_ms,e.session_id "
+        "SELECT a.activity_name,a.started_local,a.started_epoch,a.start_monotonic_ms,e.session_id,a.id "
         "FROM r2_log_activity_sessions a LEFT JOIN r2_log_events e ON e.id=a.start_event_id "
         "WHERE a.activity_key=? AND a.status='active' ORDER BY a.id DESC LIMIT 1", -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
@@ -2205,6 +2205,7 @@ int64_t r2_log_activity_end(const char *activity_key,
         started_epoch = sqlite3_column_int64(statement, 2);
         started_monotonic = sqlite3_column_int64(statement, 3);
         start_session = sqlite3_column_int64(statement, 4);
+        activity_id = sqlite3_column_int64(statement, 5);
     }
     sqlite3_finalize(statement);
     statement = NULL;
@@ -2219,7 +2220,7 @@ int64_t r2_log_activity_end(const char *activity_key,
     }
 
     int64_t event_id = -1;
-    if (activity_name && start_local &&
+    if (activity_id > 0 && activity_name && start_local &&
         asprintf(&summary, "R2 ended activity '%s'; last verified state: %s; stop reason: %s.",
                  activity_name, state_text, reason_text) >= 0 &&
         asprintf(&event_details,
@@ -2240,7 +2241,9 @@ int64_t r2_log_activity_end(const char *activity_key,
     rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_activity_sessions SET ended_utc=?,ended_local=?,ended_epoch=?,"
         "duration_ms=?,last_verified_state=?,stop_reason=?,end_event_id=?,status='ended' "
-        "WHERE activity_key=? AND status='active'",
+        /* Finish exactly the session whose start data was read. Older
+           duplicate legacy sessions must not share this duration or event. */
+        "WHERE id=? AND status='active'",
         -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, utc, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, local, -1, SQLITE_TRANSIENT);
@@ -2251,9 +2254,9 @@ int64_t r2_log_activity_end(const char *activity_key,
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 5, state_text, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 6, reason_text, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 8, activity_key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 8, activity_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
-    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) > 0;
+    int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
