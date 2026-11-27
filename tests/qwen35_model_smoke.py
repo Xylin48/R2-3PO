@@ -385,7 +385,9 @@ require(
     and "messages.items[messages.count - 1].internal_tool_result = 1;" in core
     and "Append the internal assistant tool-call and its tool-result as one logical" in core
     and "Cannot fit complete assistant/tool history pair without evicting protected context." in core
-    and "i != preserve_index && !evict[i] && !message_is_protected(&messages.items[i])" in core
+    and "message_plan_oldest_eviction(evict, preserve_index," in core
+    and "j == preserve_index || message_is_protected(&messages.items[j])" in core
+    and "!message_history_user(&messages.items[group_end])" in core
     and "raw [WORLD]/[RUN]/etc. commands into later model context" in core
     and "do not repeat it unless the user asks again" in core,
     "tool-result history stays atomic and trusted while executed control syntax is not replayed as dialogue",

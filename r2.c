@@ -7097,11 +7097,17 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
     if (max_chars == 0) return xstrdup("");
     if (!complete && max_chars > 8192) max_chars = 8192;
 
-    size_t selected[8];
+    /* The normal recent selection is eight visible messages. In complete
+       mode extend only the oldest selected exchange to its user anchor. */
+    size_t selected[MAX_MESSAGES];
+    const size_t recent_limit = 8;
     size_t found = 0;
     int skip_latest_match = exclude_latest && *exclude_latest;
     pthread_mutex_lock(&messages_lock);
-    for (size_t i = messages.count; i > 0 && found < 8; --i) {
+    for (size_t i = messages.count; i > 0 && found < MAX_MESSAGES; --i) {
+        if (found >= recent_limit &&
+            (!complete || message_history_user(&messages.items[selected[found - 1]])))
+            break;
         size_t index = i - 1;
         const Message *m = &messages.items[index];
         if (!m->role || !m->content || m->pinned) continue;
@@ -7130,15 +7136,21 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
      * on the newest complete turns first, then emit those turns chronologically.
      * Older history must never crowd out the latest user request.
      */
+    static const char clipped_marker[] = " [truncated]";
     size_t included = 0;
     size_t selected_chars = 0;
     while (included < found) {
         const Message *m = &messages.items[selected[included]];
         size_t role_length = strcmp(m->role, "user") == 0 ? 6U : 4U;
         size_t content_length = strlen(m->content);
-        if (!complete && content_length > 1000U)
+        size_t marker_length = 0;
+        if (!complete && content_length > 1000U) {
             content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
+            marker_length = sizeof(clipped_marker) - 1;
+        }
         size_t remaining = max_chars - selected_chars;
+        if (marker_length > remaining) break;
+        remaining -= marker_length;
         if (remaining <= role_length || content_length >= remaining - role_length) {
             if (complete) {
                 pthread_mutex_unlock(&messages_lock);
@@ -7147,7 +7159,7 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
             }
             break;
         }
-        selected_chars += role_length + content_length + 1U;
+        selected_chars += role_length + content_length + marker_length + 1U;
         ++included;
     }
 
@@ -7178,12 +7190,17 @@ static char *r2_build_recent_conversation_context(const char *exclude_latest,
             const char *role = strcmp(m->role, "user") == 0 ? "User: " : "R2: ";
             size_t role_length = strlen(role);
             size_t content_length = strlen(m->content);
-            if (!complete && content_length > 1000U)
+            int clipped = !complete && content_length > 1000U;
+            if (clipped)
                 content_length = r2_utf8_safe_prefix_length(m->content, 1000U);
             memcpy(out + used, role, role_length);
             used += role_length;
             memcpy(out + used, m->content, content_length);
             used += content_length;
+            if (clipped) {
+                memcpy(out + used, clipped_marker, sizeof(clipped_marker) - 1);
+                used += sizeof(clipped_marker) - 1;
+            }
             out[used++] = '\n';
         }
         out[used] = '\0';

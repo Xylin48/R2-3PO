@@ -162,9 +162,31 @@ int main(void)
     assert(context != NULL);
     assert(test_valid_utf8((const unsigned char *)context));
     assert(strchr(context, (char)0xE2) == NULL);
+    assert(strstr(context, " [truncated]\n"));
+    free(context);
+    context = r2_recent_conversation_context_complete(NULL);
+    assert(context && strstr(context, utf8_edge) && !strstr(context, "[truncated]"));
     free(context);
     clear_test_messages();
     free(utf8_edge);
+
+    /* The eight-message boundary can land on an answer when the newest
+       user has not yet received a reply. Preserve its original question. */
+    assert(message_add("user", "outside recent selection") == 0);
+    assert(message_add("assistant", "outside answer") == 0);
+    assert(message_add("user", "oldest selected question") == 0);
+    assert(message_add("assistant", "oldest selected answer") == 0);
+    for (int i = 0; i < 3; ++i) {
+        assert(message_add("user", "middle question") == 0);
+        assert(message_add("assistant", "middle answer") == 0);
+    }
+    assert(message_add("user", "latest unanswered") == 0);
+    context = r2_recent_conversation_context_complete(NULL);
+    assert(context && !strncmp(context, "User: oldest selected question\nR2: oldest selected answer\n",
+        sizeof("User: oldest selected question\nR2: oldest selected answer\n") - 1));
+    assert(strstr(context, "latest unanswered") && !strstr(context, "outside recent selection"));
+    free(context);
+    clear_test_messages();
 
     /* Selected associated records remain complete, including multibyte text. */
     const char *keywords[] = {"signal"};
