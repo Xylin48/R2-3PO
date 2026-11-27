@@ -13612,6 +13612,14 @@ typedef struct R2ExtraDesktop {
     struct R2ExtraDesktop *next;
 } R2ExtraDesktop;
 
+/* A transport read can already have failed while the worker is recording
+ * its final journal notice. Published activity requires both states. The
+ * caller retains entry/receiver lifetime with the published-list lock. */
+static int r2_extra_desktop_active(const R2ExtraDesktop *entry)
+{
+    return atomic_load(&entry->running) && r2_ears_is_open(entry->receiver);
+}
+
 static pthread_mutex_t extra_desktop_update_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t extra_desktop_lock = PTHREAD_MUTEX_INITIALIZER;
 static R2ExtraDesktop *extra_desktop_head = NULL;
@@ -13759,7 +13767,7 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
     while (*slot) {
         R2ExtraDesktop *entry = *slot;
         if (!r2_sense_auto_allowed(3) ||
-            !atomic_load(&entry->running) ||
+            !r2_extra_desktop_active(entry) ||
             !r2_extra_desktop_wanted(audio, primary, entry->monitor)) {
             *slot = entry->next;
             entry->next = retired;
@@ -13853,8 +13861,8 @@ int r2_ears_extra_reconcile_cancelable(const R2AudioDiscovery *audio, const char
                 break;
             }
             r2_log_sensory("audio_source_opened",
-                           "An additional desktop output is supplying independent raw PCM.",
-                           "This does not automatically transcribe audio or change R2's attention.",
+                           "An independent desktop output capture was opened.",
+                           "Raw PCM availability depends on its live reader; no automatic transcription or change in attention.",
                            entry->monitor);
         }
     }
@@ -13872,7 +13880,7 @@ size_t r2_ears_extra_source_count(void)
     pthread_mutex_lock(&extra_desktop_lock);
     size_t count = 0;
     for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next)
-        if (atomic_load(&p->running)) ++count;
+        if (r2_extra_desktop_active(p)) ++count;
     pthread_mutex_unlock(&extra_desktop_lock);
     return count;
 }
@@ -13892,7 +13900,7 @@ int r2_ears_extra_copy_recent(const char *monitor, size_t bytes, void *output)
     for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
         if (strcmp(entry->monitor, monitor)) continue;
         pthread_mutex_lock(&entry->history_lock);
-        int ok = atomic_load(&entry->running) && entry->length >= bytes;
+        int ok = r2_extra_desktop_active(entry) && entry->length >= bytes;
         if (ok) {
             size_t start = (entry->position + R2_EARS_RECENT_CAPACITY - bytes) %
                            R2_EARS_RECENT_CAPACITY;
@@ -13918,7 +13926,7 @@ static int r2_ears_extra_source_active(const char *monitor)
     int active = 0;
     for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
         if (!strcmp(entry->monitor, monitor)) {
-            active = atomic_load(&entry->running);
+            active = r2_extra_desktop_active(entry);
             break;
         }
     }
@@ -13953,7 +13961,7 @@ static char *r2_ears_desktop_available_sources(void)
     pthread_mutex_lock(&extra_desktop_lock);
     size_t active = 0;
     for (R2ExtraDesktop *p = extra_desktop_head; p; p = p->next) {
-        if (!atomic_load(&p->running)) continue;
+        if (!r2_extra_desktop_active(p)) continue;
         if (fprintf(stream, "INDEPENDENT DESKTOP SOURCE: %s\n", p->monitor) < 0) {
             pthread_mutex_unlock(&extra_desktop_lock);
             goto fail;
@@ -14030,7 +14038,7 @@ static int r2_ears_extra_write_pcm(const char *monitor, uint32_t bytes,
             return -1;
         }
         pthread_mutex_lock(&entry->history_lock);
-        int running = atomic_load(&entry->running);
+        int running = r2_extra_desktop_active(entry);
         if (!generation && running) {
             generation = entry->generation;
             cursor = entry->total_bytes;
@@ -15956,7 +15964,7 @@ static int r2_capture_turn_extra_sources(R2TurnSources *sources)
     int result = 0;
     pthread_mutex_lock(&extra_desktop_lock);
     for (R2ExtraDesktop *entry = extra_desktop_head; entry; entry = entry->next) {
-        if (!atomic_load(&entry->running) || !entry->monitor || !*entry->monitor)
+        if (!r2_extra_desktop_active(entry) || !entry->monitor || !*entry->monitor)
             continue;
         /* A reroute can briefly expose the same monitor in both receivers.
          * Availability of that exact desktop monitor is one association. */

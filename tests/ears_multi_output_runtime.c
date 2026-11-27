@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
-typedef struct { R2Ears *receiver; char *source; unsigned char marker; } FakeOutput;
+typedef struct { R2Ears *receiver; char *source; unsigned char marker; int open; } FakeOutput;
 static FakeOutput opened[40];
 static size_t opened_count = 0;
 static pthread_mutex_t fake_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -54,10 +54,26 @@ int __wrap_r2_ears_open_desktop_source_cancelable(R2Ears *receiver, const char *
     opened[opened_count].receiver = receiver;
     opened[opened_count].source = strdup(source);
     opened[opened_count].marker = (unsigned char)(opened_count + 17);
+    opened[opened_count].open = 1;
     assert(opened[opened_count].source);
     ++opened_count;
     pthread_mutex_unlock(&fake_lock);
     return 0;
+}
+
+int __wrap_r2_ears_is_open(R2Ears *receiver)
+{
+    int active = 0;
+    pthread_mutex_lock(&fake_lock);
+    /* Allocators may reuse a retired receiver address: latest open wins. */
+    for (size_t i = opened_count; i > 0; --i) {
+        if (opened[i - 1].receiver == receiver) {
+            active = opened[i - 1].open;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fake_lock);
+    return active;
 }
 
 ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *buffer, size_t size)
@@ -65,15 +81,19 @@ ssize_t __wrap_r2_ears_read(R2Ears *receiver, void *buffer, size_t size)
     pthread_mutex_lock(&fake_lock);
     unsigned char marker = 0;
     const char *monitor = NULL;
+    FakeOutput *selected = NULL;
     for (size_t i = 0; i < opened_count; ++i) {
         if (opened[i].receiver == receiver) {
+            selected = &opened[i];
             marker = opened[i].marker;
             monitor = opened[i].source;
         }
     }
-    assert(monitor);
+    assert(monitor && selected);
     pause_if_selected(paused_read, monitor);
+    int active = selected->open;
     pthread_mutex_unlock(&fake_lock);
+    if (!active) { errno = EIO; return -1; }
     assert(marker && size == 1920);
     memset(buffer, marker, size);
     struct timespec pause = {.tv_sec = 0, .tv_nsec = 2000000L};
@@ -205,7 +225,27 @@ int main(void)
     paused_read = names[0];
     pause_entered = pause_released = 0;
     await_gate(&pause_entered);
+    /* The transport reports failure before its worker can return from the
+     * last read (or a blocking read-failure journal callback). */
+    int retired_transport = 0;
+    for (size_t i = opened_count; i > 0; --i) {
+        if (!strcmp(opened[i - 1].source, names[0])) {
+            opened[i - 1].open = 0;
+            retired_transport = 1;
+            break;
+        }
+    }
+    assert(retired_transport);
     pthread_mutex_unlock(&fake_lock);
+    assert(r2_ears_extra_source_count() == 11);
+    assert(!r2_ears_extra_source_active(names[0]));
+    assert(r2_ears_extra_copy_recent(names[0], 1920, (unsigned char[1920]){0}) < 0);
+    R2TurnSources failed_source = r2_capture_turn_sources();
+    verify_turn_extra_sources(&failed_source, names, 0);
+    r2_release_turn_sources(&failed_source);
+    char *failed_list = r2_ears_desktop_available_sources();
+    assert(failed_list && !strstr(failed_list, names[0]) && strstr(failed_list, names[1]));
+    free(failed_list);
     request.primary = names[0];
     assert(pthread_create(&update, NULL, reconcile, &request) == 0);
     for (int tries = 0; ; ++tries) {

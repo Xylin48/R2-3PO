@@ -84,6 +84,14 @@ static void verify_visual_sources(sqlite3 *connection)
 }
 
 static char names[2][1024];
+static R2Ears *fixture_extra_receiver;
+int __real_r2_ears_is_open(R2Ears *receiver);
+int __wrap_r2_ears_is_open(R2Ears *receiver)
+{
+    /* Only the explicitly seeded synthetic PCM receiver is open here. */
+    if (receiver && receiver == fixture_extra_receiver) return 1;
+    return __real_r2_ears_is_open(receiver);
+}
 static int reroute_on_exit, read_fault;
 static const char *growing_file;
 ssize_t __real_getdelim(char **line, size_t *capacity, int delimiter, FILE *stream);
@@ -341,8 +349,10 @@ int main(void)
     /* A primary lifecycle update can stall independently. An already
      * published extra source must still reach ASR and persist its exact ID. */
     const char extra_name[] = "fixture.secondary|exact.monitor";
+    assert(r2_ears_init(&fixture_extra_receiver) == 0);
     R2ExtraDesktop extra = {
         .monitor = (char *)extra_name,
+        .receiver = fixture_extra_receiver,
         .running = ATOMIC_VAR_INIT(1),
         .history_lock = PTHREAD_MUTEX_INITIALIZER,
         .length = 192000,
@@ -380,6 +390,8 @@ int main(void)
     r2_ears_extra_requested = NULL;
     pthread_mutex_destroy(&extra.history_lock);
     free(extra.recent);
+    r2_ears_shutdown(fixture_extra_receiver);
+    fixture_extra_receiver = NULL;
 
     /* Freeze the completion-boundary identities before the durable write.
        Changing display sources during publication must not relabel the turn. */
