@@ -29,6 +29,9 @@ assert "while (!shell_watch_cancelled(NULL))" in worker
 assert "r2_audio_discover_cancelable(" in worker
 assert "audio_known ? audio.microphone_source : NULL" in worker
 assert "audio_known && audio.desktop_playing ? audio.desktop_monitor : NULL" in worker
+assert "audio_known ? &audio : NULL, &desktop" in worker
+assert "audio->playback_outputs[i].monitor" in worker
+assert "wanted = monitor;" in worker
 assert "r2_vision_camera_available()" in worker
 assert "r2_vision_select_playback_window(" in worker
 assert "r2_vision_window_available_cancelable(published, shell_watch_media_stale" in worker

@@ -207,6 +207,40 @@ int main(void)
     r2_discovery_sink_info(NULL, &output, 0, &scan);
     assert(scan.failed);
 
+    /* A malformed nonterminal row is not a successful empty snapshot.
+       The first failure survives a later nominal end-of-list callback. */
+    R2PulseScan incomplete = {0};
+    r2_discovery_source_info(NULL, NULL, 0, &incomplete);
+    r2_discovery_source_info(NULL, NULL, 1, &incomplete);
+    assert(incomplete.done && incomplete.failed == EPROTO);
+    errno = 0;
+    assert(r2_discovery_pump(&incomplete, &incomplete.done) == -1 && errno == EPROTO);
+    incomplete = (R2PulseScan){0};
+    r2_discovery_sink_input(NULL, NULL, 0, &incomplete);
+    r2_discovery_sink_input(NULL, NULL, 1, &incomplete);
+    assert(incomplete.done && incomplete.failed == EPROTO);
+    incomplete = (R2PulseScan){0};
+    pa_sink_input_info unresolved = {.sink = PA_INVALID_INDEX};
+    r2_discovery_sink_input(NULL, &unresolved, 0, &incomplete);
+    assert(incomplete.failed == ESTALE && !incomplete.data.desktop_playing);
+    unresolved.corked = 1;
+    incomplete.failed = 0;
+    r2_discovery_sink_input(NULL, &unresolved, 0, &incomplete);
+    assert(!incomplete.failed);
+    incomplete.data.default_sink = strdup("alsa_output.default");
+    assert(incomplete.data.default_sink);
+    incomplete.resolving_output_slot = SIZE_MAX;
+    r2_discovery_sink_info(NULL, &output, 0, &incomplete);
+    assert(incomplete.failed == ESTALE && !incomplete.data.desktop_monitor);
+    incomplete.failed = 0;
+    output.name = "alsa_output.default";
+    r2_discovery_sink_info(NULL, &output, 0, &incomplete);
+    assert(!incomplete.failed && incomplete.data.desktop_monitor);
+    output.monitor_source_name = "changed.monitor";
+    r2_discovery_sink_info(NULL, &output, 0, &incomplete);
+    assert(incomplete.failed == ESTALE);
+    r2_audio_discovery_free(&incomplete.data);
+
     /* An API failure must never be reported as a successful empty list. */
     scan.done = scan.failed = 0;
     r2_discovery_source_info(NULL, NULL, -1, &scan);

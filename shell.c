@@ -1577,9 +1577,22 @@ static void shell_watch_media_poll(ShellWatchMedia *managed, int eyes_permitted,
 }
 
 static int shell_watch_audio_input(uint64_t *managed, int desktop, int known,
-                                   const char *wanted, R2EarsWatchInput *input)
+                                   const char *wanted, const R2AudioDiscovery *audio,
+                                   R2EarsWatchInput *input)
 {
     if (r2_ears_watch_input_snapshot(desktop, input) != 0) return -1;
+    /* Native server enumeration order can change without any route changing.
+       Keep the active primary monitor if it still exists in this complete
+       snapshot; supplementary monitors remain independently reconciled. */
+    if (desktop && known && audio && audio->desktop_playing && input->active && input->source) {
+        for (size_t i = 0; i < audio->playback_output_count; ++i) {
+            const char *monitor = audio->playback_outputs[i].monitor;
+            if (monitor && !strcmp(input->source, monitor)) {
+                wanted = monitor;
+                break;
+            }
+        }
+    }
     int permitted = r2_sense_auto_allowed(desktop ? 3 : 2);
     if (*managed && *managed != input->owner) *managed = 0;
     if (*managed && (!permitted || !input->active ||
@@ -1655,11 +1668,12 @@ static void *shell_watch_worker(void *unused)
          * A manual open on one input must not block checks of the others. */
         R2EarsWatchInput microphone, desktop;
         (void)shell_watch_audio_input(&managed_microphone, 0, audio_known,
-                                       audio_known ? audio.microphone_source : NULL, &microphone);
+                                       audio_known ? audio.microphone_source : NULL, NULL, &microphone);
         free(microphone.source);
         int desktop_known = shell_watch_audio_input(
             &managed_desktop, 1, audio_known,
-            audio_known && audio.desktop_playing ? audio.desktop_monitor : NULL, &desktop) == 0;
+            audio_known && audio.desktop_playing ? audio.desktop_monitor : NULL,
+            audio_known ? &audio : NULL, &desktop) == 0;
 
         if (!r2_sense_auto_allowed(3))
             r2_ears_extra_stop_all();

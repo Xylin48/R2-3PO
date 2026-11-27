@@ -310,31 +310,48 @@ int main(void)
     uint64_t mic = 0, desktop = 0;
     R2EarsWatchInput input;
     input_busy[0] = 1;
-    assert(shell_watch_audio_input(&mic, 0, 1, "mic", &input) == -1);
+    assert(shell_watch_audio_input(&mic, 0, 1, "mic", NULL, &input) == -1);
     assert(!mic && !input.source);
     vlc_window = 501;
     playback.playback_producer_count = 0;
     shell_watch_media_poll(&managed, 1, &playback);
     assert(active_window == 501);
-    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.a", &input) == 0);
+    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.a", NULL, &input) == 0);
     assert(input.active && desktop && !strcmp(input.source, "monitor.a"));
     free(input.source);
     previous = desktop;
-    assert(shell_watch_audio_input(&desktop, 1, 0, NULL, &input) == 0);
+    assert(shell_watch_audio_input(&desktop, 1, 0, NULL, NULL, &input) == 0);
     assert(desktop == previous && !strcmp(input.source, "monitor.a"));
     free(input.source);
+    /* Reordering the same two live sinks must not interrupt the primary.
+       A real disappearance still switches to the remaining sink. */
+    R2AudioPlaybackOutput routes[] = {
+        {.monitor = "monitor.b", .sink_index = 10},
+        {.monitor = "monitor.a", .sink_index = 11},
+    };
+    R2AudioDiscovery reordered = {
+        .desktop_playing = 1, .desktop_monitor = "monitor.b",
+        .playback_outputs = routes, .playback_output_count = 2,
+    };
+    assert(shell_watch_audio_input(&desktop, 1, 1, reordered.desktop_monitor,
+                                   &reordered, &input) == 0);
+    assert(desktop == previous && !strcmp(input.source, "monitor.a"));
+    free(input.source);
+    reordered.playback_output_count = 1;
+
     vlc_window = 502;
     shell_watch_media_poll(&managed, 1, &playback);
     assert(active_window == 502);
-    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.b", &input) == 0);
+    assert(shell_watch_audio_input(&desktop, 1, 1, reordered.desktop_monitor,
+                                   &reordered, &input) == 0);
     assert(desktop != previous && !strcmp(input.source, "monitor.b"));
     free(input.source);
     input_owner[1] = 0; /* manual takeover */
-    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.c", &input) == 0);
+    assert(shell_watch_audio_input(&desktop, 1, 1, "monitor.c", NULL, &input) == 0);
     assert(!desktop && !strcmp(input.source, "monitor.b"));
     free(input.source);
     input_busy[0] = 0;
-    assert(shell_watch_audio_input(&mic, 0, 1, "mic", &input) == 0);
+    assert(shell_watch_audio_input(&mic, 0, 1, "mic", NULL, &input) == 0);
     assert(mic && !strcmp(input.source, "mic"));
     free(input.source);
     assert(shell_watch_worker(NULL) == NULL);
