@@ -31,7 +31,6 @@ static const char blank_answer_body[] =
     "\"message\":{\"role\":\"assistant\",\"content\":\" \\t\\n\","
     "\"thinking\":\"PRIVATE-THINKING-NEVER-ARCHIVE\"}}";
 static CURLcode invalid_body_result = CURLE_OK;
-static char *isolated_retry_payload;
 static int foreground_after_response;
 static int completed_turn_after_response;
 static const char retry_copy_user[] = "Replay this evidence after an allocation failure.";
@@ -132,12 +131,6 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
     if (perform_count == invalid_body_at) {
         static const char truncated_body[] = "{\"message\":{\"role\":\"assistant\",\"content\":\"Incomplete";
         body = invalid_body_override ? invalid_body_override : truncated_body;
-        isolated_retry_payload = strdup(posted);
-        assert(isolated_retry_payload);
-    } else if (isolated_retry_payload) {
-        assert(!strcmp(posted, isolated_retry_payload));
-        free(isolated_retry_payload);
-        isolated_retry_payload = NULL;
     }
     size_t n = strlen(body), split = n / 3;
     assert(write_response((char *)body, 1, split, write_data) == split);
@@ -1804,7 +1797,7 @@ static void check_compact_ranked_memory(void)
     db = NULL;
 }
 
-static void check_foreground_answer_replay(void)
+static void check_foreground_answer_single_request(void)
 {
     const char *query = "Which book did we put on the shelf?";
     Message turn = {.role = "user", .content = (char *)query};
@@ -1818,12 +1811,9 @@ static void check_foreground_answer_replay(void)
         int before = perform_count;
         invalid_body_at = before + 1;
         invalid_body_result = results[i];
-        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
-                                                query, 512, 60, NULL);
-        assert(reply && !strcmp(reply, "We put the blue book there."));
-        assert(perform_count == before + 2 && !isolated_retry_payload);
-        assert(captured_contains(query));
-        free(reply);
+        assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                         query, 512, 60, NULL));
+        assert(perform_count == before + 1 && captured_contains(query));
     }
     invalid_body_result = CURLE_OK;
     const char *empty_answers[] = {
@@ -1835,23 +1825,19 @@ static void check_foreground_answer_replay(void)
         int before = perform_count;
         invalid_body_at = before + 1;
         invalid_body_override = empty_answers[i];
-        char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
-                                                query, 512, 60, NULL);
-        assert(reply && !strcmp(reply, "We put the blue book there."));
-        assert(perform_count == before + 2 && !isolated_retry_payload);
-        assert(captured_contains(query));
-        free(reply);
+        assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                         query, 512, 60, NULL));
+        assert(perform_count == before + 1 && captured_contains(query));
     }
     invalid_body_at = 0;
     invalid_body_override = NULL;
-
     free(response_body);
     response_body = strdup(blank_answer_body);
     assert(response_body);
     int before = perform_count;
     assert(!r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
                                       query, 512, 60, NULL));
-    assert(perform_count == before + 2);
+    assert(perform_count == before + 1);
 
     const char *non_stop_reasons[] = {"length", "cancelled", "load", "missing"};
     for (size_t i = 0; i < sizeof(non_stop_reasons) / sizeof(non_stop_reasons[0]); ++i) {
@@ -1861,45 +1847,42 @@ static void check_foreground_answer_replay(void)
                                           query, 512, 60, NULL));
         assert(perform_count == before + 1);
     }
+    /* An independently issued later request still uses the same normal path. */
+    set_response("We put the blue book there.", "stop", 1);
+    before = perform_count;
+    char *reply = r2_chat_with_input_source(&turn, 1, r2_conversation_system_prompt,
+                                            query, 512, 60, NULL);
+    assert(reply && !strcmp(reply, "We put the blue book there."));
+    assert(perform_count == before + 1 && captured_contains(query));
+    free(reply);
     ollama_authoritative_user_query = NULL;
     ollama_audit_stage = NULL;
     ollama_foreground_turn_mode = 0;
 }
 
-static void check_isolated_response_replay(void)
+static void check_isolated_response_single_request(void)
 {
     const char *policy = "Read the complete evidence.";
-    const char *fragment = "Evidence fragment stays exact across the replay.";
+    const char *fragment = "Evidence fragment stays exact when inference fails.";
     const char *note = "The complete fragment was reviewed.";
     int old_mode = ollama_foreground_turn_mode;
     ollama_foreground_turn_mode = 1;
     set_response(note, "stop", 1);
-    int before = perform_count;
-    invalid_body_at = before + 1;
-    char *reply = r2_model_generate(policy, fragment, 512);
-    assert(reply && !strcmp(reply, note) && perform_count == before + 2);
-    assert(!isolated_retry_payload);
-    free(reply);
-    invalid_body_at = 0;
-
-    const CURLcode receive_failures[] = {CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
+    const CURLcode receive_failures[] = {CURLE_OK, CURLE_PARTIAL_FILE, CURLE_RECV_ERROR};
     for (size_t i = 0; i < sizeof(receive_failures) / sizeof(receive_failures[0]); ++i) {
-        before = perform_count;
+        int before = perform_count;
         invalid_body_result = receive_failures[i];
         invalid_body_at = before + 1;
-        reply = r2_model_generate(policy, fragment, 512);
-        assert(reply && !strcmp(reply, note) && perform_count == before + 2);
-        assert(!isolated_retry_payload);
-        free(reply);
+        assert(!r2_model_generate(policy, fragment, 512));
+        assert(perform_count == before + 1 && captured_contains(fragment));
         invalid_body_at = 0;
     }
     invalid_body_result = CURLE_OK;
-
-    before = perform_count;
+    int before = perform_count;
     free(response_body);
     response_body = strdup("{\"done\":");
     assert(response_body);
-    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 2);
+    assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
 
     fixture_http_status = 503;
     before = perform_count;
@@ -1912,9 +1895,6 @@ static void check_isolated_response_replay(void)
     invalid_body_at = before + 1;
     foreground_after_response = 1;
     assert(!r2_model_generate(policy, fragment, 512) && perform_count == before + 1);
-    assert(isolated_retry_payload);
-    free(isolated_retry_payload);
-    isolated_retry_payload = NULL;
     invalid_body_at = 0;
     atomic_store(&foreground_conversation_waiting, 0);
     ollama_foreground_turn_mode = old_mode;
@@ -2528,12 +2508,17 @@ static void check_failed_reality_refresh_keeps_action_evidence(void)
         char *reply = r2_chat_with_input_source(turn, 4, r2_conversation_system_prompt, query, 512, 60, NULL);
         invalid_body_at = 0;
         invalid_body_override = NULL;
-        assert(perform_count == before + 2 && !isolated_retry_payload);
-        assert(reply && captured_contains(query));
+        assert(perform_count == before + 1 && !reply && captured_contains(query));
         assert(captured_contains("CURRENT REALITY STATUS: The live world snapshot could not be refreshed"));
         assert(captured_contains("Moved the notebook to the shelf."));
         assert(!captured_contains("The notebook was in the pocket."));
         assert(!captured_contains("selected current views"));
+        /* A successful generation uses the same current action evidence. */
+        before = perform_count;
+        reply = r2_chat_with_input_source(turn, 4, r2_conversation_system_prompt, query, 512, 60, NULL);
+        assert(reply && perform_count == before + 1 && captured_contains(query));
+        assert(captured_contains("Moved the notebook to the shelf."));
+        assert(!captured_contains("The notebook was in the pocket."));
         free(reply);
     }
     assert(!strcmp(turn[0].content, snapshot));
@@ -2544,7 +2529,7 @@ static void check_failed_reality_refresh_keeps_action_evidence(void)
     ollama_foreground_turn_mode = 0;
 }
 
-static void check_memory_response_replay(void)
+static void check_memory_response_single_request(void)
 {
     assert(setenv("R2_OLLAMA_NUM_CTX", "8192", 1) == 0);
     set_response("knowledge | The user reported a blue key.", "stop", 1);
@@ -2554,11 +2539,14 @@ static void check_memory_response_replay(void)
     char *result = memory_decision("The spare key is blue.", "", NULL, 0, NULL);
     invalid_body_at = 0;
     invalid_body_result = CURLE_OK;
-    assert(result && !strcmp(result, "knowledge | The user reported a blue key."));
-    assert(perform_count == before + 2 && !isolated_retry_payload && !ollama_isolated_request);
+    assert(!result && perform_count == before + 1 && !ollama_isolated_request);
     assert(captured_contains("The spare key is blue.") && captured_contains("NO GENERATED R2 RESPONSE"));
+    before = perform_count;
+    result = memory_decision("The spare key is blue.", "", NULL, 0, NULL);
+    assert(result && !strcmp(result, "knowledge | The user reported a blue key."));
+    assert(perform_count == before + 1 && !ollama_isolated_request);
     free(result);
-    puts("A partial memory response was replayed against the same saved evidence.");
+    puts("A partial memory response failed its single request; a later independent decision used the saved evidence.");
 }
 
 /* Both memory-decision paths must ignore unrelated live input state while
@@ -2924,9 +2912,9 @@ int main(void)
     char *legacy = ollama_chat_with_limit(&small, 1, NULL, 512, 60);
     assert(legacy && !strcmp(legacy, "legacy complete response")); free(legacy);
     assert(cleanup_count == perform_count + 2);
-    check_isolated_response_replay();
-    check_foreground_answer_replay();
-    check_memory_response_replay();
+    check_isolated_response_single_request();
+    check_foreground_answer_single_request();
+    check_memory_response_single_request();
     check_memory_decision_private_scope();
     check_private_evidence_exact_framing();
     check_rejected_memory_output_retains_evidence();

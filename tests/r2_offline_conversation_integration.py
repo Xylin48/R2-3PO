@@ -507,12 +507,12 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
         input="".join(f"talk {request}\n" for request in FOLLOWUP_FILES) + "exit\n",
         text=True, capture_output=True, timeout=100, check=True,
     )
-    assert output.stdout.count("R2-3PO: " + FOLLOWUP_RECOVERY_ANSWER) == 1, output.stdout + output.stderr
-    assert output.stdout.count("Here is the recorded result:") == 1, output.stdout + output.stderr
+    assert FOLLOWUP_RECOVERY_ANSWER not in output.stdout, output.stdout + output.stderr
+    assert output.stdout.count("Here is the recorded result:") == 2, output.stdout + output.stderr
     assert "[DELETE]" not in output.stdout and "[R2_SOUND" not in output.stdout
     assert sentinel.read_bytes() == b"private planned action must remain inert"
     assert PRIVATE_GREETING_REASONING not in output.stdout
-    assert LocalOllama.post_action_attempts.get(FOLLOWUP_RECOVERY_REQUEST) == 2
+    assert LocalOllama.post_action_attempts.get(FOLLOWUP_RECOVERY_REQUEST) == 1
     assert LocalOllama.post_action_attempts.get(FOLLOWUP_FALLBACK_REQUEST) == 1
     for request in FOLLOWUP_FILES:
         followups = [
@@ -522,10 +522,8 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
             and any(item["role"] == "system" and "\n\nCURRENT TURN PHASE:" in item["content"]
                     for item in payload["messages"])
         ]
-        expected_count = 2 if request == FOLLOWUP_RECOVERY_REQUEST else 1
-        assert len(followups) == expected_count
+        assert len(followups) == 1
         assert followups[0]["messages"][-1]["role"] == "tool"
-        assert all(payload == followups[0] for payload in followups)
     with closing(sqlite3.connect(workspace / "R2" / "r2_memory.db")) as db:
         for request, name in FOLLOWUP_FILES.items():
             assert (workspace / name).read_bytes() == FOLLOWUP_FILE_CONTENT.encode()
@@ -533,16 +531,13 @@ def complete_post_action_response(binary: Path, workspace: Path, url: str) -> No
                               (request,)).fetchall()
             assert len(rows) == 1
             reply = rows[0][0]
-            if request == FOLLOWUP_RECOVERY_REQUEST:
-                assert reply.strip() == FOLLOWUP_RECOVERY_ANSWER
-            else:
-                assert "REAL WRITE RESULT:" in reply and name in reply
-                assert f"Bytes: {len(FOLLOWUP_FILE_CONTENT)}" in reply
+            assert "REAL WRITE RESULT:" in reply and name in reply
+            assert f"Bytes: {len(FOLLOWUP_FILE_CONTENT)}" in reply
             assert db.execute(
                 "SELECT count(*) FROM r2_log_events WHERE event_type='write_succeeded' AND summary LIKE ?",
                 (f"%/{name} (success)",),
             ).fetchone() == (1,)
-    print("PASS: a blank post-action answer replayed the same tool result without repeating the action.")
+    print("PASS: a blank post-action answer did not regenerate; each exact action result remained visible and each action ran once.")
 
 
 def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) -> None:
@@ -586,8 +581,8 @@ def learn_when_model_returns_no_answer(binary: Path, workspace: Path, url: str) 
         if payload["messages"][0]["content"].startswith(CONVERSATION_POLICIES)
         and payload["messages"][-1] == {"role": "user", "content": UNANSWERED_LEARNING_REQUEST}
     ]
-    assert len(requests) == 2 and requests[0] == requests[1]
-    print("PASS: two blank model answers exhausted one replay and preserved the exact user report for learning.")
+    assert len(requests) == 1
+    print("PASS: one blank model answer preserved the exact user report for learning without reply regeneration.")
 
 
 def preserve_robot_identity(binary: Path, workspace: Path, url: str) -> None:

@@ -4364,14 +4364,8 @@ static int r2_preserve_inference_units(const Message *msgs, size_t count,
     return 0;
 }
 
-typedef enum {
-    OLLAMA_RETRY_NONE,
-    OLLAMA_RETRY_INCOMPLETE_RESPONSE
-} OllamaRetryReason;
-
 static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predict,
-                                long timeout_seconds,
-                                OllamaRetryReason *retry);
+                                long timeout_seconds);
 
 /* The policy selector, compact allocator and wire serializer must use the
  * same generation quota. In particular, a 1024-token requested answer on a
@@ -5195,27 +5189,16 @@ static char *ollama_chat_with_limit(
             !!(current_visual_observations & R2_LIVE_DISPLAY),
             !ollama_isolated_request && ollama_original_reviewed_query != NULL);
 
-    OllamaRetryReason retry = OLLAMA_RETRY_NONE;
-    char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
-    int foreground_answer = ollama_foreground_turn_mode && ollama_audit_stage &&
-        !strcmp(ollama_audit_stage, "conversation-answer");
-    if (!result && retry == OLLAMA_RETRY_INCOMPLETE_RESPONSE &&
-        (ollama_isolated_request || foreground_answer) && !shutting_down) {
-        /* Replay the serialized request only. Keep the same evidence, and
-           return no action text until the response can be parsed. */
-        fprintf(stderr, "[R2 Ollama] Replaying one %s request after an incomplete or invalid response.\n",
-                ollama_isolated_request ? "isolated" : "foreground answer");
-        result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds, &retry);
-    }
+    /* A failed response is a failed inference, not authorization to
+       regenerate it. Durable post-turn work owns its own persistence lifecycle. */
+    char *result = ollama_submit_chat(payload, num_ctx, num_predict, timeout_seconds);
     json_object_put(root);
     return result;
 }
 
 static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predict,
-                                long timeout_seconds,
-                                OllamaRetryReason *retry)
+                                long timeout_seconds)
 {
-    *retry = OLLAMA_RETRY_NONE;
     /* Capture exactly what will be sent to Ollama only when the owner opts in. */
     ollama_trace_prompt_if_enabled(payload);
 
@@ -5309,8 +5292,6 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
             free(b.data);
             return NULL;
         }
-        if (cc == CURLE_PARTIAL_FILE || (cc == CURLE_RECV_ERROR && b.size > 0))
-            *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         const char *why = curl_error[0] ? curl_error : curl_easy_strerror(cc);
         char details[768];
         snprintf(details, sizeof(details),
@@ -5341,7 +5322,6 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
     }
 
     if (!b.data || b.size == 0) {
-        *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         fprintf(stderr, "[R2 Ollama] empty response body (HTTP %ld).\n", http_status);
         if (r2_log_is_initialized())
             r2_log_event(R2_LOG_ERROR, "ollama_empty_response",
@@ -5363,7 +5343,6 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
         if (r2_log_is_initialized())
             r2_log_event(R2_LOG_ERROR, "ollama_invalid_json",
                          "R2's text-model endpoint returned invalid JSON.", details, MODEL);
-        *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
         free(b.data);
         return NULL;
     }
@@ -5512,9 +5491,8 @@ static char *ollama_submit_chat(const char *payload, int num_ctx, int num_predic
     }
 
     if (!result) {
-        /* Retry empty output, but another request cannot fix a failed copy. */
-        if (!final_has_nonspace)
-            *retry = OLLAMA_RETRY_INCOMPLETE_RESPONSE;
+        /* Empty output and allocation failures remain distinct diagnostics;
+           neither triggers an additional model request. */
         /*
          * Do not print the model's private thinking text. Its presence/length,
          * final-channel length, and Ollama completion metadata distinguish an
@@ -15795,7 +15773,7 @@ static char *r2_talk_impl(const char *message)
     if (!core_initialized || shutting_down || !message)
         return NULL;
 
-    /* Retries within this turn reuse semantic cues but rebuild live context. */
+    /* The action follow-up reuses semantic cues but rebuilds live context. */
     r2_associative_query_cache_clear();
 
     fprintf(stderr, "[R2 Input Audit] r2_talk_received_chars=%zu\n", strlen(message));
