@@ -864,24 +864,11 @@ static int message_is_protected(const Message *message)
    BASIC HELPERS
    ============================================================ */
 
-static void die(const char *msg)
-{
-    fprintf(stderr, "Fatal: %s\n", msg);
-    exit(EXIT_FAILURE);
-}
-
-
+/* All callers own allocation failure through their ordinary cleanup path.
+ * In particular, failure to copy a reply must not terminate R2. */
 static char *xstrdup(const char *s)
 {
-    if (!s)
-        return strdup("");
-
-    char *p = strdup(s);
-
-    if (!p)
-        die("out of memory");
-
-    return p;
+    return strdup(s ? s : "");
 }
 
 
@@ -6188,6 +6175,15 @@ static char *chat_copy_all(void)
             xstrdup(
                 messages.items[i].content
             );
+        if (!copy[i].role || !copy[i].content) {
+            for (size_t j = 0; j <= i; ++j) {
+                free(copy[j].role);
+                free(copy[j].content);
+            }
+            free(copy);
+            pthread_mutex_unlock(&messages_lock);
+            return NULL;
+        }
 
         copy[i].pinned =
             messages.items[i].pinned;
@@ -15831,6 +15827,7 @@ static char *r2_talk_impl(const char *message)
 
     int64_t hands_result_id = attach_pending_hands_result();
     char *tool_evidence = NULL;
+    const char *runtime_notice = NULL;
     char *reply = chat_with_relevant_memories(message);
     int generated_reply = 0;
     if (shutting_down) goto interrupted_reply;
@@ -15842,14 +15839,9 @@ static char *r2_talk_impl(const char *message)
          */
         fprintf(stderr,
                 "[R2] Conversation generation failed; preserving the user turn.\n");
-        reply = xstrdup(
+        runtime_notice =
             "I'm sorry—I couldn't produce a usable reply just now. "
-            "Your message hasn't been discarded; please try again in a moment.");
-        if (!reply) {
-            fprintf(stderr,
-                    "[R2] Could not allocate the conversation fallback reply; preserving the user turn for the caller's fallback.\n");
-            return NULL;
-        }
+            "Your message hasn't been discarded; please try again in a moment.";
         goto finalize_reply;
     }
 
@@ -15861,8 +15853,8 @@ static char *r2_talk_impl(const char *message)
         !reply_is_standalone_media_inspection(stripped_reply)) {
         free(reply);
         free(stripped_reply);
-        reply = xstrdup("I couldn't produce a reply to this turn. Your message is still here.");
-        if (!reply) return NULL;
+        reply = NULL;
+        runtime_notice = "I couldn't produce a reply to this turn. Your message is still here.";
         goto finalize_reply;
     }
 
@@ -15875,13 +15867,10 @@ static char *r2_talk_impl(const char *message)
     if (!tools) {
         free(reply);
         free(stripped_reply);
-        reply = xstrdup(
+        reply = NULL;
+        runtime_notice =
             "I'm sorry—I couldn't finish processing that response. "
-            "Your message is still here; please try again in a moment.");
-        if (!reply) {
-            fprintf(stderr, "[R2] Could not allocate a visible reply after tool-processing failure; preserving the user turn.\n");
-            return NULL;
-        }
+            "Your message is still here; please try again in a moment.";
         fprintf(stderr,
                 "[R2] Tool processing failed; returning a visible reply and preserving the user turn.\n");
         goto finalize_reply;
@@ -15988,13 +15977,10 @@ static char *r2_talk_impl(const char *message)
         if (!reply_has_visible_text(sound_clean_reply)) {
             free(reply);
             free(sound_clean_reply);
-            reply = xstrdup(
+            reply = NULL;
+            runtime_notice =
                 "I'm sorry—I couldn't prepare a usable reply after processing it. "
-                "Your message is still here; please try again.");
-            if (!reply) {
-                    fprintf(stderr, "[R2] Could not allocate a visible reply after sound-marker cleanup failed; preserving the user turn.\n");
-                return NULL;
-            }
+                "Your message is still here; please try again.";
             fprintf(stderr,
                     "[R2] Reply cleanup produced no visible text; returning a visible reply and preserving the user turn.\n");
         } else {
@@ -16008,11 +15994,14 @@ static char *r2_talk_impl(const char *message)
 
 interrupted_reply:
     free(reply);
-    reply = strdup("I received your message. Shutdown interrupted my reply.");
-    if (!reply) return NULL;
+    reply = NULL;
+    runtime_notice = "I received your message. Shutdown interrupted my reply.";
 
 finalize_reply:
+    /* A runtime notice is static text, not model dialogue. Persist the
+       accepted turn before allocating the caller-owned display copy. */
     pthread_mutex_lock(&messages_lock);
+    const char *reply_text = reply ? reply : runtime_notice;
     /* The result has now served its inference lifetime. Its durable row is
        acknowledged only after the turn commits; the temporary live pair need
        not consume space while admitting the final visible reply. */
@@ -16042,7 +16031,7 @@ finalize_reply:
     int64_t turn_event_id = (shutting_down && !generated_reply ? r2_log_conversation_turn_with_notice :
                              shutting_down ? r2_log_conversation_turn_with_evidence :
                              generated_reply ? r2_log_conversation_turn_for_learning :
-                                               r2_log_conversation_turn_with_fallback)(message, reply,
+                                               r2_log_conversation_turn_with_fallback)(message, reply_text,
         speech ? speech->events : NULL, speech ? speech->count : 0,
         reviews ? reviews->archives : NULL, reviews ? reviews->count : 0, tool_evidence);
     if (!shutting_down && hands_result_id > 0 && generated_reply && turn_event_id > 0 &&
@@ -16192,12 +16181,14 @@ finalize_reply:
     if (turn_event_id <= 0) {
         char *with_storage_status = NULL;
         if (asprintf(&with_storage_status, "%s\n\n[R2 Runtime] This exchange could not be saved to the Life Log.",
-                     reply) >= 0) {
+                     reply_text) >= 0) {
             free(reply);
             reply = with_storage_status;
         }
     }
 
+    if (!reply)
+        reply = xstrdup(reply_text);
     last_talk_reply_generated = generated_reply;
     return reply;
 }

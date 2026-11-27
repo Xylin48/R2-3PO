@@ -37,6 +37,9 @@ static const char retry_copy_user[] = "Replay this evidence after an allocation 
 static atomic_int fail_replay_copy = ATOMIC_VAR_INIT(0);
 static char borrowed_tool_fixture[] = "Exact borrowed action result fixture.";
 static atomic_int fail_borrowed_tool_copy = ATOMIC_VAR_INIT(0);
+static atomic_int fail_runtime_notice_copy = ATOMIC_VAR_INIT(0);
+static const char runtime_notice_fixture[] =
+    "I couldn't produce a reply to this turn. Your message is still here.";
 
 char *__real_strdup(const char *value);
 char *__wrap_strdup(const char *value)
@@ -49,6 +52,10 @@ char *__wrap_strdup(const char *value)
         errno = ENOMEM;
         return NULL;
     }
+    if (!strcmp(value, runtime_notice_fixture) && atomic_exchange(&fail_runtime_notice_copy, 0)) {
+        errno = ENOMEM;
+        return NULL;
+    }
     return __real_strdup(value);
 }
 
@@ -56,6 +63,13 @@ char *__wrap_strdup(const char *value)
  * byte of already captured evidence, including the terminating NUL. */
 static void check_tool_capture_failure_preserves_evidence(void)
 {
+    /* The shared copy helper must propagate ENOMEM instead of exiting. */
+    atomic_store(&fail_replay_copy, 1);
+    errno = 0;
+    assert(xstrdup(retry_copy_user) == NULL && errno == ENOMEM);
+    char *copied = xstrdup(retry_copy_user);
+    assert(copied && !strcmp(copied, retry_copy_user));
+    free(copied);
     int failed = 1;
     char *empty = process_tools_with_capture_status("ordinary dialogue", NULL, &failed);
     assert(empty && !*empty && failed == 0);
@@ -1785,6 +1799,27 @@ static void check_action_result_under_history_pressure(void)
             assert(strcmp(json_object_get_string(content), reply));
     }
     free(answer);
+    free(reply);
+    r2_associative_query_cache_clear();
+    message_free_all();
+
+    /* Failure to allocate the caller-owned notice must not skip durable
+       finalization of the user turn, or terminate the process. */
+    set_response("[MEDIA_SEE] What is on the screen?\n[READ] turn-result-fixture.txt", "stop", 1);
+    atomic_store(&fail_runtime_notice_copy, 1);
+    core_initialized = 1;
+    reply = r2_talk("Inspect the screen once more.");
+    core_initialized = 0;
+    pthread_mutex_lock(&post_turn_lock);
+    while (post_turn_active) pthread_cond_wait(&post_turn_cond, &post_turn_lock);
+    pthread_mutex_unlock(&post_turn_lock);
+    assert(!atomic_load(&fail_runtime_notice_copy));
+    assert(reply && !r2_talk_last_reply_generated());
+    assert(memory_fixture_count("SELECT count(*) FROM r2_log_conversations "
+        "WHERE user_text='Inspect the screen once more.' AND assistant_text="
+        "'I couldn''t produce a reply to this turn. Your message is still here.';") == 1);
+    assert(messages.count && !strcmp(messages.items[messages.count - 1].role, "user") &&
+           !strcmp(messages.items[messages.count - 1].content, "Inspect the screen once more."));
     free(reply);
     r2_associative_query_cache_clear();
     message_free_all();
