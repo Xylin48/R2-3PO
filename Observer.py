@@ -53,6 +53,25 @@ class ActivityWriter:
         self._offset = 0
         self._saved_ids = set()
 
+    def _reset_index(self):
+        self._identity = None
+        self._offset = 0
+        self._saved_ids.clear()
+
+    def replay_cursor(self, cursor: int) -> int:
+        """Restart authoritative replay when the indexed file no longer exists."""
+        if self._identity is None:
+            return cursor
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            self._reset_index()
+            return 0
+        if (stat.st_dev, stat.st_ino) != self._identity or stat.st_size < self._offset:
+            self._reset_index()
+            return 0
+        return cursor
+
     @staticmethod
     def _append_and_sync(stream, data: bytes) -> int:
         if stream.write(data) != len(data):
@@ -61,7 +80,8 @@ class ActivityWriter:
         os.fsync(stream.fileno())
         return stream.tell()
 
-    def append(self, local_time: str, summary: str, event_id: int) -> None:
+    def append(self, local_time: str, summary: str, event_id: int, *,
+               replay: bool = False) -> None:
         if event_id <= 0:
             raise ValueError("Activity event ID must be positive")
         clean_time = " ".join((local_time or "time unavailable").split())
@@ -73,10 +93,12 @@ class ActivityWriter:
             stat = os.fstat(stream.fileno())
             identity = (stat.st_dev, stat.st_ino)
             if identity != self._identity or stat.st_size < self._offset:
-                # Do not carry cached event IDs across a log rotation or truncation.
+                # If the file changed during a replay page, do not append a
+                # newer ID ahead of the earlier rows that now need replay.
+                if replay and self._identity is not None:
+                    raise OSError(errno.ESTALE, "Activity.txt changed during replay")
+                self._reset_index()
                 self._identity = identity
-                self._offset = 0
-                self._saved_ids.clear()
 
             # A crash can interrupt initial header creation. If every existing
             # byte is its exact prefix, repair by appending the missing suffix.
@@ -144,6 +166,9 @@ def reconcile_activity_page(connection, writer: ActivityWriter, cursor: int,
     The Life Log remains query-only. A failed append never advances the
     cursor; the file index makes replay after an uncertain flush idempotent.
     """
+    if batch_size <= 0:
+        raise ValueError("Activity replay batch size must be positive")
+    cursor = writer.replay_cursor(cursor)
     allowed_types = tuple(sorted(PUBLIC_EVENT_TYPES))
     placeholders = ",".join("?" for _ in allowed_types)
     rows = connection.execute(
@@ -153,7 +178,7 @@ def reconcile_activity_page(connection, writer: ActivityWriter, cursor: int,
         (cursor, latest, *allowed_types, batch_size),
     ).fetchall()
     for row in rows:
-        writer.append(row["local_time"], row["summary"], int(row["id"]))
+        writer.append(row["local_time"], row["summary"], int(row["id"]), replay=True)
     return (latest if len(rows) < batch_size else int(rows[-1]["id"])), rows
 
 
@@ -244,6 +269,9 @@ def main() -> int:
                             summary = " ".join((row["summary"] or "").split())
                             tree.insert("", "end", iid=item_id,
                                         values=(row["local_time"] or "time unavailable", summary))
+                        # A file replay can revisit rows already aged out of
+                        # the popup. Never reinsert them as new live events.
+                        display_cutoff = event_id
                     last_id = next_cursor
                     activity_file_error = False
                 children = tree.get_children()

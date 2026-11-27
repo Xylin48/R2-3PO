@@ -138,3 +138,55 @@ with tempfile.TemporaryDirectory() as directory:
     writer.append("2026-11-14", "Another event", 3)
     assert output.read_bytes() == complete + exact + b"[2026-11-14] Another event (event #3)\n"
 print("Observer repaired known interrupted header and UTF-8 event bytes without rewriting history.")
+
+
+# Rotation/truncation while the Observer stays open must replay the original
+# public history, even when no new event has appeared in the Life Log.
+with tempfile.TemporaryDirectory() as directory:
+    output = Path(directory) / "Activity.txt"
+    rotated = Path(directory) / "Activity.old"
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE r2_log_events "
+               "(id INTEGER PRIMARY KEY,local_time TEXT,category TEXT,event_type TEXT,summary TEXT)")
+    db.executemany("INSERT INTO r2_log_events VALUES(?,?,?,?,?)", [
+        (1, "2026-11-26", "world", "object_added", "First"),
+        (2, "2026-11-26", "thinking", "thought", "PRIVATE"),
+        (3, "2026-11-26", "media", "activity_ended", "Third"),
+    ])
+    writer = module.ActivityWriter(output)
+    cursor, _ = module.reconcile_activity_page(db, writer, 0, 3)
+    original = output.read_bytes()
+    assert cursor == 3 and b"PRIVATE" not in original
+    output.rename(rotated)
+    cursor, _ = module.reconcile_activity_page(db, writer, cursor, 3, batch_size=1)
+    assert cursor == 1
+    while cursor < 3:
+        cursor, _ = module.reconcile_activity_page(db, writer, cursor, 3, batch_size=1)
+    assert output.read_bytes() == original == rotated.read_bytes()
+    output.write_bytes(b"")
+    cursor, _ = module.reconcile_activity_page(db, writer, cursor, 3)
+    assert cursor == 3 and output.read_bytes() == original
+
+    # A replacement between the page's cursor check and its first append
+    # must fail that page rather than publish event four ahead of the past.
+    db.execute("INSERT INTO r2_log_events VALUES(4,'2026-11-26','world','object_added','Fourth')")
+    saved_append = writer.append
+    def rotate_before_append(*args, **kwargs):
+        output.rename(rotated)
+        writer.append = saved_append
+        return saved_append(*args, **kwargs)
+    writer.append = rotate_before_append
+    try:
+        module.reconcile_activity_page(db, writer, cursor, 4)
+    except OSError as exc:
+        assert exc.errno == module.errno.ESTALE
+    else:
+        raise AssertionError("replay accepted a changed Activity file mid-page")
+    assert output.read_bytes() == b""
+    cursor, _ = module.reconcile_activity_page(db, writer, cursor, 4)
+    assert cursor == 4
+    assert output.read_bytes() == original + b"[2026-11-26] Fourth (event #4)\n"
+    db.close()
+assert "display_cutoff = event_id" in poll
+print("Observer live rotation, truncation, mid-page replacement and popup high-water regression passed.")
