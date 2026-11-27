@@ -3179,3 +3179,131 @@ Manually inspect every line in every tracked source file, not merely signatures,
 - Both primary start functions check cancellation before early return/takeover and reject Watch acquisition of an explicitly opened nonworker source under the lifecycle lock, closing the race between discovery snapshot and actual acquisition. Native actual-Ears fixture tests manual custody and cancelled acquisition. Startup notices describe worker opening rather than asserting PCM receipt before any sample arrives. Shell listen parser rejects negative unsigned wrap just as the model tool already does; static fixture updated. Source commit 6201adbf254e8a740b4cb7fffe3d902d2dd4d46a.
 - Actual local execution: /tmp/r2-audit386.c, standalone C transcription of primary/desktop ring and live interval logic with synthetic receiver, real pthread/atomics/stdio. Corrected a harness-only misleading-indentation warning, then strict C11 -Wall -Wextra -Werror ASan/UBSan with leak detection PASS: 90 primary/desktop retained-span, ring-wrap, transport retirement, generation and cancellation cases. No full checkout/build, hardware/model or overnight acceptance.
 - Exact comparison of starting checkpoint to final source: 3 source/test commits, 15 files changed, 250 insertions / 26 deletions. Intermediate hosted runs 46078974359 and 46079062401 cancelled on subsequent source pushes after 32 and 37 successes respectively, zero failed steps. Final exact-source run 46079261736 (job 140774186204) observed {"success":36,"in_progress":1,"pending":91}; do not treat partial result as full pass. Conservative unique whole-file inventory remains 76/193, not readiness percentage. Continue exact-head verification, remaining capture cancellation/publication windows and broader whole-file audit reconciliation. No main merge, target-host or network configuration changes, model/context capacity change, fallback or recovery layer.
+
+
+### 387. Reconcile Watch desktop ownership fixture with active-transport evidence
+
+- Exact preceding source workflow 46079261736, job 140774186204: 42 successes, one failure, 86 skipped. Read actual job log: tests/ears_watch_ownership_runtime.c:317 failed desktop_transcript && !strcmp(desktop_transcript, expected). Its seeded desktop history and running flag omitted the synthetic transport-open state now required by the real active-source contract. Set synthetic_desktop_open on the seeded fixture and clear it during teardown; preserve production liveness and exact transcript assertions. Commit 60692c04383ba824d0d6f44cad2236d68558c455.
+- Independently rebuilt and reran both retained /tmp/r2-audit384.c and /tmp/r2-audit386.c isolated harnesses with strict C11 warnings, ASan/UBSan and leak detection. Actual repeated results: 28 canonical conversions, 47 malformed/truncated/cancelled clips, 36 transcript cases; 90 retained-span/ring-wrap/retirement/generation/cancellation cases. Neither harness is a full production build. Local compiler, SQLite 3.46.1, json-c 0.18 and libcurl 8.10.1 available; libpulse development pkg-config missing, GitHub DNS unresolved. Audit 383's earlier unverified isolated claims remain unverified.
+
+### 388. Verify Choice Lab status, relationship, comparison and cancelled review results
+
+- Complete manual reads of AlternateSelf.c/h, Imagination.c/h, tests/alternate_self_smoke.c, tests/imagination_unit_smoke.c; traced actual Life Log hypothetical transaction callback, structured finish/write helpers and shared evidence-review/model/marker call sites in r2.c. Existing status and feedback link SQL could report success after a trigger changed the requested record. Use explicit immediate transactions with exact in-transaction readback of status or branch/event/relation/details and rollback on mismatch; preserve null versus empty and binary matching. Status logging remains separate and emits a diagnostic if its event write fails. Compare requires two distinct positive existing branch IDs, while all queries expose branch kind and Life Log ID; archived imagination input remains in show, not list/compare. Evidence review checks cancellation for already fitting input and after final review; whitespace-only accuracy feedback cannot earn reinforcement. Native fixtures exercise rewrite rollback, exact links, full archive and identity, missing/duplicate comparison, shutdown and blank notes. Commit d6101d620c2549d57ee612825adb72b0c1779ad3.
+
+### 389. Verify exact hypothetical payload in branch creation and import transactions
+
+- Life Log/Choice Lab shared structured transaction accepts callback success, so verify the full row before returning SQLITE_OK: branch and Life Log IDs, name, scenario, assumptions, outcome, conclusion, evidence identity, explicit branch kind, optional complete imagination archive, and initial status. A rewritten/missing record now returns a constraint error and rolls back both inserts. New imported branch uses the same exact verification in its own transaction, without changing existing-content idempotency or deleting the preexisting source event. Native fixture injects scenario rewrite on creation/import, asserts no orphan event/branch from failed creation, and confirms import after fault removal. Commit 84f8e22a1e0e4d83f18dd1700d63962b461107e6.
+- Actual local /tmp/r2-audit388-sql.py executed on disposable SQLite 3.46.1: PASS 98 exact branch/status/link transaction cases, rollback and reopen integrity, including 1.1 MiB content, nullable values and changed fields. Isolated SQL verification, not full native execution.
+
+### 390. Keep VCR startup silent and read coherent Reality display snapshots
+
+- Read complete TV.py and both TV display/lifecycle fixtures. The two separate state connections could combine TV power/input with a different committed tape/position. Within each read and the combined refresh/deferred seek, use one read-only SQLite read transaction, preserving the standalone readers. Mute before setting media and playing during initialization; defer unmute until after submitting the saved position and only for selected playing transport. Periodic refresh cannot unmute or lift a pending/mismatched tape or publish its renderer. Existing generation cancellation and media-release ownership retained. Native Python fixture adds a real interleaved WAL commit and pending-tape refresh assertions; updates existing order assertion to require mute before play and seek before unmute. Does not certify actual VLC seek completion or physical AV behavior. Commit 43c0384ced70a5db1e6894fde7678acd6f514c6c.
+- Actual isolated Python/SQLite execution: PASS 100 read-only display snapshot/concurrent committed update pairs plus integrity_check (SQLite 3.46.1), reproducing the real query sequence with disposable storage. Full repository Python and native workflow still pending. No new model recovery, host/network changes, or architecture/context-capacity changes.
+- Compared starting documentation head b1c6e3d3a9abbf5756c8449f93b16f2b216d5448 to source head 43c0384ced70a5db1e6894fde7678acd6f514c6c: four source/test commits, nine files, +385/-99. Intermediate runs 46079637638, 46079815338 and 46079879795 cancelled by later source pushes after 36, 27 and 41 successful steps respectively; zero failures in those intermediate runs. Exact latest source run 46080167670, job 140777123521, observed 2 successes, 1 active and 125 pending. Do not count incomplete workflows as passes.
+
+#### Reconciled named whole-file audit inventory at audit 390
+
+Tree contains 193 tracked blobs. Reconstructed earlier 76 unique recorded whole-file paths, removing one repeated AudioDiscovery.c; independently reread the two memory fixtures named in audit 343. Add 21 newly reconciled whole-file paths from recent/current inspections (including prior full Ears fixture reads that had not been included in the frozen tally). All 97 names checked against the exact source tree. This counts historical complete manual reads of paths, not a guarantee every line is unchanged at current head or that 50% of software is ready. Scoped traces and test execution alone do not count. 96 tracked paths remain outside this inventory, including several large core files. Re-review changed regions separately.
+
+Earlier 76:
+- AGENTS.md
+- Addiction.c
+- Addiction.h
+- AlternateSelf.c
+- AlternateSelf.h
+- AudioCapture.c
+- AudioCapture.h
+- AudioDiscovery.c
+- AudioDiscovery.h
+- AudioFile.c
+- AudioFile.h
+- Ears.c
+- Ears.h
+- Eyes.c
+- Eyes.h
+- Imagination.c
+- Imagination.h
+- Log.c
+- Log.h
+- Makefile
+- Observer.py
+- R2Reply.c
+- R2Reply.h
+- R2Sounds.c
+- R2Sounds.h
+- Reward.c
+- Reward.h
+- SensoryJournal.c
+- SensoryJournal.h
+- V-Webcam.py
+- deploy/r2-3po.service
+- deploy/r2-ollama.service
+- r2_context_budget.h
+- r2_diary.c
+- r2_diary.h
+- r2_input.h
+- tests/addiction_legacy_schema_smoke.c
+- tests/alternate_self_smoke.c
+- tests/current_turn_context_smoke.py
+- tests/database_connection_audit_smoke.py
+- tests/diary_integration_smoke.c
+- tests/dream_context_integrity_runtime.c
+- tests/ears_attention_tool_smoke.py
+- tests/ears_live_interval_runtime.c
+- tests/ears_source_discovery_smoke.c
+- tests/eyes_file_geometry_runtime.c
+- tests/final_context_budget_smoke.py
+- tests/gpu_context_budget_smoke.py
+- tests/life_log_legacy_schema_smoke.c
+- tests/log_conversation_archive_failure_smoke.c
+- tests/log_linked_retrieval_smoke.c
+- tests/memory_ranking_behavior_smoke.c
+- tests/memory_schema_migration_smoke.c
+- tests/model_reference_consistency_smoke.py
+- tests/observer_filter_smoke.py
+- tests/ollama_gate_smoke.c
+- tests/ollama_preflight_smoke.py
+- tests/r2_conversation_context_runtime.c
+- tests/r2_reply_smoke.c
+- tests/r2_sounds_smoke.c
+- tests/recent_context_budget_runtime.c
+- tests/recent_context_budget_smoke.py
+- tests/reward_addiction_replay_runtime.c
+- tests/reward_atomic_idempotency_smoke.py
+- tests/reward_legacy_schema_smoke.c
+- tests/runtime_headroom_smoke.py
+- tests/sensory_journal_diary_identity_runtime.c
+- tests/sensory_journal_search_smoke.c
+- tests/vwebcam_smoke.py
+- tests/watch_coordinator_lifecycle_smoke.py
+- tests/watch_renderer_switch_runtime.c
+- tests/workspace_read_inode_runtime.c
+- tools/install_r2_overnight.sh
+- tools/preflight_ollama_model.py
+- tools/r2_ollama_runner.sh
+- tools/r2_service_runner.sh
+
+Additional 21:
+- Reality.h
+- TV.py
+- Visual.h
+- docs/local-speech-input.md
+- docs/state-aware-sounds.md
+- r2.h
+- shell.h
+- tests/ears_connect_cancel_runtime.c
+- tests/ears_dual_attention_wiring_smoke.py
+- tests/ears_dual_sources_runtime.c
+- tests/ears_extra_connect_cancel_runtime.c
+- tests/ears_file_cancel_runtime.c
+- tests/ears_multi_output_runtime.c
+- tests/ears_primary_history_runtime.c
+- tests/ears_speech_bridge_smoke.py
+- tests/ears_watch_ownership_runtime.c
+- tests/ears_whisper_wav_runtime.c
+- tests/imagination_unit_smoke.c
+- tests/r2_input_smoke.c
+- tests/tv_control_lifecycle_smoke.py
+- tests/tv_display_smoke.py
+
+Next: verify exact source workflow, reconcile any actual regressions, and continue substantial manual audit of the remaining paths, particularly r2.c, Reality.c, shell.c, Visual.c, lifecycle/launch and Game Boy integration. Main and physical host unchanged; installed model/device and overnight acceptance not established.
