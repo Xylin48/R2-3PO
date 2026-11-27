@@ -100,6 +100,7 @@ live_error = read_impl[live_error_start:live_error_end]
 assert "atomic_store(&ears->open, 0);" in live_error, (
     "a failed live microphone read must promptly invalidate its state"
 )
+assert live_error.index("atomic_store(&ears->open, 0);") < live_error.index('r2_log_sensory("audio_read_failed"')
 assert "r2_ears_close(ears);" not in live_error, (
     "the worker must not free a source or Pulse handle before its lifecycle owner joins it"
 )

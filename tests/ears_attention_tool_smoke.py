@@ -55,11 +55,13 @@ assert "reflection_repeated_hearing_request" in core
 # an orphaned open Pulse source left behind when the worker reaches EOF/error.
 status = core[core.index("int r2_ears_status(void)") : core.index("int r2_watch_active(void)")]
 assert "ears_capture_thread_started" in status
-assert "atomic_load(&ears_capture_running) ? 1 : 0" in status
+assert "atomic_load(&ears_capture_running) && r2_ears_is_open(ears)" in status
 capture = core[core.index("static void *r2_ears_capture_worker(void *unused)") :
                core.index("static int r2_ears_write_buffered_audio(")]
 assert "audio_capture_ended" in capture
 assert "atomic_store(&ears_capture_running, 0);" in capture
+assert capture.index("atomic_exchange(&ears_capture_running, 0)") < capture.index('"audio_capture_ended"')
+assert "atomic_load(&entry->running) && r2_ears_is_open(entry->receiver)" in core
 
 # Watch only maintains raw capture and must not turn incoming speech into chat.
 assert "r2_ears_listen_cancelable(" not in worker

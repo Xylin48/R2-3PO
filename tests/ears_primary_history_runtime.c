@@ -27,7 +27,10 @@ int64_t __wrap_r2_log_sensory(const char *event, const char *summary,
     int slot = !strcmp(source, source_names[1]);
     assert(!strcmp(source, source_names[slot]));
     if (!strcmp(event, "audio_level_change_notice")) ++level_notices[slot];
-    if (!strcmp(event, "audio_capture_ended")) ++ended_notices[slot];
+    if (!strcmp(event, "audio_capture_ended")) {
+        assert(!atomic_load(slot ? &ears_desktop_capture_running : &ears_capture_running));
+        ++ended_notices[slot];
+    }
     return 1;
 }
 
