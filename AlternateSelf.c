@@ -311,6 +311,41 @@ typedef struct {
     int64_t id;
 } AlternateSelfBranch;
 
+/* The Life Log transaction owns both records. Verify the exact branch row,
+ * not just SQLITE_DONE/changes, before either can be committed. */
+static int branch_row_matches(sqlite3 *db, int64_t id, int64_t event_id,
+                              const AlternateSelfBranch *branch)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db,
+        "SELECT 1 FROM r2_alternate_self_branches WHERE id=?1 AND log_event_id=?2 "
+        "AND name=?3 COLLATE BINARY AND scenario=?4 COLLATE BINARY "
+        "AND assumptions IS ?5 COLLATE BINARY AND predicted_outcome IS ?6 COLLATE BINARY "
+        "AND conclusion IS ?7 COLLATE BINARY AND evidence_event_id IS ?8 "
+        "AND branch_kind=?9 COLLATE BINARY AND imagination_context IS ?10 COLLATE BINARY "
+        "AND status='active' COLLATE BINARY;",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, event_id);
+    const char *fields[] = {branch->name, branch->scenario, branch->assumptions,
+                            branch->predicted_outcome, branch->conclusion};
+    for (int i = 0; i < 5 && rc == SQLITE_OK; ++i)
+        rc = fields[i] ? sqlite3_bind_text64(st, i + 3, fields[i], strlen(fields[i]),
+                                             SQLITE_TRANSIENT, SQLITE_UTF8)
+                       : sqlite3_bind_null(st, i + 3);
+    if (rc == SQLITE_OK) rc = branch->evidence_event_id > 0
+        ? sqlite3_bind_int64(st, 8, branch->evidence_event_id) : sqlite3_bind_null(st, 8);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 9,
+        branch->imagination_context ? "imagination" : "counterfactual", -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK) rc = branch->imagination_context
+        ? sqlite3_bind_text64(st, 10, branch->imagination_context,
+                              strlen(branch->imagination_context), SQLITE_TRANSIENT, SQLITE_UTF8)
+        : sqlite3_bind_null(st, 10);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW;
+}
+
 static int write_branch(sqlite3 *db, int64_t event_id, void *context)
 {
     AlternateSelfBranch *branch = context;
@@ -335,10 +370,14 @@ static int write_branch(sqlite3 *db, int64_t event_id, void *context)
                              SQLITE_TRANSIENT, SQLITE_UTF8)
         : sqlite3_bind_null(st, 9);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    if (rc == SQLITE_DONE && sqlite3_changes(db) == 1)
-        branch->id = sqlite3_last_insert_rowid(db);
+    int64_t id = rc == SQLITE_DONE && sqlite3_changes(db) == 1
+        ? sqlite3_last_insert_rowid(db) : -1;
     sqlite3_finalize(st);
-    return rc;
+    if (rc != SQLITE_DONE) return rc;
+    if (id <= 0 || !branch_row_matches(db, id, event_id, branch))
+        return SQLITE_CONSTRAINT;
+    branch->id = id;
+    return SQLITE_DONE;
 }
 
 static int64_t create_branch(const char *name, const char *scenario,
@@ -449,6 +488,10 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
         pthread_mutex_unlock(&as_lock);
         return -1;
     }
+    if (!sqlite3_get_autocommit(as_db) || as_exec("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&as_lock);
+        return -1;
+    }
     rc = sqlite3_prepare_v2(as_db,
         "INSERT OR IGNORE INTO r2_alternate_self_branches"
         "(name,scenario,assumptions,predicted_outcome,conclusion,status,evidence_event_id,log_event_id,created_utc,updated_utc,branch_kind)"
@@ -469,6 +512,16 @@ int64_t r2_altself_import_hypothesis(const char *scenario,
     int64_t id = rc == SQLITE_DONE && sqlite3_changes(as_db) == 1
         ? sqlite3_last_insert_rowid(as_db) : -1;
     sqlite3_finalize(st);
+    AlternateSelfBranch expected = {
+        .name = name, .scenario = scenario, .assumptions = assumptions,
+        .predicted_outcome = predicted_outcome, .conclusion = conclusion,
+        .evidence_event_id = evidence_event_id,
+    };
+    if (id <= 0 || !branch_row_matches(as_db, id, hypothetical_event_id, &expected) ||
+        as_exec("COMMIT;") != 0) {
+        if (!sqlite3_get_autocommit(as_db)) (void)as_exec("ROLLBACK;");
+        id = -1;
+    }
     pthread_mutex_unlock(&as_lock);
     return id;
 }

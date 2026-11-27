@@ -224,6 +224,37 @@ int main(void)
                "preserve legacy Alternate-Self branch through additive migration")) goto done;
     free(view); view = NULL;
 
+    fixture = NULL;
+    if (!check(sqlite3_open(database, &fixture) == SQLITE_OK, "open branch rewrite fixture")) goto done;
+    int rewrite_branch = sqlite3_exec(fixture,
+        "CREATE TRIGGER rewrite_branch AFTER INSERT ON r2_alternate_self_branches "
+        "WHEN NEW.scenario IN ('Exact new branch','Exact new import') BEGIN "
+        "UPDATE r2_alternate_self_branches SET scenario='different scenario' WHERE id=NEW.id; END;",
+        NULL, NULL, NULL);
+    if (!check(rewrite_branch == SQLITE_OK, "install branch rewrite fixture")) {
+        sqlite3_close(fixture); goto done;
+    }
+    int64_t false_branch = r2_altself_create("Exact name", "Exact new branch",
+                                            "exact assumptions", NULL, NULL, 0);
+    int64_t source_event = r2_log_hypothetical("Exact new import", NULL, NULL, NULL, "fixture");
+    int64_t false_import = r2_altself_import_hypothesis("Exact new import", NULL, NULL,
+                                                       NULL, source_event, 0);
+    sqlite3_stmt *changed_branch = NULL;
+    int rolled_back = sqlite3_prepare_v2(fixture,
+        "SELECT (SELECT count(*) FROM r2_log_events WHERE summary='Exact new branch'),"
+        "(SELECT count(*) FROM r2_alternate_self_branches WHERE scenario='different scenario');",
+        -1, &changed_branch, NULL) == SQLITE_OK &&
+        sqlite3_step(changed_branch) == SQLITE_ROW &&
+        sqlite3_column_int(changed_branch, 0) == 0 &&
+        sqlite3_column_int(changed_branch, 1) == 0;
+    sqlite3_finalize(changed_branch);
+    rewrite_branch = sqlite3_exec(fixture, "DROP TRIGGER rewrite_branch;", NULL, NULL, NULL);
+    sqlite3_close(fixture);
+    if (!check(false_branch < 0 && source_event > 0 && false_import < 0 &&
+               rolled_back && rewrite_branch == SQLITE_OK &&
+               r2_altself_import_hypothesis("Exact new import", NULL, NULL, NULL, source_event, 0) > 0,
+               "rewritten branch and import roll back; exact import can succeed afterward")) goto done;
+
     first = r2_altself_create("Look left", "What if I looked left?",
                               "I have not looked yet.", "I might see an object.",
                               "This is only a prediction.", evidence_id);
