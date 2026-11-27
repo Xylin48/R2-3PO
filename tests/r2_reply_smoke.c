@@ -95,6 +95,32 @@ int main(void)
     assert(reply && !strcmp(reply, "Safe answer."));
     free(reply);
 
+    /* The final channel is ordinary dialogue unless it contains explicit
+       private syntax or a metaconversational planning prefix. */
+    const char *const direct_replies[] = {
+        "I'll answer your question in a moment.",
+        "I need to answer the phone.",
+        "I should answer that question carefully.",
+        "I will respond when I have finished reading.",
+        "Let's craft a paper airplane.",
+        "We need to answer the door.",
+        "We need to make sure the television is off.",
+        "The user wantsomething is a literal identifier."
+    };
+    for (size_t i = 0; i < sizeof(direct_replies) / sizeof(direct_replies[0]); ++i) {
+        reply = r2_reply_sanitize(direct_replies[i]);
+        assert(reply && !strcmp(reply, direct_replies[i]));
+        free(reply);
+    }
+    reply = r2_reply_sanitize("<think>private material</think>I'll answer your question.");
+    assert(reply && !strcmp(reply, "I'll answer your question."));
+    free(reply);
+    reply = r2_reply_sanitize("I should answer the user with a concise response.");
+    assert(reply == NULL);
+    reply = r2_reply_sanitize("I should answer the user.\nFinal: Here is my answer.");
+    assert(reply && !strcmp(reply, "Here is my answer."));
+    free(reply);
+
     /* Literal private-tag syntax in Markdown code is user-facing content,
        not an instruction to remove the example. */
     reply = r2_reply_sanitize("Use `<think>example</think>` literally.");

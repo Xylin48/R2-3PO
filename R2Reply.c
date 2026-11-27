@@ -235,14 +235,22 @@ char *r2_reply_sanitize_with_literals(const char *reply,
     /* Classify labeled scratch only after private tags have been removed.
        A Final: line inside a hidden block is never an answer boundary. */
     const char *start = reply;
+    /* The final-channel text can legitimately begin with ordinary
+       first-person language. Only explicitly metaconversational prefixes
+       identify unlabeled planning; a promise to answer a question or a
+       statement of intent is not itself private reasoning. */
     static const char *const scratch_prefixes[] = {
-        "we need answer", "we need to answer", "we need respond",
-        "we need to respond", "we should answer", "we should respond",
-        "we need provide", "we need to provide", "we should provide",
-        "let's craft", "let us craft", "let me formulate",
-        "i need to answer", "i should answer", "i will respond",
-        "i'll answer", "the user asks", "the user wants",
-        "we need make sure", "we need ensure", NULL
+        "we need answer the user", "we need to answer the user",
+        "we need respond to the user", "we need to respond to the user",
+        "we should answer the user", "we should respond to the user",
+        "we need provide the user", "we need to provide the user",
+        "we should provide the user",
+        "let's craft a response to the user",
+        "let us craft a response to the user",
+        "let me formulate a response to the user",
+        "i need to answer the user", "i should answer the user",
+        "i will respond to the user", "i'll answer the user",
+        "the user asks", "the user wants", NULL
     };
     size_t len = strlen(start);
     size_t block_count = 0;
@@ -419,7 +427,8 @@ char *r2_reply_sanitize_with_literals(const char *reply,
         !strncasecmp(visible, "thinking:", 9);
     for (size_t i = 0; !visible_looks_private && scratch_prefixes[i]; ++i) {
         size_t n = strlen(scratch_prefixes[i]);
-        if (!strncasecmp(visible, scratch_prefixes[i], n))
+        if (!strncasecmp(visible, scratch_prefixes[i], n) &&
+            !isalnum((unsigned char)visible[n]) && visible[n] != '_')
             visible_looks_private = 1;
     }
     if (visible_looks_private) {

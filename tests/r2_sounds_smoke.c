@@ -153,6 +153,33 @@ int main(void)
            strstr(clean, "hello "));
     free(clean);
 
+    /* CRLF fence recognition preserves the literal example and its exact
+       line endings, but recognizes the active marker after the fence. */
+    const char *crlf = "Example:\r\n```text\r\n[R2_SOUND:beep:curious]\r\n```\r\n"
+                       "Hello [R2_SOUND:whistle:happy] again.";
+    const char *crlf_visible = "Example:\r\n```text\r\n[R2_SOUND:beep:curious]\r\n```\r\n"
+                               "Hello  again.";
+    clean = r2_sounds_process_reply(crlf);
+    assert(clean && !strcmp(clean, crlf_visible));
+    free(clean);
+    clean = r2_sounds_strip_markers(crlf);
+    assert(clean && !strcmp(clean, crlf_visible));
+    free(clean);
+
+    /* An unmatched tick is ordinary text; a matched multiline span
+       still preserves its literal marker. */
+    clean = r2_sounds_process_reply("A stray ` tick. [R2_SOUND:beep:curious] Hello.");
+    assert(clean && !strcmp(clean, "A stray ` tick.  Hello."));
+    free(clean);
+    clean = r2_sounds_strip_markers("A stray ` tick. [R2_SOUND:beep:curious] Hello.");
+    assert(clean && !strcmp(clean, "A stray ` tick.  Hello."));
+    free(clean);
+    clean = r2_sounds_process_reply(
+        "Example `first\n[R2_SOUND:beep:curious]` then [R2_SOUND:whistle:happy] hello.");
+    assert(clean && !strcmp(clean,
+        "Example `first\n[R2_SOUND:beep:curious]` then  hello."));
+    free(clean);
+
     /* Model output casing can vary; control syntax must never leak as prose. */
     clean = r2_sounds_process_reply("Before [r2_sound:beep:curious] after");
     assert(clean && !strcasestr(clean, "[r2_sound:") &&

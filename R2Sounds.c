@@ -478,6 +478,24 @@ static int sound_fence_line(const char *line, size_t length,
     return 1;
 }
 
+/* A backtick run is an inline delimiter only if a matching run exists.
+   A stray literal tick must not turn the rest of a reply into code. */
+static int sound_has_matching_ticks(const char *reply, size_t len,
+                                    size_t pos, size_t run_length)
+{
+    while (pos < len) {
+        if (reply[pos] != '`') {
+            ++pos;
+            continue;
+        }
+        size_t run = 1;
+        while (run < len - pos && reply[pos + run] == '`') ++run;
+        if (run == run_length) return 1;
+        pos += run;
+    }
+    return 0;
+}
+
 static char *process_reply_markers(const char *reply, int play_sound,
                                    size_t (*literal_span)(const char *, size_t))
 {
@@ -509,17 +527,20 @@ static char *process_reply_markers(const char *reply, int play_sound,
         while (line_end < len && reply[line_end] != '\n')
             ++line_end;
         size_t line_length = line_end - src;
+        size_t fence_check_length = line_length;
+        if (fence_check_length && reply[line_end - 1] == '\r')
+            --fence_check_length;
         char found_fence_char = '\0';
         size_t found_fence_length = 0;
 
         if (in_fence) {
             memcpy(clean + dst, reply + src, line_length);
             dst += line_length;
-            if (sound_fence_line(reply + src, line_length, fence_char,
+            if (sound_fence_line(reply + src, fence_check_length, fence_char,
                                  fence_length, 1, NULL, NULL))
                 in_fence = 0;
         } else if (inline_ticks == 0 &&
-                   sound_fence_line(reply + src, line_length, '\0', 0, 0,
+                   sound_fence_line(reply + src, fence_check_length, '\0', 0, 0,
                                     &found_fence_char, &found_fence_length)) {
             /* Fenced examples are literal text, never hidden actions. */
             memcpy(clean + dst, reply + src, line_length);
@@ -536,10 +557,12 @@ static char *process_reply_markers(const char *reply, int play_sound,
                         ++run;
                     memcpy(clean + dst, reply + pos, run);
                     dst += run;
-                    if (inline_ticks == 0)
-                        inline_ticks = run;
-                    else if (inline_ticks == run)
+                    if (inline_ticks == 0) {
+                        if (sound_has_matching_ticks(reply, len, pos + run, run))
+                            inline_ticks = run;
+                    } else if (inline_ticks == run) {
                         inline_ticks = 0;
+                    }
                     pos += run;
                     continue;
                 }
