@@ -77,6 +77,8 @@ int main(void)
         "done\n"
         "printf '%s\\n' \"$$\" > \"$R2_TEST_CHILD_PID_FILE\"\n"
         "if [ \"$R2_TEST_FILE_MODE\" = failed ]; then exit 23; fi\n"
+        "if [ \"$R2_TEST_FILE_MODE\" = malformed ]; then printf 'ABCDEFG'; exit 0; fi\n"
+        "if [ \"$R2_TEST_FILE_MODE\" = tail_only ]; then printf 'A'; exit 0; fi\n"
         "if [ \"$R2_TEST_FILE_MODE\" = unconfirmed ]; then\n"
         "  printf 'WXYZ'\n"
         "  exec 1>&-\n"
@@ -145,6 +147,24 @@ int main(void)
     assert(r2_audio_file_read(ears->file_stream, out, sizeof(out)) == -1 && errno == ETIMEDOUT);
     r2_ears_close(ears);
 
+    /* Do not lose an intact frame that shares a read with a malformed tail. */
+    assert(setenv("R2_TEST_FILE_MODE", "malformed", 1) == 0);
+    assert(r2_ears_open_file(ears, unusual_filename) == 0);
+    char partial[8];
+    assert(r2_ears_read(ears, partial, sizeof(partial)) == 4);
+    assert(memcmp(partial, "ABCD", 4) == 0);
+    assert(r2_ears_read(ears, partial, sizeof(partial)) == -1 && errno == EPROTO);
+    assert(!r2_ears_is_open(ears));
+    assert(r2_audio_file_read(ears->file_stream, partial, sizeof(partial)) == -1 && errno == EPROTO);
+    r2_ears_close(ears);
+
+    assert(setenv("R2_TEST_FILE_MODE", "tail_only", 1) == 0);
+    R2AudioFile *tail = r2_audio_file_open(unusual_filename, 48000, 2);
+    assert(tail);
+    assert(r2_audio_file_read(tail, partial, sizeof(partial)) == -1 && errno == EPROTO);
+    assert(r2_audio_file_read(tail, partial, sizeof(partial)) == -1 && errno == EPROTO);
+    r2_audio_file_close(tail);
+
     assert(setenv("R2_TEST_FILE_MODE", "stalled", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 4);
@@ -177,7 +197,7 @@ int main(void)
     assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
-    assert(source_closes == 5); /* EOF, reopen, failed decoder, unconfirmed exit, cancellation */
+    assert(source_closes == 6); /* EOF, reopen, failed decoder, unconfirmed exit, malformed tail, cancellation */
     assert(unlink(pid_path) == 0);
     assert(unlink(script) == 0);
     assert(rmdir(root) == 0);
