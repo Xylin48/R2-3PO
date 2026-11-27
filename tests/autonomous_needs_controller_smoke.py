@@ -63,7 +63,7 @@ assert "if (!autonomous_needs_action_still_needed(safe_action))" in function
 assert "autonomous_needs_stale_action" in function
 
 assert "int action_succeeded = 0;" in function
-assert "process_tools_with_status(safe_action, &action_succeeded, NULL)" in function
+assert "process_tools_with_status(safe_action, &action_succeeded)" in function
 assert "action_succeeded ? R2_LOG_WORLD : R2_LOG_ERROR" in function
 assert "autonomous_needs_yielded_to_conversation" in function
 assert "pthread_mutex_trylock(&conversation_turn_lock)" in function

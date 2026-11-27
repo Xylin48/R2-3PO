@@ -81,7 +81,7 @@ require(
     "action-control blocks and lines do not count as visible user-facing text",
 )
 visible_gate = impl.find("if (!reply_has_visible_text(stripped_reply) &&")
-tool_execution = impl.find("char *tools = process_tools_with_status(stripped_reply, NULL, &capture_failed)")
+tool_execution = impl.find("char *tools = process_tools_with_capture_status(stripped_reply, NULL, &capture_failed)")
 require(
     visible_gate >= 0 and tool_execution > visible_gate
     and "!reply_is_standalone_media_inspection(stripped_reply)" in impl[visible_gate:tool_execution]
@@ -96,7 +96,7 @@ require(
 )
 
 tool_processor = function_slice(
-    "static char *process_tools_with_status(",
+    "static char *process_tools_with_capture_status(",
     "/* Preserve the existing result-only interface for ordinary callers. */",
 )
 growth_start = tool_processor.find("char *_grown = realloc(results, _new_cap);")

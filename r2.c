@@ -9446,7 +9446,7 @@ static char *tool_capture_failure(char *results, size_t len)
     return results;
 }
 
-static char *process_tools_with_status(
+static char *process_tools_with_capture_status(
     const char *reply,
     int *world_action_succeeded,
     int *capture_failed)
@@ -10644,10 +10644,16 @@ static char *process_tools_with_status(
     return results;
 }
 
+/* Keep the world-action status interface independent of capture status. */
+static char *process_tools_with_status(const char *reply, int *world_action_succeeded)
+{
+    return process_tools_with_capture_status(reply, world_action_succeeded, NULL);
+}
+
 /* Preserve the existing result-only interface for ordinary callers. */
 static char *process_tools(const char *reply)
 {
-    return process_tools_with_status(reply, NULL, NULL);
+    return process_tools_with_status(reply, NULL);
 }
 
 
@@ -11867,7 +11873,7 @@ static void autonomous_needs_check(void)
                 pthread_mutex_unlock(&conversation_turn_lock);
             } else {
                 int action_succeeded = 0;
-                char *result = process_tools_with_status(safe_action, &action_succeeded, NULL);
+                char *result = process_tools_with_status(safe_action, &action_succeeded);
                 /* The action handler reports its actual persistence result. Do
                    not infer success by searching user-facing output prose: that
                    text may change or fail to allocate after the world changed. */
@@ -15865,7 +15871,7 @@ static char *r2_talk_impl(const char *message)
         goto interrupted_reply;
     }
     int capture_failed = 0;
-    char *tools = process_tools_with_status(stripped_reply, NULL, &capture_failed);
+    char *tools = process_tools_with_capture_status(stripped_reply, NULL, &capture_failed);
     if (!tools) {
         free(reply);
         free(stripped_reply);

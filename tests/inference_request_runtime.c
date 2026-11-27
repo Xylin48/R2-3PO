@@ -57,7 +57,7 @@ char *__wrap_strdup(const char *value)
 static void check_tool_capture_failure_preserves_evidence(void)
 {
     int failed = 1;
-    char *empty = process_tools_with_status("ordinary dialogue", NULL, &failed);
+    char *empty = process_tools_with_capture_status("ordinary dialogue", NULL, &failed);
     assert(empty && !*empty && failed == 0);
     free(empty);
     const char prior[] = "first action completed\nsecond action completed\n";

@@ -9,7 +9,7 @@ sound_header = (ROOT / "R2Sounds.h").read_text(encoding="utf-8")
 reply_module = (ROOT / "R2Reply.c").read_text(encoding="utf-8")
 
 marker_processing_index = r2.find("clean_final_reply(reply)")
-tool_processing_index = r2.find("char *tools = process_tools_with_status(stripped_reply, NULL, &capture_failed)")
+tool_processing_index = r2.find("char *tools = process_tools_with_capture_status(stripped_reply, NULL, &capture_failed)")
 strip_marker_index = r2.find("r2_sounds_strip_markers_with_literals(reply, literal_tool_span)")
 
 checks = {
@@ -18,7 +18,7 @@ checks = {
     "sound-state choices use contextual affect judgment rather than a fixed mapping": "AFFECT AND NONVERBAL EXPRESSION" in r2 and "Distinguish observed cues from uncertain interpretations" in r2 and "choose any state tag as your own contextual judgment, not by a fixed mapping" in r2 and "do not rely on a hard-coded emotion-to-response table" in r2,
     "nonverbal sounds remain optional and are not forced into routine replies": "Do not invent a physical event or force a sound into a routine reply" in r2 and "Prefer no sound when it adds nothing" in r2,
     "tool routing is decided before playback": marker_processing_index >= 0 and tool_processing_index >= 0 and tool_processing_index < marker_processing_index,
-    "sound markers are stripped before tool side effects": strip_marker_index >= 0 and tool_processing_index >= 0 and strip_marker_index < tool_processing_index and "process_tools_with_status(stripped_reply, NULL, &capture_failed)" in r2 and "r2_sounds_strip_markers" in sound_header,
+    "sound markers are stripped before tool side effects": strip_marker_index >= 0 and tool_processing_index >= 0 and strip_marker_index < tool_processing_index and "process_tools_with_capture_status(stripped_reply, NULL, &capture_failed)" in r2 and "r2_sounds_strip_markers" in sound_header,
     "official FX location is hard-coded in the sound API": '/home/x/R2_Home/R2_sounds/FX' in sound_header,
     "launcher uses the official FX location as its default": '/home/x/R2_Home/R2_sounds/FX' in launcher,
     "reply sanitizer removes explicit private reasoning blocks": 'r2_reply_sanitize' in reply_module and '"<think>"' in reply_module and '"<analysis>"' in reply_module,
