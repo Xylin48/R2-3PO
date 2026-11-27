@@ -22,7 +22,9 @@
 #include <unistd.h>
 
 #define R2_SOUND_PATH_MAX 4096
-#define R2_SOUND_TOKEN_MAX 64
+#define R2_SOUND_TOKEN_MAX (NAME_MAX + 1)
+/* At most ceil(NAME_MAX/2) nonempty words separated by single bytes. */
+#define R2_SOUND_FILENAME_TOKENS ((NAME_MAX + 1) / 2)
 #define R2_SOUND_MARKER_MAX 160
 #define R2_SOUND_MIN_INTERVAL_MS 900
 
@@ -98,16 +100,15 @@ static int tokenize_filename(const char *name, char tokens[][R2_SOUND_TOKEN_MAX]
     for (const unsigned char *p = (const unsigned char *)name; ; ++p) {
         int is_word = *p && isalnum(*p);
         if (is_word) {
-            if (length + 1 < sizeof(token))
-                token[length++] = (char)tolower(*p);
+            if (length + 1 >= sizeof(token)) return -1;
+            token[length++] = (char)tolower(*p);
             continue;
         }
         if (length) {
             token[length] = '\0';
-            if (count < max_tokens) {
-                snprintf(tokens[count], R2_SOUND_TOKEN_MAX, "%s", token);
-                ++count;
-            }
+            if (count >= max_tokens) return -1;
+            memcpy(tokens[count], token, length + 1);
+            ++count;
             length = 0;
         }
         if (!*p) break;
@@ -123,14 +124,17 @@ static int state_score(char tokens[][R2_SOUND_TOKEN_MAX], int count,
 {
     char requested[R2_SOUND_TOKEN_MAX];
     size_t n = 0;
+    int overlong = 0;
     if (!state || !*state) return 0;
     for (const unsigned char *p = (const unsigned char *)state; ; ++p) {
         if (*p && isalnum(*p)) {
             if (n + 1 < sizeof(requested))
                 requested[n++] = (char)tolower(*p);
+            else
+                overlong = 1;
             continue;
         }
-        if (n) {
+        if (n && !overlong) {
             requested[n] = '\0';
             if (!token_is_generic_state(requested)) {
                 for (int i = 0; i < count; ++i)
@@ -141,8 +145,9 @@ static int state_score(char tokens[][R2_SOUND_TOKEN_MAX], int count,
                     state_alias_match(requested, tokens, count))
                     return 90;
             }
-            n = 0;
         }
+        n = 0;
+        overlong = 0;
         if (!*p) break;
     }
     return 0;
@@ -185,8 +190,9 @@ static int state_alias_match(const char *requested,
 
 static int filename_score(const char *name, const char *kind, const char *state)
 {
-    char tokens[64][R2_SOUND_TOKEN_MAX];
-    int count = tokenize_filename(name, tokens, 64);
+    char tokens[R2_SOUND_FILENAME_TOKENS][R2_SOUND_TOKEN_MAX];
+    int count = tokenize_filename(name, tokens, R2_SOUND_FILENAME_TOKENS);
+    if (count < 0) return -1;
     int has_kind = 0, generic = 0, has_other_state = 0;
     for (int i = 0; i < count; ++i) {
         if (token_is_kind(tokens[i], kind)) has_kind = 1;
@@ -224,7 +230,14 @@ int r2_sounds_select_file(const char *fx_dir, const char *kind,
     struct dirent *entry;
     char best_name[NAME_MAX + 1] = {0};
     int best_score = -1;
-    while ((entry = readdir(dir)) != NULL) {
+    int read_error = 0;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            read_error = errno;
+            break;
+        }
         if (!is_mp3_name(entry->d_name)) continue;
         char candidate[R2_SOUND_PATH_MAX];
         int candidate_len = snprintf(candidate, sizeof(candidate), "%s/%s",
@@ -242,8 +255,8 @@ int r2_sounds_select_file(const char *fx_dir, const char *kind,
             snprintf(best_name, sizeof(best_name), "%s", entry->d_name);
         }
     }
-    closedir(dir);
-    if (!*best_name) return -1;
+    int close_error = closedir(dir);
+    if (read_error || close_error != 0 || !*best_name) return -1;
     int written = snprintf(out, out_cap, "%s/%s", fx_dir, best_name);
     if (written < 0 || (size_t)written >= out_cap) {
         out[0] = '\0';
@@ -363,12 +376,16 @@ int r2_sounds_play(const char *kind, const char *state)
     if (r2_log_is_initialized()) {
         const char *filename = strrchr(path, '/');
         filename = filename ? filename + 1 : path;
-        char details[512];
-        snprintf(details, sizeof(details), "kind=%.16s; state=%.64s; file=%.200s",
-                 kind, (state && *state) ? state : "unspecified", filename);
-        (void)r2_log_event(R2_LOG_SENSORY, "sound_effect_scheduled",
-                           "R2 scheduled a named local droid sound effect.",
-                           details, "R2Sounds");
+        char *details = NULL;
+        if (asprintf(&details, "kind=%s; state=%s; file=%s",
+                     kind, (state && *state) ? state : "unspecified", filename) >= 0) {
+            (void)r2_log_event(R2_LOG_SENSORY, "sound_effect_scheduled",
+                               "R2 scheduled a named local droid sound effect.",
+                               details, "R2Sounds");
+            free(details);
+        } else {
+            fprintf(stderr, "[R2 Sounds] Could not allocate exact sound event details.\n");
+        }
     }
     return 0;
 }

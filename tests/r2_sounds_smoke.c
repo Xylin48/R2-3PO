@@ -9,12 +9,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-int r2_log_is_initialized(void) { return 0; }
+static int capture_log;
+static char *logged_details;
+int r2_log_is_initialized(void) { return capture_log; }
 int64_t r2_log_event(R2LogCategory category, const char *event_type,
                      const char *summary, const char *details, const char *source)
 {
-    (void)category; (void)event_type; (void)summary; (void)details; (void)source;
-    return -1;
+    if (!capture_log) return -1;
+    assert(category == R2_LOG_SENSORY && !strcmp(event_type, "sound_effect_scheduled"));
+    assert(summary && details && !strcmp(source, "R2Sounds"));
+    free(logged_details);
+    logged_details = strdup(details);
+    assert(logged_details);
+    return 1;
 }
 
 static void touch(const char *dir, const char *name)
@@ -115,6 +122,32 @@ int main(void)
     snprintf(mismatch_file, sizeof(mismatch_file), "%s/R2_Beep_Sleepy.mp3", mismatch_dir);
     unlink(mismatch_file);
     rmdir(mismatch_dir);
+
+    /* State labels sharing 63 bytes are distinct, and all filename words
+       must be considered even when kind/state come after 64 numeric tokens. */
+    char state_a[92], state_b[92];
+    memset(state_a, 'x', sizeof(state_a) - 1);
+    state_a[sizeof(state_a) - 2] = 'a';
+    state_a[sizeof(state_a) - 1] = '\0';
+    memcpy(state_b, state_a, sizeof(state_a));
+    state_b[sizeof(state_b) - 2] = 'b';
+    char long_name_a[256], long_name_b[256], numeric_suffix[125];
+    memset(numeric_suffix, '7', sizeof(numeric_suffix) - 1);
+    numeric_suffix[sizeof(numeric_suffix) - 1] = '\0';
+    int n = snprintf(long_name_a, sizeof(long_name_a), "R2_Beep_%s_%s.mp3", state_a, numeric_suffix);
+    assert(n > 200 && (size_t)n < sizeof(long_name_a));
+    n = snprintf(long_name_b, sizeof(long_name_b), "R2_Beep_%s_%s.mp3", state_b, numeric_suffix);
+    assert(n > 200 && (size_t)n < sizeof(long_name_b));
+    touch(root, long_name_a);
+    touch(root, long_name_b);
+    assert(r2_sounds_select_file(root, "beep", state_b, path, sizeof(path)) == 0);
+    assert(strstr(path, long_name_b));
+    char many_tokens[256];
+    for (size_t i = 0; i < 70; ++i) memcpy(many_tokens + 2*i, "1_", 2);
+    strcpy(many_tokens + 140, "R2_Beep_Banana.mp3");
+    touch(root, many_tokens);
+    assert(r2_sounds_select_file(root, "beep", "banana", path, sizeof(path)) == 0);
+    assert(strstr(path, many_tokens));
 
     assert(r2_sounds_select_file(root, "laugh", "happy", path, sizeof(path)) != 0);
     assert(r2_sounds_select_file(root, "beep", "curious", path, 2) != 0);
@@ -228,9 +261,23 @@ int main(void)
     assert(r2_sounds_play("beep", "curious") != 0);
     /* The public core lifecycle permits a later init in the same process. */
     r2_sounds_init();
-    assert(r2_sounds_play("beep", "curious") == 0);
+    capture_log = 1;
+    assert(r2_sounds_play("beep", state_b) == 0);
+    char *expected_details = NULL;
+    assert(asprintf(&expected_details, "kind=beep; state=%s; file=%s", state_b, long_name_b) >= 0);
+    assert(logged_details && !strcmp(logged_details, expected_details));
+    free(expected_details);
+    free(logged_details);
+    logged_details = NULL;
+    capture_log = 0;
     r2_sounds_shutdown();
     unlink(player_path);
+    const char *long_names[] = {long_name_a, long_name_b, many_tokens};
+    for (size_t i = 0; i < sizeof(long_names)/sizeof(long_names[0]); ++i) {
+        char full[4096];
+        n = snprintf(full, sizeof(full), "%s/%s", root, long_names[i]);
+        assert(n > 0 && (size_t)n < sizeof(full) && unlink(full) == 0);
+    }
 
     const char *const names[] = {
         "R2_Beep_Curious.mp3", "R2_Beep_Sleepy.mp3", "R2_Beep_Default.mp3",
