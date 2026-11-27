@@ -88,7 +88,9 @@ int r2_log_save_shared_sensory(struct sqlite3 *peer, const char *event_type,
 
 /* Commit an evaluated memory and its Life Log evidence together. The callback
  * writes the memory through the supplied connection inside the transaction.
- * Return 0 from the callback on success. The callback must not reenter Life Log. */
+ * Return 0 from the callback on success. The callback must not reenter Life Log.
+ * An exact memory/category decision already committed for the same positive
+ * source event is acknowledged without duplicating the write or provenance. */
 int r2_log_ack_learning(int64_t event_id);
 int r2_log_save_learning(struct sqlite3 *peer, const char *memory, const char *category,
                          int64_t source_event_id,

@@ -1175,6 +1175,31 @@ int r2_log_save_learning(sqlite3 *peer, const char *memory, const char *category
         return -1;
     }
 
+    /* An exact decision already committed for this source owns its original
+       event and memory write. A second source is independent evidence. */
+    if (source_event_id > 0) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(log_db,
+            "SELECT 1 FROM r2_log_links l "
+            "JOIN r2_log_events e ON e.id=l.from_event_id "
+            "JOIN r2_log_events parent ON parent.id=l.to_event_id "
+            "WHERE l.to_event_id=? AND l.relationship='memory_learned_from' "
+            "AND e.category='memory' AND e.event_type='memory_saved' "
+            "AND e.details COLLATE BINARY=? AND e.source COLLATE BINARY=? LIMIT 1;",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, source_event_id);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 2, memory, strlen(memory), SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 3, category, strlen(category), SQLITE_TRANSIENT, SQLITE_UTF8);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) {
+            int result = log_finish_write(rc == SQLITE_ROW &&
+                                          log_ack_learning_locked(source_event_id) == 0);
+            pthread_mutex_unlock(&log_lock);
+            return result;
+        }
+    }
+
     int64_t learning = log_insert_event_locked(R2_LOG_MEMORY, "memory_saved",
         "A persistent memory was saved from an evaluated exchange or observation.",
         memory, category);

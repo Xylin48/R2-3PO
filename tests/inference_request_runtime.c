@@ -1358,11 +1358,33 @@ static void check_evaluated_memory_atomicity(void)
         "WHERE l.relationship='memory_learned_from' AND from_event.event_type='memory_saved' "
         "AND from_event.details='I prefer quiet music.' AND to_event.event_type='fixture_memory_source';") == 1);
 
+    /* Exact replay does not duplicate the provenance or refresh the memory. */
     assert(db_exec("CREATE TRIGGER ignore_learning_refresh BEFORE UPDATE ON memories "
                    "WHEN OLD.category='preference' BEGIN SELECT RAISE(IGNORE); END;") == 0);
-    preserve_evidence_memory("What do you like?", "I prefer quiet music.", NULL, source);
+    assert(r2_log_save_learning(db, "I prefer quiet music.", "preference",
+                                source, write_memory) == 0);
+    assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 1);
+
+    /* The same memory from a genuinely different source still performs the
+       original write and records a separate event, or rolls both back. */
+    int64_t other = r2_log_event(R2_LOG_CONVERSATION, "fixture_memory_source_second",
+        "An independent exchange with exact learning evidence.", NULL, NULL);
+    assert(other > 0 && other != source);
+    assert(r2_log_save_learning(db, "I prefer quiet music.", "preference",
+                                other, write_memory) < 0);
     assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 1);
     assert(db_exec("DROP TRIGGER ignore_learning_refresh;") == 0);
+    assert(r2_log_save_learning(db, "I prefer quiet music.", "preference",
+                                other, write_memory) == 0);
+    assert(r2_log_save_learning(db, "I prefer quiet music.", "preference",
+                                source, write_memory) == 0);
+    assert(memory_fixture_count(memory_count) == 1 && memory_fixture_count(log_count) == 2);
+    assert(memory_fixture_count(
+        "SELECT count(*) FROM r2_log_links l JOIN r2_log_events from_event "
+        "ON from_event.id=l.from_event_id JOIN r2_log_events to_event ON to_event.id=l.to_event_id "
+        "WHERE l.relationship='memory_learned_from' AND from_event.event_type='memory_saved' "
+        "AND from_event.details='I prefer quiet music.' AND to_event.event_type IN "
+        "('fixture_memory_source','fixture_memory_source_second');") == 2);
     assert(sqlite3_close(db) == SQLITE_OK);
     db = NULL;
 }
