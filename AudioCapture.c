@@ -114,6 +114,9 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
         return -1;
     }
     capture->mainloop_started = 1;
+    /* Pulse operations do not promise to set the caller's errno. Keep the
+     * actual failure classification separate from unrelated prior syscalls. */
+    int error = EIO;
     pa_threaded_mainloop_lock(capture->mainloop);
 
     capture->context = pa_context_new(
@@ -135,13 +138,13 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
         if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
             goto failed;
         if (capture->connect_timed_out || atomic_load(&capture->cancelled)) {
-            errno = capture->connect_timed_out ? ETIMEDOUT : ECANCELED;
+            error = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
             goto failed;
         }
         pa_threaded_mainloop_wait(capture->mainloop);
     }
-    if (atomic_load(&capture->cancelled)) {
-        errno = ECANCELED;
+    if (capture->connect_timed_out || atomic_load(&capture->cancelled)) {
+        error = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
         goto failed;
     }
 
@@ -165,18 +168,18 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
             pa_context_get_state(capture->context) != PA_CONTEXT_READY)
             goto failed;
         if (capture->connect_timed_out || atomic_load(&capture->cancelled)) {
-            errno = capture->connect_timed_out ? ETIMEDOUT : ECANCELED;
+            error = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
             goto failed;
         }
         pa_threaded_mainloop_wait(capture->mainloop);
     }
     if (capture->connect_timed_out || atomic_load(&capture->cancelled)) {
-        errno = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
+        error = atomic_load(&capture->cancelled) ? ECANCELED : ETIMEDOUT;
         goto failed;
     }
     const char *selected = pa_stream_get_device_name(capture->stream);
     if (capture->stream_moved || !selected || strcmp(selected, source) != 0) {
-        errno = ENODEV;
+        error = ENODEV;
         goto failed;
     }
     pa_threaded_mainloop_get_api(capture->mainloop)->time_free(capture->connect_timeout);
@@ -185,7 +188,10 @@ int r2_audio_capture_connect(R2AudioCapture *capture, const char *source,
     return 0;
 
 failed:
-    if (!errno) errno = EIO;
+    /* Cancellation/timeout may arrive as the context or stream transitions
+     * to a terminal state. Preserve the explicit cancellation outcome. */
+    if (atomic_load(&capture->cancelled)) error = ECANCELED;
+    else if (capture->connect_timed_out && error == EIO) error = ETIMEDOUT;
     /* The lifecycle owner will free/disconnect the partially initialized
      * context; it may still be referenced by a concurrent cancel. */
     if (capture->connect_timeout) {
@@ -193,6 +199,7 @@ failed:
         capture->connect_timeout = NULL;
     }
     pa_threaded_mainloop_unlock(capture->mainloop);
+    errno = error;
     return -1;
 }
 

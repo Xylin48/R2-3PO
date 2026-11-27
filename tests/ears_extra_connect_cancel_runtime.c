@@ -378,6 +378,19 @@ int main(void)
     int model_fd = mkstemp(model_path);
     assert(model_fd >= 0 && close(model_fd) == 0);
     assert(setenv("R2_WHISPER_MODEL", model_path, 1) == 0);
+    /* The public one-shot listener, not only the model tool wrapper,
+     * must preserve a separately opened non-continuous recording route. */
+    assert(r2_ears_open_source(ears, "test.explicit.input") == 0);
+    int connections_before = connect_calls;
+    assert(!r2_ears_listen_cancelable(1, NULL, NULL));
+    assert(connect_calls == connections_before && r2_ears_is_open(ears));
+    R2HearingEvent explicit_source = {0};
+    assert(r2_ears_get_open_event(ears, &explicit_source) == 0);
+    assert(!strcmp(explicit_source.source_name, "test.explicit.input"));
+    r2_ears_release_event(&explicit_source);
+    assert(!read_entered);
+    r2_ears_close(ears);
+    transport_cancelled = read_entered = 0;
     atomic_store(&owner_cancelled, 0);
     assert(pthread_create(&opening, NULL, direct_listen, NULL) == 0);
     pthread_mutex_lock(&gate);

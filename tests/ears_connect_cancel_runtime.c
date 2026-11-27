@@ -71,6 +71,15 @@ int main(void)
     assert(unlink(address.sun_path) == 0);
     assert(rmdir(directory) == 0);
 
+    /* A missing configured server is a transport failure, not the stale
+     * errno from a previous device operation on this thread. */
+    request.capture = r2_audio_capture_new();
+    assert(request.capture);
+    errno = ENODEV;
+    connect_source(&request);
+    assert(request.rc == -1 && request.error == EIO);
+    r2_audio_capture_free(request.capture);
+
     /* A cancellation before starting the event loop is also definitive. */
     request.capture = r2_audio_capture_new();
     assert(request.capture);

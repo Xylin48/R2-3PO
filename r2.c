@@ -14477,6 +14477,13 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
             fprintf(stderr, "[Ears] No continuously buffered audio is available to inspect.\n");
             goto cleanup;
         }
+        /* Direct shell/API listening shares this boundary with model actions.
+         * Do not replace an explicitly opened non-worker source. */
+        if (!ears_capture_thread_started && r2_ears_is_open(ears)) {
+            pthread_mutex_unlock(&ears_capture_lock);
+            fprintf(stderr, "[Ears] An explicitly opened audio source is still active; leave it untouched.\n");
+            goto cleanup;
+        }
         ears_microphone_watch_token = 0;
         if (ears_capture_thread_started) {
             pthread_join(ears_capture_thread, NULL);
@@ -14508,7 +14515,7 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
             if (wanted > sizeof(pcm)) wanted = sizeof(pcm);
             ssize_t got = r2_ears_read_live_cancelable(ears, pcm, wanted,
                                                       r2_ears_open_cancelled, &request);
-            if (got <= 0 || ((size_t)got % 4U) != 0U) {
+            if (got <= 0 || (size_t)got > wanted || ((size_t)got % 4U) != 0U) {
                 fprintf(stderr, "[Ears] Microphone capture ended early or returned invalid PCM.\n");
                 break;
             }
@@ -14607,8 +14614,13 @@ char *r2_ears_listen_source_cancelable(unsigned seconds,
     }
 
     {
-        FILE *text_fp = fopen(transcript_path, "rb");
-        if (!text_fp) goto cleanup;
+        /* The configured local recognizer must produce a regular file.
+         * Opening nonblocking prevents a malformed FIFO output from hanging
+         * the accepted turn before its type can be checked. */
+        int text_fd = open(transcript_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        if (text_fd < 0) goto cleanup;
+        FILE *text_fp = fdopen(text_fd, "rb");
+        if (!text_fp) { close(text_fd); goto cleanup; }
         struct stat before, after;
         if (fstat(fileno(text_fp), &before) != 0 ||
             !S_ISREG(before.st_mode) || before.st_size < 0) {

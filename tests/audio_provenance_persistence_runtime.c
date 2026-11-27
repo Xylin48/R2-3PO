@@ -662,6 +662,15 @@ int main(void)
     assert(bad && fwrite("\xc0\xaf", 1, 2, bad) == 2 && fclose(bad) == 0);
     assert(!r2_ears_listen_source_cancelable(1, NULL, NULL, &no_source, &no_event));
     assert(!no_source && no_event == 0 && r2_sj_count() == prior_count);
+    /* A successful recognizer exit with a FIFO instead of a regular
+     * transcript must not block or publish any fabricated speech. */
+    FILE *fifo_cli = fopen(cli_path, "wb");
+    assert(fifo_cli);
+    assert(fputs("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n"
+                 "if [ \"$1\" = -of ]; then shift; out=$1; fi\nshift\ndone\n"
+                 "mkfifo \"$out.txt\"\n", fifo_cli) >= 0 && fclose(fifo_cli) == 0);
+    assert(!r2_ears_listen_source_cancelable(1, NULL, NULL, &no_source, &no_event));
+    assert(!no_source && no_event == 0 && r2_sj_count() == prior_count);
     fixture_primary_open[1] = 0;
     r2_ears_desktop_requested = r2_ears_recent_requested = 0;
     sqlite3_close(connection);
