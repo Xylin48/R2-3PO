@@ -294,7 +294,17 @@ int main(void)
     assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
     assert(exec_sql(db, "UPDATE r2_log_conversations SET user_text=CAST(X'61620063' AS TEXT);") == 0);
     assert(sqlite3_close(db) == SQLITE_OK);
-    assert(r2_sj_search("assistant!suffix", 20) == NULL);
+    found = r2_sj_search("assistant!suffix", 20);
+    assert(found && strstr(found, "Archived user message:\n[hex bytes] 61620063") &&
+           strstr(found, "Archived R2 reply:\nassistant!suffix"));
+    free(found);
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    assert(exec_sql(db, "UPDATE r2_log_conversations SET assistant_text=CAST(X'61006200' AS TEXT);") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    found = r2_sj_search("bang!mark", 20);
+    assert(found && strstr(found, "Archived user message:\n[hex bytes] 61620063") &&
+           strstr(found, "Archived R2 reply:\n[hex bytes] 61006200"));
+    free(found);
 
     r2_sj_shutdown();
     remove(R2_DIARY_DATABASE);

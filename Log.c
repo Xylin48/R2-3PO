@@ -657,20 +657,9 @@ static char *log_legacy_text(sqlite3_stmt *st, int column)
     const unsigned char *value = sqlite3_column_text(st, column);
     if (!value) return NULL; /* These queries use COALESCE. */
     size_t length = (size_t)sqlite3_column_bytes(st, column);
-    if (!memchr(value, '\0', length)) return strdup((const char *)value);
-    static const char prefix[] = "[hex bytes] ";
-    if (length > (SIZE_MAX - sizeof(prefix)) / 2) return NULL;
-    char *encoded = malloc(sizeof(prefix) + length * 2);
-    if (!encoded) return NULL;
-    memcpy(encoded, prefix, sizeof(prefix) - 1);
-    char *out = encoded + sizeof(prefix) - 1;
-    static const char hex[] = "0123456789abcdef";
-    for (size_t i = 0; i < length; ++i) {
-        *out++ = hex[value[i] >> 4];
-        *out++ = hex[value[i] & 15];
-    }
-    *out = '\0';
-    return encoded;
+    char *encoded = NULL;
+    const char *text = r2_log_render_archive_text(value, length, &encoded);
+    return encoded ? encoded : text ? strdup(text) : NULL;
 }
 
 static int64_t log_insert_event_locked(R2LogCategory category,
@@ -3431,16 +3420,29 @@ static int append_archived_conversation(sqlite3_stmt *archive, int64_t event_id,
     if (rc == SQLITE_OK) rc = sqlite3_step(archive);
     if (rc == SQLITE_DONE) return 0;
     if (rc != SQLITE_ROW) return -1;
-    const char *fields[2];
-    if (log_read_text_fields(archive, 0, 2, fields) != 0 || !fields[0] || !fields[1])
-        return -1;
-    if (r2_log_details_include_conversation(details, fields[0], fields[1]))
-        return 0;
-    return append_text(out, length, capacity,
-        "  Archived conversation [%" PRId64 "] (historical dialogue):\n"
-        "    Original user message: %s\n"
-        "    Original R2 response: %s\n",
-        event_id, fields[0], fields[1]);
+    const char *fields[2] = {NULL, NULL};
+    char *owned[2] = {NULL, NULL};
+    for (int i = 0; i < 2; ++i) {
+        const unsigned char *value = sqlite3_column_text(archive, i);
+        size_t bytes = (size_t)sqlite3_column_bytes(archive, i);
+        fields[i] = r2_log_render_archive_text(value, bytes, &owned[i]);
+        if (!fields[i]) break;
+    }
+    int result = -1;
+    if (fields[0] && fields[1]) {
+        if (!owned[0] && !owned[1] &&
+            r2_log_details_include_conversation(details, fields[0], fields[1]))
+            result = 0;
+        else
+            result = append_text(out, length, capacity,
+                "  Archived conversation [%" PRId64 "] (historical dialogue):\n"
+                "    Original user message: %s\n"
+                "    Original R2 response: %s\n",
+                event_id, fields[0], fields[1]);
+    }
+    free(owned[0]);
+    free(owned[1]);
+    return result;
 }
 
 static char *query_events(const char *query, int limit, R2LogRecordBatch *batch,

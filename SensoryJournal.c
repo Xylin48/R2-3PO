@@ -408,8 +408,7 @@ static char *sj_query(const char *query, int limit)
         const char *archive_user = (const char *)sqlite3_column_text(st, 9);
         const char *archive_reply = (const char *)sqlite3_column_text(st, 10);
         const unsigned char *fields[] = {
-            utc, local, kind, type, summary, details, source, diary_id,
-            (const unsigned char *)archive_user, (const unsigned char *)archive_reply
+            utc, local, kind, type, summary, details, source, diary_id
         };
         for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
             int column = (int)i + 1;
@@ -420,8 +419,26 @@ static char *sj_query(const char *query, int limit)
             }
         }
         if (serialization_failed) break;
-        int show_archive = (archive_user || archive_reply) &&
-            !r2_log_details_include_conversation((const char *)details, archive_user, archive_reply);
+        /* Archived beta dialogue may contain embedded NULs even when the
+           authoritative event has a lossless textual migration record. */
+        char *owned_user = NULL, *owned_reply = NULL;
+        const char *raw_user = archive_user, *raw_reply = archive_reply;
+        if (raw_user)
+            archive_user = r2_log_render_archive_text((const unsigned char *)raw_user,
+                (size_t)sqlite3_column_bytes(st, 9), &owned_user);
+        if (raw_reply)
+            archive_reply = r2_log_render_archive_text((const unsigned char *)raw_reply,
+                (size_t)sqlite3_column_bytes(st, 10), &owned_reply);
+        if ((!archive_user && (raw_user || sqlite3_column_type(st, 9) != SQLITE_NULL)) ||
+            (!archive_reply && (raw_reply || sqlite3_column_type(st, 10) != SQLITE_NULL))) {
+            free(owned_user);
+            free(owned_reply);
+            serialization_failed = 1;
+            break;
+        }
+        int show_archive = owned_user || owned_reply ||
+            ((archive_user || archive_reply) &&
+             !r2_log_details_include_conversation((const char *)details, archive_user, archive_reply));
         char *row = NULL;
         int needed = asprintf(&row,
             "[%lld] %s | %s | %s/%s\n  %s\n  Source: %s\n  Diary link: %s\n  %s%s%s%s%s\n\n",
@@ -438,6 +455,8 @@ static char *sj_query(const char *query, int limit)
             show_archive ? (archive_user ? archive_user : "(unavailable)") : "",
             show_archive ? "\n  Archived R2 reply:\n" : "",
             show_archive ? (archive_reply ? archive_reply : "(unavailable)") : "");
+        free(owned_user);
+        free(owned_reply);
         if (needed < 0) {
             serialization_failed = 1;
             break;

@@ -133,6 +133,18 @@ int main(void)
     assert(strstr(old_record, "legacy preserved identity record") != NULL);
     free(old_record);
 
+    /* Migration retains the original raw archive and labels its encoded
+       representation. Recall must not discard the whole matched event. */
+    char *legacy_bytes = r2_log_search("6c656674007269676874", 10);
+    assert(legacy_bytes && strstr(legacy_bytes,
+        "Original user message: [hex bytes] 6c656674007269676874"));
+    assert(strstr(legacy_bytes, "Original R2 response: old answer"));
+    free(legacy_bytes);
+    R2LogRecordBatch legacy_batch = {0};
+    assert(r2_log_search_records("6c656674007269676874", 10, &legacy_batch) == 0);
+    assert(legacy_batch.count == 1 && strstr(legacy_batch.text, "[hex bytes] 6c656674007269676874"));
+    r2_log_release_records(&legacy_batch);
+
     int64_t new_id = r2_log_event(
         R2_LOG_MEMORY, "post_migration_write",
         "new event after legacy migration",
