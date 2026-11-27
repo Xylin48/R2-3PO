@@ -168,6 +168,26 @@ with tempfile.TemporaryDirectory() as directory:
     cursor, _ = module.reconcile_activity_page(db, writer, cursor, 3)
     assert cursor == 3 and output.read_bytes() == original
 
+    # The caller retains the old cursor on a failed replacement page. The
+    # restart must survive both an initial failure and a partially written page.
+    for fail_id in (1, 3):
+        output.write_bytes(b"")
+        saved_append = writer.append
+        def fail_once(*args, **kwargs):
+            if args[2] == fail_id:
+                writer.append = saved_append
+                raise OSError(module.errno.EIO, "injected replacement page failure")
+            return saved_append(*args, **kwargs)
+        writer.append = fail_once
+        try:
+            module.reconcile_activity_page(db, writer, cursor, 3)
+        except OSError as exc:
+            assert exc.errno == module.errno.EIO
+        else:
+            raise AssertionError("replacement page unexpectedly succeeded")
+        cursor, _ = module.reconcile_activity_page(db, writer, cursor, 3)
+        assert cursor == 3 and output.read_bytes() == original
+
     # A replacement between the page's cursor check and its first append
     # must fail that page rather than publish event four ahead of the past.
     db.execute("INSERT INTO r2_log_events VALUES(4,'2026-11-26','world','object_added','Fourth')")

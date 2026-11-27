@@ -52,6 +52,7 @@ class ActivityWriter:
         self._identity = None
         self._offset = 0
         self._saved_ids = set()
+        self._replay_restart = False
 
     def _reset_index(self):
         self._identity = None
@@ -60,17 +61,22 @@ class ActivityWriter:
 
     def replay_cursor(self, cursor: int) -> int:
         """Restart authoritative replay when the indexed file no longer exists."""
-        if self._identity is None:
-            return cursor
-        try:
-            stat = self.path.stat()
-        except FileNotFoundError:
-            self._reset_index()
-            return 0
-        if (stat.st_dev, stat.st_ino) != self._identity or stat.st_size < self._offset:
-            self._reset_index()
-            return 0
-        return cursor
+        if self._identity is not None:
+            try:
+                stat = self.path.stat()
+            except FileNotFoundError:
+                self._reset_index()
+                self._replay_restart = True
+            else:
+                if (stat.st_dev, stat.st_ino) != self._identity or stat.st_size < self._offset:
+                    self._reset_index()
+                    self._replay_restart = True
+        # Keep the rewind pending until an entire replacement page succeeds.
+        # The caller still owns its old cursor if a query or append fails.
+        return 0 if self._replay_restart else cursor
+
+    def replay_page_completed(self):
+        self._replay_restart = False
 
     @staticmethod
     def _append_and_sync(stream, data: bytes) -> int:
@@ -96,6 +102,7 @@ class ActivityWriter:
                 # If the file changed during a replay page, do not append a
                 # newer ID ahead of the earlier rows that now need replay.
                 if replay and self._identity is not None:
+                    self._replay_restart = True
                     raise OSError(errno.ESTALE, "Activity.txt changed during replay")
                 self._reset_index()
                 self._identity = identity
@@ -179,6 +186,7 @@ def reconcile_activity_page(connection, writer: ActivityWriter, cursor: int,
     ).fetchall()
     for row in rows:
         writer.append(row["local_time"], row["summary"], int(row["id"]), replay=True)
+    writer.replay_page_completed()
     return (latest if len(rows) < batch_size else int(rows[-1]["id"])), rows
 
 
