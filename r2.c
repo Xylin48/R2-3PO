@@ -13500,7 +13500,8 @@ static void *r2_ears_capture_worker(void *unused)
     while (!shutting_down && atomic_load(&ears_capture_running)) {
         ssize_t got = r2_ears_read(ears, pcm, sizeof(pcm));
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
-            if (!shutting_down && atomic_load(&ears_capture_running))
+            int was_running = atomic_exchange(&ears_capture_running, 0);
+            if (!shutting_down && was_running)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous microphone stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
@@ -13550,7 +13551,8 @@ static void *r2_ears_desktop_capture_worker(void *unused)
     while (!shutting_down && atomic_load(&ears_desktop_capture_running)) {
         ssize_t got = r2_ears_read(ears_desktop, pcm, sizeof(pcm));
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
-            if (!shutting_down && atomic_load(&ears_desktop_capture_running))
+            int was_running = atomic_exchange(&ears_desktop_capture_running, 0);
+            if (!shutting_down && was_running)
                 r2_log_sensory("audio_capture_ended",
                                "R2's continuous desktop playback stream stopped supplying valid PCM.",
                                "The input worker ended; the buffered audio is not an active live stream.",
@@ -13654,7 +13656,8 @@ static void *r2_extra_desktop_worker(void *arg)
     while (!shutting_down && atomic_load(&entry->running)) {
         ssize_t got = r2_ears_read(entry->receiver, pcm, sizeof(pcm));
         if (got <= 0 || ((size_t)got % 4U) != 0U) {
-            if (!shutting_down && atomic_load(&entry->running))
+            int was_running = atomic_exchange(&entry->running, 0);
+            if (!shutting_down && was_running)
                 r2_log_sensory("audio_capture_ended",
                               "An independent desktop playback output stopped supplying valid PCM.",
                               "Its own monitor will be retried on the next valid discovery snapshot.",
@@ -13933,17 +13936,17 @@ static char *r2_ears_desktop_available_sources(void)
     FILE *stream = open_memstream(&report, &report_size);
     if (!stream) return NULL;
     R2HearingEvent primary = {0};
-    const char *primary_status = "(capture lifecycle update in progress)";
-    if (pthread_mutex_trylock(&ears_desktop_capture_lock) == 0) {
-        if (ears_desktop && atomic_load(&ears_desktop_capture_running)) {
+    const char *primary_status = "(not active)";
+    /* The pointer lock retains the lazy receiver; the event lock snapshots
+     * the published identity without waiting for connect, stop or PCM. */
+    pthread_mutex_lock(&ears_desktop_pointer_lock);
+    if (ears_desktop && atomic_load(&ears_desktop_capture_running)) {
+        if (r2_ears_get_open_event(ears_desktop, &primary) == 0)
+            primary_status = primary.source_name;
+        else if (errno != ENODATA)
             primary_status = "(source identity unavailable)";
-            if (r2_ears_get_event(ears_desktop, &primary) == 0 && primary.source_name)
-                primary_status = primary.source_name;
-        } else {
-            primary_status = "(not active)";
-        }
-        pthread_mutex_unlock(&ears_desktop_capture_lock);
     }
+    pthread_mutex_unlock(&ears_desktop_pointer_lock);
     if (fprintf(stream, "PRIMARY DESKTOP AUDIO SOURCE: %s\n", primary_status) < 0)
         goto fail;
     r2_ears_release_event(&primary);
@@ -14699,7 +14702,8 @@ static int r2_ears_start_input(uint64_t *watch_token_out, const char *microphone
     int lock_result = watch_token_out ? pthread_mutex_trylock(&ears_capture_lock)
                                       : pthread_mutex_lock(&ears_capture_lock);
     if (lock_result != 0) { errno = lock_result; return -1; }
-    if (atomic_load(&ears_capture_running) && ears_capture_thread_started) {
+    if (atomic_load(&ears_capture_running) && ears_capture_thread_started &&
+        r2_ears_is_open(ears)) {
         /* An explicit start takes over an existing Watch-owned stream. */
         if (!watch_token_out) ears_microphone_watch_token = 0;
         pthread_mutex_unlock(&ears_capture_lock);
@@ -14765,7 +14769,7 @@ static int r2_ears_start_desktop_impl(uint64_t *watch_token_out, const char *mon
                                       : pthread_mutex_lock(&ears_desktop_capture_lock);
     if (lock_result != 0) { errno = lock_result; return -1; }
     if (atomic_load(&ears_desktop_capture_running) &&
-        ears_desktop_capture_thread_started) {
+        ears_desktop_capture_thread_started && r2_ears_is_open(ears_desktop)) {
         if (!watch_token_out) ears_desktop_watch_token = 0;
         pthread_mutex_unlock(&ears_desktop_capture_lock);
         return 0;
@@ -14888,11 +14892,17 @@ int r2_ears_watch_input_snapshot(int desktop, R2EarsWatchInput *input)
     int running = atomic_load(desktop ? &ears_desktop_capture_running : &ears_capture_running);
     int active = receiver && (worker ? running : !desktop && r2_ears_is_open(receiver));
     R2HearingEvent event = {0};
-    if (active && (r2_ears_get_event(receiver, &event) != 0 ||
-                   !event.source_name || !*event.source_name)) {
-        r2_ears_release_event(&event);
-        pthread_mutex_unlock(lock);
-        return -1;
+    if (active && r2_ears_get_open_event(receiver, &event) != 0) {
+        int saved = errno;
+        if (saved == ENODATA) {
+            /* Preserve the old ownership token for exact Watch cleanup.
+             * A worker can still be unwinding an already failed read. */
+            active = 0;
+        } else {
+            pthread_mutex_unlock(lock);
+            errno = saved;
+            return -1;
+        }
     }
     input->active = active;
     input->owner = atomic_load(desktop ? &ears_desktop_watch_token : &ears_microphone_watch_token);
@@ -14905,7 +14915,8 @@ int r2_ears_status_desktop(void)
 {
     pthread_mutex_lock(&ears_desktop_capture_lock);
     int active = ears_desktop_capture_thread_started &&
-                 atomic_load(&ears_desktop_capture_running) ? 1 : 0;
+                 atomic_load(&ears_desktop_capture_running) &&
+                 r2_ears_is_open(ears_desktop) ? 1 : 0;
     pthread_mutex_unlock(&ears_desktop_capture_lock);
     return active;
 }
@@ -14919,7 +14930,7 @@ char *r2_ears_current_desktop_source(void)
     R2HearingEvent event = {0};
     int valid = ears_desktop && ears_desktop_capture_thread_started &&
         atomic_load(&ears_desktop_capture_running) &&
-        r2_ears_get_event(ears_desktop, &event) == 0;
+        r2_ears_get_open_event(ears_desktop, &event) == 0;
     pthread_mutex_unlock(&ears_desktop_capture_lock);
     if (!valid) {
         r2_ears_release_event(&event);
@@ -14937,7 +14948,7 @@ int r2_ears_status_desktop_source(const char *expected_monitor)
     int matches = ears_desktop &&
         ears_desktop_capture_thread_started &&
         atomic_load(&ears_desktop_capture_running) &&
-        r2_ears_get_event(ears_desktop, &event) == 0 &&
+        r2_ears_get_open_event(ears_desktop, &event) == 0 &&
         event.source_name && !strcmp(event.source_name, expected_monitor);
     r2_ears_release_event(&event);
     pthread_mutex_unlock(&ears_desktop_capture_lock);
@@ -14955,7 +14966,7 @@ int r2_ears_status_microphone_source(const char *expected_source)
     int matches = ears &&
         ears_capture_thread_started &&
         atomic_load(&ears_capture_running) &&
-        r2_ears_get_event(ears, &event) == 0 &&
+        r2_ears_get_open_event(ears, &event) == 0 &&
         event.source_name && !strcmp(event.source_name, expected_source);
     r2_ears_release_event(&event);
     pthread_mutex_unlock(&ears_capture_lock);
@@ -15016,7 +15027,7 @@ int r2_ears_status(void)
        handle can remain open until restart/stop. Do not report that as live
        hearing. Explicitly opened non-worker sources retain their own status. */
     int active = ears_capture_thread_started
-        ? (atomic_load(&ears_capture_running) ? 1 : 0)
+        ? (atomic_load(&ears_capture_running) && r2_ears_is_open(ears) ? 1 : 0)
         : (ears ? (r2_ears_is_open(ears) ? 1 : 0) : 0);
     pthread_mutex_unlock(&ears_capture_lock);
     return active;
