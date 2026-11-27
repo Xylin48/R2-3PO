@@ -343,7 +343,7 @@ require(
     and "The message may not have been saved to conversation history; please try again." in core,
     "the public conversation API itself reports a failed turn instead of passing silent NULL/empty output to callers",
 )
-conversation_impl_start = core.find("static char *r2_talk_impl(const char *message)")
+conversation_impl_start = core.find("static char *r2_talk_impl(const char *message, int64_t *turn_event_id_out)")
 conversation_impl_end = core.find("\nchar *r2_talk(const char *message)", conversation_impl_start)
 conversation_impl = core[conversation_impl_start:conversation_impl_end]
 require(
@@ -435,7 +435,9 @@ require(
 require(
     "conversation_public_api_fallback" in core
     and "implementation_reply=%s; input_chars=%zu; user_text_logged=no" in core
-    and "Public conversation API received a %s reply" in core,
+    and "Public conversation API received a %s reply" in core
+    and "*turn_event_id_out = turn_event_id;" in conversation_impl
+    and "conversation_event_id=%lld; turn_saved=%s" in core,
     "the last public API recovery boundary logs null/empty implementation replies without recording private user text",
 )
 
