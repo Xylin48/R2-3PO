@@ -135,6 +135,30 @@ int main(void)
     r2_sj_index_event(third, "thinking", "diary_entry_linked", "diary");
     /* A mismatched ID pair must not be projected as real diary history. */
     assert(r2_sj_link_diary_event(third, 101) == -1);
+    /* A failed derived write must not hide the already committed exact link. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    sql(db, "CREATE TRIGGER block_diary_projection BEFORE INSERT ON "
+            "r2_sensory_journal_diary_links BEGIN SELECT RAISE(IGNORE); END;");
+    assert(r2_sj_link_diary_event(third, 103) == -1);
+    expect_link("Exact new diary entry", "Diary link: 103");
+    sql(db, "DROP TRIGGER block_diary_projection;");
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(r2_sj_link_diary_event(third, 103) == 0);
+    expect_link("Exact new diary entry", "Diary link: 103");
+
+    /* A stale derived pointer must not override the authoritative mapping;
+       two authoritative candidates are ambiguous, not two event records. */
+    assert(sqlite3_open(R2_DIARY_DATABASE, &db) == SQLITE_OK);
+    sql(db, "UPDATE r2_sensory_journal_diary_links SET diary_entry_id=101 "
+            "WHERE diary_entry_id=103;");
+    expect_link("Exact new diary entry", "Diary link: 103");
+    sql(db, "INSERT INTO diary_entries(id,entry) VALUES(106,'ambiguous exact candidate');"
+            "INSERT INTO r2_diary_entry_links(diary_entry_id,log_event_id) "
+            "SELECT 106,log_event_id FROM r2_diary_entry_links WHERE diary_entry_id=103;");
+    assert(r2_sj_link_diary_event(third, 103) == -1);
+    expect_link("Exact new diary entry", "Diary link: none");
+    sql(db, "DELETE FROM r2_diary_entry_links WHERE diary_entry_id=106;");
+    assert(sqlite3_close(db) == SQLITE_OK);
     assert(r2_sj_link_diary_event(third, 103) == 0);
     expect_link("Exact new diary entry", "Diary link: 103");
 

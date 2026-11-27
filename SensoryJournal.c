@@ -166,7 +166,9 @@ int r2_sj_init(void)
                 "FROM r2_diary_entry_links l "
                 "JOIN r2_log_events e ON e.id=l.log_event_id "
                 "JOIN diary_entries d ON d.id=l.diary_entry_id "
-                "WHERE e.category='thinking' AND e.event_type='diary_entry_linked';") != 0) {
+                "WHERE e.category='thinking' AND e.event_type='diary_entry_linked' "
+                "AND (SELECT COUNT(*) FROM r2_diary_entry_links exact "
+                "WHERE exact.log_event_id=e.id)=1;") != 0) {
         goto failed;
     }
     if (!sj_index_complete() || sj_exec("COMMIT;") != 0)
@@ -277,7 +279,9 @@ int r2_sj_link_diary_event(int64_t event_id, int64_t diary_entry_id)
         "JOIN r2_diary_entry_links l ON l.log_event_id=e.id AND l.diary_entry_id=? "
         "JOIN diary_entries d ON d.id=l.diary_entry_id "
         "WHERE e.id=? AND e.category='thinking' "
-        "AND e.event_type='diary_entry_linked';",
+        "AND e.event_type='diary_entry_linked' "
+        "AND (SELECT COUNT(*) FROM r2_diary_entry_links exact "
+        "WHERE exact.log_event_id=e.id)=1;",
         -1, &st, NULL);
     if (rc == SQLITE_OK)
         rc = sqlite3_bind_int64(st, 1, diary_entry_id);
@@ -334,14 +338,30 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
 
+    /* Exact diary identity belongs to the authoritative diary table,
+       not to the asynchronously written Journal projection. */
+    int diary_entry_id = sj_column_exists("r2_diary_entry_links", "diary_entry_id");
+    int diary_event_id = sj_column_exists("r2_diary_entry_links", "log_event_id");
+    if (diary_entry_id < 0 || diary_event_id < 0) {
+        pthread_mutex_unlock(&sj_lock);
+        return NULL;
+    }
+    const char *exact_diary_link = diary_entry_id && diary_event_id
+        ? "(SELECT CASE WHEN COUNT(*)=1 AND COUNT(entry.id)=1 "
+          "THEN MIN(exact.diary_entry_id) END FROM r2_diary_entry_links exact "
+          "LEFT JOIN diary_entries entry ON entry.id=exact.diary_entry_id "
+          "WHERE exact.log_event_id=e.id)"
+        : "NULL";
     const char *sql_select =
         "SELECT e.id,e.utc_time,e.local_time,e.category,e.event_type,e.summary,"
-        "e.details,e.source,COALESCE(r.diary_entry_id,CASE WHEN "
+        "e.details,e.source,CASE WHEN e.event_type='diary_entry_linked' THEN ";
+    const char *other_diary_link =
+        " ELSE COALESCE(r.diary_entry_id,CASE WHEN "
         "e.event_type IN ('diary_entry_written','reflection_completed') "
         "AND (NOT EXISTS (SELECT 1 FROM diary_entries linked "
         "WHERE linked.id=d.diary_entry_id AND linked.entry=e.details) "
         "OR (SELECT COUNT(*) FROM diary_entries match_row WHERE match_row.entry=e.details)<>1) "
-        "THEN NULL ELSE d.diary_entry_id END)";
+        "THEN NULL ELSE d.diary_entry_id END) END";
     /* The Life Log event is the authoritative Journal record. Its materialized
        index is maintained for compatibility and metadata, but a separate
        index write must not determine whether a committed event is visible. */
@@ -362,8 +382,9 @@ static char *sj_query(const char *query, int limit)
         return NULL;
     }
     int archive_available = event_id && user_text && assistant_text;
-    char *sql = sqlite3_mprintf("%s%s%s%s%s%s%s%s ORDER BY e.id DESC LIMIT %s;",
-        sql_select, archive_available ? ",c.user_text,c.assistant_text" : ",NULL,NULL", from,
+    char *sql = sqlite3_mprintf("%s%s%s%s%s%s%s%s%s%s ORDER BY e.id DESC LIMIT %s;",
+        sql_select, exact_diary_link, other_diary_link,
+        archive_available ? ",c.user_text,c.assistant_text" : ",NULL,NULL", from,
         archive_available ? "LEFT JOIN r2_log_conversations c ON c.event_id=e.id " : "",
         categories, query ? search : "",
         query && archive_available ? " OR instr(lower(c.user_text),lower(?1))>0 "
