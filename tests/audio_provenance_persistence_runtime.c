@@ -358,7 +358,10 @@ int main(void)
     char *independent_source = NULL;
     pthread_mutex_lock(&ears_desktop_capture_lock);
     char *available = r2_ears_desktop_available_sources();
-    assert(available && strstr(available, "capture lifecycle update in progress") &&
+    /* This fixture supplies historical PCM through a synthetic event, but
+     * has not opened the primary transport. Do not label it as available
+     * just because its worker flag or lifecycle lock is set. */
+    assert(available && strstr(available, "PRIMARY DESKTOP AUDIO SOURCE: (not active)") &&
            strstr(available, extra_name));
     free(available);
     char *independent_transcript = r2_ears_listen_source_cancelable(
