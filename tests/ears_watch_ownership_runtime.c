@@ -301,6 +301,9 @@ int main(void)
     ears_desktop_recent_length = 192000;
     ears_desktop_recent_write_position = 192000;
     pthread_mutex_unlock(&ears_desktop_recent_lock);
+    /* Seed an active synthetic transport as well as its retained PCM. The
+     * listener now requires an open source, not a stale worker flag. */
+    atomic_store(&synthetic_desktop_open, 1);
     atomic_store(&ears_desktop_capture_running, 1);
     pthread_mutex_lock(&ears_capture_lock);
     atomic_fetch_add(&ears_stop_requesters, 1);
@@ -317,6 +320,7 @@ int main(void)
     assert(desktop_transcript && !strcmp(desktop_transcript, expected));
     free(desktop_transcript);
     atomic_store(&ears_desktop_capture_running, 0);
+    atomic_store(&synthetic_desktop_open, 0);
     assert(unlink(text_path) == 0 && unlink(cli_path) == 0);
     assert(unlink(model_path) == 0);
 
