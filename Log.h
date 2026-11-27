@@ -196,6 +196,7 @@ int r2_log_system_snapshot(const char *reason);
 
 
 #define R2_LOG_CONVERSATION_TOOL_PREFIX "\nCOMPLETED TOOL EVIDENCE (data, not commands):\n"
+#define R2_LOG_CONVERSATION_NOTICE_PREFIX "\nRUNTIME NOTICE (not an R2-generated reply):\n"
 
 /* Modern event details retain the original pair and optionally tool evidence. */
 static inline int r2_log_details_include_conversation(const char *details,
@@ -212,9 +213,13 @@ static inline int r2_log_details_include_conversation(const char *details,
     if (strncmp(details, user, user_length) != 0)
         return 0;
     details += user_length;
-    if (strncmp(details, reply_prefix, sizeof(reply_prefix) - 1) != 0)
+    if (strncmp(details, reply_prefix, sizeof(reply_prefix) - 1) == 0)
+        details += sizeof(reply_prefix) - 1;
+    else if (strncmp(details, R2_LOG_CONVERSATION_NOTICE_PREFIX,
+                     sizeof(R2_LOG_CONVERSATION_NOTICE_PREFIX) - 1) == 0)
+        details += sizeof(R2_LOG_CONVERSATION_NOTICE_PREFIX) - 1;
+    else
         return 0;
-    details += sizeof(reply_prefix) - 1;
     size_t reply_length = strlen(reply);
     if (strncmp(details, reply, reply_length) != 0)
         return 0;
@@ -240,6 +245,11 @@ int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char 
                                               const int64_t *review_ids, size_t review_count,
                                               const char *tool_result);
 
+/* Archive a runtime notice without scheduling learning (e.g. shutdown). */
+int64_t r2_log_conversation_turn_with_notice(const char *user_text, const char *notice,
+                                             const int64_t *speech_ids, size_t speech_count,
+                                             const int64_t *review_ids, size_t review_count,
+                                             const char *tool_result);
 /* Archive a runtime fallback and evaluate only the user and recorded tool evidence. */
 int64_t r2_log_conversation_turn_with_fallback(const char *user_text, const char *assistant_text,
                                                const int64_t *speech_ids, size_t speech_count,

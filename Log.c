@@ -1528,6 +1528,7 @@ static int log_stage_learning_locked(int64_t event_id, const char *user,
 
 typedef enum {
     LOG_TURN_ARCHIVE_ONLY,
+    LOG_TURN_ARCHIVE_NOTICE,
     LOG_TURN_LEARN_FROM_EVIDENCE,
     LOG_TURN_LEARN_FROM_REPLY
 } LogTurnLearning;
@@ -1544,9 +1545,12 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     size_t user_len = strlen(user_text);
     size_t assistant_len = strlen(assistant_text);
     const char user_prefix[] = "USER SAID:\n";
-    const char reply_prefix[] = "\nR2 REPLIED:\n";
+    const char *reply_prefix =
+        (learning == LOG_TURN_ARCHIVE_NOTICE || learning == LOG_TURN_LEARN_FROM_EVIDENCE)
+        ? R2_LOG_CONVERSATION_NOTICE_PREFIX : "\nR2 REPLIED:\n";
+    size_t reply_prefix_len = strlen(reply_prefix);
     size_t tool_len = tool_result ? strlen(tool_result) : 0;
-    size_t overhead = (sizeof(user_prefix) - 1) + (sizeof(reply_prefix) - 1) +
+    size_t overhead = (sizeof(user_prefix) - 1) + reply_prefix_len +
                       (tool_len ? sizeof(log_conversation_tool_prefix) - 1 : 0);
     if (user_len > SIZE_MAX - overhead ||
         assistant_len > SIZE_MAX - overhead - user_len ||
@@ -1566,12 +1570,12 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     memcpy(details, user_prefix, sizeof(user_prefix) - 1);
     memcpy(details + sizeof(user_prefix) - 1, user_text, user_len);
     memcpy(details + sizeof(user_prefix) - 1 + user_len,
-           reply_prefix, sizeof(reply_prefix) - 1);
-    memcpy(details + sizeof(user_prefix) - 1 + user_len + sizeof(reply_prefix) - 1,
+           reply_prefix, reply_prefix_len);
+    memcpy(details + sizeof(user_prefix) - 1 + user_len + reply_prefix_len,
            assistant_text, assistant_len + 1);
     if (tool_len) {
         char *tool_at = details + sizeof(user_prefix) - 1 + user_len +
-                        sizeof(reply_prefix) - 1 + assistant_len;
+                        reply_prefix_len + assistant_len;
         memcpy(tool_at, log_conversation_tool_prefix, sizeof(log_conversation_tool_prefix) - 1);
         memcpy(tool_at + sizeof(log_conversation_tool_prefix) - 1, tool_result, tool_len + 1);
     }
@@ -1604,7 +1608,8 @@ static int64_t log_conversation_turn_with_evidence(const char *user_text, const 
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
-    if (saved && learning != LOG_TURN_ARCHIVE_ONLY) {
+    if (saved && (learning == LOG_TURN_LEARN_FROM_EVIDENCE ||
+                  learning == LOG_TURN_LEARN_FROM_REPLY)) {
         const char *learning_reply = learning == LOG_TURN_LEARN_FROM_REPLY ? assistant_text : "";
         saved = log_stage_learning_locked(event_id, user_text, learning_reply, tool_result);
         if (saved && learning == LOG_TURN_LEARN_FROM_REPLY)
@@ -1640,6 +1645,15 @@ int64_t r2_log_conversation_turn_for_learning(const char *user_text, const char 
 {
     return log_conversation_turn_with_evidence(user_text, assistant_text, speech_ids, speech_count,
                                                review_ids, review_count, tool_result, LOG_TURN_LEARN_FROM_REPLY);
+}
+
+int64_t r2_log_conversation_turn_with_notice(const char *user_text, const char *notice,
+                                             const int64_t *speech_ids, size_t speech_count,
+                                             const int64_t *review_ids, size_t review_count,
+                                             const char *tool_result)
+{
+    return log_conversation_turn_with_evidence(user_text, notice, speech_ids, speech_count,
+                                               review_ids, review_count, tool_result, LOG_TURN_ARCHIVE_NOTICE);
 }
 
 int64_t r2_log_conversation_turn_with_fallback(const char *user_text, const char *assistant_text,

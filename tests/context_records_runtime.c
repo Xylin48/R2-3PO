@@ -75,6 +75,26 @@ static void insert_visual(sqlite3 *connection, const char *description, int imag
     assert(sqlite3_bind_text(st, 2, description, -1, SQLITE_TRANSIENT) == SQLITE_OK);
     assert(sqlite3_step(st) == SQLITE_DONE); sqlite3_finalize(st);
 }
+static void verify_runtime_notice(void)
+{
+    static const char user[] = "Unanswered cobalt fixture";
+    static const char notice[] = "Runtime failure diagnostic: cobalt fixture";
+    static const char tool[] = "Exact completed cobalt action evidence";
+    char *expected = NULL;
+    assert(asprintf(&expected, "USER SAID:\n%s%s%s%s%s", user,
+                    R2_LOG_CONVERSATION_NOTICE_PREFIX, notice,
+                    R2_LOG_CONVERSATION_TOOL_PREFIX, tool) >= 0);
+    assert(r2_log_details_include_conversation(expected, user, notice));
+    expect_copies(r2_log_search(user, 1), expected, 1);
+    expect_copies(r2_sj_search(user, 1), expected, 1);
+    char *ctx = r2_diary_build_reflection_context(20);
+    assert(ctx && strstr(ctx, expected));
+    assert(!strstr(ctx, "Archived R2 reply:\nRuntime failure diagnostic: cobalt fixture"));
+    assert(!strstr(ctx, "R2 REPLIED:\nRuntime failure diagnostic: cobalt fixture"));
+    free(ctx);
+    free(expected);
+}
+
 static void verify_complete_reads(void)
 {
     expect_contains(r2_diary_recent(20), diary_text);
@@ -118,6 +138,37 @@ int main(void)
     assert(sqlite3_open(database, &connection) == SQLITE_OK);
     insert_visual(connection, visual_text, 1); insert_visual(connection, "another visual row", 2);
     verify_complete_reads();
+    int64_t notice = r2_log_conversation_turn_with_fallback(
+        "Unanswered cobalt fixture", "Runtime failure diagnostic: cobalt fixture",
+        NULL, 0, NULL, 0, "Exact completed cobalt action evidence");
+    assert(notice > 0);
+    int64_t interrupted = r2_log_conversation_turn_with_notice(
+        "Interrupted indigo fixture", "Runtime stopped before generation",
+        NULL, 0, NULL, 0, NULL);
+    assert(interrupted > 0);
+    sqlite3_stmt *pending = NULL;
+    sqlite3 *records = NULL;
+    assert(sqlite3_open(R2_DIARY_DATABASE, &records) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(records,
+        "SELECT l.user_text,l.assistant_text,l.tool_result,"
+        "EXISTS(SELECT 1 FROM r2_log_pending_self_reports WHERE event_id=?1) "
+        "FROM r2_log_pending_learning l WHERE l.event_id=?1",
+        -1, &pending, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_int64(pending, 1, notice) == SQLITE_OK);
+    assert(sqlite3_step(pending) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 0), "Unanswered cobalt fixture"));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 1), ""));
+    assert(!strcmp((const char *)sqlite3_column_text(pending, 2), "Exact completed cobalt action evidence"));
+    assert(sqlite3_column_int(pending, 3) == 0);
+    assert(sqlite3_reset(pending) == SQLITE_OK);
+    assert(sqlite3_bind_int64(pending, 1, interrupted) == SQLITE_OK);
+    assert(sqlite3_step(pending) == SQLITE_DONE);
+    sqlite3_finalize(pending);
+    assert(sqlite3_close(records) == SQLITE_OK);
+    assert(r2_log_ack_learning(notice) == 0);
+    verify_runtime_notice();
+    expect_contains(r2_log_search("Interrupted indigo fixture", 1),
+        R2_LOG_CONVERSATION_NOTICE_PREFIX "Runtime stopped before generation");
 
     const char *keywords[] = {"DIARY-END", "DIARY"};
     expect_copies(r2_collect_associated_records(keywords, 2, r2_diary_visit_search, NULL, NULL), diary_text, 1);
@@ -245,6 +296,7 @@ int main(void)
     assert(r2_diary_init() == 0 && r2_log_init() == 0 && r2_sj_init() == 0);
     assert(r2_visual_init(database, library) == 0);
     verify_complete_reads();
+    verify_runtime_notice();
     /* An embedded-NUL historical row cannot be returned as a complete prefix. */
     assert(sqlite3_open(database, &connection) == SQLITE_OK);
     assert(sqlite3_exec(connection, "UPDATE r2_visual_experiences SET description=CAST(x'410042' AS TEXT)", NULL, NULL, NULL) == SQLITE_OK);

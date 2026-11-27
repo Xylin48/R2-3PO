@@ -15996,7 +15996,8 @@ finalize_reply:
 
     const R2AudioTurnEvidence *speech = r2_audio_turn_evidence;
     const R2TurnContextReviews *reviews = r2_turn_context_reviews;
-    int64_t turn_event_id = (shutting_down ? r2_log_conversation_turn_with_evidence :
+    int64_t turn_event_id = (shutting_down && !generated_reply ? r2_log_conversation_turn_with_notice :
+                             shutting_down ? r2_log_conversation_turn_with_evidence :
                              generated_reply ? r2_log_conversation_turn_for_learning :
                                                r2_log_conversation_turn_with_fallback)(message, reply,
         speech ? speech->events : NULL, speech ? speech->count : 0,
