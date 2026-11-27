@@ -149,10 +149,16 @@ ssize_t __wrap_read(int fd, void *p, size_t n)
 }
 pid_t __real_fork(void);
 pid_t __real_waitpid(pid_t, int *, int);
+static int encoder_wait_error;
 pid_t __wrap_fork(void) { killed_encoder = 0; return encoder_pid; }
 pid_t __wrap_waitpid(pid_t pid, int *status, int options)
 {
     assert(pid == encoder_pid);
+    if (encoder_wait_error) {
+        errno = encoder_wait_error;
+        encoder_wait_error = 0;
+        return -1;
+    }
     if (stall_encoder && !killed_encoder) { assert(options == WNOHANG); return 0; }
     if (!killed_encoder) {
         int fd = open(jpeg_path, O_WRONLY | O_TRUNC); assert(fd >= 0);
@@ -390,6 +396,16 @@ int main(void)
     timeout_clock = 1; clock_calls = 0; before_reap = reaped_encoder;
     assert(!encode_jpeg(&frame, &encoded) && errno == ETIMEDOUT && killed_encoder && reaped_encoder == before_reap + 1);
     temporary_files_gone(); timeout_clock = stall_encoder = 0;
+    before_reap = reaped_encoder;
+    encoder_wait_error = EIO;
+    assert(!encode_jpeg(&frame, &encoded) && errno == EIO && killed_encoder &&
+           reaped_encoder == before_reap + 1);
+    temporary_files_gone();
+    before_reap = reaped_encoder;
+    encoder_wait_error = ECHILD;
+    assert(!encode_jpeg(&frame, &encoded) && errno == ECHILD && !killed_encoder &&
+           reaped_encoder == before_reap);
+    temporary_files_gone();
 
     snprintf(probe_path, sizeof(probe_path), "%s/probe.jpg", R2_HOME);
     int fd = open(probe_path, O_WRONLY|O_CREAT|O_TRUNC, 0600); assert(fd >= 0);

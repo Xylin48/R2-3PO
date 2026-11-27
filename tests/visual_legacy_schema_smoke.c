@@ -159,6 +159,28 @@ int main(void)
         assert(strcmp((const char *)sqlite3_column_text(st, i), expected) == 0);
     }
     sqlite3_finalize(st);
+    assert(sqlite3_exec(visual_db,
+        "CREATE TRIGGER revert_withdrawal AFTER UPDATE OF withdrawn ON r2_visual_pending_archives "
+        "BEGIN UPDATE r2_visual_pending_archives SET withdrawn=0 WHERE id=NEW.id; END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_withdraw_archive(visual_db, "/legacy/missing.jpg") == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER revert_withdrawal", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(visual_db,
+        "CREATE TRIGGER restore_pending AFTER DELETE ON r2_visual_pending_archives "
+        "BEGIN INSERT INTO r2_visual_pending_archives(id,image_path,created_utc,source,model,prompt,"
+        "description,width,height,frame_number,frame_timestamp,jpeg,withdrawn) VALUES(OLD.id,"
+        "OLD.image_path,OLD.created_utc,OLD.source,OLD.model,OLD.prompt,OLD.description,"
+        "OLD.width,OLD.height,OLD.frame_number,OLD.frame_timestamp,OLD.jpeg,OLD.withdrawn); END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_finish_transaction(visual_db,
+        visual_drop_pending(visual_db, "/legacy/missing.jpg", 0)) == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER restore_pending", NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_withdraw_archive(visual_db, "/legacy/missing.jpg") == SQLITE_DONE);
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT 1 FROM r2_visual_pending_archives WHERE id=91",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE);
+    sqlite3_finalize(st);
     r2_visual_shutdown();
     assert(unlink(path) == 0);
     assert(rmdir(library) == 0);
