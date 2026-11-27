@@ -11401,9 +11401,19 @@ cleanup:
 
 int r2_write_diary(void)
 {
+    /* An explicit reflection owns the foreground lifecycle just like a
+       typed turn: shutdown cannot close its stores, other turns cannot
+       change its context, and replay cannot clear its publication request
+       between the reflection commit and the notification. */
+    atomic_fetch_add(&foreground_conversation_waiting, 1);
+    pthread_mutex_lock(&conversation_turn_lock);
+    int rc = -1;
+    if (!core_initialized || shutting_down || !diary_initialized)
+        goto done;
+
     char *ctx = r2_diary_build_reflection_context(10);
     ctx = append_reality_context(ctx);
-    if (!ctx) return -1;
+    if (!ctx) goto done;
 
     const char *prompt =
         "You are R2-3PO's private autonomous reflection process.\n"
@@ -11433,15 +11443,18 @@ int r2_write_diary(void)
     ollama_background_mode = previous_mode;
     free(ctx);
 
-    if (!reflection) return -1;
+    if (!reflection) goto done;
 
     const int64_t reviews[] = {archive_id, 0};
-    int rc = r2_store_reflection(reflection, NULL, reviews, NULL, NULL);
+    rc = r2_store_reflection(reflection, NULL, reviews, NULL, NULL);
     free(reflection);
     /* The manual path has no live reflection publisher. Dispatch its
        already-staged self-report using the same durable queue as chat. */
     if (rc == 0)
         atomic_store(&post_turn_replay_requested, 1);
+done:
+    pthread_mutex_unlock(&conversation_turn_lock);
+    atomic_fetch_sub(&foreground_conversation_waiting, 1);
     return rc;
 }
 

@@ -2014,7 +2014,10 @@ char *r2_workspace_read(
         return NULL;
     }
 
-    rewind(file);
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
 
     buffer = malloc(
         (size_t)size + 1
@@ -2026,25 +2029,19 @@ char *r2_workspace_read(
         return NULL;
     }
 
-    if (
-        fread(
-            buffer,
-            1,
-            (size_t)size,
-            file
-        )
-        != (size_t)size
-    )
-    {
-        fclose(file);
+    size_t received = fread(buffer, 1, (size_t)size, file);
+    /* ftell describes the earlier file size, not an immutable snapshot.
+       Do not label a shortened or growing file prefix as a full read. */
+    int extra = received == (size_t)size ? fgetc(file) : EOF;
+    int failed = received != (size_t)size || extra != EOF || ferror(file);
+    if (fclose(file) != 0) failed = 1;
+    if (failed) {
         free(buffer);
-
+        errno = EIO;
         return NULL;
     }
 
     buffer[size] = '\0';
-
-    fclose(file);
 
     if (file_size)
     {
@@ -2160,7 +2157,10 @@ char *r2_workspace_read_chunk(
     }
     buffer[actual] = '\0';
 
-    fclose(file);
+    if (fclose(file) != 0) {
+        free(buffer);
+        return NULL;
+    }
 
     if (out_size)
     {
@@ -2413,6 +2413,8 @@ static char *r2_workspace_read_chunk_tool(
 
     end_pointer = NULL;
 
+    const char *length_digits = length_text;
+    while (isspace((unsigned char)*length_digits)) ++length_digits;
     requested_length = strtoull(
         length_text,
         &end_pointer,
@@ -2425,6 +2427,8 @@ static char *r2_workspace_read_chunk_tool(
         end_pointer == length_text
         ||
         *end_pointer != '\0'
+        ||
+        *length_digits == '-'
         ||
         requested_length == 0
     )

@@ -2683,6 +2683,11 @@ static void check_shutdown_drain_and_rollback(void)
     char *reply = r2_talk("A turn arrived after shutdown.");
     assert(reply && strstr(reply, "couldn't start this turn"));
     free(reply);
+    int requests_before = perform_count;
+    assert(r2_write_diary() == -1);
+    assert(!atomic_load(&foreground_conversation_waiting));
+    assert(!atomic_load(&post_turn_replay_requested));
+    assert(perform_count == requests_before);
 
     sqlite3 *reader = NULL;
     assert(sqlite3_open_v2(R2_DIARY_DATABASE, &reader, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);

@@ -27,6 +27,7 @@ static int replace_mirror_directory = 0;
 static char replaced_mirror_name[14];
 static int fail_diary_readdir = 0;
 static int fail_diary_fread = 0;
+static int grow_diary_fread = 0;
 static int fail_diary_getdelim = 0;
 static const char *const diary_outside = "/tmp/r2-diary-workspace-outside-sentinel";
 static void maybe_swap_checked_workspace_open(const char *path, int flags)
@@ -111,6 +112,11 @@ size_t __wrap_fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
     if (fail_diary_fread) {
         fail_diary_fread = 0;
         assert(close(fileno(stream)) == 0);
+    }
+    if (grow_diary_fread) {
+        grow_diary_fread = 0;
+        FILE *append = fopen(R2_WORKSPACE "/audit-byte-count-fixture.txt", "ab");
+        assert(append && fputs("def", append) >= 0 && fclose(append) == 0);
     }
     return __real_fread(ptr, size, nmemb, stream);
 }
@@ -207,6 +213,36 @@ static void verify_workspace_text_byte_counts(void)
     reply = r2_diary_tool("FILE_READ_CHUNK", "audit-byte-count-fixture.txt|3|3");
     assert(reply && strcmp(reply, "\n\n[CHUNK_BYTES_READ=0]\n[NEXT_OFFSET=3]\n") == 0);
     free(reply);
+
+    /* strtoull accepts a sign: a negative requested byte count must not
+       wrap into a huge unsigned value and silently become a maximum read. */
+    const char *invalid_lengths[] = {"-1", " -1", "-0", "-18446744073709551615"};
+    for (size_t i = 0; i < sizeof(invalid_lengths) / sizeof(invalid_lengths[0]); ++i) {
+        char request[128];
+        int n = snprintf(request, sizeof(request), "audit-byte-count-fixture.txt|0|%s",
+                         invalid_lengths[i]);
+        assert(n > 0 && (size_t)n < sizeof(request));
+        reply = r2_diary_tool("FILE_READ_CHUNK", request);
+        assert(reply && strstr(reply, "FILE READ CHUNK ERROR:") &&
+               !strstr(reply, "[NEXT_OFFSET="));
+        free(reply);
+    }
+
+    /* Grow the file after the full reader measured it, before fread.
+       The old implementation incorrectly returned abc as the entire file. */
+    grow_diary_fread = 1;
+    count = 12345;
+    raw = r2_workspace_read("audit-byte-count-fixture.txt", &count);
+    assert(!raw && !grow_diary_fread && count == 12345);
+    raw = r2_workspace_read("audit-byte-count-fixture.txt", &count);
+    assert(raw && count == 6 && !memcmp(raw, "abcdef", 6));
+    free(raw);
+
+    file = fopen(path, "wb");
+    assert(file && fclose(file) == 0);
+    raw = r2_workspace_read("audit-byte-count-fixture.txt", &count);
+    assert(raw && count == 0 && !*raw);
+    free(raw);
     assert(unlink(path) == 0);
 }
 
