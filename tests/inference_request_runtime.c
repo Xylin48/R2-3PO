@@ -368,6 +368,25 @@ static void check_final_budget_keeps_exchanges_whole(void)
         for (size_t i = 3; i < 7; ++i)
             assert(!include[i] && limits[i] == 0);
     }
+
+    /* Only a recognizable, complete internal pair may be omitted. */
+    turns[4].content = "[R2_INTERNAL_TOOL_REQUEST]\nInternal action request";
+    size_t visible = strlen(turns[3].content) + strlen(turns[6].content) +
+                     strlen(turns[7].content);
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, visible, NULL) == 0);
+    assert(include[3] && include[6] && include[7]);
+    assert(!include[4] && !include[5]);
+    assert(limits[3] == strlen(turns[3].content) && limits[6] == strlen(turns[6].content));
+    assert(limits[4] == 0 && limits[5] == 0);
+
+    /* A marker quoted by a human remains visible; it does not form a pair. */
+    turns[4].role = "user";
+    turns[5].internal_tool_result = 0;
+    turns[5].role = "assistant";
+    memset(include, 1, sizeof(include));
+    assert(r2_preserve_inference_units(turns, 8, include, limits, 7, 0, visible, NULL) == 0);
+    assert(!include[4]);
 }
 
 static void check_boundaries(void)

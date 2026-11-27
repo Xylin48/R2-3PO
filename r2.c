@@ -4182,13 +4182,19 @@ static int r2_required_inference_bytes(const Message *msgs, size_t count,
 /* Historical action handoffs are separate from the visible exchange. A
  * result is tagged by the runtime, and only its assistant-side request is
  * internal; never classify a human's quoted marker as internal evidence. */
+static int r2_history_internal_request(const Message *message)
+{
+    return !r2_is_internal_tool_result(message) &&
+        message->role && !strcmp(message->role, "assistant") &&
+        message->content &&
+        !strncmp(message->content, "[R2_INTERNAL_TOOL_REQUEST]\n",
+                 sizeof("[R2_INTERNAL_TOOL_REQUEST]\n") - 1U);
+}
+
 static int r2_history_internal_message(const Message *message)
 {
     return r2_is_internal_tool_result(message) ||
-        (message->role && !strcmp(message->role, "assistant") &&
-         message->content &&
-         !strncmp(message->content, "[R2_INTERNAL_TOOL_REQUEST]\n",
-                  sizeof("[R2_INTERNAL_TOOL_REQUEST]\n") - 1U));
+           r2_history_internal_request(message);
 }
 
 typedef struct {
@@ -4211,6 +4217,7 @@ static R2HistoryExchange r2_select_history_exchange(const Message *msgs,
     size_t full_bytes = 0, visible_bytes = 0;
     size_t full_slots = 0, visible_slots = 0;
     int full_fits = 1, visible_fits = 1, anchored = 0;
+    int pairs_verified = 1;
     while (selected.start > 0) {
         size_t index = --selected.start;
         const Message *m = &msgs[index];
@@ -4222,6 +4229,16 @@ static R2HistoryExchange r2_select_history_exchange(const Message *msgs,
             full_fits = 0;
         else
             full_bytes += n;
+
+        /* An unrecognized or incomplete handoff cannot safely be split.
+           Preserve the original all-or-nothing exchange rule for it. */
+        if (r2_is_internal_tool_result(m)) {
+            if (index == 0 || !r2_history_internal_request(&msgs[index - 1]))
+                pairs_verified = 0;
+        } else if (r2_history_internal_request(m)) {
+            if (index + 1 >= end || !r2_is_internal_tool_result(&msgs[index + 1]))
+                pairs_verified = 0;
+        }
 
         if (current_user == SIZE_MAX || !r2_history_internal_message(m)) {
             ++visible_slots;
@@ -4241,8 +4258,8 @@ static R2HistoryExchange r2_select_history_exchange(const Message *msgs,
         selected.slots = full_slots;
         selected.keep = 1;
         selected.include_actions = 1;
-    } else if (anchored && visible_fits && visible_slots <= available_slots &&
-               visible_slots) {
+    } else if (anchored && pairs_verified && visible_fits &&
+               visible_slots <= available_slots && visible_slots) {
         selected.bytes = visible_bytes;
         selected.slots = visible_slots;
         selected.keep = 1;
