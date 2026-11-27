@@ -9429,6 +9429,23 @@ static void release_tool_result_json(struct json_object **value)
     if (*value) json_object_put(*value);
 }
 
+/* Reserve enough space for the existing capture-failure notice on every
+ * successful append. If a later allocation fails, retain earlier action
+ * outcomes rather than replacing them with the notice. */
+static const char tool_capture_failure_notice[] =
+    "I ran out of memory while recording an action result. "
+    "An action may already have completed, so I will not "
+    "repeat it automatically. Verify the current state "
+    "before retrying the request.\n";
+
+static char *tool_capture_failure(char *results, size_t len)
+{
+    const size_t prefix = sizeof(tool_capture_failure_notice) - 1;
+    memmove(results + prefix, results, len + 1);
+    memcpy(results, tool_capture_failure_notice, prefix);
+    return results;
+}
+
 static char *process_tools_with_status(
     const char *reply,
     int *world_action_succeeded)
@@ -9438,8 +9455,7 @@ static char *process_tools_with_status(
     size_t cap = 1024;
     size_t len = 0;
 
-    char *results =
-        malloc(cap);
+    char *results = malloc(cap);
 
     if (!results)
         return NULL;
@@ -9449,50 +9465,37 @@ static char *process_tools_with_status(
     /* APPEND can return immediately after an action. Its block-scoped
        inputs must still be released on that early return. */
 #define TOOL_OWNED_TEXT __attribute__((cleanup(release_tool_result_text)))
-#define APPEND(...)                                                       \
-    do {                                                                    \
-        char *_part = NULL;                                                 \
-        int _n = asprintf(&_part, __VA_ARGS__);                              \
-        if (_n < 0 || !_part || (size_t)_n > SIZE_MAX - len - 1U) {          \
-            free(_part);                                                    \
-            static const char _capture_failure[] =                          \
-                "I ran out of memory while recording an action result. "    \
-                "An action may already have completed, so I will not "      \
-                "repeat it automatically. Verify the current state "        \
-                "before retrying the request.";                             \
-            snprintf(results, cap, "%s", _capture_failure);                  \
-            return results;                                                 \
-        }                                                                   \
-        size_t _needed = len + (size_t)_n + 1U;                             \
-        if (_needed > cap) {                                                \
-            size_t _new_cap = cap;                                          \
-            while (_new_cap < _needed) {                                    \
-                if (_new_cap > SIZE_MAX / 2U) {                             \
-                    _new_cap = _needed;                                     \
-                    break;                                                  \
-                }                                                           \
-                _new_cap *= 2U;                                             \
-            }                                                               \
-            char *_grown = realloc(results, _new_cap);                      \
-            if (!_grown) {                                                  \
-                free(_part);                                                \
-                /* Keep the original cap: previously committed actions may  \
-                 * have succeeded, and the error must remain a valid reply. */ \
-                static const char _capture_failure[] =                      \
-                    "I ran out of memory while recording an action result. " \
-                    "An action may already have completed, so I will not "  \
-                    "repeat it automatically. Verify the current state "    \
-                    "before retrying the request.";                         \
-                snprintf(results, cap, "%s", _capture_failure);              \
-                return results;                                             \
-            }                                                               \
-            results = _grown;                                               \
-            cap = _new_cap;                                                 \
-        }                                                                   \
-        memcpy(results + len, _part, (size_t)_n);                            \
-        len += (size_t)_n;                                                  \
-        results[len] = '\0';                                               \
-        free(_part);                                                        \
+#define APPEND(...)                                                        \
+    do {                                                                   \
+        char *_part = NULL;                                                \
+        int _n = asprintf(&_part, __VA_ARGS__);                             \
+        if (_n < 0 || !_part ||                                            \
+            (size_t)_n > SIZE_MAX - len - sizeof(tool_capture_failure_notice)) { \
+            free(_part);                                                   \
+            return tool_capture_failure(results, len);                     \
+        }                                                                  \
+        size_t _needed = len + (size_t)_n + sizeof(tool_capture_failure_notice); \
+        if (_needed > cap) {                                               \
+            size_t _new_cap = cap;                                         \
+            while (_new_cap < _needed) {                                   \
+                if (_new_cap > SIZE_MAX / 2U) {                            \
+                    _new_cap = _needed;                                    \
+                    break;                                                 \
+                }                                                          \
+                _new_cap *= 2U;                                            \
+            }                                                              \
+            char *_grown = realloc(results, _new_cap);                     \
+            if (!_grown) {                                                 \
+                free(_part);                                               \
+                return tool_capture_failure(results, len);                 \
+            }                                                              \
+            results = _grown;                                              \
+            cap = _new_cap;                                                \
+        }                                                                  \
+        memcpy(results + len, _part, (size_t)_n);                           \
+        len += (size_t)_n;                                                 \
+        results[len] = '\0';                                              \
+        free(_part);                                                       \
     } while (0)
 
     /*
@@ -15884,7 +15887,8 @@ static char *r2_talk_impl(const char *message)
             free(reply);
             free(stripped_reply);
             stripped_reply = NULL;
-            reply = tools; /* Transfer the existing buffer; do not allocate during OOM. */
+            reply = tools; /* Borrow this same buffer as evidence; no allocation during OOM. */
+            tool_evidence = tools;
             tools = NULL;
             goto finalize_reply;
         }
