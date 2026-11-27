@@ -121,7 +121,7 @@ int main(void)
         { .role = "system", .content = "CURRENT TURN RETRIEVED CONTEXT", .pinned = 0 },
         { .role = "system", .content = "PERSISTENT REALITY CONTEXT", .pinned = 0 },
         { .role = "system", .content = "============================================================\nIDENTITY AND PERSISTENT MEMORY", .pinned = 0 },
-        { .role = "system", .content = "============================================================\nR2 PERSISTENT MEMORY - STARTUP CONTEXT", .pinned = 0 },
+        { .role = "system", .content = R2_STARTUP_MEMORY_HEADING, .pinned = 0 },
         { .role = "user", .content = "current user turn", .pinned = 0 }
     };
     const unsigned char include_all[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1 };

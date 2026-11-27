@@ -66,8 +66,10 @@ require(
     "retrieved evidence for the active turn outranks persistent learning and archived history",
 )
 require(
-    '"R2 PERSISTENT MEMORY - STARTUP CONTEXT"' in priority_logic
-    and "return 5;" in priority_logic,
+    "r2_is_startup_memory_context(content)" in priority_logic
+    and "return 5;" in priority_logic
+    and "strncmp(content, R2_STARTUP_MEMORY_HEADING," in core
+    and 'R2_STARTUP_MEMORY_HEADING\n        "\\n"' in core,
     "persistent startup memory follows live Reality, active-turn evidence, and relevant capability guidance",
 )
 require(

@@ -332,13 +332,20 @@ static void check_final_budget_prefers_recent_dialogue(void)
 static void check_optional_snapshots_yield_to_dialogue(void)
 {
     Message turns[] = {
-        {"system", "R2 PERSISTENT MEMORY - STARTUP CONTEXT: Unrelated old memory.", 0, 0},
+        {"system", R2_STARTUP_MEMORY_HEADING "Unrelated old memory.", 0, 0},
         {"system", "PERSISTENT LEARNING CONTEXT: Unrelated old learning.", 0, 0},
-        {"system", "Current instructions.", 0, 0},
+        {"system", "Current instructions. Explain the label R2 PERSISTENT MEMORY - STARTUP CONTEXT.", 0, 0},
         {"user", "Where did we put the blue book?", 0, 0},
         {"assistant", "The blue book is on the top shelf.", 0, 0},
         {"user", "Can I reach it?", 0, 0},
     };
+    assert(r2_is_startup_memory_context(turns[0].content));
+    assert(!r2_inference_unit_required(&turns[0], 0, 5));
+    assert(!r2_is_startup_memory_context(turns[2].content));
+    assert(r2_inference_unit_required(&turns[2], 2, 5));
+    char *actual_snapshot = r2_format_startup_memory_context("fixture memory\n");
+    assert(actual_snapshot && r2_is_startup_memory_context(actual_snapshot));
+    free(actual_snapshot);
     unsigned char include[6];
     size_t limits[6];
     size_t dialogue_budget = 0, all_budget = 0;
@@ -467,7 +474,7 @@ static void check_optional_snapshot_survives_provisional_budget(void)
     assert(setenv("R2_OLLAMA_NUM_CTX", "2048", 1) == 0);
     const char *query = "Which book did we choose?";
     char *contract = text(1800, 'c', "Complete fixture contract. ");
-    const char *snapshot = "R2 PERSISTENT MEMORY - STARTUP CONTEXT: The book is blue.";
+    const char *snapshot = R2_STARTUP_MEMORY_HEADING "The book is blue.";
     Message turn[] = {
         {.role = "system", .content = (char *)snapshot},
         {.role = "user", .content = "We chose a blue book."},

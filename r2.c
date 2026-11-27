@@ -968,10 +968,12 @@ static int prepare_original_archive(char **original)
         return -1;
     }
     size_t read_length = fread(data, 1, length, stream);
+    data[length] = '\0';
     int extra = fgetc(stream);
     struct stat after;
     int failed = ferror(stream) || read_length != length ||
         memchr(data, '\0', read_length) != NULL ||
+        !r2_input_is_utf8(data) ||
         fstat(fileno(stream), &after) != 0 ||
         !original_archive_unchanged(&status, &after);
     if (fclose(stream) != 0) failed = 1;
@@ -1989,13 +1991,23 @@ static char *get_startup_memories(int limit)
     return out;
 }
 
+#define R2_STARTUP_MEMORY_HEADING \
+    "============================================================\n" \
+    "R2 PERSISTENT MEMORY - STARTUP CONTEXT\n" \
+    "============================================================\n"
+
+/* Classification and diagnostics share the actual producer's section boundary. */
+static int r2_is_startup_memory_context(const char *content)
+{
+    return content && !strncmp(content, R2_STARTUP_MEMORY_HEADING,
+                               sizeof(R2_STARTUP_MEMORY_HEADING) - 1);
+}
+
 static char *r2_format_startup_memory_context(const char *snapshot)
 {
     char *context = NULL;
     if (asprintf(&context,
-        "============================================================\n"
-        "R2 PERSISTENT MEMORY - STARTUP CONTEXT\n"
-        "============================================================\n"
+        R2_STARTUP_MEMORY_HEADING
         "\n"
         "The following is a broad snapshot of R2's persistent memory.\n"
         "This can include up to %d recent memories that fit the startup context.\n"
@@ -3728,7 +3740,7 @@ static int r2_inference_system_priority(const char *content, const char *query)
         }
         return 4;
     }
-    if (strstr(content, "R2 PERSISTENT MEMORY - STARTUP CONTEXT"))
+    if (r2_is_startup_memory_context(content))
         return 5;
     if (!strncmp(content, "PERSISTENT LEARNING CONTEXT",
                   strlen("PERSISTENT LEARNING CONTEXT")))
@@ -5198,7 +5210,7 @@ static char *ollama_chat_with_limit(
         } else if (!strcmp(role, "system")) {
             if (i == 0 && strstr(content, R2_CONVERSATION_IDENTITY))
                 audit_robot_identity = 1;
-            if (strstr(content, "R2 PERSISTENT MEMORY - STARTUP CONTEXT"))
+            if (r2_is_startup_memory_context(content))
                 audit_startup_memory = 1;
             if (!strncmp(content, "CURRENT TURN RETRIEVED CONTEXT",
                           strlen("CURRENT TURN RETRIEVED CONTEXT")))
@@ -6797,7 +6809,11 @@ static int r2_append_original_archive_matches(char **context,
         best[first].score = 0;
     }
     for (size_t i = 0; i < MAX_ORIGINAL_ARCHIVE_MATCHES; ++i) free(best[i].line);
-    if (r2_is_shutting_down()) { errno = ECANCELED; return -1; }
+    if (r2_is_shutting_down()) {
+        (*context)[original_length] = '\0';
+        errno = ECANCELED;
+        return -1;
+    }
     if (!failed && rc == 0) return matching_lines > MAX_ORIGINAL_ARCHIVE_MATCHES;
 
 unavailable:

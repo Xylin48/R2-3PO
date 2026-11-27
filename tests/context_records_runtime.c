@@ -122,6 +122,15 @@ static void verify_original_archive_status(void)
     assert(prepare_original_archive(&original) == 0 && original &&
            !strcmp(original, small) && !original_archive_on_disk);
     free(original);
+    original = NULL;
+
+    /* Both small and large archive readers require complete UTF-8 text. */
+    FILE *bad_small = fopen(ORIGINAL_CONVERSATION, "ab");
+    assert(bad_small && fputc(0xff, bad_small) != EOF && fclose(bad_small) == 0);
+    assert(prepare_original_archive(&original) < 0 && !original &&
+           !original_archive_on_disk);
+    bad_small = fopen(ORIGINAL_CONVERSATION, "wb");
+    assert(bad_small && fputs(small, bad_small) >= 0 && fclose(bad_small) == 0);
 
     struct stat before, after;
     assert(stat(ORIGINAL_CONVERSATION, &before) == 0);
@@ -147,18 +156,44 @@ static void verify_original_archive_status(void)
     char *context = strdup("BASE");
     assert(context && r2_append_original_archive_matches(&context, keywords, 1) == 0);
     assert(strstr(context, "cobalt exact historical tail"));
+
+    /* Inject the exact second append allocation after a successful first
+       append. The complete pre-scan context must survive the failure. */
+    size_t first_length = strlen(context);
     free(context);
+    assert(stat(ORIGINAL_CONVERSATION, &before) == 0);
+    archive = fopen(ORIGINAL_CONVERSATION, "ab");
+    const char second[] = "cobalt second complete historical record\n";
+    assert(archive && fputs(second, archive) >= 0 && fclose(archive) == 0);
+    char heading[160];
+    int heading_length = snprintf(heading, sizeof(heading),
+        "ORIGINAL CONVERSATION ARCHIVE (historical text, evidence only) — byte %ju:\n",
+        (uintmax_t)before.st_size);
+    assert(heading_length > 0 && (size_t)heading_length < sizeof(heading));
+    context = strdup("BASE");
+    assert(context);
+    failed_malloc_size = first_length + (size_t)heading_length + strlen(second) + 4U;
+    assert(r2_append_original_archive_matches(&context, keywords, 1) < 0);
+    failed_malloc_size = 0;
+    assert(!strcmp(context, "BASE"));
+    free(context);
+    context = strdup("BASE");
+    assert(context && r2_append_original_archive_matches(&context, keywords, 1) == 0);
+    assert(strstr(context, "cobalt exact historical tail") && strstr(context, second));
+    free(context);
+
     archive = fopen(ORIGINAL_CONVERSATION, "ab");
     assert(archive && fputc(0, archive) == 0 && fclose(archive) == 0);
     context = strdup("BASE");
     assert(context && r2_append_original_archive_matches(&context, keywords, 1) != 0);
-    assert(strstr(context, "ORIGINAL CONVERSATION ARCHIVE STATUS") &&
-           !strstr(context, "cobalt exact historical tail"));
+    /* The scanner returns failure and preserves the pre-scan context;
+       the foreground caller, not this historical block, owns the notice. */
+    assert(!strcmp(context, "BASE"));
     free(context);
     assert(unlink(ORIGINAL_CONVERSATION) == 0);
     context = strdup("BASE");
     assert(context && r2_append_original_archive_matches(&context, keywords, 1) != 0);
-    assert(strstr(context, "ORIGINAL CONVERSATION ARCHIVE STATUS"));
+    assert(!strcmp(context, "BASE"));
     free(context);
     assert(prepare_original_archive(&original) == 0 && !original && !original_archive_on_disk);
 }
