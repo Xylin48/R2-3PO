@@ -318,6 +318,13 @@ int main(void)
     pthread_mutex_lock(&gate);
     await_flag(&connect_entered);
     pthread_mutex_unlock(&gate);
+    /* The pending connection owns the lifecycle mutex but has not yet
+     * published an open event. A conversation must not wait for it. */
+    start = seconds();
+    R2TurnSources pending_sources = r2_capture_turn_sources();
+    assert(seconds() - start < 1.0);
+    assert(!pending_sources.hearing_event.source_name);
+    r2_release_turn_sources(&pending_sources);
     assert(r2_watch_stop() == 0);
     pthread_mutex_lock(&gate);
     assert(!transport_cancelled);
@@ -336,6 +343,16 @@ int main(void)
     pthread_mutex_lock(&gate);
     await_flag(&read_entered);
     pthread_mutex_unlock(&gate);
+    /* A direct read holds the primary lifecycle mutex for the entire
+     * recording. The turn's exact source snapshot must still be available. */
+    assert(pthread_mutex_trylock(&ears_capture_lock) == EBUSY);
+    start = seconds();
+    R2TurnSources listening_sources = r2_capture_turn_sources();
+    assert(seconds() - start < 1.0);
+    assert(listening_sources.hearing_event.source_name &&
+           !strcmp(listening_sources.hearing_event.source_name, "test.direct.mic"));
+    assert(listening_sources.hearing_event.origin == R2_HEARING_WORLD);
+    r2_release_turn_sources(&listening_sources);
     start = seconds();
     r2_request_shutdown();
     assert(pthread_join(opening, NULL) == 0);

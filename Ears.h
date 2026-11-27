@@ -280,6 +280,12 @@ int r2_ears_get_event(
     R2HearingEvent *event
 );
 
+/* Atomically snapshot the published identity of an open source, without
+ * waiting for PCM or transport lifecycle work. The caller retains receiver
+ * lifetime, supplies an empty output, and releases the successful copy.
+ * Returns -1 (ENODATA when inactive) without modifying the output. */
+int r2_ears_get_open_event(R2Ears *ears, R2HearingEvent *event);
+
 
 /*
  * Retrieve the PCM format currently being delivered.

@@ -15995,16 +15995,16 @@ static R2TurnSources r2_capture_turn_sources(void)
         sources.display_source = strdup(media_latest_source);
     pthread_mutex_unlock(&media_frame_lock);
 
-    pthread_mutex_lock(&ears_capture_lock);
-    if (ears && r2_ears_is_open(ears))
-        (void)r2_ears_get_event(ears, &sources.hearing_event);
-    pthread_mutex_unlock(&ears_capture_lock);
-
-    pthread_mutex_lock(&ears_desktop_capture_lock);
-    if (ears_desktop && atomic_load(&ears_desktop_capture_running) &&
-        r2_ears_is_open(ears_desktop))
-        (void)r2_ears_get_event(ears_desktop, &sources.desktop_event);
-    pthread_mutex_unlock(&ears_desktop_capture_lock);
+    /* The active turn retains primary Ears lifetime through shutdown.
+     * Read its published metadata, never wait behind a one-shot capture.
+     * Desktop is lazily allocated, so retain its pointer under the existing
+     * short publication lock rather than taking its lifecycle mutex. */
+    if (ears)
+        (void)r2_ears_get_open_event(ears, &sources.hearing_event);
+    pthread_mutex_lock(&ears_desktop_pointer_lock);
+    if (ears_desktop && atomic_load(&ears_desktop_capture_running))
+        (void)r2_ears_get_open_event(ears_desktop, &sources.desktop_event);
+    pthread_mutex_unlock(&ears_desktop_pointer_lock);
     if (r2_capture_turn_extra_sources(&sources) != 0)
         fprintf(stderr, "[R2 Life Log] Could not copy all active desktop source identities.\n");
     return sources;

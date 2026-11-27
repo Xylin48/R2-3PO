@@ -104,6 +104,9 @@
 struct R2Ears
 {
     R2HearingEvent event;
+    /* Owns only published metadata. Never held during transport connect,
+     * PCM reads, decoder close/reap, or a Life Log write. */
+    pthread_mutex_t event_lock;
 
     atomic_int open; /* read failures may be signaled from a worker thread */
 
@@ -178,13 +181,24 @@ static void r2_ears_reset_event(R2Ears *ears)
 }
 
 
-static int r2_ears_set_source_name(R2Ears *ears, const char *name)
+/* Called by the lifecycle owner after the previous receiver was closed and
+ * the new transport opened successfully. PCM format is fixed at init. */
+static int r2_ears_publish_event(R2Ears *ears, R2HearingOrigin origin, const char *name)
 {
-    if (!ears) return -1;
-    char *copy = strdup(name ? name : "");
+    char *copy = strdup(name);
     if (!copy) return -1;
+    pthread_mutex_lock(&ears->event_lock);
     free(ears->event.source_name);
     ears->event.source_name = copy;
+    ears->event.origin = origin;
+    ears->event.type = R2_AUDIO_UNKNOWN;
+    ears->event.format = ears->format;
+    ears->event.timestamp = r2_ears_timestamp();
+    ears->using_file = origin == R2_HEARING_FILE;
+    ears->bytes_since_log = 0;
+    ears->last_log_timestamp_us = ears->event.timestamp;
+    atomic_store(&ears->open, 1);
+    pthread_mutex_unlock(&ears->event_lock);
     return 0;
 }
 
@@ -285,6 +299,11 @@ int r2_ears_init(R2Ears **ears)
         free(new_ears);
         return -1;
     }
+    if (pthread_mutex_init(&new_ears->event_lock, NULL) != 0) {
+        pthread_mutex_destroy(&new_ears->transport_lock);
+        free(new_ears);
+        return -1;
+    }
     new_ears->pulse_stream = NULL;
     new_ears->file_stream = NULL;
     new_ears->using_file = 0;
@@ -306,6 +325,20 @@ void r2_ears_close(R2Ears *ears)
     if (!ears)
         return;
 
+    /* The lifecycle owner has stopped/joined the reader. Retire the source
+     * before potentially blocking teardown, and keep the old owned identity
+     * for the close journal event. */
+    pthread_mutex_lock(&ears->event_lock);
+    char *closed_source = ears->event.source_name;
+    R2HearingOrigin closed_origin = ears->event.origin;
+    uint64_t closed_bytes = ears->bytes_since_log;
+    atomic_store(&ears->open, 0);
+    ears->using_file = 0;
+    ears->bytes_since_log = 0;
+    ears->last_log_timestamp_us = 0;
+    r2_ears_reset_event(ears);
+    pthread_mutex_unlock(&ears->event_lock);
+
     pthread_mutex_lock(&ears->transport_lock);
     if (ears->pulse_stream) {
         /* Only the lifecycle owner may close, after its reader has exited. */
@@ -326,25 +359,16 @@ void r2_ears_close(R2Ears *ears)
      * lifecycle owner closes it. Preserve the final close journal event
      * regardless of the availability flag; a source name means a session
      * was actually opened. */
-    if (ears->event.source_name) {
+    if (closed_source) {
         char details[768];
         snprintf(details, sizeof(details),
                  "origin=%d; bytes_since_last_journal_entry=%llu",
-                 (int)ears->event.origin,
-                 (unsigned long long)ears->bytes_since_log);
+                 (int)closed_origin, (unsigned long long)closed_bytes);
         r2_log_sensory("audio_source_closed",
                        "R2 Ears stopped receiving audio samples.",
-                       details, ears->event.source_name ? ears->event.source_name : "Ears.c");
+                       details, closed_source);
     }
-
-    free(ears->event.source_name);
-    ears->event.source_name = NULL;
-    ears->using_file = 0;
-    ears->open = 0;
-    ears->bytes_since_log = 0;
-    ears->last_log_timestamp_us = 0;
-
-    r2_ears_reset_event(ears);
+    free(closed_source);
 }
 
 
@@ -373,6 +397,7 @@ void r2_ears_shutdown(R2Ears *ears)
         return;
 
     r2_ears_close(ears);
+    pthread_mutex_destroy(&ears->event_lock);
     pthread_mutex_destroy(&ears->transport_lock);
     free(ears);
 }
@@ -478,37 +503,11 @@ int r2_ears_open_source_cancelable(
         return -1;
     }
 
-    ears->format.sample_rate =
-        R2_EARS_SAMPLE_RATE;
-
-    ears->format.channels =
-        R2_EARS_CHANNELS;
-
-    ears->format.bits_per_sample =
-        R2_EARS_BITS_PER_SAMPLE;
-
-    ears->event.origin =
-        R2_HEARING_WORLD;
-
-    ears->event.type =
-        R2_AUDIO_UNKNOWN;
-
-    ears->event.format =
-        ears->format;
-
-    ears->event.timestamp =
-        r2_ears_timestamp();
-
-    if (r2_ears_set_source_name(ears, actual_source) != 0) {
+    if (r2_ears_publish_event(ears, R2_HEARING_WORLD, actual_source) != 0) {
         free(resolved_source);
         r2_ears_close(ears);
         return -1;
     }
-
-    ears->using_file = 0;
-    ears->open = 1;
-    ears->bytes_since_log = 0;
-    ears->last_log_timestamp_us = ears->event.timestamp;
 
     {
         char details[768];
@@ -644,37 +643,12 @@ int r2_ears_open_file(
         return -1;
     }
 
-    ears->format.sample_rate = R2_EARS_SAMPLE_RATE;
-    ears->format.channels = R2_EARS_CHANNELS;
-    ears->format.bits_per_sample = R2_EARS_BITS_PER_SAMPLE;
-
-    /*
-     * R2 knows that this audio originated as a file.
-     *
-     * It does NOT know what the audio means.
-     */
-    ears->event.origin =
-        R2_HEARING_FILE;
-
-    ears->event.type =
-        R2_AUDIO_UNKNOWN;
-
-    ears->event.format =
-        ears->format;
-
-    ears->event.timestamp =
-        r2_ears_timestamp();
-
-    if (r2_ears_set_source_name(ears, stable_path) != 0) {
+    /* The file origin describes transport, not the meaning of its audio. */
+    if (r2_ears_publish_event(ears, R2_HEARING_FILE, stable_path) != 0) {
         r2_ears_close(ears);
         free(stable_path);
         return -1;
     }
-
-    ears->using_file = 1;
-    ears->open = 1;
-    ears->bytes_since_log = 0;
-    ears->last_log_timestamp_us = ears->event.timestamp;
 
     {
         char details[768];
@@ -829,14 +803,32 @@ ssize_t r2_ears_read(R2Ears *ears, void *buffer, size_t buffer_size)
  * Event information
  * --------------------------------------------------------- */
 
+static int r2_ears_snapshot_event(R2Ears *ears, R2HearingEvent *event, int require_open)
+{
+    if (!ears || !event) { errno = EINVAL; return -1; }
+    pthread_mutex_lock(&ears->event_lock);
+    if (require_open && (!atomic_load(&ears->open) || !ears->event.source_name)) {
+        pthread_mutex_unlock(&ears->event_lock);
+        errno = ENODATA;
+        return -1;
+    }
+    char *source = strdup(ears->event.source_name ? ears->event.source_name : "");
+    if (source) {
+        *event = ears->event;
+        event->source_name = source;
+    }
+    pthread_mutex_unlock(&ears->event_lock);
+    return source ? 0 : -1;
+}
+
 int r2_ears_get_event(R2Ears *ears, R2HearingEvent *event)
 {
-    if (!ears || !event) return -1;
-    char *source = strdup(ears->event.source_name ? ears->event.source_name : "");
-    if (!source) return -1;
-    *event = ears->event;
-    event->source_name = source;
-    return 0;
+    return r2_ears_snapshot_event(ears, event, 0);
+}
+
+int r2_ears_get_open_event(R2Ears *ears, R2HearingEvent *event)
+{
+    return r2_ears_snapshot_event(ears, event, 1);
 }
 
 void r2_ears_release_event(R2HearingEvent *event)
@@ -887,5 +879,8 @@ R2HearingOrigin r2_ears_get_origin(R2Ears *ears)
     if (!ears)
         return R2_HEARING_NONE;
 
-    return ears->event.origin;
+    pthread_mutex_lock(&ears->event_lock);
+    R2HearingOrigin origin = ears->event.origin;
+    pthread_mutex_unlock(&ears->event_lock);
+    return origin;
 }

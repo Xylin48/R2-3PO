@@ -105,6 +105,9 @@ int main(void)
     assert(r2_ears_init(&ears) == 0);
     assert(setenv("R2_TEST_FILE_MODE", "complete", 1) == 0);
     assert(r2_ears_open_file(ears, unusual_filename) == 0);
+    R2HearingEvent original = {0};
+    assert(r2_ears_get_open_event(ears, &original) == 0);
+    assert(original.origin == R2_HEARING_FILE && !strcmp(original.source_name, unusual_filename));
     char out[4];
     /* Invalid sub-frame requests must fail before consuming any decoder
      * bytes. Ears history and timestamps only accept complete S16LE frames. */
@@ -117,6 +120,10 @@ int main(void)
     assert(memcmp(out, "EFGH", 4) == 0);
     assert(r2_ears_read(ears, out, sizeof(out)) == 0);
     assert(!r2_ears_is_open(ears));
+    R2HearingEvent inactive = {0};
+    assert(r2_ears_get_open_event(ears, &inactive) < 0 && errno == ENODATA);
+    assert(!inactive.source_name);
+    assert(!strcmp(original.source_name, unusual_filename));
 
     R2AudioFile *mono = r2_audio_file_open(unusual_filename, 44100, 1);
     assert(mono);
@@ -197,6 +204,9 @@ int main(void)
     assert(kill((pid_t)child_pid, 0) == -1 && errno == ESRCH);
     assert(duration(before, after) < 2.0);
     r2_ears_shutdown(ears);
+    /* A successful event snapshot belongs to its caller, not the receiver. */
+    assert(!strcmp(original.source_name, unusual_filename));
+    r2_ears_release_event(&original);
     assert(source_closes == 6); /* EOF, reopen, failed decoder, unconfirmed exit, malformed tail, cancellation */
     assert(unlink(pid_path) == 0);
     assert(unlink(script) == 0);
