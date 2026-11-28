@@ -2228,21 +2228,25 @@ static int shell_gameboy_state_database_path(char *out, size_t capacity)
     char inferred[PATH_MAX];
     if (!root || !*root) root = getenv("R2_GAMEBOY_DIR");
     if (!root || !*root) {
-        const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-        if (configured && *configured) {
-            const char *slash = strrchr(configured, '/');
-            if (slash == configured) {
-                root = "/";
-            } else if (slash && (size_t)(slash - configured) < sizeof(inferred)) {
-                size_t length = (size_t)(slash - configured);
-                memcpy(inferred, configured, length);
-                inferred[length] = 0;
-                root = inferred;
-            }
+        /* Python resolves its executable's symlinks before choosing the
+         * default device root. Use the very same executable and resolution. */
+        char *resolved = realpath(r2_gameboy_console_path(), NULL);
+        if (!resolved) return 0;
+        char *slash = strrchr(resolved, '/');
+        size_t length = slash ? (size_t)(slash - resolved) : 0;
+        if (!slash || length >= sizeof(inferred)) {
+            free(resolved);
+            return 0;
         }
+        if (length == 0) {
+            memcpy(inferred, "/", 2);
+        } else {
+            memcpy(inferred, resolved, length);
+            inferred[length] = 0;
+        }
+        free(resolved);
+        root = inferred;
     }
-    if (!root || !*root)
-        root = "/home/x/R2_Home/Devices/GameBoyAdvance";
     size_t root_length = strlen(root);
     const char *separator = root_length > 0 && root[root_length - 1] == '/' ? "" : "/";
     int n = snprintf(out, capacity, "%s%sState/console_state.db", root, separator);
@@ -2335,9 +2339,7 @@ static void shell_gameboy_log_session_end(const ShellGameboyStatus *state,
 
 static int shell_gameboy(const char *arg)
 {
-    const char *configured = getenv("R2_GAMEBOY_EXECUTABLE");
-    const char *device = configured && *configured
-        ? configured : "/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance";
+    const char *device = r2_gameboy_console_path();
     const char *sub = (arg && *arg) ? arg : "power on";
     char *copy = strdup(sub);
     if (!copy) {

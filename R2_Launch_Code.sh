@@ -11,17 +11,31 @@ fi
 
 R2_ROOT="/home/x/R2_Home"
 # Keep the Game Boy CLI and the shell's state reader on the same configured root.
+# Preserve the historical console override using the same precedence as r2.c.
+R2_GAMEBOY_EXECUTABLE="${R2_GAMEBOY_CONSOLE:-${R2_GAMEBOY_EXECUTABLE:-}}"
 if [[ -z "${R2_GAMEBOY_ROOT:-}" ]]; then
     if [[ -n "${R2_GAMEBOY_DIR:-}" ]]; then
         R2_GAMEBOY_ROOT="$R2_GAMEBOY_DIR"
-    elif [[ -n "${R2_GAMEBOY_EXECUTABLE:-}" && "${R2_GAMEBOY_EXECUTABLE}" == */* ]]; then
-        R2_GAMEBOY_ROOT="$(dirname -- "$R2_GAMEBOY_EXECUTABLE")"
+    elif [[ -n "$R2_GAMEBOY_EXECUTABLE" ]]; then
+        # Resolve the actual script (including relative paths and symlinks),
+        # matching GameBoyAdvance.py's Path(__file__).resolve().parent.
+        if ! GAMEBOY_RESOLVED="$(realpath -- "$R2_GAMEBOY_EXECUTABLE")"; then
+            echo "ERROR: Could not resolve configured Game Boy executable." >&2
+            exit 1
+        fi
+        R2_GAMEBOY_ROOT="$(dirname -- "$GAMEBOY_RESOLVED")"
     else
         R2_GAMEBOY_ROOT="$R2_ROOT/Devices/GameBoyAdvance"
     fi
 fi
 R2_GAMEBOY_DIR="${R2_GAMEBOY_DIR:-$R2_GAMEBOY_ROOT}"
 R2_GAMEBOY_EXECUTABLE="${R2_GAMEBOY_EXECUTABLE:-$R2_GAMEBOY_ROOT/GameBoyAdvance}"
+# The runtime may change working directories; keep the selected script absolute.
+if ! R2_GAMEBOY_EXECUTABLE="$(realpath -m -- "$R2_GAMEBOY_EXECUTABLE")"; then
+    echo "ERROR: Could not normalize Game Boy executable path." >&2
+    exit 1
+fi
+R2_GAMEBOY_CONSOLE="$R2_GAMEBOY_EXECUTABLE"
 R2_SOURCE="$R2_ROOT/R2"
 R2_EXEC="$R2_ROOT/r2"
 R2_FX_DIR="${R2_FX_DIR:-$R2_ROOT/R2_sounds/FX}"
@@ -878,6 +892,7 @@ run_as_r2 env \
     R2_OLLAMA_TRACE_PROMPTS="${R2_OLLAMA_TRACE_PROMPTS:-}" \
     R2_WHISPER_MODEL="${R2_WHISPER_MODEL:-}" \
     R2_WHISPER_CLI="${R2_WHISPER_CLI:-}" \
+    R2_GAMEBOY_CONSOLE="$R2_GAMEBOY_CONSOLE" \
     R2_GAMEBOY_EXECUTABLE="$R2_GAMEBOY_EXECUTABLE" \
     R2_GAMEBOY_ROOT="$R2_GAMEBOY_ROOT" \
     R2_GAMEBOY_DIR="$R2_GAMEBOY_DIR" \

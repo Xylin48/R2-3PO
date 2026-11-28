@@ -8994,7 +8994,7 @@ static char *extract_marker(
    TOOL PROCESSING
    ============================================================ */
 
-static const char *gameboy_console_path(void)
+const char *r2_gameboy_console_path(void)
 {
     const char *configured = getenv("R2_GAMEBOY_CONSOLE");
     if (!configured || !*configured) configured = getenv("R2_GAMEBOY_EXECUTABLE");
@@ -10474,7 +10474,7 @@ static char *process_tools_with_capture_status(
                 arg2 = nf >= 3 ? fields[2] : "120";
             }
 
-            const char *console_path = gameboy_console_path();
+            const char *console_path = r2_gameboy_console_path();
             char *console_output = NULL;
             int command_rc = command
                 ? run_gameboy_console(console_path, command, arg1, arg2, &console_output)

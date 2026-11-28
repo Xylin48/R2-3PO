@@ -14,22 +14,30 @@ start = shell.find("static int shell_gameboy(const char *arg)\n{")
 end = shell.find("\nstatic int shell_parse_amount(", start)
 assert start >= 0 and end > start, "single lifecycle-aware Game Boy handler must exist"
 handler = shell[start:end]
-assert 'getenv("R2_GAMEBOY_EXECUTABLE")' in handler
-assert '"/home/x/R2_Home/Devices/GameBoyAdvance/GameBoyAdvance"' in handler
+assert "const char *device = r2_gameboy_console_path();" in handler
+core_path_start = core.index("const char *r2_gameboy_console_path(void)")
+core_path_end = core.index("\n}", core_path_start)
+core_path = core[core_path_start:core_path_end]
+assert core_path.index('getenv("R2_GAMEBOY_CONSOLE")') < core_path.index('getenv("R2_GAMEBOY_EXECUTABLE")')
+assert 'R2_ROOT "/Devices/GameBoyAdvance/GameBoyAdvance"' in core_path
+assert "const char *console_path = r2_gameboy_console_path();" in core
 path_start = shell.index("static int shell_gameboy_state_database_path(")
 path_end = shell.index("/* Read authoritative device state", path_start)
 state_path = shell[path_start:path_end]
 assert 'getenv("R2_GAMEBOY_ROOT")' in state_path
 assert 'getenv("R2_GAMEBOY_DIR")' in state_path
-assert 'getenv("R2_GAMEBOY_EXECUTABLE")' in state_path
-assert '"/home/x/R2_Home/Devices/GameBoyAdvance"' in state_path
+assert "realpath(r2_gameboy_console_path(), NULL)" in state_path
 assert '"%s%sState/console_state.db"' in state_path
 status_start = shell.index("static int shell_gameboy_read_status(")
 status_end = shell.index("static void shell_gameboy_log_session_start(", status_start)
 assert "shell_gameboy_state_database_path(database, sizeof(database))" in shell[status_start:status_end]
-for name in ("R2_GAMEBOY_EXECUTABLE", "R2_GAMEBOY_ROOT", "R2_GAMEBOY_DIR"):
+for name in ("R2_GAMEBOY_CONSOLE", "R2_GAMEBOY_EXECUTABLE", "R2_GAMEBOY_ROOT", "R2_GAMEBOY_DIR"):
     assert name in launcher, f"interactive launcher must pass through {name}"
     assert name in service, f"overnight service must pass through {name}"
+for runner in (launcher, service):
+    assert 'R2_GAMEBOY_EXECUTABLE="${R2_GAMEBOY_CONSOLE:-${R2_GAMEBOY_EXECUTABLE:-}}"' in runner
+    assert 'R2_GAMEBOY_CONSOLE="$R2_GAMEBOY_EXECUTABLE"' in runner
+    assert 'realpath -- "$R2_GAMEBOY_EXECUTABLE"' in runner
 assert 'R2_GAMEBOY_ROOT="$R2_ROOT/Devices/GameBoyAdvance"' in launcher
 assert '"R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"' in service
 assert "execv(device, argv)" in handler

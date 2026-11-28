@@ -243,6 +243,9 @@ char *r2_process_tools(const char *input);
  */
 int r2_write_diary(void);
 
+/* Shared executable selection for model and shell Game Boy commands. */
+const char *r2_gameboy_console_path(void);
+
 /* Sync adapter-verified events from the console command the caller selected. */
 int r2_sync_gameboy_verified_events(const char *path);
 int r2_gameboy_command_deadline(struct timespec *deadline);
