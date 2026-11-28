@@ -105,6 +105,28 @@ static void verify_complete_legacy_tv_status(void)
     if (sqlite3_exec(db, "DELETE FROM r2_tv_devices WHERE connection_kind='rf' AND port=13;",
                      NULL, NULL, NULL) != SQLITE_OK)
         fail("could not remove TV allocation fixture");
+    /* A legacy INTEGER column can contain a value outside C int range.
+       It must not wrap into a valid power/port and become false evidence. */
+    if (sqlite3_exec(db, "UPDATE r2_tv_state SET power=4294967297 WHERE id=1;",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not seed oversized legacy TV state");
+    status = r2_reality_tv_status();
+    if (status) { free(status); fail("TV status accepted a wrapped power value"); }
+    if (sqlite3_exec(db, "UPDATE r2_tv_state SET power=1 WHERE id=1;"
+        "CREATE TRIGGER rewrite_tv_power AFTER UPDATE OF power ON r2_tv_state "
+        "BEGIN UPDATE r2_tv_state SET power=1 WHERE id=1; END;",
+        NULL, NULL, NULL) != SQLITE_OK ||
+        r2_reality_tv_power(0) != -1)
+        fail("a rewritten TV power update reported success");
+    if (sqlite3_exec(db, "DROP TRIGGER rewrite_tv_power;"
+        "CREATE TRIGGER rewrite_tv_source AFTER UPDATE OF source_value ON r2_tv_state "
+        "BEGIN UPDATE r2_tv_state SET source_kind='input',source_value=2 WHERE id=1; END;",
+        NULL, NULL, NULL) != SQLITE_OK ||
+        r2_reality_tv_select_input(3) != -1 || r2_reality_tv_tune_rf(4) != -1)
+        fail("a rewritten TV source update reported success");
+    if (sqlite3_exec(db, "DROP TRIGGER rewrite_tv_source;",
+                     NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not restore TV fixtures");
     sqlite3_close(db);
 }
 
@@ -157,6 +179,29 @@ static void verify_vcr_tape_identity(void)
         fail("reinserted tape lost its own saved position");
     free(status);
     if (sqlite3_exec(db, "DROP TRIGGER ignore_tape_insert;"
+        "CREATE TRIGGER rewrite_tape_position AFTER UPDATE OF position_seconds ON r2_tv_vcr_tapes "
+        "BEGIN UPDATE r2_tv_vcr_tapes SET position_seconds=0 WHERE media_path=NEW.media_path; END;",
+        NULL, NULL, NULL) != SQLITE_OK ||
+        r2_reality_tv_vcr_set_tape_position(first, 90) != -1)
+        fail("a rewritten tape position reported success");
+    if (sqlite3_exec(db, "DROP TRIGGER rewrite_tape_position;"
+        "CREATE TRIGGER rewrite_transport AFTER UPDATE OF transport ON r2_tv_vcr_state "
+        "WHEN NEW.transport='play' BEGIN UPDATE r2_tv_vcr_state SET transport='stop' WHERE id=1; END;",
+        NULL, NULL, NULL) != SQLITE_OK ||
+        r2_reality_tv_vcr_transport("play") != -1)
+        fail("a rewritten transport reported success");
+    if (sqlite3_exec(db, "DROP TRIGGER rewrite_transport;"
+        "CREATE TRIGGER rewrite_tape_insert AFTER UPDATE OF cassette_path ON r2_tv_vcr_state "
+        "BEGIN UPDATE r2_tv_vcr_state SET cassette_path=NULL WHERE id=1; END;",
+        NULL, NULL, NULL) != SQLITE_OK ||
+        r2_reality_tv_vcr_insert(blocked) != -1)
+        fail("a rewritten cassette path reported success");
+    status = r2_reality_tv_status();
+    if (!status || !strstr(status, first) || !strstr(status, "63.2 seconds") ||
+        !strstr(status, "tape inserted (stop)"))
+        fail("failed VCR updates changed authoritative state");
+    free(status);
+    if (sqlite3_exec(db, "DROP TRIGGER rewrite_tape_insert;"
                          "UPDATE r2_tv_vcr_state SET cassette_path='legacy_tape.mkv',"
                          "transport='pause' WHERE id=1;", NULL, NULL, NULL) != SQLITE_OK)
         fail("could not restore the migrated cassette fixture");
