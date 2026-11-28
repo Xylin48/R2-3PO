@@ -80,9 +80,14 @@ assert "free(owned_media_image);" in turn and "free(owned_image);" in turn
 diary = core[core.index("/* Autonomous reflection can deliberately use"):
              core.index("ollama_autonomous_sensory_input = previous_sensory_input;",
                         core.index("/* Autonomous reflection can deliberately use"))]
-assert 'extract_marker(reflection, "[MEDIA_FOCUS]"' in diary
-assert "r2_process_media_focus_request(trim(focus_request))" in diary
-assert "free(focus_request);" in diary
+assert "r2_reflection_sensory_marker(reflection)" in diary
+assert 'extract_marker(reflection, marker, "\\n", &position)' in diary
+assert 'else if (!strcmp(marker, "[MEDIA_FOCUS]"))' in diary
+assert "r2_process_media_focus_request(trim(request))" in diary
+assert "free(request);" in diary
+assert diary.index("r2_reflection_try_claim(reflection_activity_ms)") < diary.index(
+    "r2_process_media_focus_request(trim(request))"
+)
 
 assert core.count("[MEDIA_FOCUS]") >= 7
 close_eyes = core[core.index("int r2_vision_close(void)"):core.index("int r2_eyes_start(void)")]
