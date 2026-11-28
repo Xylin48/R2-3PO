@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[1]
 CONSOLE = REPO / "GameBoyAdvance.py"
@@ -380,6 +381,37 @@ def main() -> int:
             assert module.pending_verified_events(device_db) == pending
         assert module.acknowledge_verified_event(device_db, event_id) is True
         assert module.pending_verified_events(device_db) == []
+        # A live session is not retired merely because identity is unreadable
+        # or a stop request returned without confirmed process exit.
+        active = module.state_row(device_db)
+        pid = active["emulator_pid"]
+        ticks = active["emulator_start_ticks"]
+        assert module.open_owned_emulator_pidfd(pid, ticks + 1) is None
+        fd = module.open_owned_emulator_pidfd(pid, ticks)
+        assert fd is not None
+        try:
+            assert not module.wait_for_emulator_exit(fd, 0)
+        finally:
+            os.close(fd)
+        with patch.object(module, "process_start_ticks",
+                          side_effect=module.ProcessIdentityError("identity read failed")):
+            try:
+                module.reconcile(device_db)
+            except module.ProcessIdentityError:
+                pass
+            else:
+                raise AssertionError("Unobservable emulator was treated as exited")
+        assert tuple(module.state_row(device_db)) == tuple(active)
+        event_count = device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0]
+        with patch.object(module, "wait_for_emulator_exit", return_value=False), \
+             patch.object(module.signal, "pidfd_send_signal"), \
+             patch.object(module.shutil, "which", return_value=None):
+            stop = module.power_off(device_db)
+        assert not stop["ok"] and "exit was not confirmed" in stop["message"]
+        assert tuple(module.state_row(device_db)) == tuple(active)
+        assert device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == event_count
+        assert module.process_matches(pid, ticks)
+
         device_db.close()
         # A duplicate/unknown acknowledgement must not claim that a pending
         # factual event was changed. The CLI contract is what the C bridge sees.

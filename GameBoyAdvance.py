@@ -13,6 +13,7 @@ import argparse
 import fcntl
 import json
 import os
+import select
 import signal
 import shutil
 import sqlite3
@@ -404,26 +405,116 @@ def acknowledge_verified_event(db: sqlite3.Connection, event_id: int) -> bool:
     return True
 
 
+class ProcessIdentityError(RuntimeError):
+    """The running process cannot be identified; absence has not been proved."""
+
+
 def process_start_ticks(pid: int) -> int | None:
-    """Linux /proc start time, used to avoid mistaking a recycled PID for mGBA."""
+    """Read the Linux process identity without treating a read error as exit."""
     try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        tail = raw[raw.rfind(")") + 2:].split()
-        # tail starts at proc stat field 3; starttime is field 22.
-        return None if tail[0] in {"Z", "X", "x"} else int(tail[19])
-    except (OSError, ValueError, IndexError):
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    except OSError as exc:
+        raise ProcessIdentityError(f"Cannot read emulator process {pid}: {exc}") from exc
+    try:
+        end = raw.rfind(b")")
+        if end < 0:
+            raise ValueError("missing process name terminator")
+        tail = raw[end + 2:].split()
+        # tail begins with proc stat field 3; starttime is field 22.
+        if tail[0] in {b"Z", b"X", b"x"}:
+            return None
+        ticks = int(tail[19])
+        if ticks < 0:
+            raise ValueError("negative process start time")
+        return ticks
+    except (ValueError, IndexError) as exc:
+        raise ProcessIdentityError(f"Malformed emulator process identity for {pid}.") from exc
 
 
 def process_matches(pid: int | None, expected_ticks: int | None) -> bool:
     if not pid or pid <= 1:
         return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
     actual = process_start_ticks(pid)
-    return actual is not None and expected_ticks is not None and actual == expected_ticks
+    if actual is None:
+        return False
+    if not isinstance(expected_ticks, int) or expected_ticks < 0:
+        raise ProcessIdentityError(f"Live emulator PID {pid} has no verified stored start time.")
+    return actual == expected_ticks
+
+
+def wait_for_emulator_exit(fd: int, timeout_ms: int) -> bool:
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    events = poller.poll(timeout_ms)
+    if any(flags & (select.POLLERR | select.POLLNVAL) for _, flags in events):
+        raise ProcessIdentityError("Cannot observe the owned emulator process descriptor.")
+    return any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events)
+
+
+def open_owned_emulator_pidfd(pid: int, expected_ticks: int | None) -> int | None:
+    """Acquire a Linux process handle and verify it still owns the session."""
+    if not process_matches(pid, expected_ticks):
+        return None
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None
+    except (AttributeError, OSError) as exc:
+        raise ProcessIdentityError(f"Cannot acquire emulator process descriptor: {exc}") from exc
+    try:
+        if process_matches(pid, expected_ticks) and not wait_for_emulator_exit(fd, 0):
+            return fd
+    except BaseException:
+        os.close(fd)
+        raise
+    os.close(fd)
+    return None
+
+
+def stop_owned_emulator(fd: int, pid: int) -> bool:
+    """Request normal window closure, then signal only the acquired process."""
+    if wait_for_emulator_exit(fd, 0):
+        return True
+    if shutil.which("xdotool"):
+        try:
+            found = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            windows = [line.strip() for line in found.stdout.splitlines()
+                       if line.strip().isascii() and line.strip().isdecimal()]
+            if found.returncode == 0 and windows and not wait_for_emulator_exit(fd, 0):
+                owner = subprocess.run(
+                    ["xdotool", "getwindowpid", windows[0]],
+                    capture_output=True, text=True, timeout=2, check=False,
+                )
+                if (owner.returncode == 0 and owner.stdout.strip() == str(pid)
+                        and not wait_for_emulator_exit(fd, 0)):
+                    subprocess.run(
+                        ["xdotool", "windowclose", windows[0]],
+                        check=False, timeout=3,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    if wait_for_emulator_exit(fd, 4000):
+                        return True
+        except (OSError, subprocess.SubprocessError):
+            # A failed graphical close is not proof of exit. Continue the
+            # existing termination sequence against the acquired descriptor.
+            pass
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if wait_for_emulator_exit(fd, 0):
+            return True
+        try:
+            signal.pidfd_send_signal(fd, sig)
+        except ProcessLookupError:
+            pass
+        except AttributeError as exc:
+            raise ProcessIdentityError("Descriptor-based emulator signaling is unavailable.") from exc
+        if wait_for_emulator_exit(fd, 2000):
+            return True
+    return False
 
 
 def state_row(db: sqlite3.Connection) -> sqlite3.Row:
@@ -776,7 +867,7 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
             require_console_state(db, row, power_state="on", emulator_pid=proc.pid,
                                   emulator_start_ticks=ticks, game_started_at=started_at,
                                   session_id=session_id)
-    except (OSError, ValueError, sqlite3.Error) as exc:
+    except (OSError, ValueError, sqlite3.Error, ProcessIdentityError) as exc:
         message = str(exc)
         if proc is not None and proc.poll() is None:
             try:
@@ -802,43 +893,18 @@ def power_off(db: sqlite3.Connection) -> dict[str, Any]:
     pid = row["emulator_pid"]
     title = row["cartridge_title"] or "unknown game"
     session_id = row["session_id"]
-    if pid and process_matches(int(pid), row["emulator_start_ticks"]):
-        try:
-            # Ask the window manager to close mGBA normally first. This lets
-            # the emulator flush already-written cartridge save RAM to its
-            # .sav backing file; it does not trigger an in-game save command.
-            if shutil.which("xdotool"):
-                found = subprocess.run(
-                    ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
-                    capture_output=True, text=True, timeout=2, check=False,
-                )
-                windows = [line.strip() for line in found.stdout.splitlines() if line.strip()]
-                if windows:
-                    subprocess.run(
-                        ["xdotool", "windowclose", windows[0]],
-                        check=False, timeout=3,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-            deadline = time.monotonic() + 4.0
-            while time.monotonic() < deadline and process_matches(
-                int(pid), row["emulator_start_ticks"]
-            ):
-                time.sleep(0.1)
-            # Fall back only if the emulator did not close in response.
-            if process_matches(int(pid), row["emulator_start_ticks"]):
-                os.kill(int(pid), signal.SIGTERM)
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline and process_matches(
-                    int(pid), row["emulator_start_ticks"]
-                ):
-                    time.sleep(0.1)
-            if process_matches(int(pid), row["emulator_start_ticks"]):
-                os.kill(int(pid), signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            return {"ok": False, "message": "Permission denied while powering off the emulator.",
-                    **status_data(db)}
+    if pid:
+        fd = open_owned_emulator_pidfd(int(pid), row["emulator_start_ticks"])
+        if fd is not None:
+            try:
+                if not stop_owned_emulator(fd, int(pid)):
+                    return {"ok": False, "message": "Emulator exit was not confirmed.",
+                            **status_data(db)}
+            except OSError as exc:
+                return {"ok": False, "message": f"Could not stop the emulator: {exc}",
+                        **status_data(db)}
+            finally:
+                os.close(fd)
     # Never publish an off state without its physical and virtual history.
     with db:
         db.execute(
@@ -1071,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = power_on(db) if state == "on" else power_off(db)
             else:
                 result = {"ok": False, "message": f"Unsupported command: {command}"}
-    except TimeoutError as exc:
+    except (TimeoutError, ProcessIdentityError) as exc:
         result = {"ok": False, "message": str(exc)}
     print_result(result, args.json)
     return 0 if not isinstance(result, dict) or result.get("ok", True) else 1
