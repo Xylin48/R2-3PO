@@ -1553,6 +1553,31 @@ static void check_gameboy_delivery(void)
         -1, &statement, NULL) == SQLITE_OK);
     assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 1);
     sqlite3_finalize(statement);
+    /* New stable event IDs distinguish unrelated console databases even if
+     * both reuse the same local numeric row ID. Retry each without a second
+     * Life Log/reward write. The legacy event already owns that numeric ID. */
+    const char *new_ids[] = {
+        "11111111111141118111111111111111",
+        "22222222222242228222222222222222"
+    };
+    for (size_t i = 0; i < sizeof(new_ids)/sizeof(new_ids[0]); ++i) {
+        events = fopen(event_path, "w");
+        assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+            "\"delivery_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+            "\"delivery_id\":\"%s\",\"context\":\"virtual\",\"event_type\":\"coin_collected\","
+            "\"summary\":\"Another coin\",\"game_title\":\"Fixture game\","
+            "\"evidence_source\":\"adapter:fixture\",\"details\":\"exact\"}]\n", new_ids[i]) > 0);
+        assert(fclose(events) == 0);
+        assert(r2_sync_gameboy_verified_events(executable) == 1);
+        assert(r2_sync_gameboy_verified_events(executable) == 1);
+    }
+    assert(sqlite3_prepare_v2(rewards,
+        "SELECT COUNT(*) FROM reward_events WHERE source IN "
+        "('game_delivery:11111111111141118111111111111111',"
+        "'game_delivery:22222222222242228222222222222222')",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 2);
+    sqlite3_finalize(statement);
     sqlite3_close(rewards);
     r2_reward_shutdown();
 
@@ -1568,6 +1593,13 @@ static void check_gameboy_delivery(void)
     assert(!json_object_object_get_ex(stored, "delivery_token", &transport));
     json_object_put(stored);
     assert(sqlite3_step(statement) == SQLITE_DONE);
+    sqlite3_finalize(statement);
+    assert(sqlite3_prepare_v2(history,
+        "SELECT COUNT(*) FROM r2_log_events WHERE source IN "
+        "('GameBoyAdvance.py:delivery:11111111111141118111111111111111',"
+        "'GameBoyAdvance.py:delivery:22222222222242228222222222222222')",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 2);
     sqlite3_finalize(statement);
     /* The exact event is resolved under Life Log's write lock. Trigger
      * rewriting after insertion must roll back, not strand a corrupt receipt. */
@@ -1594,6 +1626,16 @@ static void check_gameboy_delivery(void)
         "context=virtual; console_event_id=350003; adapter_details=coin") == legacy);
     assert(r2_log_save_gameboy_once("GameBoyAdvance.py:event:350003", 350003,
         "coin", "{\"details\":\"other\"}", NULL, NULL) < 0);
+    int64_t independent = r2_log_save_gameboy_once(
+        "GameBoyAdvance.py:delivery:33333333333343338333333333333333", 350003,
+        "new coin", "{\"details\":\"independent\"}", NULL, NULL);
+    assert(independent > 0 && independent != legacy);
+    assert(r2_log_save_gameboy_once(
+        "GameBoyAdvance.py:delivery:33333333333343338333333333333333", 350003,
+        "new coin", "{\"details\":\"independent\"}", NULL, NULL) == independent);
+    assert(r2_log_save_gameboy_once(
+        "GameBoyAdvance.py:delivery:33333333333343338333333333333333", 350003,
+        "new coin", "{\"details\":\"changed\"}", NULL, NULL) < 0);
     sqlite3_close(history);
     free(details);
     assert(unlink(executable) == 0 && unlink(event_path) == 0 && unlink(ack_path) == 0);

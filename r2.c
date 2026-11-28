@@ -9289,8 +9289,17 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
      * reward identity unchanged so existing committed deliveries can replay. */
     json_object_object_del(item, "delivery_token");
 
+    json_object *delivery_id_object = NULL;
+    int has_delivery_id = json_object_object_get_ex(item, "delivery_id", &delivery_id_object);
+    const char *delivery_id = gameboy_json_string(item, "delivery_id", "");
+    if (has_delivery_id && (strlen(delivery_id) != 32 ||
+                            strspn(delivery_id, "0123456789abcdef") != 32))
+        return -1;
     char source[96];
-    snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)event_id);
+    if (has_delivery_id)
+        snprintf(source, sizeof(source), "GameBoyAdvance.py:delivery:%s", delivery_id);
+    else
+        snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)event_id);
     const char *details = json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN);
     if (!details) return -1;
 
@@ -9308,7 +9317,7 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
         "evidence_source=%s; console_event_id=%lld; session_id=%s; "
         "observed_at=%s; adapter_details=%s", event_type, title, evidence,
         (long long)event_id, session, timestamp, adapter_details);
-    int complete_legacy = strlen(summary) <= 800 && strlen(adapter_details) <= 2200 &&
+    int complete_legacy = !has_delivery_id && strlen(summary) <= 800 && strlen(adapter_details) <= 2200 &&
         legacy_summary_len >= 0 && (size_t)legacy_summary_len < sizeof(legacy_summary) &&
         legacy_details_len >= 0 && (size_t)legacy_details_len < sizeof(legacy_details);
     int64_t life_event_id = r2_log_save_gameboy_once(source, event_id, summary, details,
@@ -9320,7 +9329,10 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
     char reward_source[96];
     snprintf(reward_target, sizeof(reward_target), "game:%.240s",
              *title ? title : "unknown");
-    snprintf(reward_source, sizeof(reward_source), "game_event:%lld", (long long)event_id);
+    if (has_delivery_id)
+        snprintf(reward_source, sizeof(reward_source), "game_delivery:%s", delivery_id);
+    else
+        snprintf(reward_source, sizeof(reward_source), "game_event:%lld", (long long)event_id);
     int reward_points = (!strcmp(event_type, "life_lost") ||
                          !strcmp(event_type, "damage_taken")) ? -1 :
                         (!strcmp(event_type, "game_completed") ||

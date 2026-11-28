@@ -152,6 +152,7 @@ for binding in (
 ):
     index = ("source", "summary", "details", "legacy_summary", "legacy_details", "pattern").index(binding) + 1
     assert f"if (rc == SQLITE_OK) rc = bind_optional_text(st, {index}, {binding});" in gameboy_link
+assert "if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 7, legacy_identity);" in gameboy_link
 assert "sqlite3_step(st) != SQLITE_DONE" in gameboy_link
 assert 'exec_sql("BEGIN IMMEDIATE;")' in gameboy_link
 assert "log_finish_write(id > 0)" in gameboy_link

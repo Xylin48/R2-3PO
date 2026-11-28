@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -304,6 +305,7 @@ def _initialize_connection(db: sqlite3.Connection) -> None:
             game_title TEXT,
             session_id TEXT,
             evidence_source TEXT,
+            delivery_id TEXT,
             verified INTEGER NOT NULL DEFAULT 0,
             life_log_synced INTEGER NOT NULL DEFAULT 0
         );
@@ -362,11 +364,17 @@ def _initialize_connection(db: sqlite3.Connection) -> None:
     columns = {row[1] for row in db.execute("PRAGMA table_info(console_events)")}
     for name, declaration in (
         ("evidence_source", "TEXT"),
+        ("delivery_id", "TEXT"),
         ("verified", "INTEGER NOT NULL DEFAULT 0"),
         ("life_log_synced", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if name not in columns:
             db.execute(f"ALTER TABLE console_events ADD COLUMN {name} {declaration}")
+    # NULL denotes pre-upgrade events, which must keep their historical
+    # numeric Life Log/reward identity. Newly verified events have immutable
+    # globally unique delivery IDs, independent of this database's row IDs.
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS console_events_delivery_idx "
+               "ON console_events(delivery_id) WHERE delivery_id IS NOT NULL")
     # Import old combined-database state before creating a default state row.
     # An existing destination state row remains authoritative.
     _migrate_legacy_combined_database(db)
@@ -377,7 +385,7 @@ def _initialize_connection(db: sqlite3.Connection) -> None:
 def event_payload(db: sqlite3.Connection, event_id: int) -> tuple | None:
     row = db.execute(
         "SELECT timestamp,context,event_type,summary,details,game_title,session_id,"
-        "evidence_source,verified,life_log_synced FROM console_events WHERE id=?",
+        "evidence_source,delivery_id,verified,life_log_synced FROM console_events WHERE id=?",
         (event_id,),
     ).fetchone()
     return tuple(row) if row is not None else None
@@ -388,12 +396,13 @@ def record_event(db: sqlite3.Connection, context: str, event_type: str,
                  game_title: str | None = None, session_id: str | None = None,
                  evidence_source: str | None = None, verified: bool = False,
                  *, commit: bool = True) -> int:
+    delivery_id = uuid.uuid4().hex if verified else None
     expected = (utc_now(), context, event_type, summary, details, game_title,
-                session_id, evidence_source, 1 if verified else 0, 0)
+                session_id, evidence_source, delivery_id, 1 if verified else 0, 0)
     with (db if commit else nullcontext()):
         inserted = db.execute(
             "INSERT INTO console_events(timestamp,context,event_type,summary,details,game_title,session_id,"
-            "evidence_source,verified,life_log_synced) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "evidence_source,delivery_id,verified,life_log_synced) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             expected,
         )
         event_id = inserted.lastrowid
@@ -437,7 +446,7 @@ def event_delivery_token(event_id: int, payload: tuple) -> str:
 def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = db.execute(
         "SELECT id,timestamp,context,event_type,summary,details,game_title,session_id,"
-        "evidence_source,verified,life_log_synced "
+        "evidence_source,delivery_id,verified,life_log_synced "
         "FROM console_events WHERE context='virtual' AND verified=1 AND life_log_synced=0 "
         "ORDER BY id"
     ).fetchall()
@@ -447,6 +456,9 @@ def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
         "details": row["details"], "game_title": row["game_title"],
         "session_id": row["session_id"], "evidence_source": row["evidence_source"],
         "context": "virtual", "verified": True,
+        # Omit the new field on pre-upgrade rows so their exact legacy
+        # archived JSON remains replayable.
+        **({"delivery_id": row["delivery_id"]} if row["delivery_id"] is not None else {}),
         "delivery_token": event_delivery_token(row["id"], tuple(row)[1:]),
     } for row in rows]
 
@@ -897,7 +909,7 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
                 "Set R2_MGBA_EXECUTABLE to its actual executable path."
             )
         title = row["cartridge_title"] or read_rom_title(rom)
-        session_id = f"gba-{int(time.time())}-{os.getpid()}"
+        session_id = f"gba-{uuid.uuid4().hex}"
         # Do not pass --savestate/-t, and do not expose a save-state command.
         # Use per-console config and only the one ROM recorded in the slot.
         proc = subprocess.Popen(

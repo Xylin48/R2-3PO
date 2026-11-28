@@ -335,6 +335,8 @@ def main() -> int:
         # survived its trigger or that acknowledgement changed only delivery state.
         original_event = module.event_payload(device_db, event_id)
         token = pending[0]["delivery_token"]
+        delivery_id = pending[0]["delivery_id"]
+        assert len(delivery_id) == 32 and all(ch in "0123456789abcdef" for ch in delivery_id)
         assert len(token) == 64
         assert not module.acknowledge_verified_event(device_db, event_id, "")
         assert not module.acknowledge_verified_event(device_db, event_id, "g" * 64)
@@ -355,6 +357,7 @@ def main() -> int:
             "UPDATE console_events SET life_log_synced=0 WHERE id=NEW.id;",
             "UPDATE console_events SET summary='rewritten' WHERE id=NEW.id;",
             "UPDATE console_events SET evidence_source='adapter:other' WHERE id=NEW.id;",
+            "UPDATE console_events SET delivery_id=NULL WHERE id=NEW.id;",
             "DELETE FROM console_events WHERE id=NEW.id;",
         ):
             device_db.execute(
@@ -376,6 +379,7 @@ def main() -> int:
         for mutation in (
             "UPDATE console_events SET summary='rewritten' WHERE id=NEW.id;",
             "UPDATE console_events SET verified=0 WHERE id=NEW.id;",
+            "UPDATE console_events SET delivery_id=NULL WHERE id=NEW.id;",
             "UPDATE console_events SET life_log_synced=1 WHERE id=NEW.id;",
             "DELETE FROM console_events WHERE id=NEW.id;",
         ):
@@ -397,6 +401,19 @@ def main() -> int:
             assert device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == before_count
             assert module.pending_verified_events(device_db) == pending
         assert module.acknowledge_verified_event(device_db, event_id, token) is True
+        assert module.pending_verified_events(device_db) == []
+        assert device_db.execute("SELECT delivery_id FROM console_events WHERE id=?",
+                                 (event_id,)).fetchone()[0] == delivery_id
+        # A second event with identical observable data still owns its own
+        # durable identity; the first event's token cannot acknowledge it.
+        second_id = module.record_verified_game_event(
+            device_db, "coin_collected", "Mario collected a coin.",
+            "Observed coin counter increase from 12 to 13.", "adapter:test-mario")
+        second = module.pending_verified_events(device_db)[0]
+        assert second["event_id"] == second_id
+        assert second["delivery_id"] != delivery_id
+        assert not module.acknowledge_verified_event(device_db, second_id, token)
+        assert module.acknowledge_verified_event(device_db, second_id, second["delivery_token"])
         assert module.pending_verified_events(device_db) == []
         # A live session is not retired merely because identity is unreadable
         # or a stop request returned without confirmed process exit.

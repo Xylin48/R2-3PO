@@ -66,6 +66,9 @@ assert sync.index("r2_log_save_gameboy_once(") < sync.index("r2_reward_apply_onc
 assert "complete_legacy ? legacy_details : NULL" in sync
 assert "json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN)" in sync
 assert 'snprintf(reward_source, sizeof(reward_source), "game_event:%lld"' in sync
+assert '"GameBoyAdvance.py:delivery:%s"' in sync
+assert '"game_delivery:%s"' in sync
+assert 'sqlite3_bind_int(st, 7, legacy_identity)' in log
 assert sync.index("r2_reward_apply_once(") < sync.index('run_gameboy_console(path, "ack_event"')
 assert 'run_gameboy_console(path, "ack_event", event_id_text, delivery_token, &ack_output)' in sync
 assert sync.index('json_object_object_del(item, "delivery_token")') < sync.index("json_object_to_json_string_ext(")

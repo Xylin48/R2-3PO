@@ -118,6 +118,7 @@ def main() -> int:
             assert old_event is not None
             assert old_event["summary"] == "legacy event retained"
             assert old_event["verified"] == 0 and old_event["life_log_synced"] == 0
+            assert db.execute("SELECT delivery_id FROM console_events WHERE event_type='legacy_boot'").fetchone()[0] is None
 
             combined_event = db.execute(
                 "SELECT summary, verified, life_log_synced FROM console_events "
@@ -126,6 +127,7 @@ def main() -> int:
             assert combined_event is not None
             assert combined_event["summary"] == "legacy combined event retained"
             assert combined_event["verified"] == 0 and combined_event["life_log_synced"] == 0
+            assert db.execute("SELECT delivery_id FROM console_events WHERE event_type='legacy_combined_boot'").fetchone()[0] is None
             assert db.execute(
                 "SELECT id FROM console_events WHERE event_type='legacy_combined_event_7'"
             ).fetchone()[0] == 7

@@ -1098,20 +1098,23 @@ static int64_t log_find_gameboy_locked(const char *source, int64_t console_event
                                       const char *legacy_summary, const char *legacy_details)
 {
     sqlite3_stmt *st = NULL;
-    char pattern[96];
+    char pattern[96], legacy_source[96];
     snprintf(pattern, sizeof(pattern), "%%; console_event_id=%lld;%%",
              (long long)console_event_id);
+    snprintf(legacy_source, sizeof(legacy_source), "GameBoyAdvance.py:event:%lld",
+             (long long)console_event_id);
+    int legacy_identity = strcmp(source, legacy_source) == 0;
     int rc = sqlite3_prepare_v2(log_db,
         "SELECT id,CASE "
         "WHEN category='media' AND event_type='virtual_game_event' AND source COLLATE BINARY=?1 "
         "AND typeof(summary)='text' AND summary COLLATE BINARY=?2 "
         "AND typeof(details)='text' AND details COLLATE BINARY=?3 THEN 1 "
-        "WHEN ((category='world' AND event_type='gameboy_game_event' AND source='GameBoyAdvance') "
-        "OR (category='media' AND event_type='virtual_game_event' AND source COLLATE BINARY=?1)) "
+        "WHEN (?7 AND ((category='world' AND event_type='gameboy_game_event' AND source='GameBoyAdvance') "
+        "OR (category='media' AND event_type='virtual_game_event' AND source COLLATE BINARY=?1))) "
         "AND typeof(summary)='text' AND summary COLLATE BINARY=?4 "
         "AND typeof(details)='text' AND details COLLATE BINARY=?5 THEN 1 ELSE 0 END "
         "FROM r2_log_events WHERE source COLLATE BINARY=?1 OR "
-        "(event_type='gameboy_game_event' AND source='GameBoyAdvance' AND details LIKE ?6)",
+        "(?7 AND event_type='gameboy_game_event' AND source='GameBoyAdvance' AND details LIKE ?6)",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, source);
     if (rc == SQLITE_OK) rc = bind_optional_text(st, 2, summary);
@@ -1119,6 +1122,7 @@ static int64_t log_find_gameboy_locked(const char *source, int64_t console_event
     if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, legacy_summary);
     if (rc == SQLITE_OK) rc = bind_optional_text(st, 5, legacy_details);
     if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, pattern);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(st, 7, legacy_identity);
     int64_t id = -1;
     if (rc == SQLITE_OK) {
         rc = sqlite3_step(st);
