@@ -958,6 +958,40 @@ static int bind_text(sqlite3_stmt *st, int n, const char *s)
 {
     return sqlite3_bind_text(st, n, s ? s : "", -1, SQLITE_TRANSIENT) == SQLITE_OK ? 0 : -1;
 }
+/* These helpers are used only while holding reality_lock. A caller owns
+ * a transaction only after a successful BEGIN; do not roll back another
+ * operation's transaction when that BEGIN failed. */
+static int reality_begin_write_locked(void)
+{
+    return reality_ready && reality_db &&
+        sqlite3_exec(reality_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
+}
+
+static int reality_finish_write_locked(int verified)
+{
+    if (verified && sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK)
+        return 0;
+    if (!sqlite3_get_autocommit(reality_db))
+        (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
+}
+
+static int reality_text_matches(sqlite3_stmt *st, int col, const char *expected)
+{
+    if (!expected) return sqlite3_column_type(st, col) == SQLITE_NULL;
+    if (sqlite3_column_type(st, col) != SQLITE_TEXT) return 0;
+    const unsigned char *value = sqlite3_column_text(st, col);
+    size_t bytes = strlen(expected);
+    return value && (size_t)sqlite3_column_bytes(st, col) == bytes &&
+        !memcmp(value, expected, bytes);
+}
+
+static int reality_integer_matches(sqlite3_stmt *st, int col, sqlite3_int64 expected)
+{
+    return sqlite3_column_type(st, col) == SQLITE_INTEGER &&
+        sqlite3_column_int64(st, col) == expected;
+}
+
 static int reality_home_state = 1;
 static int reality_is_home(void)
 {
@@ -3635,6 +3669,10 @@ void r2_reality_shutdown(void)
 {
     /* Wait for any purchase to finish its cross-database commit before
        closing either Reality or fridge handles. Lock order matches mutators. */
+    /* A named movement may be between its Reality and Life Log commits.
+       Keep its original connection alive until delivery/acknowledgement
+       finishes. Neither purchase nor location acquires the other's lock. */
+    pthread_mutex_lock(&location_transition_lock);
     pthread_mutex_lock(&purchase_lock);
     pthread_mutex_lock(&reality_lock);
     if (reality_db) {
@@ -3646,6 +3684,7 @@ void r2_reality_shutdown(void)
     reality_ready = 0;
     pthread_mutex_unlock(&reality_lock);
     pthread_mutex_unlock(&purchase_lock);
+    pthread_mutex_unlock(&location_transition_lock);
     r2_addiction_shutdown();
 }
 
@@ -3660,6 +3699,25 @@ int r2_reality_is_initialized(void)
  * lives in a different SQLite file: replay the intent until its idempotent
  * location transition is durable, and only then delete the intent. This is
  * deliberately called without reality_lock while entering Life Log. */
+/* A pending named movement is authoritative only when its exact identity
+ * and the committed effective home/away state agree. */
+static int location_state_matches_locked(const char *location, int home)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(reality_db,
+        "SELECT (SELECT value FROM r2_reality_meta WHERE key='current_location'),"
+        "location,is_home FROM r2_location_delivery WHERE id=1",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int matches = rc == SQLITE_ROW &&
+        reality_text_matches(st, 0, home ? "home" : "outside") &&
+        reality_text_matches(st, 1, location) &&
+        reality_integer_matches(st, 2, home);
+    if (matches) matches = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return matches;
+}
+
 static int location_delivery_replay_locked(void)
 {
     sqlite3_stmt *st = NULL;
@@ -3675,20 +3733,24 @@ static int location_delivery_replay_locked(void)
         if (rc == SQLITE_ROW) {
             const char *value = (const char *)sqlite3_column_text(st, 0);
             int length = sqlite3_column_bytes(st, 0);
-            home = sqlite3_column_int(st, 1);
-            if (!value || length < 1 || length > 256 ||
+            sqlite3_int64 stored_home = sqlite3_column_int64(st, 1);
+            if (!value || sqlite3_column_type(st, 0) != SQLITE_TEXT ||
+                length < 1 || length > 256 ||
                 strlen(value) != (size_t)length ||
                 sqlite3_column_type(st, 1) != SQLITE_INTEGER ||
-                (home != 0 && home != 1))
+                (stored_home != 0 && stored_home != 1))
                 rc = SQLITE_MISMATCH;
             else {
+                home = (int)stored_home;
                 location = strdup(value);
                 rc = location ? SQLITE_OK : SQLITE_NOMEM;
             }
         }
     }
-    if (st && sqlite3_finalize(st) != SQLITE_OK && rc == SQLITE_DONE)
+    if (st && sqlite3_finalize(st) != SQLITE_OK && (rc == SQLITE_DONE || rc == SQLITE_OK))
         rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK && !location_state_matches_locked(location, home))
+        rc = SQLITE_CONSTRAINT;
     pthread_mutex_unlock(&reality_lock);
     if (rc == SQLITE_DONE) return 0;
     if (rc != SQLITE_OK) {
@@ -3696,20 +3758,38 @@ static int location_delivery_replay_locked(void)
         return -1;
     }
     int delivered = r2_log_location_transition(location, home);
-    free(location);
-    if (delivered != 0) return -1;
+    if (delivered != 0) { free(location); return -1; }
 
 #ifdef R2_INVENTORY_TEST_FAILURE_INJECTION
-    if (getenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT"))
+    if (getenv("R2_TEST_LOCATION_STOP_AFTER_LOG_COMMIT")) {
+        free(location);
         return -1;
+    }
 #endif
     pthread_mutex_lock(&reality_lock);
-    rc = sqlite3_exec(reality_db,
-        "DELETE FROM r2_location_delivery WHERE id=1", NULL, NULL, NULL);
-    if (rc == SQLITE_OK && sqlite3_changes(reality_db) != 1)
-        rc = SQLITE_CONSTRAINT;
+    int result = -1;
+    if (reality_begin_write_locked()) {
+        int verified = location_state_matches_locked(location, home);
+        if (verified) {
+            rc = sqlite3_exec(reality_db,
+                "DELETE FROM r2_location_delivery WHERE id=1", NULL, NULL, NULL);
+            verified = rc == SQLITE_OK && sqlite3_changes(reality_db) == 1;
+        }
+        if (verified) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(reality_db,
+                "SELECT value FROM r2_reality_meta WHERE key='current_location' "
+                "AND NOT EXISTS(SELECT 1 FROM r2_location_delivery WHERE id=1)",
+                -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            verified = rc == SQLITE_ROW && reality_text_matches(st, 0, home ? "home" : "outside");
+            sqlite3_finalize(st);
+        }
+        result = reality_finish_write_locked(verified);
+    }
     pthread_mutex_unlock(&reality_lock);
-    return rc == SQLITE_OK ? 0 : -1;
+    free(location);
+    return result;
 }
 
 static int location_delivery_replay(void)
@@ -3764,10 +3844,9 @@ int r2_reality_transition_location(const char *location, int home)
     if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
         rc = SQLITE_CONSTRAINT;
     if (st) sqlite3_finalize(st);
-    if (rc == SQLITE_DONE)
-        rc = sqlite3_exec(reality_db, "COMMIT", NULL, NULL, NULL);
-    if (rc != SQLITE_OK && transaction_started)
-        (void)sqlite3_exec(reality_db, "ROLLBACK", NULL, NULL, NULL);
+    if (transaction_started)
+        rc = reality_finish_write_locked(rc == SQLITE_DONE &&
+            location_state_matches_locked(location, home)) == 0 ? SQLITE_OK : SQLITE_CONSTRAINT;
     if (rc == SQLITE_OK)
         __atomic_store_n(&reality_home_state, home, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&reality_lock);
@@ -3788,38 +3867,44 @@ int r2_reality_transition_location(const char *location, int home)
 
 int r2_reality_set_location(int home)
 {
-    if (!r2_reality_is_initialized()) return -1;
+    if (home != 0 && home != 1) return -1;
     /* Legacy direct callers cannot bypass an outstanding named movement
-       delivery or race the two-store transition coordinator. Reject instead
-       of overwriting the authoritative location while its Life Log is pending. */
+       delivery or race the two-store transition coordinator. */
     pthread_mutex_lock(&location_transition_lock);
     pthread_mutex_lock(&reality_lock);
-    sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(reality_db,
-        "SELECT 1 FROM r2_location_delivery WHERE id=1", -1, &st, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    if (st && sqlite3_finalize(st) != SQLITE_OK) rc = SQLITE_ERROR;
-    st = NULL;
-    if (rc != SQLITE_DONE) {
-        pthread_mutex_unlock(&reality_lock);
-        pthread_mutex_unlock(&location_transition_lock);
-        return -1;
+    int result = -1;
+    if (reality_begin_write_locked()) {
+        sqlite3_stmt *st = NULL;
+        int rc = sqlite3_prepare_v2(reality_db,
+            "SELECT 1 FROM r2_location_delivery WHERE id=1", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        st = NULL;
+        if (rc == SQLITE_DONE) {
+            rc = sqlite3_prepare_v2(reality_db,
+                "INSERT INTO r2_reality_meta(key,value) VALUES('current_location',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = bind_text(st, 1, home ? "home" : "outside") == 0
+                ? sqlite3_step(st) : SQLITE_ERROR;
+            if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1) rc = SQLITE_CONSTRAINT;
+            sqlite3_finalize(st);
+        }
+        int verified = rc == SQLITE_DONE;
+        if (verified) {
+            st = NULL;
+            rc = sqlite3_prepare_v2(reality_db,
+                "SELECT value FROM r2_reality_meta WHERE key='current_location' "
+                "AND NOT EXISTS(SELECT 1 FROM r2_location_delivery WHERE id=1)", -1, &st, NULL);
+            if (rc == SQLITE_OK) rc = sqlite3_step(st);
+            verified = rc == SQLITE_ROW && reality_text_matches(st, 0, home ? "home" : "outside");
+            sqlite3_finalize(st);
+        }
+        result = reality_finish_write_locked(verified);
+        if (result == 0) __atomic_store_n(&reality_home_state, home, __ATOMIC_RELEASE);
     }
-
-    rc = sqlite3_prepare_v2(reality_db,
-        "INSERT INTO r2_reality_meta(key,value) VALUES('current_location',?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", -1, &st, NULL);
-    if (rc == SQLITE_OK) {
-        rc = bind_text(st, 1, home ? "home" : "outside") == 0
-            ? sqlite3_step(st) : SQLITE_ERROR;
-    }
-    if (rc == SQLITE_DONE && sqlite3_changes(reality_db) != 1)
-        rc = SQLITE_CONSTRAINT;
-    if (st && sqlite3_finalize(st) != SQLITE_OK) rc = SQLITE_ERROR;
-    if (rc == SQLITE_DONE) __atomic_store_n(&reality_home_state, home ? 1 : 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&reality_lock);
     pthread_mutex_unlock(&location_transition_lock);
-    return rc == SQLITE_DONE ? 0 : -1;
+    return result;
 }
 
 

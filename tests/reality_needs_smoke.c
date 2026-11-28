@@ -635,7 +635,22 @@ static void verify_location_delivery_replay(void)
         strcmp((const char *)sqlite3_column_text(st, 0), "home"))
         fail("an ignored location stage modified the current location");
     sqlite3_finalize(st); st = NULL;
-    if (sqlite3_exec(reality, "DROP TRIGGER ignore_location_stage;",
+    if (sqlite3_exec(reality, "DROP TRIGGER ignore_location_stage;"
+        "CREATE TRIGGER rewrite_location_stage AFTER INSERT ON r2_location_delivery "
+        "BEGIN UPDATE r2_location_delivery SET location='wrong location' WHERE id=NEW.id; END;",
+        NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not install exact location staging fixture");
+    if (r2_reality_transition_location("sample library", 0) != -1)
+        fail("a rewritten named location was committed");
+    if (sqlite3_exec(reality, "DROP TRIGGER rewrite_location_stage;"
+        "CREATE TRIGGER rewrite_location_state AFTER UPDATE ON r2_reality_meta "
+        "WHEN NEW.key='current_location' BEGIN UPDATE r2_reality_meta SET value='home' "
+        "WHERE key=NEW.key; END;", NULL, NULL, NULL) != SQLITE_OK)
+        fail("could not install effective location fixture");
+    if (r2_reality_transition_location("sample library", 0) != -1 ||
+        r2_reality_set_location(0) != -1)
+        fail("a rewritten effective location was committed");
+    if (sqlite3_exec(reality, "DROP TRIGGER rewrite_location_state;",
                      NULL, NULL, NULL) != SQLITE_OK)
         fail("could not restore location staging");
     sqlite3_close(reality); reality = NULL;
