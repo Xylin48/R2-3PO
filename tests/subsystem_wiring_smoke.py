@@ -142,13 +142,20 @@ for bind in (
     if bind not in memory_save:
         raise SystemExit(f"Persistent memory update ignores a SQLite binding result: {bind}")
 
-gameboy_link_start = core.find("static int64_t gameboy_find_life_event_for_console_event(")
-gameboy_link_end = core.find("\nstatic int gameboy_sync_verified_event(", gameboy_link_start)
+gameboy_link_start = log.find("static int64_t log_find_gameboy_locked(")
+gameboy_link_end = log.find("\n/* A sampled source is evidence", gameboy_link_start)
 if gameboy_link_start < 0 or gameboy_link_end < 0:
-    raise SystemExit("Could not locate Game Boy Life Log deduplication lookup.")
-gameboy_link = core[gameboy_link_start:gameboy_link_end]
-if "lookup_rc = sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT)" not in gameboy_link:
-    raise SystemExit("Game Boy Life Log deduplication ignores the event lookup binding result.")
+    raise SystemExit("Could not locate transactional Game Boy Life Log deduplication.")
+gameboy_link = log[gameboy_link_start:gameboy_link_end]
+for binding in (
+    "source", "summary", "details", "legacy_summary", "legacy_details", "pattern",
+):
+    index = ("source", "summary", "details", "legacy_summary", "legacy_details", "pattern").index(binding) + 1
+    assert f"if (rc == SQLITE_OK) rc = bind_optional_text(st, {index}, {binding});" in gameboy_link
+assert "sqlite3_step(st) != SQLITE_DONE" in gameboy_link
+assert 'exec_sql("BEGIN IMMEDIATE;")' in gameboy_link
+assert "log_finish_write(id > 0)" in gameboy_link
+assert "r2_log_save_gameboy_once(source, event_id, summary, details," in core
 
 reward_modifier_start = reward.find("int r2_reward_current_modifier(")
 reward_modifier_end = reward.find("\nchar *r2_reward_context(", reward_modifier_start)
