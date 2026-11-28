@@ -56,7 +56,6 @@
 #include "Reality.h"
 #include "Addiction.h"
 #include "AlternateSelf.h"
-#include <sqlite3.h>
 #include <json-c/json.h>
 
 
@@ -2213,130 +2212,6 @@ static int shell_give(const char *arg)
     return 1;
 }
 
-typedef struct {
-    int valid;
-    int running;
-    char power_state[16];
-    char title[256];
-    char session_id[160];
-} ShellGameboyStatus;
-
-/* Resolve the console state DB using the same root policy as GameBoyAdvance.py. */
-static int shell_gameboy_state_database_path(char *out, size_t capacity)
-{
-    const char *root = getenv("R2_GAMEBOY_ROOT");
-    char inferred[PATH_MAX];
-    if (!root || !*root) root = getenv("R2_GAMEBOY_DIR");
-    if (!root || !*root) {
-        /* Python resolves its executable's symlinks before choosing the
-         * default device root. Use the very same executable and resolution. */
-        char *resolved = realpath(r2_gameboy_console_path(), NULL);
-        if (!resolved) return 0;
-        char *slash = strrchr(resolved, '/');
-        size_t length = slash ? (size_t)(slash - resolved) : 0;
-        if (!slash || length >= sizeof(inferred)) {
-            free(resolved);
-            return 0;
-        }
-        if (length == 0) {
-            memcpy(inferred, "/", 2);
-        } else {
-            memcpy(inferred, resolved, length);
-            inferred[length] = 0;
-        }
-        free(resolved);
-        root = inferred;
-    }
-    size_t root_length = strlen(root);
-    const char *separator = root_length > 0 && root[root_length - 1] == '/' ? "" : "/";
-    int n = snprintf(out, capacity, "%s%sState/console_state.db", root, separator);
-    return n >= 0 && (size_t)n < capacity;
-}
-
-/* Read authoritative device state without showing JSON to the user. */
-static int shell_gameboy_read_status(ShellGameboyStatus *out)
-{
-    char database[PATH_MAX];
-    sqlite3 *db = NULL;
-    sqlite3_stmt *statement = NULL;
-    int ok = 0;
-    if (!out) return 0;
-    memset(out, 0, sizeof(*out));
-    if (!shell_gameboy_state_database_path(database, sizeof(database))) return 0;
-    if (sqlite3_open_v2(database, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        if (db) sqlite3_close(db);
-        return 0;
-    }
-    sqlite3_busy_timeout(db, 1000);
-    const char *sql =
-        "SELECT s.power_state,s.emulator_pid,s.session_id,"
-        "(SELECT e.game_title FROM console_events e "
-        " WHERE e.session_id=s.session_id AND e.game_title IS NOT NULL "
-        " ORDER BY e.id DESC LIMIT 1) "
-        "FROM console_state s WHERE s.id=1";
-    if (sqlite3_prepare_v2(db, sql, -1, &statement, NULL) == SQLITE_OK &&
-        sqlite3_step(statement) == SQLITE_ROW) {
-        const unsigned char *power = sqlite3_column_text(statement, 0);
-        const unsigned char *session = sqlite3_column_text(statement, 2);
-        const unsigned char *title = sqlite3_column_text(statement, 3);
-        int has_pid = sqlite3_column_type(statement, 1) != SQLITE_NULL &&
-                      sqlite3_column_int(statement, 1) > 1;
-        if (power)
-            snprintf(out->power_state, sizeof(out->power_state), "%s", (const char *)power);
-        if (session)
-            snprintf(out->session_id, sizeof(out->session_id), "%s", (const char *)session);
-        if (title)
-            snprintf(out->title, sizeof(out->title), "%s", (const char *)title);
-        out->running = power && strcmp((const char *)power, "on") == 0 && has_pid;
-        out->valid = out->power_state[0] != '\0';
-        ok = out->valid;
-    }
-    if (statement) sqlite3_finalize(statement);
-    sqlite3_close(db);
-    return ok;
-}
-
-static void shell_gameboy_log_session_start(const ShellGameboyStatus *state)
-{
-    char key[256], name[512], details[1200], summary[1200];
-    if (!state || !state->running || !state->session_id[0]) return;
-    snprintf(key, sizeof(key), "gameboy:%s", state->session_id);
-    snprintf(name, sizeof(name), "Playing %s on Game Boy Advance",
-             state->title[0] ? state->title : "a game");
-    snprintf(details, sizeof(details),
-             "Real-life activity: R2 started a game session. session_id=%s; "
-             "the game's virtual events remain separate from physical Reality.",
-             state->session_id);
-    if (r2_log_activity_start(key, name, details) < 0) {
-        snprintf(summary, sizeof(summary), "R2 began playing %s on the Game Boy Advance.",
-                 state->title[0] ? state->title : "a game");
-        (void)r2_log_event(R2_LOG_MEDIA, "game_session_started", summary,
-                           details, "GameBoyAdvance.py");
-    }
-}
-
-static void shell_gameboy_log_session_end(const ShellGameboyStatus *state,
-                                          const char *stop_reason)
-{
-    char key[256], details[1200], summary[1200];
-    const char *title;
-    const char *reason = stop_reason && *stop_reason ? stop_reason : "unknown";
-    if (!state || !state->session_id[0]) return;
-    title = state->title[0] ? state->title : "a game";
-    snprintf(key, sizeof(key), "gameboy:%s", state->session_id);
-    snprintf(details, sizeof(details),
-             "Real-life activity ended because the console session stopped. "
-             "session_id=%s; stop_reason=%s; in-game events are not physical-life events.",
-             state->session_id, reason);
-    if (r2_log_activity_end(key, "Game Boy Advance emulator stopped",
-                            reason, details) < 0) {
-        snprintf(summary, sizeof(summary), "R2 stopped playing %s on the Game Boy Advance.", title);
-        (void)r2_log_event(R2_LOG_MEDIA, "game_session_ended", summary,
-                           details, "GameBoyAdvance.py");
-    }
-}
-
-
 static int shell_gameboy(const char *arg)
 {
     const char *device = r2_gameboy_console_path();
@@ -2385,10 +2260,6 @@ static int shell_gameboy(const char *arg)
         }
     }
 
-    int is_power_off = argc == 2 && !strcmp(argv[1], "power") && !strcmp(argv[2], "off");
-    ShellGameboyStatus before = {0}, after = {0};
-    int have_before = shell_gameboy_read_status(&before);
-
     struct timespec deadline;
     if (r2_gameboy_command_deadline(&deadline) != 0) {
         perror("[Game Boy Advance] clock_gettime");
@@ -2436,23 +2307,14 @@ static int shell_gameboy(const char *arg)
     } else if (!command_ok) {
         printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
     } else {
-        /* The event-outbox read may reconcile an exited emulator, so sync it
-           before comparing session IDs for Life Log start/end bookkeeping. */
         if (r2_sync_gameboy_verified_events(device) < 0)
             printf("[Game Boy Advance] Verified event synchronization is incomplete.\n");
-        if (shell_gameboy_read_status(&after)) {
-            /* Compare persistent session IDs, not command names. This also closes
-               Life Log activities when status/verify discovers an unexpected exit.
-               If the database did not exist before first launch, still record start. */
-            if (have_before && before.session_id[0] &&
-                (!after.session_id[0] || strcmp(before.session_id, after.session_id) != 0))
-                shell_gameboy_log_session_end(&before, is_power_off ? "console_powered_off" : "emulator_exited_or_session_reconciled");
-            if (after.session_id[0] &&
-                (!have_before || !before.session_id[0] ||
-                 strcmp(before.session_id, after.session_id) != 0))
-                shell_gameboy_log_session_start(&after);
-        }
     }
+    /* A failed action may still have reconciled an exited emulator. Use the
+     * same live status and duration-bearing history path as model commands. */
+    if (!cancelled && WIFEXITED(status) && !r2_is_shutting_down() &&
+        r2_gameboy_sync_activity(device) != 0)
+        printf("[Game Boy Advance] Activity history synchronization is incomplete.\n");
     free(copy);
     return 1;
 }

@@ -2333,9 +2333,20 @@ static int log_activity_receipt_matches_locked(
     return matches;
 }
 
+static int64_t log_activity_start_with_choice(const char *activity_key,
+                                             const char *activity_name,
+                                             const char *details, int record_choice);
+
 int64_t r2_log_activity_start(const char *activity_key,
                               const char *activity_name,
                               const char *details)
+{
+    return log_activity_start_with_choice(activity_key, activity_name, details, 1);
+}
+
+static int64_t log_activity_start_with_choice(const char *activity_key,
+                                             const char *activity_name,
+                                             const char *details, int record_choice)
 {
     sqlite3_stmt *statement = NULL;
     char utc[40], local[48], event_details[4096], summary[1024];
@@ -2407,8 +2418,9 @@ int64_t r2_log_activity_start(const char *activity_key,
 
     /* Every explicitly started activity is a voluntary choice signal for the
        shared preference evaluator. Start/end events are not double-counted. */
-    (void)r2_addiction_record_choice(activity_name, "activity", 50,
-                                     "activity_start", event_details);
+    if (record_choice)
+        (void)r2_addiction_record_choice(activity_name, "activity", 50,
+                                         "activity_start", event_details);
     return event_id;
 }
 
@@ -2519,6 +2531,150 @@ int64_t r2_log_activity_end(const char *activity_key,
     free(start_utc);
     pthread_mutex_unlock(&log_lock);
     return result == 0 ? event_id : -1;
+}
+
+
+/* Reconcile the selected console using its actual session identity, not the
+ * caller or the command verb. The caller serializes status observations. */
+static pthread_mutex_t log_gameboy_activity_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 0: no record, positive: exact active receipt, -1: failed/ambiguous/ended.
+ * A console session identity must never be reopened as a second activity. */
+static int64_t log_gameboy_active_event(const char *key)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t id = -1;
+    pthread_mutex_lock(&log_lock);
+    int rc = log_initialized && log_db ? sqlite3_prepare_v2(log_db,
+        "SELECT a.start_event_id,a.status,e.category,e.event_type,e.source "
+        "FROM r2_log_activity_sessions a LEFT JOIN r2_log_events e ON e.id=a.start_event_id "
+        "WHERE a.activity_key COLLATE BINARY=?1", -1, &st, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, key);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) id = 0;
+        else if (rc == SQLITE_ROW) {
+            const char *fields[4];
+            if (log_read_text_fields(st, 1, 4, fields) == 0 &&
+                fields[0] && !strcmp(fields[0], "active") &&
+                fields[1] && !strcmp(fields[1], "media") &&
+                fields[2] && !strcmp(fields[2], "activity_started") &&
+                fields[3] && !strcmp(fields[3], key)) {
+                id = sqlite3_column_int64(st, 0);
+                if (id <= 0 || sqlite3_step(st) != SQLITE_DONE) id = -1;
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return id;
+}
+
+/* Copy one stale key before calling the public end transaction. Generic
+ * pre-upgrade keys have no console session identity, so do not guess which
+ * running session they describe. Retire them only when no game is running. */
+static int log_gameboy_stale_key(const char *physical, const char *virtual,
+                                 char **out)
+{
+    sqlite3_stmt *st = NULL;
+    *out = NULL;
+    pthread_mutex_lock(&log_lock);
+    int rc = log_initialized && log_db ? sqlite3_prepare_v2(log_db,
+        "SELECT activity_key FROM r2_log_activity_sessions WHERE status='active' "
+        "AND (activity_key IN ('gameboy:physical','gameboy:virtual') "
+        "OR activity_key GLOB 'gameboy:gba-*') "
+        "AND (?1 IS NULL OR activity_key NOT IN (?1,?2,'gameboy:physical','gameboy:virtual')) "
+        "ORDER BY id LIMIT 1", -1, &st, NULL) : SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, physical);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 2, virtual);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    int result = rc == SQLITE_DONE ? 0 : -1;
+    if (rc == SQLITE_ROW) {
+        const char *key = NULL;
+        if (log_read_text_fields(st, 0, 1, &key) == 0 &&
+            valid_text(key) && strlen(key) <= 256) {
+            *out = strdup(key);
+            if (*out) result = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    pthread_mutex_unlock(&log_lock);
+    return result;
+}
+
+int r2_log_gameboy_reconcile_activity(const char *session_id, const char *title,
+                                       const char *started_at)
+{
+    char physical[256], virtual[256];
+    char *name = NULL, *virtual_name = NULL, *details = NULL, *virtual_details = NULL;
+    const char *physical_key = NULL, *virtual_key = NULL;
+    int result = -1;
+    if (session_id) {
+        if (strncmp(session_id, "gba-", 4) || !session_id[4] || strlen(session_id) > 160 ||
+            strspn(session_id, "abcdefghijklmnopqrstuvwxyz0123456789-") != strlen(session_id) ||
+            !valid_text(started_at))
+            return -1;
+        const char *game = valid_text(title) ? title : "unknown game";
+        int p = snprintf(physical, sizeof(physical), "gameboy:%s", session_id);
+        int v = snprintf(virtual, sizeof(virtual), "gameboy:%s:virtual", session_id);
+        if (p < 0 || (size_t)p >= sizeof(physical) || v < 0 || (size_t)v >= sizeof(virtual))
+            return -1;
+        physical_key = physical;
+        virtual_key = virtual;
+        if (asprintf(&name, "Playing %s on Game Boy Advance", game) < 0 ||
+            asprintf(&virtual_name, "Playing %s inside the game", game) < 0 ||
+            asprintf(&details, "context=physical; device=GameBoyAdvance; session_id=%s; "
+                     "game_title=%s; verified_emulator_started_at=%s; "
+                     "the game's virtual events remain separate from physical Reality. "
+                     "Activity timing begins when R2 records this observation.",
+                     session_id, game, started_at) < 0 ||
+            asprintf(&virtual_details, "context=virtual; device=GameBoyAdvance; session_id=%s; "
+                     "game_title=%s; verified_emulator_started_at=%s; "
+                     "in-game events are not physical-life events and require independent verification. "
+                     "Activity timing begins when R2 records this observation.",
+                     session_id, game, started_at) < 0)
+            goto cleanup;
+    }
+
+    pthread_mutex_lock(&log_gameboy_activity_lock);
+    for (;;) {
+        char *stale = NULL;
+        int next = log_gameboy_stale_key(physical_key, virtual_key, &stale);
+        if (next < 0) goto unlock;
+        if (next == 0) break;
+        int legacy = !strcmp(stale, "gameboy:physical") || !strcmp(stale, "gameboy:virtual");
+        int64_t ended = r2_log_activity_end(stale, "unknown",
+            session_id ? "verified different selected console session" :
+                         "no running game in the selected console",
+            legacy ? "Legacy activity had no console session identity. Closure is an observation, not an exact emulator exit time." :
+                     "Session is no longer current in the selected console. Closure is an observation, not an exact emulator exit time; no in-game save is asserted.");
+        free(stale);
+        if (ended <= 0) goto unlock;
+    }
+
+    if (physical_key) {
+        int64_t physical_event = log_gameboy_active_event(physical_key);
+        if (physical_event == 0)
+            physical_event = log_activity_start_with_choice(physical_key, name, details, 1);
+        if (physical_event <= 0) goto unlock;
+        int64_t virtual_event = log_gameboy_active_event(virtual_key);
+        if (virtual_event == 0)
+            virtual_event = log_activity_start_with_choice(virtual_key, virtual_name,
+                                                          virtual_details, 0);
+        if (virtual_event <= 0) goto unlock;
+        if (r2_log_link(physical_event, virtual_event,
+                        "physical_and_virtual_views_of_same_session", session_id) != 0)
+            goto unlock;
+    }
+    result = 0;
+unlock:
+    pthread_mutex_unlock(&log_gameboy_activity_lock);
+cleanup:
+    free(name);
+    free(virtual_name);
+    free(details);
+    free(virtual_details);
+    return result;
 }
 
 

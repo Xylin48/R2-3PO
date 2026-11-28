@@ -21,16 +21,14 @@ core_path = core[core_path_start:core_path_end]
 assert core_path.index('getenv("R2_GAMEBOY_CONSOLE")') < core_path.index('getenv("R2_GAMEBOY_EXECUTABLE")')
 assert 'R2_ROOT "/Devices/GameBoyAdvance/GameBoyAdvance"' in core_path
 assert "const char *console_path = r2_gameboy_console_path();" in core
-path_start = shell.index("static int shell_gameboy_state_database_path(")
-path_end = shell.index("/* Read authoritative device state", path_start)
-state_path = shell[path_start:path_end]
-assert 'getenv("R2_GAMEBOY_ROOT")' in state_path
-assert 'getenv("R2_GAMEBOY_DIR")' in state_path
-assert "realpath(r2_gameboy_console_path(), NULL)" in state_path
-assert '"%s%sState/console_state.db"' in state_path
-status_start = shell.index("static int shell_gameboy_read_status(")
-status_end = shell.index("static void shell_gameboy_log_session_start(", status_start)
-assert "shell_gameboy_state_database_path(database, sizeof(database))" in shell[status_start:status_end]
+activity_start = core.index("int r2_gameboy_sync_activity(")
+activity_end = core.index("static int gameboy_sync_verified_event(", activity_start)
+activity = core[activity_start:activity_end]
+assert 'run_gameboy_console(path, "status", NULL, NULL, &output)' in activity
+assert "gameboy_status_valid(status)" in activity
+assert "r2_log_gameboy_reconcile_activity(" in activity
+assert "pthread_mutex_lock(&activity_sync_lock)" in activity
+assert "shell_gameboy_read_status" not in shell
 for name in ("R2_GAMEBOY_CONSOLE", "R2_GAMEBOY_EXECUTABLE", "R2_GAMEBOY_ROOT", "R2_GAMEBOY_DIR"):
     assert name in launcher, f"interactive launcher must pass through {name}"
     assert name in service, f"overnight service must pass through {name}"
@@ -45,8 +43,11 @@ assert '"R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"' in service
 assert "execv(device, argv)" in handler
 assert "system(" not in handler and "popen(" not in handler, "arguments must never enter a shell"
 assert "r2_sync_gameboy_verified_events(device)" in handler
-assert "shell_gameboy_log_session_start(&after)" in handler
-assert "shell_gameboy_log_session_end(&before" in handler
+assert "r2_gameboy_sync_activity(device)" in handler
+assert "r2_gameboy_sync_activity(console_path)" in core
+assert '"gameboy:%s"' in log and '"gameboy:%s:virtual"' in log
+assert "log_activity_start_with_choice(virtual_key" in log
+assert "physical_and_virtual_views_of_same_session" in log
 assert shell.count("static int shell_gameboy(") == 1
 assert 'shell_gameboy(shell_starts_with(command, "gameboy ") ? shell_trim(command + 8) : NULL);' in shell
 for command in (

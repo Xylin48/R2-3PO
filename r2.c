@@ -9231,35 +9231,29 @@ static int gameboy_action_state_valid(const char *command, const char *arg,
     return 0;
 }
 
-static void gameboy_end_activity_sessions(const char *reason)
+/* Both interactive shell and model tools use the same verified status,
+ * serialized through reconciliation so an older observation cannot be applied
+ * after a newer one by another caller. */
+int r2_gameboy_sync_activity(const char *path)
 {
-    (void)r2_log_activity_end("gameboy:virtual", "unknown", reason,
-        "context=virtual; game-specific state was not verified at shutdown");
-    (void)r2_log_activity_end("gameboy:physical", "unknown", reason,
-        "context=physical; Game Boy Advance console session ended");
-}
-
-static void gameboy_start_activity_sessions(const char *title)
-{
-    char virtual_name[600];
-    char details[1200];
-    const char *game = title && *title ? title : "unknown game";
-    snprintf(virtual_name, sizeof(virtual_name), "Playing %s inside the game", game);
-    snprintf(details, sizeof(details),
-             "context=physical; device=GameBoyAdvance; game_title=%s; "
-             "this records R2 operating the console, not the character's actions",
-             game);
-    int64_t physical_event = r2_log_activity_start(
-        "gameboy:physical", "Playing the Game Boy Advance", details);
-    snprintf(details, sizeof(details),
-             "context=virtual; device=GameBoyAdvance; game_title=%s; "
-             "gameplay events require independent verification",
-             game);
-    int64_t virtual_event = r2_log_activity_start(
-        "gameboy:virtual", virtual_name, details);
-    if (physical_event > 0 && virtual_event > 0)
-        (void)r2_log_link(physical_event, virtual_event,
-                          "physical_and_virtual_views_of_same_session", game);
+    if (!path || !*path) return -1;
+    static pthread_mutex_t activity_sync_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&activity_sync_lock);
+    char *output = NULL;
+    int rc = run_gameboy_console(path, "status", NULL, NULL, &output);
+    json_object *status = rc == 0 ? gameboy_parse_response(output) : NULL;
+    free(output);
+    int result = -1;
+    if (gameboy_status_valid(status)) {
+        int running = gameboy_json_bool(status, "game_running", 0);
+        result = r2_log_gameboy_reconcile_activity(
+            running ? gameboy_json_string(status, "session_id", NULL) : NULL,
+            gameboy_json_string(status, "cartridge_title", NULL),
+            running ? gameboy_json_string(status, "game_started_at", NULL) : NULL);
+    }
+    if (status) json_object_put(status);
+    pthread_mutex_unlock(&activity_sync_lock);
+    return result;
 }
 
 static int gameboy_sync_verified_event(const char *path, json_object *item)
@@ -10528,23 +10522,14 @@ static char *process_tools_with_capture_status(
                 console_json, "cartridge_inserted", 0);
 
             if (command_ok && is_power_on && game_running) {
-                gameboy_end_activity_sessions(
-                    "a previous emulator session was no longer running");
-                gameboy_start_activity_sessions(title);
                 r2_log_event(R2_LOG_WORLD, "gameboy_game_started",
                              "R2 started a game on the virtual Game Boy Advance.",
                              title, "GameBoyAdvance");
             } else if (command_ok && is_power_off) {
-                gameboy_end_activity_sessions(
-                    "console powered off; no in-game save command was issued");
                 r2_log_event(R2_LOG_WORLD, "gameboy_console_powered_off",
                              "R2 powered off the virtual Game Boy Advance.",
                              "No emulator save state or in-game save command was issued.",
                              "GameBoyAdvance");
-            } else if (command_ok && is_status && !game_running) {
-                /* Also closes the recorded activity if R2 closed mGBA manually. */
-                gameboy_end_activity_sessions(
-                    "emulator was no longer running when console status was checked");
             }
 
             if (!command_ok) {
@@ -10584,6 +10569,12 @@ static char *process_tools_with_capture_status(
                 else if (synced_events < 0)
                     APPEND("GAME BOY: verified event synchronization is incomplete.\n");
             }
+
+            /* Even a rejected operation can have reconciled a previously
+             * exited emulator. Use a fresh verified observation for history. */
+            if (command && command_rc >= 0 && !r2_is_shutting_down() &&
+                r2_gameboy_sync_activity(console_path) != 0)
+                APPEND("GAME BOY: activity history synchronization is incomplete.\n");
 
             if (command_ok && command &&
                 (!strcmp(command, "insert") || !strcmp(command, "eject") ||

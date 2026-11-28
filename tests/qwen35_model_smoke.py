@@ -294,24 +294,31 @@ require(
     "a game session is explicitly marked as virtual context, separate from physical life",
 )
 require(
-    'r2_log_activity_start(key, name, details)' in shell
-    and 'r2_log_activity_end(key, "Game Boy Advance emulator stopped"' in shell
-    and '"gameboy:%s"' in shell,
-    "starting and stopping gameplay records a duration-bearing real-life activity in the Life Log",
+    'r2_gameboy_sync_activity(device)' in shell
+    and 'r2_gameboy_sync_activity(console_path)' in core
+    and 'r2_log_gameboy_reconcile_activity(' in core
+    and '"gameboy:%s"' in log
+    and '"gameboy:%s:virtual"' in log
+    and 'r2_log_activity_end(stale, "unknown"' in log,
+    "starting and stopping gameplay records shared duration-bearing physical and virtual activities",
 )
 require(
-    'in-game events are not physical-life events' in shell
-    and 'the game\'s virtual events remain separate from physical Reality' in shell,
+    'in-game events are not physical-life events' in log
+    and 'the game\'s virtual events remain separate from physical Reality' in log,
     "game activity records explicitly preserve the life-versus-game boundary",
 )
-gameboy_helper_start = shell.find("static int shell_gameboy_read_status")
-gameboy_helper_end = shell.find("static int shell_gameboy(const char *arg)")
-gameboy_helpers = shell[gameboy_helper_start:gameboy_helper_end]
+gameboy_helper_start = core.find("int r2_gameboy_sync_activity(")
+gameboy_helper_end = core.find("static int gameboy_sync_verified_event(", gameboy_helper_start)
+gameboy_helpers = core[gameboy_helper_start:gameboy_helper_end]
+gameboy_log_start = log.find("int r2_log_gameboy_reconcile_activity(")
+gameboy_log_end = log.find("/* ------------------------------------------------------------", gameboy_log_start)
 require(
     'r2_reality_' not in gameboy
     and gameboy_helper_start >= 0
     and gameboy_helper_end > gameboy_helper_start
-    and 'r2_reality_' not in gameboy_helpers,
+    and 'r2_reality_' not in gameboy_helpers
+    and gameboy_log_start >= 0 and gameboy_log_end > gameboy_log_start
+    and 'r2_reality_' not in log[gameboy_log_start:gameboy_log_end],
     "Game Boy session logging does not mutate R2's physical Reality state",
 )
 

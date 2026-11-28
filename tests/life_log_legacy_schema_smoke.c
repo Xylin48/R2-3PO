@@ -19,6 +19,7 @@
 static int journal_index_calls = 0;
 static int reject_welcome = 0;
 static int welcome_attempts = 0;
+static int activity_choice_calls = 0;
 
 void r2_sj_index_event(int64_t event_id, const char *category,
                        const char *event_type, const char *source)
@@ -42,7 +43,8 @@ int r2_addiction_record_choice(const char *target, const char *target_type,
                                const char *details)
 {
     (void)target; (void)target_type; (void)enjoyment_0_100;
-    (void)source; (void)details;
+    (void)details;
+    if (!strcmp(source, "activity_start")) ++activity_choice_calls;
     return 0;
 }
 
@@ -338,6 +340,48 @@ int main(void)
     assert(r2_log_activity_end("duplicate-fixture", "older state", "fixture", NULL) > 0);
     assert(scalar(writer, "SELECT COUNT(DISTINCT end_event_id) FROM r2_log_activity_sessions "
                           "WHERE activity_key='duplicate-fixture' AND status='ended';") == 2);
+
+    /* Both callers can observe the same console repeatedly and across a
+       Life Log restart. The physical and virtual views share one session. */
+    int choices_before = activity_choice_calls;
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
+    assert(activity_choice_calls == choices_before + 1);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key IN ('gameboy:gba-first','gameboy:gba-first:virtual') "
+                          "AND status='active';") == 2);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_links "
+                          "WHERE relationship='physical_and_virtual_views_of_same_session';") == 1);
+    r2_log_shutdown();
+    assert(r2_log_init() == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
+    assert(activity_choice_calls == choices_before + 1);
+
+    /* Existing shell-only activity uses the same physical key. Do not
+       duplicate its learning choice; supply the missing virtual view. */
+    assert(r2_log_activity_start("gameboy:gba-second", "Existing shell activity", "legacy shell fixture") > 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00") == 0);
+    assert(activity_choice_calls == choices_before + 2);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key GLOB 'gameboy:gba-first*' AND status='ended';") == 2);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key GLOB 'gameboy:gba-second*' AND status='active';") == 2);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key GLOB 'gameboy:gba-*' AND status='active';") == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00") < 0);
+    assert(activity_choice_calls == choices_before + 2);
+
+    /* Generic core-only legacy keys cannot be attributed to a live session
+       without an ID. Keep them until an observed no-running-game state. */
+    assert(r2_log_activity_start("gameboy:physical", "Legacy physical view", "legacy fixture") > 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-third", "Fixture", "2026-11-28T03:00:00+00:00") == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key='gameboy:physical' AND status='active';") == 1);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
+    assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                          "WHERE activity_key='gameboy:physical' AND status='ended';") == 1);
 
     char long_result[4096];
     memset(long_result, 'w', sizeof(long_result) - 1);
