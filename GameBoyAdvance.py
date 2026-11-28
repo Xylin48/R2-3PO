@@ -1046,7 +1046,22 @@ def press_button(db: sqlite3.Connection, button: str, duration_ms: int) -> dict[
         return {"ok": False, "message": "xdotool is not installed; controller input was not sent. Install xdotool to enable R2 button presses.",
                 **status_data(db)}
     pid = str(row["emulator_pid"])
+    fd = open_owned_emulator_pidfd(int(pid), row["emulator_start_ticks"])
+    if fd is None:
+        return {"ok": False, "message": "Emulator session ended before controller input.",
+                **status_data(db)}
     key = BUTTON_KEYS[name]
+
+    def require_window_owner(window: str) -> None:
+        if wait_for_emulator_exit(fd, 0):
+            raise ProcessIdentityError("Emulator session ended during controller input.")
+        owner = subprocess.run(
+            ["xdotool", "getwindowpid", window],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if (owner.returncode != 0 or owner.stdout.strip() != pid
+                or wait_for_emulator_exit(fd, 0)):
+            raise ProcessIdentityError("Controller window no longer belongs to the active emulator.")
     pressed_window: str | None = None
     input_error: str | None = None
     try:
@@ -1054,26 +1069,32 @@ def press_button(db: sqlite3.Connection, button: str, duration_ms: int) -> dict[
             ["xdotool", "search", "--onlyvisible", "--pid", pid],
             capture_output=True, text=True, timeout=2, check=False,
         )
-        windows = [line.strip() for line in found.stdout.splitlines() if line.strip()]
+        windows = [line.strip() for line in found.stdout.splitlines()
+                   if line.strip().isascii() and line.strip().isdecimal()]
         if found.returncode != 0 or not windows:
             return {"ok": False, "message": "Could not find the running mGBA window; no button press was sent.",
                     **status_data(db)}
         window = windows[0]
-        # Record the target before keydown: even if xdotool reports an error
-        # after delivering the press, finally still attempts to release it.
-        pressed_window = window
+        require_window_owner(window)
         subprocess.run(["xdotool", "windowactivate", "--sync", window],
                        check=True, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        require_window_owner(window)
+        # Record the target immediately before keydown, which may deliver the
+        # key before reporting an error. Do not release a key merely because
+        # window activation was attempted.
+        pressed_window = window
         subprocess.run(["xdotool", "keydown", "--window", window, key],
                        check=True, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        time.sleep(duration_ms / 1000.0)
-    except (OSError, subprocess.SubprocessError) as exc:
+        if wait_for_emulator_exit(fd, duration_ms):
+            raise ProcessIdentityError("Emulator session ended while holding the controller button.")
+    except (OSError, subprocess.SubprocessError, ProcessIdentityError) as exc:
         input_error = f"Button input failed: {exc}"
     finally:
-        # Always attempt keyup after a target window is identified. A failed
-        # keydown can still have reached the emulator before xdotool exits.
-        if pressed_window is not None:
-            try:
+        # A failed keydown may still have reached the emulator. Release
+        # only while the same process and window still own that input.
+        try:
+            if pressed_window is not None:
+                require_window_owner(pressed_window)
                 released = subprocess.run(
                     ["xdotool", "keyup", "--window", pressed_window, key],
                     check=False, timeout=3,
@@ -1081,9 +1102,13 @@ def press_button(db: sqlite3.Connection, button: str, duration_ms: int) -> dict[
                 )
                 if released.returncode != 0 and input_error is None:
                     input_error = "Button release failed; xdotool did not confirm keyup."
-            except (OSError, subprocess.SubprocessError) as exc:
-                if input_error is None:
-                    input_error = f"Button release failed: {exc}"
+                if wait_for_emulator_exit(fd, 0) and input_error is None:
+                    input_error = "Emulator session ended before input completion was confirmed."
+        except (OSError, subprocess.SubprocessError, ProcessIdentityError) as exc:
+            if input_error is None:
+                input_error = f"Button release failed: {exc}"
+        finally:
+            os.close(fd)
     if input_error is not None:
         return {"ok": False, "message": input_error, **status_data(db)}
     title = row["cartridge_title"] or "unknown game"

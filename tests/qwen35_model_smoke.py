@@ -319,7 +319,7 @@ require(
 require(
     "r2_sync_gameboy_verified_events(device)" in shell
     and "r2_sync_gameboy_verified_events(console_path)" in core
-    and "gameboy_find_life_event_for_console_event(source, event_id)" in core,
+    and "r2_log_save_gameboy_once(source, event_id, summary, details," in core,
     "shell and model sync verified in-game events through the same durable path",
 )
 gameboy_sync_start = core.index("static int gameboy_sync_verified_event(")
@@ -327,7 +327,10 @@ gameboy_sync_end = core.index("static int r2_parse_control_positive_id(", gamebo
 gameboy_sync = core[gameboy_sync_start:gameboy_sync_end]
 require(
     '"context", ""), "virtual"' in gameboy_sync
-    and 'r2_log_event(R2_LOG_MEDIA, "virtual_game_event"' in gameboy_sync
+    and 'r2_log_save_gameboy_once(source, event_id, summary, details,' in gameboy_sync
+    and 'log_insert_event_locked(R2_LOG_MEDIA, "virtual_game_event", summary, details, source)' in log
+    and 'log_finish_write(id > 0)' in log
+    and gameboy_sync.index("r2_log_save_gameboy_once(") < gameboy_sync.index("r2_reward_apply_once(")
     and 'r2_reality_' not in gameboy_sync,
     "synced game events remain virtual and never mutate physical Reality",
 )

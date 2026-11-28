@@ -412,6 +412,51 @@ def main() -> int:
         assert device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == event_count
         assert module.process_matches(pid, ticks)
 
+        # Exercise controller ownership using the real live emulator fixture
+        # and actual pidfd, but no X display. A failed keydown still needs
+        # release; a changed window owner must never receive input.
+        def controller_case(mode):
+            calls = []
+            owner_reads = 0
+
+            def xdotool(args, **kwargs):
+                nonlocal owner_reads
+                action = args[1]
+                calls.append(action)
+                if action == "search":
+                    return subprocess.CompletedProcess(args, 0, stdout="42\n")
+                if action == "getwindowpid":
+                    owner_reads += 1
+                    wrong = (mode == "wrong-owner" or
+                             (mode == "replaced-after-activate" and owner_reads == 2) or
+                             (mode == "replaced-before-release" and owner_reads == 3))
+                    return subprocess.CompletedProcess(args, 0, stdout=str(pid + 1 if wrong else pid) + "\n")
+                if action == "keydown" and mode == "failed-keydown":
+                    raise subprocess.CalledProcessError(1, args)
+                return subprocess.CompletedProcess(args, 0)
+
+            before = device_db.execute(
+                "SELECT COUNT(*) FROM console_events WHERE event_type='controller_input'"
+            ).fetchone()[0]
+            with patch.object(module.shutil, "which", return_value="/mock/xdotool"), \
+                 patch.object(module.subprocess, "run", side_effect=xdotool):
+                result = module.press_button(device_db, "A", 1)
+            after = device_db.execute(
+                "SELECT COUNT(*) FROM console_events WHERE event_type='controller_input'"
+            ).fetchone()[0]
+            assert result["ok"] == (mode == "success"), (mode, result)
+            assert after - before == (1 if mode == "success" else 0)
+            return calls
+
+        assert controller_case("success") == [
+            "search", "getwindowpid", "windowactivate", "getwindowpid",
+            "keydown", "getwindowpid", "keyup"]
+        assert controller_case("wrong-owner") == ["search", "getwindowpid"]
+        assert controller_case("replaced-after-activate") == [
+            "search", "getwindowpid", "windowactivate", "getwindowpid"]
+        assert controller_case("failed-keydown")[-2:] == ["getwindowpid", "keyup"]
+        assert "keyup" not in controller_case("replaced-before-release")
+
         device_db.close()
         # A duplicate/unknown acknowledgement must not claim that a pending
         # factual event was changed. The CLI contract is what the C bridge sees.
