@@ -147,8 +147,10 @@ def main() -> None:
     assert "r2_log_save_shared_sensory(visual_db" in visual
     assert "visual_save_separate(experience)" in visual
     assert "visual_insert_compat(db, experience->created, experience->source," in visual
-    for legacy_column in ("created_at", "timestamp", "file_path", "path"):
-        assert f'visual_column_exists(db, "{legacy_column}")' in visual
+    assert 'const char *aliases[] = {"created_at", "timestamp", "file_path", "path"};' in visual
+    assert "visual_column_exists(db, aliases[i])" in visual
+    assert "if (exists < 0) return SQLITE_ERROR;" in visual
+    assert "if (exists) ADD_TEXT(aliases[i], i < 2 ? created : image_path);" in visual
     assert 'visual_backfill("image_path", "file_path")' in visual
     assert "publish_focus_region_impl(focus, preview_session)" in visual
     assert "const char *display = getenv(\"DISPLAY\")" in visual

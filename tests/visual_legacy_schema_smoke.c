@@ -146,7 +146,7 @@ int main(void)
 
     assert(visual_insert_compat(visual_db, "2026-10-16T07:00:00Z", "Eyes",
         "/new/frame.jpg", "qwen3.5:9b", NULL, "new frame",
-        640, 480, 7, 123456, 0, NULL) == SQLITE_DONE);
+        640, 480, 7, 123456, 0, NULL, 0) == SQLITE_DONE);
 
     assert(sqlite3_prepare_v2(visual_db,
         "SELECT created_utc,image_path,created_at,timestamp,file_path,path "
@@ -181,6 +181,33 @@ int main(void)
         "SELECT 1 FROM r2_visual_pending_archives WHERE id=91",
         -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE);
     sqlite3_finalize(st);
+    /* Exact pending metadata and image bytes must survive as one write. */
+    R2VisionFrame frame = {.format.width=640, .format.height=480,
+                           .frame_number=7, .timestamp=123456};
+    const unsigned char jpeg[] = {0, 0xff, 0x11, 0};
+    VisualExperience experience = {&frame, "fixture date", "fixture source", "/fixture.jpg",
+                                    "fixture model", "", "fixture description", 0, 0};
+    assert(sqlite3_exec(visual_db,
+        "CREATE TRIGGER rewrite_pending_bytes AFTER INSERT ON r2_visual_pending_archives "
+        "BEGIN UPDATE r2_visual_pending_archives SET jpeg=X'00000000' WHERE id=NEW.id; END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_stage_archive(visual_db, &experience, jpeg, sizeof(jpeg)) == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER rewrite_pending_bytes", NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_stage_archive(visual_db, &experience, jpeg, sizeof(jpeg)) == SQLITE_DONE);
+    assert(sqlite3_exec(visual_db,
+        "CREATE TRIGGER rewrite_experience AFTER INSERT ON r2_visual_experiences "
+        "BEGIN UPDATE r2_visual_experiences SET file_path='/wrong.jpg' WHERE id=NEW.id; END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_finish_transaction(visual_db, visual_save_experience(visual_db, 0, &experience)) == SQLITE_CONSTRAINT);
+    assert(sqlite3_prepare_v2(visual_db,
+        "SELECT hex(jpeg) FROM r2_visual_pending_archives WHERE image_path='/fixture.jpg'",
+        -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+    assert(!strcmp((const char *)sqlite3_column_text(st, 0), "00FF1100"));
+    sqlite3_finalize(st);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER rewrite_experience", NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK);
+    assert(visual_finish_transaction(visual_db, visual_save_experience(visual_db, 0, &experience)) == SQLITE_DONE);
     r2_visual_shutdown();
     assert(unlink(path) == 0);
     assert(rmdir(library) == 0);

@@ -993,6 +993,17 @@ int main(void)
             "ON e.id=v.life_log_event_id WHERE v.source='uncertain committed camera' "
             "AND e.details='committed before an uncertain result' AND v.prompt='late cancellation'") == 1);
     }
+    /* A rewritten detached key must not commit an orphan Life Log event. */
+    assert(sqlite3_exec(visual_db,
+        "CREATE TRIGGER rewrite_detached_key AFTER INSERT ON r2_log_visual_keys "
+        "BEGIN UPDATE r2_log_visual_keys SET archive_key='wrong-key' WHERE event_id=NEW.event_id; END",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_save_visual_once("exact-key", "exact description", "exact detached fixture") < 0);
+    assert(scalar(visual_db, "SELECT count(*) FROM r2_log_events WHERE source='exact detached fixture'") == 0);
+    assert(sqlite3_exec(visual_db, "DROP TRIGGER rewrite_detached_key", NULL, NULL, NULL) == SQLITE_OK);
+    int64_t exact_event = r2_log_save_visual_once("exact-key", "exact description", "exact detached fixture");
+    assert(exact_event > 0 && r2_log_save_visual_once("exact-key", "exact description", "exact detached fixture") == exact_event);
+    assert(r2_log_save_visual_once("exact-key", "different description", "exact detached fixture") < 0);
     r2_visual_shutdown(); r2_sj_shutdown(); r2_log_shutdown(); r2_diary_shutdown();
     if (request_copy) json_object_put(request_copy);
     free(body); free(description); curl_global_cleanup();

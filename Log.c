@@ -1283,7 +1283,25 @@ int64_t r2_log_save_visual_once(const char *archive_key, const char *description
         }
     }
 
-    if (id <= 0 || (rc != SQLITE_DONE && rc != SQLITE_ROW) ||
+    if (id > 0 && (rc == SQLITE_DONE || rc == SQLITE_ROW)) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(log_db,
+            "SELECT 1 FROM r2_log_visual_keys k JOIN r2_log_events e ON e.id=k.event_id "
+            "WHERE k.archive_key=? COLLATE BINARY AND e.id=? "
+            "AND e.category='sensory' AND e.event_type='visual_experience' "
+            "AND e.details=? COLLATE BINARY AND e.source=? COLLATE BINARY",
+            -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, archive_key);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, id);
+        if (rc == SQLITE_OK) rc = bind_optional_text(st, 3, description);
+        if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, source);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) rc = sqlite3_step(st);
+        else if (rc == SQLITE_DONE) rc = SQLITE_CONSTRAINT;
+        if (rc == SQLITE_ROW) rc = SQLITE_CONSTRAINT;
+        sqlite3_finalize(st);
+    }
+    if (id <= 0 || rc != SQLITE_DONE ||
         sqlite3_exec(log_db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
         if (!sqlite3_get_autocommit(log_db))
             (void)sqlite3_exec(log_db, "ROLLBACK", NULL, NULL, NULL);

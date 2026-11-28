@@ -953,6 +953,25 @@ static int visual_migrate_schema(void)
 }
 
 
+/* Read back complete SQLite values without accepting type coercion, embedded
+ * NUL, truncated strings, or a NULL in place of an empty text field. */
+static int visual_text_matches(sqlite3_stmt *st, int column, const char *expected)
+{
+    if (!expected) return sqlite3_column_type(st, column) == SQLITE_NULL;
+    if (sqlite3_column_type(st, column) != SQLITE_TEXT) return 0;
+    const unsigned char *value = sqlite3_column_text(st, column);
+    return value && strlen(expected) == (size_t)sqlite3_column_bytes(st, column) &&
+        !memcmp(value, expected, strlen(expected));
+}
+
+static int visual_integer_matches(sqlite3_stmt *st, int column, sqlite3_int64 expected)
+{
+    return sqlite3_column_type(st, column) == SQLITE_INTEGER &&
+        sqlite3_column_int64(st, column) == expected;
+}
+
+static int visual_drop_pending(sqlite3 *db, const char *path, int withdrawn);
+
 /* Old visual-library schemas may retain required created_at/timestamp and
    file_path/path columns after the canonical columns are added. Populate
    those aliases on every insert so an upgrade remains writable for old DBs. */
@@ -961,7 +980,7 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
                                 const char *prompt, const char *description,
                                 int width, int height, sqlite3_int64 frame_number,
                                 sqlite3_int64 frame_timestamp, int64_t event_id,
-                                const char *archive_key)
+                                const char *archive_key, int consume_pending)
 {
     enum { VISUAL_TEXT = 1, VISUAL_INTEGER = 2, VISUAL_NULL = 3 };
     struct visual_value {
@@ -995,6 +1014,7 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
     if (event_id > 0) ADD_INTEGER("life_log_event_id", event_id);
     else ADD_NULL("life_log_event_id");
     if (archive_key) ADD_TEXT("life_log_archive_key", archive_key);
+    else ADD_NULL("life_log_archive_key");
 
     const char *aliases[] = {"created_at", "timestamp", "file_path", "path"};
     for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
@@ -1044,6 +1064,43 @@ static int visual_insert_compat(sqlite3 *db, const char *created, const char *so
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(db) != 1)
         rc = SQLITE_CONSTRAINT;
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rc;
+    sqlite3_int64 row_id = sqlite3_last_insert_rowid(db);
+    /* Both operations belong to the caller's existing write transaction.
+       Check the final experience after consuming its pending row, so a
+       changed or removed record cannot be acknowledged by the caller. */
+    if (consume_pending) {
+        rc = visual_drop_pending(db, image_path, 0);
+        if (rc != SQLITE_DONE) return rc;
+    }
+    used = 0;
+    n = snprintf(sql, sizeof(sql), "SELECT ");
+    if (n < 0 || (size_t)n >= sizeof(sql)) return SQLITE_TOOBIG;
+    used = (size_t)n;
+    for (size_t i = 0; i < count; ++i) {
+        n = snprintf(sql + used, sizeof(sql) - used, "%s%s",
+                     i ? "," : "", values[i].column);
+        if (n < 0 || (size_t)n >= sizeof(sql) - used) return SQLITE_TOOBIG;
+        used += (size_t)n;
+    }
+    n = snprintf(sql + used, sizeof(sql) - used,
+                 " FROM r2_visual_experiences WHERE id=?");
+    if (n < 0 || (size_t)n >= sizeof(sql) - used) return SQLITE_TOOBIG;
+    st = NULL;
+    rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, row_id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        int matches = 1;
+        for (size_t i = 0; i < count && matches; ++i) {
+            matches = values[i].type == VISUAL_INTEGER
+                ? visual_integer_matches(st, (int)i, values[i].integer)
+                : visual_text_matches(st, (int)i, values[i].text);
+        }
+        rc = matches ? sqlite3_step(st) : SQLITE_CONSTRAINT;
+        if (rc == SQLITE_ROW) rc = SQLITE_CONSTRAINT;
+    } else if (rc == SQLITE_DONE) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
     return rc;
 }
@@ -1122,6 +1179,36 @@ static int visual_stage_archive(sqlite3 *db, const VisualExperience *experience,
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
     if (rc == SQLITE_DONE && sqlite3_changes(db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) {
+        sqlite3_int64 row_id = sqlite3_last_insert_rowid(db);
+        st = NULL;
+        rc = sqlite3_prepare_v2(db,
+            "SELECT image_path,created_utc,source,model,prompt,description,"
+            "width,height,frame_number,frame_timestamp,jpeg,withdrawn "
+            "FROM r2_visual_pending_archives WHERE id=?", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, row_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            int matches = 1;
+            for (int i = 0; i < 6 && matches; ++i)
+                matches = visual_text_matches(st, i, fields[i]);
+            matches = matches &&
+                visual_integer_matches(st, 6, frame->format.width) &&
+                visual_integer_matches(st, 7, frame->format.height) &&
+                visual_integer_matches(st, 8, (sqlite3_int64)frame->frame_number) &&
+                visual_integer_matches(st, 9, (sqlite3_int64)frame->timestamp) &&
+                sqlite3_column_type(st, 10) == SQLITE_BLOB &&
+                visual_integer_matches(st, 11, 0);
+            if (matches) {
+                const void *stored = sqlite3_column_blob(st, 10);
+                matches = stored && (size_t)sqlite3_column_bytes(st, 10) == length &&
+                    !memcmp(stored, jpeg, length);
+            }
+            rc = matches ? sqlite3_step(st) : SQLITE_CONSTRAINT;
+            if (rc == SQLITE_ROW) rc = SQLITE_CONSTRAINT;
+        } else if (rc == SQLITE_DONE) rc = SQLITE_CONSTRAINT;
+        sqlite3_finalize(st);
+    }
     return visual_finish_transaction(db, rc);
 }
 
@@ -1196,12 +1283,12 @@ static int visual_save_experience(sqlite3 *db, int64_t event_id, void *context)
                                 (int)frame->format.width, (int)frame->format.height,
                                 (sqlite3_int64)frame->frame_number,
                                 (sqlite3_int64)frame->timestamp, event_id,
-                                event_id > 0 ? NULL : experience->image_path);
+                                event_id > 0 ? NULL : experience->image_path, 1);
     if (rc == SQLITE_DONE && !experience->recovering && r2_ollama_vision_request_should_abort()) {
         experience->cancelled = 1;
         return SQLITE_ABORT;
     }
-    return rc == SQLITE_DONE ? visual_drop_pending(db, experience->image_path, 0) : rc;
+    return rc;
 }
 
 static int visual_link_detached(sqlite3_int64 row_id, const char *key,
@@ -1210,18 +1297,38 @@ static int visual_link_detached(sqlite3_int64 row_id, const char *key,
     int64_t event_id = r2_log_save_visual_once(key, description, source);
     if (event_id <= 0) return -1;
 
+    int rc = sqlite3_exec(visual_db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return -1;
     sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(visual_db,
+    rc = sqlite3_prepare_v2(visual_db,
         "UPDATE r2_visual_experiences SET life_log_event_id=? WHERE id=? "
-        "AND life_log_archive_key=? AND life_log_event_id IS NULL",
+        "AND life_log_archive_key=? COLLATE BINARY AND life_log_event_id IS NULL "
+        "AND description=? COLLATE BINARY AND source=? COLLATE BINARY",
         -1, &st, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, event_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, row_id);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 4, description, strlen(description), SQLITE_TRANSIENT, SQLITE_UTF8);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text64(st, 5, source, strlen(source), SQLITE_TRANSIENT, SQLITE_UTF8);
     if (rc == SQLITE_OK) rc = sqlite3_step(st);
-    int linked = rc == SQLITE_DONE && sqlite3_changes(visual_db) == 1;
+    if (rc == SQLITE_DONE && sqlite3_changes(visual_db) != 1) rc = SQLITE_CONSTRAINT;
     sqlite3_finalize(st);
-    return linked ? 0 : -1;
+    if (rc == SQLITE_DONE) {
+        st = NULL;
+        rc = sqlite3_prepare_v2(visual_db,
+            "SELECT life_log_event_id,life_log_archive_key,description,source "
+            "FROM r2_visual_experiences WHERE id=?", -1, &st, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, row_id);
+        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW && visual_integer_matches(st, 0, event_id) &&
+            visual_text_matches(st, 1, key) && visual_text_matches(st, 2, description) &&
+            visual_text_matches(st, 3, source))
+            rc = sqlite3_step(st);
+        else if (rc == SQLITE_ROW || rc == SQLITE_DONE) rc = SQLITE_CONSTRAINT;
+        if (rc == SQLITE_ROW) rc = SQLITE_CONSTRAINT;
+        sqlite3_finalize(st);
+    }
+    return visual_finish_transaction(visual_db, rc) == SQLITE_DONE ? 0 : -1;
 }
 
 /* Save the replay identity in the same transaction as the authoritative row. */
