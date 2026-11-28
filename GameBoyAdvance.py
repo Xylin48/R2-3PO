@@ -523,6 +523,25 @@ def safe_cartridge(name: str) -> Path:
     return path
 
 
+def stored_cartridge_path(value: str) -> Path:
+    # Apply the same loose-file contract at verification and actual startup.
+    # Resolving the slot first would silently follow a replaced in-folder link.
+    raw = Path(value)
+    if raw.parent.resolve() != CARTRIDGES.resolve():
+        raise ValueError("The inserted cartridge path is outside Cartridges.")
+    return safe_cartridge(raw.name)
+
+
+def inventory_file_available(filename: str) -> bool:
+    # Legacy inventory may contain old non-filename identities. Keep the
+    # historical row, but never report an unrelated external file as available.
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        return False
+    path = CARTRIDGES / filename
+    return (not path.is_symlink() and path.is_file()
+            and path.resolve().parent == CARTRIDGES.resolve())
+
+
 def sync_cartridge_inventory(db: sqlite3.Connection) -> None:
     """Discover loose cartridge files without moving previously stored games."""
     ensure_dirs()
@@ -572,6 +591,8 @@ def move_cartridge(db: sqlite3.Connection, filename: str, location: str) -> dict
     if current is None:
         return {"ok": False, "message": f"No known cartridge named '{filename}'.", **status_data(db)}
     filename = current["filename"]
+    if not filename or Path(filename).name != filename or filename in {".", ".."}:
+        return {"ok": False, "message": "Historical inventory identity is not a loose cartridge filename.", **status_data(db)}
     if (CARTRIDGES / filename).is_symlink():
         return {"ok": False, "message": "A linked ROM is not a physical loose cartridge; its historical inventory record remains preserved.", **status_data(db)}
     slot = db.execute("SELECT rom_path FROM cartridge.cartridge_slot WHERE id=1").fetchone()
@@ -651,10 +672,16 @@ def verify_console(db: sqlite3.Connection) -> dict[str, Any]:
         "emulator_executable": emulator.is_file() and os.access(emulator, os.X_OK),
     }
     rom_path = row["cartridge_path"]
+    slot_error = None
     if rom_path:
-        rom = Path(rom_path).resolve()
-        checks["slot_rom_exists"] = rom.is_file() and rom.parent == CARTRIDGES.resolve()
+        rom = Path(rom_path)
+        checks["slot_rom_exists"] = (rom.parent.resolve() == CARTRIDGES.resolve()
+                                     and inventory_file_available(rom.name))
         checks["slot_rom_format_supported"] = rom.suffix.lower() in ROM_EXTENSIONS
+        try:
+            stored_cartridge_path(rom_path)
+        except (ValueError, OSError) as exc:
+            slot_error = str(exc)
     else:
         checks["slot_rom_exists"] = False
         checks["slot_rom_format_supported"] = False
@@ -668,11 +695,8 @@ def verify_console(db: sqlite3.Connection) -> dict[str, Any]:
     ):
         if not checks[key]:
             failures.append(description)
-    if rom_path:
-        if not checks["slot_rom_exists"]:
-            failures.append("the recorded cartridge path is missing or outside Cartridges")
-        if not checks["slot_rom_format_supported"]:
-            failures.append("the inserted cartridge format is unsupported")
+    if rom_path and slot_error:
+        failures.append(slot_error.rstrip("."))
     ok = not failures
     if failures:
         message = "Console verification failed: " + "; ".join(failures) + "."
@@ -705,11 +729,7 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
                 **status_data(db)}
     proc = None
     try:
-        rom = Path(cartridge).resolve()
-        if rom.parent != CARTRIDGES.resolve() or not rom.is_file():
-            raise ValueError("The inserted cartridge file is missing or outside Cartridges.")
-        if rom.suffix.lower() not in ROM_EXTENSIONS:
-            raise ValueError("The inserted cartridge format is unsupported.")
+        rom = stored_cartridge_path(cartridge)
         emulator = Path(EMULATOR).expanduser().resolve()
         if not emulator.is_file() or not os.access(emulator, os.X_OK):
             raise ValueError(
@@ -904,7 +924,7 @@ def eject_cartridge(db: sqlite3.Connection) -> dict[str, Any]:
 def list_cartridges(db: sqlite3.Connection) -> list[dict[str, Any]]:
     sync_cartridge_inventory(db)
     rows = db.execute("SELECT filename,title,location FROM cartridge_inventory ORDER BY filename COLLATE NOCASE").fetchall()
-    return [{"filename": row["filename"], "title": row["title"], "location": row["location"], "file_available": ((CARTRIDGES / row["filename"]).is_file() and not (CARTRIDGES / row["filename"]).is_symlink())} for row in rows]
+    return [{"filename": row["filename"], "title": row["title"], "location": row["location"], "file_available": inventory_file_available(row["filename"])} for row in rows]
 
 
 def press_button(db: sqlite3.Connection, button: str, duration_ms: int) -> dict[str, Any]:

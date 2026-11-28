@@ -164,7 +164,16 @@ def main() -> int:
                 ("External.gba", "historical linked cartridge",
                  "2001-01-01T00:00:00Z", "2001-01-01T00:00:00Z"),
             )
+        with sqlite3.connect(root / "State" / "console_state.db") as state_db:
+            state_db.execute(
+                "INSERT INTO cartridge_inventory(filename,title,location,discovered_at,updated_at) "
+                "VALUES(?,?,'pockets',?,?)",
+                (str(outside_rom), "historical absolute path",
+                 "2001-01-01T00:00:00Z", "2001-01-01T00:00:00Z"),
+            )
         legacy_list = run(root, emulator, "list")
+        external_entry = next(item for item in legacy_list if item["filename"] == str(outside_rom))
+        assert external_entry["file_available"] is False
         linked_entry = next(item for item in legacy_list
                             if item["filename"] == "External.gba")
         assert linked_entry["file_available"] is False
@@ -229,6 +238,28 @@ def main() -> int:
         assert verified["ok"] is True
         assert verified["checks"]["slot_rom_exists"] is True
         assert "TEST MARIO" in verified["message"]
+
+        # The inserted filename can be replaced after insertion. Verification
+        # and startup must enforce the same loose-file contract as insertion.
+        inserted_rom = cartridges / "Mario.gba"
+        inserted_rom.unlink()
+        inserted_rom.symlink_to(cartridges / "Second.gba")
+        try:
+            verified = run(root, emulator, "verify", expect_ok=False)
+            assert not verified["checks"]["slot_rom_exists"]
+            assert "symbolic links" in verified["message"]
+            refused = run(root, emulator, "power", "on", expect_ok=False)
+            assert "symbolic links" in refused["message"] and refused["power_state"] == "off"
+            assert not launch_pid.exists()
+        finally:
+            inserted_rom.unlink()
+        inserted_rom.write_bytes(b"too small")
+        verified = run(root, emulator, "verify", expect_ok=False)
+        assert "too small" in verified["message"]
+        refused = run(root, emulator, "power", "on", expect_ok=False)
+        assert "too small" in refused["message"] and refused["power_state"] == "off"
+        assert not launch_pid.exists()
+        inserted_rom.write_bytes(rom)
 
         with sqlite3.connect(root / "State" / "console_state.db") as state_db:
             state_db.execute(
