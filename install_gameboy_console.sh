@@ -12,7 +12,11 @@ MGBA_PATH="${R2_MGBA_EXECUTABLE:-/usr/games/mgba-qt}"
 TARGET_DIR="$(python3 - "$TARGET_DIR" <<'PY'
 import sys
 from pathlib import Path
-print(Path(sys.argv[1]).resolve())
+target = str(Path(sys.argv[1]).resolve())
+# Validate before command substitution can strip a trailing newline.
+if "=" in target or any(not 32 <= ord(ch) <= 126 for ch in target):
+    raise SystemExit("Game Boy launcher path cannot be represented in a Desktop Entry Exec executable.")
+print(target)
 PY
 )"
 LAUNCHER_TMP="$(mktemp)"

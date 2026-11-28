@@ -95,6 +95,16 @@ if R2_GAMEBOY_DIR="$TEMP_DIR/bad=device" \
     exit 1
 fi
 test ! -e "$TEMP_DIR/bad=device"
+BAD_NEWLINE="$TEMP_DIR/"$'bad-newline\n'
+if R2_GAMEBOY_DIR="$BAD_NEWLINE" \
+   R2_POCKET_DIR="$TEMP_DIR/Pockets" \
+   R2_DESKTOP_DIR="$TEMP_DIR/applications" \
+   bash "$REPO_DIR/install_gameboy_console.sh" >"$TEMP_DIR/rejected-newline.log" 2>&1; then
+    echo "Trailing newline path unexpectedly accepted" >&2
+    exit 1
+fi
+test ! -e "$BAD_NEWLINE"
+test ! -e "$TEMP_DIR/bad-newline"
 grep -Fx "Exec=$TEMP_DIR/device/GameBoyAdvance" \
   "$TEMP_DIR/applications/GameBoyAdvance.desktop" >/dev/null
 echo "Game Boy installer, pocket launcher, and desktop-entry smoke test passed."
