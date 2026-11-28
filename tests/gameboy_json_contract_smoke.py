@@ -26,6 +26,11 @@ assert "command_rc == 0" in dispatch and "response_is_success_object" in dispatc
     "a zero process exit alone must not imply a successful command"
 )
 
+assert "gameboy_list_valid(console_json)" in dispatch
+assert "gameboy_status_valid(console_json)" in dispatch
+assert "gameboy_action_state_valid(command, arg1, console_json)" in dispatch
+assert 'strcmp(command, "list") && strcmp(command, "status")' in dispatch
+
 # Inventory JSON is authoritative about both recorded physical location and
 # whether a ROM file is currently present. Do not turn a legacy linked-file row
 # into an apparently available cartridge when R2 reads the list.

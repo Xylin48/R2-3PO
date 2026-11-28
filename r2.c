@@ -9166,6 +9166,71 @@ static const char *gameboy_json_string(struct json_object *object,
     return text && strlen(text) == (size_t)json_object_get_string_len(value) ? text : fallback;
 }
 
+/* Device response types must agree with the command, not just its exit code.
+ * In particular a missing running flag must not close a genuine session. */
+static int gameboy_status_valid(json_object *object)
+{
+    json_object *running = NULL, *inserted = NULL, *pid = NULL, *session = NULL;
+    json_object *started = NULL, *ok = NULL;
+    const char *power = gameboy_json_string(object, "power_state", NULL);
+    if (!power || (strcmp(power, "on") && strcmp(power, "off")) ||
+        !json_object_object_get_ex(object, "game_running", &running) ||
+        !json_object_is_type(running, json_type_boolean) ||
+        !json_object_object_get_ex(object, "cartridge_inserted", &inserted) ||
+        !json_object_is_type(inserted, json_type_boolean) ||
+        !json_object_object_get_ex(object, "emulator_pid", &pid) ||
+        !json_object_object_get_ex(object, "session_id", &session) ||
+        !json_object_object_get_ex(object, "game_started_at", &started))
+        return 0;
+    if (json_object_object_get_ex(object, "ok", &ok) &&
+        (!json_object_is_type(ok, json_type_boolean) || !json_object_get_boolean(ok)))
+        return 0;
+    if (json_object_get_boolean(running)) {
+        const char *session_text = gameboy_json_string(object, "session_id", "");
+        const char *start_text = gameboy_json_string(object, "game_started_at", "");
+        return !strcmp(power, "on") && json_object_get_boolean(inserted) &&
+            json_object_is_type(pid, json_type_int) &&
+            json_object_get_int64(pid) > 1 && json_object_get_int64(pid) <= INT_MAX &&
+            *session_text && *start_text;
+    }
+    return json_object_is_type(pid, json_type_null) &&
+        json_object_is_type(session, json_type_null) &&
+        json_object_is_type(started, json_type_null) &&
+        (strcmp(power, "on") || !json_object_get_boolean(inserted));
+}
+
+static int gameboy_list_valid(json_object *object)
+{
+    if (!json_object_is_type(object, json_type_array)) return 0;
+    for (size_t i = 0; i < json_object_array_length(object); ++i) {
+        json_object *item = json_object_array_get_idx(object, i), *available = NULL;
+        const char *filename = gameboy_json_string(item, "filename", "");
+        const char *title = gameboy_json_string(item, "title", NULL);
+        const char *location = gameboy_json_string(item, "location", "");
+        if (!*filename || !title || !*location ||
+            !json_object_object_get_ex(item, "file_available", &available) ||
+            !json_object_is_type(available, json_type_boolean))
+            return 0;
+    }
+    return 1;
+}
+
+static int gameboy_action_state_valid(const char *command, const char *arg,
+                                      json_object *object)
+{
+    if (!command || !gameboy_status_valid(object)) return 0;
+    const char *power = gameboy_json_string(object, "power_state", "");
+    int inserted = gameboy_json_bool(object, "cartridge_inserted", 0);
+    int running = gameboy_json_bool(object, "game_running", 0);
+    if (!strcmp(command, "power"))
+        return arg && !strcmp(power, arg);
+    if (!strcmp(command, "insert")) return inserted && !strcmp(power, "off");
+    if (!strcmp(command, "eject")) return !inserted && !strcmp(power, "off");
+    if (!strcmp(command, "move")) return !strcmp(power, "off");
+    if (!strcmp(command, "press")) return running;
+    return 0;
+}
+
 static void gameboy_end_activity_sessions(const char *reason)
 {
     (void)r2_log_activity_end("gameboy:virtual", "unknown", reason,
@@ -10418,12 +10483,16 @@ static char *process_tools_with_capture_status(
                 __attribute__((cleanup(release_tool_result_json))) = gameboy_parse_response(console_output);
             free(console_output);
             int response_is_list = command && !strcmp(command, "list") &&
-                console_json && json_object_is_type(console_json, json_type_array);
+                console_json && json_object_is_type(console_json, json_type_array) &&
+                gameboy_list_valid(console_json);
             int response_is_status = command && !strcmp(command, "status") &&
-                console_json && json_object_is_type(console_json, json_type_object);
-            int response_is_success_object = console_json &&
-                json_object_is_type(console_json, json_type_object) &&
-                gameboy_json_bool(console_json, "ok", 0);
+                console_json && json_object_is_type(console_json, json_type_object) &&
+                gameboy_status_valid(console_json);
+            int response_is_success_object = command &&
+                strcmp(command, "list") && strcmp(command, "status") &&
+                console_json && json_object_is_type(console_json, json_type_object) &&
+                gameboy_json_bool(console_json, "ok", 0) &&
+                gameboy_action_state_valid(command, arg1, console_json);
             /* list/status have their documented shapes without an "ok" field;
                every mutating/action command must return an explicit JSON true. */
             int command_ok = command_rc == 0 &&

@@ -1431,6 +1431,49 @@ static void check_staged_imagination(void)
     db = NULL;
 }
 
+static void check_gameboy_response_shapes(void)
+{
+    const char *off = "{\"power_state\":\"off\",\"game_running\":false,"
+        "\"cartridge_inserted\":true,\"emulator_pid\":null,"
+        "\"session_id\":null,\"game_started_at\":null}";
+    const char *on = "{\"power_state\":\"on\",\"game_running\":true,"
+        "\"cartridge_inserted\":true,\"emulator_pid\":42,"
+        "\"session_id\":\"gba-fixture\",\"game_started_at\":\"2026-11-28\"}";
+    json_object *state = gameboy_parse_response(off);
+    assert(state && gameboy_status_valid(state));
+    assert(gameboy_action_state_valid("power", "off", state));
+    assert(gameboy_action_state_valid("insert", NULL, state));
+    assert(!gameboy_action_state_valid("eject", NULL, state));
+    assert(!gameboy_action_state_valid("press", NULL, state));
+    assert(!gameboy_action_state_valid("power", "on", state));
+    assert(!gameboy_list_valid(state));
+    json_object_object_del(state, "game_running");
+    assert(!gameboy_status_valid(state));
+    json_object_put(state);
+
+    state = gameboy_parse_response(on);
+    assert(state && gameboy_status_valid(state));
+    assert(gameboy_action_state_valid("press", NULL, state));
+    assert(!gameboy_action_state_valid("power", "off", state));
+    json_object_object_add(state, "emulator_pid", json_object_new_int64(INT64_MAX));
+    assert(!gameboy_status_valid(state));
+    json_object_object_add(state, "emulator_pid", json_object_new_int(42));
+    json_object_object_add(state, "ok", json_object_new_boolean(0));
+    assert(!gameboy_status_valid(state));
+    json_object_put(state);
+
+    state = gameboy_parse_response("[{\"filename\":\"game.gba\",\"title\":\"Game\","
+        "\"location\":\"slot\",\"file_available\":true}]");
+    assert(state && gameboy_list_valid(state) && !gameboy_status_valid(state));
+    json_object_object_add(json_object_array_get_idx(state, 0), "file_available",
+                           json_object_new_int(1));
+    assert(!gameboy_list_valid(state));
+    json_object_put(state);
+    state = gameboy_parse_response("[]");
+    assert(state && gameboy_list_valid(state));
+    json_object_put(state);
+}
+
 static void check_gameboy_delivery(void)
 {
     char directory[] = R2_ROOT "/gameboy-delivery-XXXXXX";
@@ -3253,6 +3296,7 @@ int main(void)
     check_literal_retrieval_cues_precede_generated_cues();
     check_associative_planner_retains_previous_exchange();
     check_followup_subject_reaches_associated_stores();
+    check_gameboy_response_shapes();
     check_gameboy_delivery();
     char *identity = text(1000, 'i', "SYSTEM CONTRACT: ");
     char *retrieval = text(5000, 'r', "CURRENT TURN RETRIEVED CONTEXT\n");
