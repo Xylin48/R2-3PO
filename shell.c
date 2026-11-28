@@ -2260,6 +2260,12 @@ static int shell_gameboy(const char *arg)
         }
     }
 
+    if (argc == 2 && !strcmp(argv[1], "power") && !strcmp(argv[2], "on")) {
+        (void)r2_gameboy_shell_power_on(device);
+        free(copy);
+        return 1;
+    }
+
     struct timespec deadline;
     if (r2_gameboy_command_deadline(&deadline) != 0) {
         perror("[Game Boy Advance] clock_gettime");
@@ -2313,7 +2319,7 @@ static int shell_gameboy(const char *arg)
     /* A failed action may still have reconciled an exited emulator. Use the
      * same live status and duration-bearing history path as model commands. */
     if (!cancelled && WIFEXITED(status) && !r2_is_shutting_down() &&
-        r2_gameboy_sync_activity(device) != 0)
+        r2_gameboy_sync_activity(device, NULL) != 0)
         printf("[Game Boy Advance] Activity history synchronization is incomplete.\n");
     free(copy);
     return 1;

@@ -248,7 +248,9 @@ const char *r2_gameboy_console_path(void);
 
 /* Sync adapter-verified events from the console command the caller selected. */
 int r2_sync_gameboy_verified_events(const char *path);
-int r2_gameboy_sync_activity(const char *path);
+int r2_gameboy_sync_activity(const char *path, const char *started_session);
+/* Shell power-on needs its exact structured session receipt for choice attribution. */
+int r2_gameboy_shell_power_on(const char *path);
 int r2_gameboy_command_deadline(struct timespec *deadline);
 int r2_gameboy_command_expired(const struct timespec *deadline);
 

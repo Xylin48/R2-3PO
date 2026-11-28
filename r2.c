@@ -9234,7 +9234,7 @@ static int gameboy_action_state_valid(const char *command, const char *arg,
 /* Both interactive shell and model tools use the same verified status,
  * serialized through reconciliation so an older observation cannot be applied
  * after a newer one by another caller. */
-int r2_gameboy_sync_activity(const char *path)
+int r2_gameboy_sync_activity(const char *path, const char *started_session)
 {
     if (!path || !*path) return -1;
     static pthread_mutex_t activity_sync_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -9246,14 +9246,51 @@ int r2_gameboy_sync_activity(const char *path)
     int result = -1;
     if (gameboy_status_valid(status)) {
         int running = gameboy_json_bool(status, "game_running", 0);
+        const char *session = running ? gameboy_json_string(status, "session_id", NULL) : NULL;
         result = r2_log_gameboy_reconcile_activity(
-            running ? gameboy_json_string(status, "session_id", NULL) : NULL,
-            gameboy_json_string(status, "cartridge_title", NULL),
-            running ? gameboy_json_string(status, "game_started_at", NULL) : NULL);
+            session, gameboy_json_string(status, "cartridge_title", NULL),
+            running ? gameboy_json_string(status, "game_started_at", NULL) : NULL,
+            session && started_session && strcmp(session, started_session) == 0);
     }
     if (status) json_object_put(status);
     pthread_mutex_unlock(&activity_sync_lock);
     return result;
+}
+
+/* Preserve the shell's existing power-on display, but use the structured
+ * response to associate a voluntary activity choice with the exact new
+ * console session. Observing a running session alone is not a new choice. */
+int r2_gameboy_shell_power_on(const char *path)
+{
+    char *output = NULL;
+    int rc = run_gameboy_console(path, "power", "on", NULL, &output);
+    json_object *response = gameboy_parse_response(output);
+    free(output);
+    int success = rc == 0 && gameboy_json_bool(response, "ok", 0) &&
+        gameboy_action_state_valid("power", "on", response);
+    const char *message = gameboy_json_string(response, "message", NULL);
+    if (message) printf("%s\n", message);
+    const char *power = gameboy_json_string(response, "power_state", NULL);
+    if (power) {
+        const char *title = gameboy_json_string(response, "cartridge_title", "");
+        printf("Power: %s\nCartridge: %s\nGame running: %s\nDatabase: %s\n",
+               power, *title ? title : "(empty)",
+               gameboy_json_bool(response, "game_running", 0) ? "yes" : "no",
+               gameboy_json_string(response, "database", "unknown"));
+    }
+    if (success) {
+        if (r2_sync_gameboy_verified_events(path) < 0)
+            printf("[Game Boy Advance] Verified event synchronization is incomplete.\n");
+    } else {
+        printf("[Game Boy Advance] Command failed. Check installation, inserted ROM, and mGBA path.\n");
+    }
+    const char *started = success && gameboy_json_bool(response, "game_running", 0)
+        ? gameboy_json_string(response, "session_id", NULL) : NULL;
+    if (rc >= 0 && !r2_is_shutting_down() &&
+        r2_gameboy_sync_activity(path, started) != 0)
+        printf("[Game Boy Advance] Activity history synchronization is incomplete.\n");
+    if (response) json_object_put(response);
+    return success ? 0 : -1;
 }
 
 static int gameboy_sync_verified_event(const char *path, json_object *item)
@@ -10572,8 +10609,10 @@ static char *process_tools_with_capture_status(
 
             /* Even a rejected operation can have reconciled a previously
              * exited emulator. Use a fresh verified observation for history. */
+            const char *started_session = command_ok && is_power_on && game_running
+                ? gameboy_json_string(console_json, "session_id", NULL) : NULL;
             if (command && command_rc >= 0 && !r2_is_shutting_down() &&
-                r2_gameboy_sync_activity(console_path) != 0)
+                r2_gameboy_sync_activity(console_path, started_session) != 0)
                 APPEND("GAME BOY: activity history synchronization is incomplete.\n");
 
             if (command_ok && command &&

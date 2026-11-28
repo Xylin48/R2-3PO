@@ -294,8 +294,8 @@ require(
     "a game session is explicitly marked as virtual context, separate from physical life",
 )
 require(
-    'r2_gameboy_sync_activity(device)' in shell
-    and 'r2_gameboy_sync_activity(console_path)' in core
+    'r2_gameboy_sync_activity(device, NULL)' in shell
+    and 'r2_gameboy_sync_activity(console_path, started_session)' in core
     and 'r2_log_gameboy_reconcile_activity(' in core
     and '"gameboy:%s"' in log
     and '"gameboy:%s:virtual"' in log

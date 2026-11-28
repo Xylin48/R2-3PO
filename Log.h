@@ -149,9 +149,10 @@ int64_t r2_log_activity_end(const char *activity_key,
                             const char *details);
 
 /* Observe the selected Game Boy's verified session. NULL means no running game.
- * Repeated observations reuse its physical and virtual activity identities. */
+ * Repeated observations reuse its physical and virtual activity identities.
+ * record_choice is true only for the session verified by a start command. */
 int r2_log_gameboy_reconcile_activity(const char *session_id, const char *title,
-                                       const char *started_at);
+                                       const char *started_at, int record_choice);
 
 /* Persist an explicit location transition. Welcome Home is private and only
  * created on a previously-away to home transition.

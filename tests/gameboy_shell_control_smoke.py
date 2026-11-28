@@ -28,6 +28,9 @@ assert 'run_gameboy_console(path, "status", NULL, NULL, &output)' in activity
 assert "gameboy_status_valid(status)" in activity
 assert "r2_log_gameboy_reconcile_activity(" in activity
 assert "pthread_mutex_lock(&activity_sync_lock)" in activity
+assert "session && started_session && strcmp(session, started_session) == 0" in activity
+assert "r2_gameboy_shell_power_on(device)" in handler
+assert 'run_gameboy_console(path, "power", "on", NULL, &output)' in activity
 assert "shell_gameboy_read_status" not in shell
 for name in ("R2_GAMEBOY_CONSOLE", "R2_GAMEBOY_EXECUTABLE", "R2_GAMEBOY_ROOT", "R2_GAMEBOY_DIR"):
     assert name in launcher, f"interactive launcher must pass through {name}"
@@ -43,8 +46,8 @@ assert '"R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"' in service
 assert "execv(device, argv)" in handler
 assert "system(" not in handler and "popen(" not in handler, "arguments must never enter a shell"
 assert "r2_sync_gameboy_verified_events(device)" in handler
-assert "r2_gameboy_sync_activity(device)" in handler
-assert "r2_gameboy_sync_activity(console_path)" in core
+assert "r2_gameboy_sync_activity(device, NULL)" in handler
+assert "r2_gameboy_sync_activity(console_path, started_session)" in core
 assert '"gameboy:%s"' in log and '"gameboy:%s:virtual"' in log
 assert "log_activity_start_with_choice(virtual_key" in log
 assert "physical_and_virtual_views_of_same_session" in log

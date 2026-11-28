@@ -44,7 +44,7 @@ int r2_addiction_record_choice(const char *target, const char *target_type,
 {
     (void)target; (void)target_type; (void)enjoyment_0_100;
     (void)details;
-    if (!strcmp(source, "activity_start")) ++activity_choice_calls;
+    if (source && !strcmp(source, "activity_start")) ++activity_choice_calls;
     return 0;
 }
 
@@ -344,8 +344,8 @@ int main(void)
     /* Both callers can observe the same console repeatedly and across a
        Life Log restart. The physical and virtual views share one session. */
     int choices_before = activity_choice_calls;
-    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
-    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00", 1) == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00", 1) == 0);
     assert(activity_choice_calls == choices_before + 1);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key IN ('gameboy:gba-first','gameboy:gba-first:virtual') "
@@ -354,32 +354,34 @@ int main(void)
                           "WHERE relationship='physical_and_virtual_views_of_same_session';") == 1);
     r2_log_shutdown();
     assert(r2_log_init() == 0);
-    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00") == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-first", "Fixture", "2026-11-28T01:00:00+00:00", 1) == 0);
     assert(activity_choice_calls == choices_before + 1);
 
     /* Existing shell-only activity uses the same physical key. Do not
        duplicate its learning choice; supply the missing virtual view. */
     assert(r2_log_activity_start("gameboy:gba-second", "Existing shell activity", "legacy shell fixture") > 0);
-    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00") == 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00", 0) == 0);
     assert(activity_choice_calls == choices_before + 2);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key GLOB 'gameboy:gba-first*' AND status='ended';") == 2);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key GLOB 'gameboy:gba-second*' AND status='active';") == 2);
-    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
-    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL, 0) == 0);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL, 0) == 0);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key GLOB 'gameboy:gba-*' AND status='active';") == 0);
-    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00") < 0);
+    assert(r2_log_gameboy_reconcile_activity("gba-second", "Fixture", "2026-11-28T02:00:00+00:00", 0) < 0);
     assert(activity_choice_calls == choices_before + 2);
 
     /* Generic core-only legacy keys cannot be attributed to a live session
        without an ID. Keep them until an observed no-running-game state. */
     assert(r2_log_activity_start("gameboy:physical", "Legacy physical view", "legacy fixture") > 0);
-    assert(r2_log_gameboy_reconcile_activity("gba-third", "Fixture", "2026-11-28T03:00:00+00:00") == 0);
+    int after_legacy_choice = activity_choice_calls;
+    assert(r2_log_gameboy_reconcile_activity("gba-third", "Fixture", "2026-11-28T03:00:00+00:00", 0) == 0);
+    assert(activity_choice_calls == after_legacy_choice);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key='gameboy:physical' AND status='active';") == 1);
-    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL) == 0);
+    assert(r2_log_gameboy_reconcile_activity(NULL, NULL, NULL, 0) == 0);
     assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
                           "WHERE activity_key='gameboy:physical' AND status='ended';") == 1);
 

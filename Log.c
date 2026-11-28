@@ -2603,7 +2603,7 @@ static int log_gameboy_stale_key(const char *physical, const char *virtual,
 }
 
 int r2_log_gameboy_reconcile_activity(const char *session_id, const char *title,
-                                       const char *started_at)
+                                       const char *started_at, int record_choice)
 {
     char physical[256], virtual[256];
     char *name = NULL, *virtual_name = NULL, *details = NULL, *virtual_details = NULL;
@@ -2655,7 +2655,7 @@ int r2_log_gameboy_reconcile_activity(const char *session_id, const char *title,
     if (physical_key) {
         int64_t physical_event = log_gameboy_active_event(physical_key);
         if (physical_event == 0)
-            physical_event = log_activity_start_with_choice(physical_key, name, details, 1);
+            physical_event = log_activity_start_with_choice(physical_key, name, details, record_choice);
         if (physical_event <= 0) goto unlock;
         int64_t virtual_event = log_gameboy_active_event(virtual_key);
         if (virtual_event == 0)
