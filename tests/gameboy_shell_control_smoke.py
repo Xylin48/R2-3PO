@@ -67,6 +67,8 @@ assert "complete_legacy ? legacy_details : NULL" in sync
 assert "json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN)" in sync
 assert 'snprintf(reward_source, sizeof(reward_source), "game_event:%lld"' in sync
 assert sync.index("r2_reward_apply_once(") < sync.index('run_gameboy_console(path, "ack_event"')
+assert 'run_gameboy_console(path, "ack_event", event_id_text, delivery_token, &ack_output)' in sync
+assert sync.index('json_object_object_del(item, "delivery_token")') < sync.index("json_object_to_json_string_ext(")
 assert 'run_gameboy_console(path, "events", NULL, NULL, &output)' in sync
 assert "r2_sync_gameboy_verified_events(console_path)" in core
 helper_start = log.index("static int64_t log_find_gameboy_locked(")

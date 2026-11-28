@@ -1494,6 +1494,7 @@ static void check_gameboy_delivery(void)
                  "stall) printf '%s' '{\"incomplete\":'; sleep 20 & wait ;;\n"
                  "ack_event)\n"
                  "  [ \"$3\" = 350001 ] || exit 1\n"
+                 "  [ \"$4\" = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef ] || exit 1\n"
                  "  if [ -e ack-attempted ]; then printf '%s\\n' '{\"ok\":true}';\n"
                  "  else touch ack-attempted; printf '%s\\n' '{\"ok\":false}'; fi ;;\n"
                  "*) exit 1 ;;\n"
@@ -1507,7 +1508,7 @@ static void check_gameboy_delivery(void)
     char *details = text(70000, 'd', "Complete adapter evidence ");
     memcpy(details + 70000 - sizeof("VERIFIED-TAIL") + 1, "VERIFIED-TAIL", sizeof("VERIFIED-TAIL"));
     FILE *events = fopen(event_path, "w");
-    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,\"delivery_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
                             "\"context\":\"virtual\",\"event_type\":\"life_lost\","
                             "\"summary\":\"Lost a life\",\"game_title\":\"Fixture game\","
                             "\"evidence_source\":\"adapter:fixture\",\"details\":\"%s\"}]\n",
@@ -1529,7 +1530,7 @@ static void check_gameboy_delivery(void)
     /* A different payload reusing the numeric ID must not be acknowledged,
      * even when its reward event has already been committed. */
     events = fopen(event_path, "w");
-    assert(events && fputs("[{\"event_id\":350001,\"verified\":true,"
+    assert(events && fputs("[{\"event_id\":350001,\"verified\":true,\"delivery_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
         "\"context\":\"virtual\",\"event_type\":\"life_lost\","
         "\"summary\":\"Different event\",\"game_title\":\"Fixture game\","
         "\"evidence_source\":\"adapter:fixture\",\"details\":\"changed\"}]\n", events) >= 0);
@@ -1537,7 +1538,7 @@ static void check_gameboy_delivery(void)
     assert(r2_sync_gameboy_verified_events(executable) == -1);
     assert(access(ack_path, F_OK) != 0 && errno == ENOENT);
     events = fopen(event_path, "w");
-    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,\"delivery_token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
                             "\"context\":\"virtual\",\"event_type\":\"life_lost\","
                             "\"summary\":\"Lost a life\",\"game_title\":\"Fixture game\","
                             "\"evidence_source\":\"adapter:fixture\",\"details\":\"%s\"}]\n",
@@ -1563,6 +1564,8 @@ static void check_gameboy_delivery(void)
     assert(sqlite3_step(statement) == SQLITE_ROW);
     json_object *stored = gameboy_parse_response((const char *)sqlite3_column_text(statement, 0));
     assert(stored && strcmp(gameboy_json_string(stored, "details", ""), details) == 0);
+    json_object *transport = NULL;
+    assert(!json_object_object_get_ex(stored, "delivery_token", &transport));
     json_object_put(stored);
     assert(sqlite3_step(statement) == SQLITE_DONE);
     sqlite3_finalize(statement);

@@ -9280,6 +9280,15 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
     if (event_id <= 0 || !*event_type || !*summary || strncmp(evidence, "adapter:", 8) != 0)
         return -1;
 
+    const char *token = gameboy_json_string(item, "delivery_token", "");
+    if (strlen(token) != 64 || strspn(token, "0123456789abcdef") != 64)
+        return -1;
+    char delivery_token[65];
+    memcpy(delivery_token, token, sizeof(delivery_token));
+    /* The token is transport metadata. Keep the historical event JSON and
+     * reward identity unchanged so existing committed deliveries can replay. */
+    json_object_object_del(item, "delivery_token");
+
     char source[96];
     snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)event_id);
     const char *details = json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN);
@@ -9324,7 +9333,7 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
     char event_id_text[32];
     char *ack_output = NULL;
     snprintf(event_id_text, sizeof(event_id_text), "%lld", (long long)event_id);
-    int rc = run_gameboy_console(path, "ack_event", event_id_text, NULL, &ack_output);
+    int rc = run_gameboy_console(path, "ack_event", event_id_text, delivery_token, &ack_output);
     json_object *ack = gameboy_parse_response(ack_output);
     free(ack_output);
     int acknowledged = rc == 0 && gameboy_json_bool(ack, "ok", 0);

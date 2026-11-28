@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import select
@@ -424,9 +426,18 @@ def record_verified_game_event(db: sqlite3.Connection, event_type: str,
                             evidence_source=evidence_source, verified=True)
 
 
+def event_delivery_token(event_id: int, payload: tuple) -> str:
+    # Stable across reads and restarts; includes every persisted field,
+    # including the pending flag. It is a comparison token, not authorization.
+    encoded = json.dumps([event_id, *payload], ensure_ascii=True,
+                         separators=(",", ":"), allow_nan=False).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = db.execute(
-        "SELECT id,timestamp,event_type,summary,details,game_title,session_id,evidence_source "
+        "SELECT id,timestamp,context,event_type,summary,details,game_title,session_id,"
+        "evidence_source,verified,life_log_synced "
         "FROM console_events WHERE context='virtual' AND verified=1 AND life_log_synced=0 "
         "ORDER BY id"
     ).fetchall()
@@ -436,15 +447,22 @@ def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
         "details": row["details"], "game_title": row["game_title"],
         "session_id": row["session_id"], "evidence_source": row["evidence_source"],
         "context": "virtual", "verified": True,
+        "delivery_token": event_delivery_token(row["id"], tuple(row)[1:]),
     } for row in rows]
 
 
-def acknowledge_verified_event(db: sqlite3.Connection, event_id: int) -> bool:
+def acknowledge_verified_event(db: sqlite3.Connection, event_id: int,
+                               delivery_token: str) -> bool:
+    if (len(delivery_token) != 64
+            or any(ch not in "0123456789abcdef" for ch in delivery_token)):
+        return False
     with db:
         if not db.in_transaction:
             db.execute("BEGIN IMMEDIATE")
         previous = event_payload(db, event_id)
         if previous is None or previous[1] != "virtual" or previous[-2:] != (1, 0):
+            return False
+        if not hmac.compare_digest(event_delivery_token(event_id, previous), delivery_token):
             return False
         cursor = db.execute(
             "UPDATE console_events SET life_log_synced=1 "
@@ -1181,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("events", help="list verified virtual events waiting for Life Log sync")
     ack = sub.add_parser("ack_event", help="acknowledge a verified event after Life Log sync")
     ack.add_argument("event_id", type=int)
+    ack.add_argument("delivery_token", nargs="?", default="")
     args = parser.parse_args(argv)
     command = args.command or "power"
     state = args.state if args.command == "power" else "on"
@@ -1203,7 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
             elif command == "events":
                 result = pending_verified_events(db)
             elif command == "ack_event":
-                acknowledged = acknowledge_verified_event(db, args.event_id)
+                acknowledged = acknowledge_verified_event(db, args.event_id, args.delivery_token)
                 result = {
                     "ok": acknowledged,
                     "message": ("Verified event acknowledged." if acknowledged else

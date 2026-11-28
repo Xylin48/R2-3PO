@@ -334,6 +334,23 @@ def main() -> int:
         # A successful SQLite step is not proof that the exact adapter event
         # survived its trigger or that acknowledgement changed only delivery state.
         original_event = module.event_payload(device_db, event_id)
+        token = pending[0]["delivery_token"]
+        assert len(token) == 64
+        assert not module.acknowledge_verified_event(device_db, event_id, "")
+        assert not module.acknowledge_verified_event(device_db, event_id, "g" * 64)
+        assert not module.acknowledge_verified_event(device_db, event_id, "0" * 64)
+        # A row modified between the outbox read and acknowledgement must
+        # remain pending, even if its numeric event ID is unchanged.
+        with device_db:
+            device_db.execute("UPDATE console_events SET details=? WHERE id=?",
+                              ("Changed after delivery", event_id))
+        assert not module.acknowledge_verified_event(device_db, event_id, token)
+        changed = module.pending_verified_events(device_db)
+        assert len(changed) == 1 and changed[0]["delivery_token"] != token
+        with device_db:
+            device_db.execute("UPDATE console_events SET details=? WHERE id=?",
+                              (original_event[4], event_id))
+        assert module.pending_verified_events(device_db) == pending
         for mutation in (
             "UPDATE console_events SET life_log_synced=0 WHERE id=NEW.id;",
             "UPDATE console_events SET summary='rewritten' WHERE id=NEW.id;",
@@ -345,7 +362,7 @@ def main() -> int:
                 f"BEGIN {mutation} END"
             )
             try:
-                module.acknowledge_verified_event(device_db, event_id)
+                module.acknowledge_verified_event(device_db, event_id, token)
             except sqlite3.IntegrityError:
                 pass
             else:
@@ -379,7 +396,7 @@ def main() -> int:
                 device_db.execute("DROP TRIGGER mutate_event")
             assert device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == before_count
             assert module.pending_verified_events(device_db) == pending
-        assert module.acknowledge_verified_event(device_db, event_id) is True
+        assert module.acknowledge_verified_event(device_db, event_id, token) is True
         assert module.pending_verified_events(device_db) == []
         # A live session is not retired merely because identity is unreadable
         # or a stop request returned without confirmed process exit.
