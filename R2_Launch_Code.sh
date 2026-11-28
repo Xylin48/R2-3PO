@@ -459,11 +459,19 @@ TV_SOURCE="$R2_SOURCE/TV.py"
 TV_INSTALLER="$R2_SOURCE/install_tv.sh"
 TV_DIR="$R2_ROOT/room/TV"
 if [[ -f "$TV_SOURCE" && -f "$TV_INSTALLER" ]]; then
+    TV_INSTALLER_HASH="$(sha256sum < "$TV_INSTALLER" | cut -d ' ' -f1)"
+    INSTALLED_TV_HASH=""
+    if [[ -r "$TV_DIR/.installer-sha256" ]]; then
+        INSTALLED_TV_HASH="$(< "$TV_DIR/.installer-sha256")"
+    fi
     if [[ ! -x "$TV_DIR/run_tv.sh" || ! -f "$TV_DIR/TV.desktop" ||
-          ! -f "$TV_DIR/TV.py" ]] || ! cmp -s "$TV_SOURCE" "$TV_DIR/TV.py"; then
+          ! -f "$TV_DIR/TV.py" || -z "$TV_INSTALLER_HASH" ||
+          "$TV_INSTALLER_HASH" != "$INSTALLED_TV_HASH" ]] ||
+          ! cmp -s "$TV_SOURCE" "$TV_DIR/TV.py"; then
         echo "Installing/updating R2's TV device..."
         if ! run_as_r2 env \
             R2_ROOT="$R2_ROOT" R2_SOURCE="$R2_SOURCE" \
+            R2_HOME="$R2_ROOT" R2_TV_DIR="$TV_DIR" \
             bash "$TV_INSTALLER"; then
             echo "WARNING: TV installer failed. R2 will continue startup; TV needs attention."
         fi
