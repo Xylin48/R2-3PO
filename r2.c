@@ -9197,48 +9197,6 @@ static void gameboy_start_activity_sessions(const char *title)
                           "physical_and_virtual_views_of_same_session", game);
 }
 
-/* A console adapter event may remain pending when acknowledgement fails or the
- * process exits between the Life Log write and adapter acknowledgement. Find its
- * existing durable Life Log record so replay can finish reward/ack work without
- * duplicating the historical event. */
-static int64_t gameboy_find_life_event_for_console_event(const char *source,
-                                                        int64_t console_event_id)
-{
-    sqlite3 *log_db = NULL;
-    sqlite3_stmt *stmt = NULL;
-    int64_t life_event_id = -1;
-    char pattern[96];
-    snprintf(pattern, sizeof(pattern), "%%; console_event_id=%lld;%%",
-             (long long)console_event_id);
-
-    if (sqlite3_open_v2(R2_DIARY_DATABASE, &log_db,
-            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
-        if (log_db) sqlite3_close(log_db);
-        return -1;
-    }
-    sqlite3_busy_timeout(log_db, 3000);
-    int lookup_rc = sqlite3_prepare_v2(log_db,
-        "SELECT id FROM r2_log_events "
-        "WHERE (event_type='virtual_game_event' AND source=?) OR "
-        "(event_type='gameboy_game_event' AND source='GameBoyAdvance' "
-        "AND details LIKE ?) ORDER BY id LIMIT 1",
-        -1, &stmt, NULL);
-    if (lookup_rc == SQLITE_OK)
-        lookup_rc = sqlite3_bind_text(stmt, 1, source, -1, SQLITE_TRANSIENT);
-    if (lookup_rc == SQLITE_OK)
-        lookup_rc = sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT);
-    if (lookup_rc == SQLITE_OK) {
-        lookup_rc = sqlite3_step(stmt);
-        if (lookup_rc == SQLITE_ROW)
-            life_event_id = sqlite3_column_int64(stmt, 0);
-        else if (lookup_rc == SQLITE_DONE)
-            life_event_id = 0;
-    }
-    sqlite3_finalize(stmt);
-    sqlite3_close(log_db);
-    return life_event_id;
-}
-
 static int gameboy_sync_verified_event(const char *path, json_object *item)
 {
     struct json_object *id_object = NULL;
@@ -9259,14 +9217,28 @@ static int gameboy_sync_verified_event(const char *path, json_object *item)
 
     char source[96];
     snprintf(source, sizeof(source), "GameBoyAdvance.py:event:%lld", (long long)event_id);
-    int64_t life_event_id = gameboy_find_life_event_for_console_event(source, event_id);
-    if (life_event_id == 0) {
-        const char *details = json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN);
-        if (!details) return -1;
-        life_event_id = r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary, details, source);
-        if (life_event_id > 0)
-            life_event_id = gameboy_find_life_event_for_console_event(source, event_id);
-    }
+    const char *details = json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN);
+    if (!details) return -1;
+
+    /* Recognize both historical text formats only when they can represent the
+     * complete payload. Never use the old truncated excerpt as proof of an
+     * exact replay; current deliveries always retain the full JSON. */
+    const char *adapter_details = gameboy_json_string(item, "details", "");
+    const char *session = gameboy_json_string(item, "session_id", "unknown");
+    const char *timestamp = gameboy_json_string(item, "timestamp", "unknown");
+    char legacy_summary[1200], legacy_details[4096];
+    int legacy_summary_len = snprintf(legacy_summary, sizeof(legacy_summary),
+        "%s: %s", *title ? title : "Game Boy game", summary);
+    int legacy_details_len = snprintf(legacy_details, sizeof(legacy_details),
+        "context=virtual; event_type=%s; game_title=%s; "
+        "evidence_source=%s; console_event_id=%lld; session_id=%s; "
+        "observed_at=%s; adapter_details=%s", event_type, title, evidence,
+        (long long)event_id, session, timestamp, adapter_details);
+    int complete_legacy = strlen(summary) <= 800 && strlen(adapter_details) <= 2200 &&
+        legacy_summary_len >= 0 && (size_t)legacy_summary_len < sizeof(legacy_summary) &&
+        legacy_details_len >= 0 && (size_t)legacy_details_len < sizeof(legacy_details);
+    int64_t life_event_id = r2_log_save_gameboy_once(source, event_id, summary, details,
+        complete_legacy ? legacy_summary : NULL, complete_legacy ? legacy_details : NULL);
     if (life_event_id <= 0) return -1;
 
     /* Keep the existing per-game reward target and per-event retry identity. */

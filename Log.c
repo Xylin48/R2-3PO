@@ -1090,6 +1090,74 @@ int64_t r2_log_event(R2LogCategory category, const char *event_type,
     return inserted_id;
 }
 
+/* Return 0 for no candidate, a positive ID for a single exact candidate,
+ * and -1 for mismatched/ambiguous history or an SQLite failure. The caller
+ * holds log_lock and owns the write transaction. */
+static int64_t log_find_gameboy_locked(const char *source, int64_t console_event_id,
+                                      const char *summary, const char *details,
+                                      const char *legacy_summary, const char *legacy_details)
+{
+    sqlite3_stmt *st = NULL;
+    char pattern[96];
+    snprintf(pattern, sizeof(pattern), "%%; console_event_id=%lld;%%",
+             (long long)console_event_id);
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT id,CASE "
+        "WHEN category='media' AND event_type='virtual_game_event' AND source COLLATE BINARY=?1 "
+        "AND typeof(summary)='text' AND summary COLLATE BINARY=?2 "
+        "AND typeof(details)='text' AND details COLLATE BINARY=?3 THEN 1 "
+        "WHEN ((category='world' AND event_type='gameboy_game_event' AND source='GameBoyAdvance') "
+        "OR (category='media' AND event_type='virtual_game_event' AND source COLLATE BINARY=?1)) "
+        "AND typeof(summary)='text' AND summary COLLATE BINARY=?4 "
+        "AND typeof(details)='text' AND details COLLATE BINARY=?5 THEN 1 ELSE 0 END "
+        "FROM r2_log_events WHERE source COLLATE BINARY=?1 OR "
+        "(event_type='gameboy_game_event' AND source='GameBoyAdvance' AND details LIKE ?6)",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 1, source);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 2, summary);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 3, details);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, legacy_summary);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 5, legacy_details);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, pattern);
+    int64_t id = -1;
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) id = 0;
+        else if (rc == SQLITE_ROW && sqlite3_column_int(st, 1) == 1) {
+            id = sqlite3_column_int64(st, 0);
+            if (id <= 0 || sqlite3_step(st) != SQLITE_DONE) id = -1;
+        }
+    }
+    sqlite3_finalize(st);
+    return id;
+}
+
+int64_t r2_log_save_gameboy_once(const char *source, int64_t console_event_id,
+                                const char *summary, const char *details,
+                                const char *legacy_summary, const char *legacy_details)
+{
+    if (console_event_id <= 0 || !valid_text(source) || !valid_text(summary) ||
+        !valid_text(details) || strlen(summary) > 8192)
+        return -1;
+    pthread_mutex_lock(&log_lock);
+    if (!log_initialized || !log_db || exec_sql("BEGIN IMMEDIATE;") != 0) {
+        pthread_mutex_unlock(&log_lock);
+        return -1;
+    }
+    int64_t id = log_find_gameboy_locked(source, console_event_id, summary, details,
+                                         legacy_summary, legacy_details);
+    if (id == 0) {
+        id = log_insert_event_locked(R2_LOG_MEDIA, "virtual_game_event", summary, details, source);
+        /* Do not permit a newly inserted row to match merely the legacy form. */
+        if (id > 0 && log_find_gameboy_locked(source, console_event_id, summary, details,
+                                               NULL, NULL) != id)
+            id = -1;
+    }
+    int saved = log_finish_write(id > 0);
+    pthread_mutex_unlock(&log_lock);
+    return saved == 0 ? id : -1;
+}
+
 /* A sampled source is evidence for one accepted conversation, not a
  * standalone event that can survive a failed provenance relationship. */
 int64_t r2_log_conversation_source(int64_t turn_event_id, const char *event_type,

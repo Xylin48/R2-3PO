@@ -8,6 +8,7 @@ launcher = (ROOT / "R2_Launch_Code.sh").read_text(encoding="utf-8")
 service = (ROOT / "tools/r2_service_runner.sh").read_text(encoding="utf-8")
 gameboy = (ROOT / "GameBoyAdvance.py").read_text(encoding="utf-8")
 core = (ROOT / "r2.c").read_text(encoding="utf-8")
+log = (ROOT / "Log.c").read_text(encoding="utf-8")
 
 start = shell.find("static int shell_gameboy(const char *arg)\n{")
 end = shell.find("\nstatic int shell_parse_amount(", start)
@@ -50,18 +51,23 @@ assert 'choices=("pockets", "shelf", "box", "room")' in gameboy
 sync_start = core.index("static int gameboy_sync_verified_event(")
 sync_end = core.index("\nstatic int r2_parse_control_positive_id", sync_start)
 sync = core[sync_start:sync_end]
-assert "gameboy_find_life_event_for_console_event(source, event_id)" in sync
-assert 'r2_log_event(R2_LOG_MEDIA, "virtual_game_event", summary, details, source)' in sync
+assert "r2_log_save_gameboy_once(source, event_id, summary, details," in sync
+assert sync.index("r2_log_save_gameboy_once(") < sync.index("r2_reward_apply_once(")
+assert "complete_legacy ? legacy_details : NULL" in sync
 assert "json_object_to_json_string_ext(item, JSON_C_TO_STRING_PLAIN)" in sync
 assert 'snprintf(reward_source, sizeof(reward_source), "game_event:%lld"' in sync
 assert sync.index("r2_reward_apply_once(") < sync.index('run_gameboy_console(path, "ack_event"')
 assert 'run_gameboy_console(path, "events", NULL, NULL, &output)' in sync
 assert "r2_sync_gameboy_verified_events(console_path)" in core
-helper_start = core.index("static int64_t gameboy_find_life_event_for_console_event")
-helper = core[helper_start:sync_start]
-assert "event_type='virtual_game_event' AND source=?" in helper
+helper_start = log.index("static int64_t log_find_gameboy_locked(")
+helper_end = log.index("/* A sampled source is evidence", helper_start)
+helper = log[helper_start:helper_end]
+assert "event_type='virtual_game_event' AND source COLLATE BINARY=?1" in helper
 assert "event_type='gameboy_game_event' AND source='GameBoyAdvance'" in helper
-assert "sqlite3_bind_text(stmt, 2, pattern, -1, SQLITE_TRANSIENT)" in helper
+assert "summary COLLATE BINARY=?2" in helper and "details COLLATE BINARY=?3" in helper
+assert "sqlite3_step(st) != SQLITE_DONE" in helper
+assert 'exec_sql("BEGIN IMMEDIATE;")' in helper and "log_finish_write(id > 0)" in helper
+assert "NULL, NULL) != id" in helper
 
 assert "static void *tv_control_server(void *unused)" in shell
 assert "static int tv_control_start(void)" in shell

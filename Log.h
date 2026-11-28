@@ -77,6 +77,13 @@ int64_t r2_log_event(
     const char *source
 );
 
+/* Resolve or commit one exact verified Game Boy event before reward/ack.
+ * A mismatched or ambiguous existing source is an error, not a new event.
+ * The optional legacy strings must represent a complete historical payload. */
+int64_t r2_log_save_gameboy_once(const char *source, int64_t console_event_id,
+                                const char *summary, const char *details,
+                                const char *legacy_summary, const char *legacy_details);
+
 /* Commit a conversation source snapshot and its provenance link together.
  * Both the event and the relationship must exist before indexing the event.
  * Returns the inserted event ID on success, -1 on rollback/failure. */

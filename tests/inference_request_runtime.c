@@ -1483,6 +1483,24 @@ static void check_gameboy_delivery(void)
     assert(sqlite3_exec(rewards, "DROP TRIGGER reject_gameboy_reward", NULL, NULL, NULL) == SQLITE_OK);
     assert(r2_sync_gameboy_verified_events(executable) == -1);
     assert(access(ack_path, F_OK) == 0);
+    /* A different payload reusing the numeric ID must not be acknowledged,
+     * even when its reward event has already been committed. */
+    events = fopen(event_path, "w");
+    assert(events && fputs("[{\"event_id\":350001,\"verified\":true,"
+        "\"context\":\"virtual\",\"event_type\":\"life_lost\","
+        "\"summary\":\"Different event\",\"game_title\":\"Fixture game\","
+        "\"evidence_source\":\"adapter:fixture\",\"details\":\"changed\"}]\n", events) >= 0);
+    assert(fclose(events) == 0 && unlink(ack_path) == 0);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
+    assert(access(ack_path, F_OK) != 0 && errno == ENOENT);
+    events = fopen(event_path, "w");
+    assert(events && fprintf(events, "[{\"event_id\":350001,\"verified\":true,"
+                            "\"context\":\"virtual\",\"event_type\":\"life_lost\","
+                            "\"summary\":\"Lost a life\",\"game_title\":\"Fixture game\","
+                            "\"evidence_source\":\"adapter:fixture\",\"details\":\"%s\"}]\n",
+                            details) > 0);
+    assert(fclose(events) == 0);
+    assert(r2_sync_gameboy_verified_events(executable) == -1);
     assert(r2_sync_gameboy_verified_events(executable) == 1);
 
     sqlite3_stmt *statement = NULL;
@@ -1505,6 +1523,31 @@ static void check_gameboy_delivery(void)
     json_object_put(stored);
     assert(sqlite3_step(statement) == SQLITE_DONE);
     sqlite3_finalize(statement);
+    /* The exact event is resolved under Life Log's write lock. Trigger
+     * rewriting after insertion must roll back, not strand a corrupt receipt. */
+    assert(sqlite3_exec(history,
+        "CREATE TRIGGER rewrite_gameboy AFTER INSERT ON r2_log_events "
+        "WHEN NEW.source='GameBoyAdvance.py:event:350002' "
+        "BEGIN UPDATE r2_log_events SET details='rewritten' WHERE id=NEW.id; END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    assert(r2_log_save_gameboy_once("GameBoyAdvance.py:event:350002", 350002,
+        "Verified event", "{\"details\":\"exact\"}", NULL, NULL) < 0);
+    assert(sqlite3_prepare_v2(history,
+        "SELECT COUNT(*) FROM r2_log_events WHERE source='GameBoyAdvance.py:event:350002'",
+        -1, &statement, NULL) == SQLITE_OK);
+    assert(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) == 0);
+    sqlite3_finalize(statement);
+    assert(sqlite3_exec(history, "DROP TRIGGER rewrite_gameboy", NULL, NULL, NULL) == SQLITE_OK);
+
+    /* Both legacy layouts are supported only with an exact historical payload. */
+    int64_t legacy = r2_log_event(R2_LOG_WORLD, "gameboy_game_event", "Old: coin",
+        "context=virtual; console_event_id=350003; adapter_details=coin", "GameBoyAdvance");
+    assert(legacy > 0);
+    assert(r2_log_save_gameboy_once("GameBoyAdvance.py:event:350003", 350003,
+        "coin", "{\"details\":\"coin\"}", "Old: coin",
+        "context=virtual; console_event_id=350003; adapter_details=coin") == legacy);
+    assert(r2_log_save_gameboy_once("GameBoyAdvance.py:event:350003", 350003,
+        "coin", "{\"details\":\"other\"}", NULL, NULL) < 0);
     sqlite3_close(history);
     free(details);
     assert(unlink(executable) == 0 && unlink(event_path) == 0 && unlink(ack_path) == 0);
