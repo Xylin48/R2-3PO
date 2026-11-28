@@ -87,6 +87,8 @@ R2_NETWORK_LOCK_ACTIVE=0
 OBSERVER_XHOST_GRANTED=0
 OBSERVER_PID=""
 R2_DIAGNOSTICS_DIR=""
+R2_BUILD_DIR=""
+TEMP_EXEC=""
 
 # Observer/display cleanup must run for every exit path, not only after R2
 # returns normally. In particular, an early launch failure after opening the
@@ -122,10 +124,22 @@ r2_remove_network_lock() {
     r2_remove_network_family iptables R2_3PO_UID_NETLOCK || return 1
     r2_remove_network_family ip6tables R2_3PO_UID_NETLOCK || return 1
 }
+r2_build_cleanup() {
+    if [[ -n "$R2_BUILD_DIR" ]]; then
+        [[ -z "$TEMP_EXEC" ]] || run_as_r2 rm -f -- "$TEMP_EXEC" || true
+        if run_as_r2 rmdir -- "$R2_BUILD_DIR"; then
+            R2_BUILD_DIR=""
+            TEMP_EXEC=""
+        else
+            echo "WARNING: Could not remove temporary build directory: $R2_BUILD_DIR" >&2
+        fi
+    fi
+}
 r2_network_cleanup() {
     local exit_status=$?
     trap - EXIT
     r2_observer_cleanup
+    r2_build_cleanup
     if [[ -n "$R2_DIAGNOSTICS_DIR" ]]; then
         rm -f -- "$R2_DIAGNOSTICS_DIR/Debug.txt"
         rmdir -- "$R2_DIAGNOSTICS_DIR"
@@ -745,14 +759,14 @@ echo
 echo "[3/4] Recompiling R2..."
 echo
 
-# Build beside the live executable and replace it only after a successful link.
-# This preserves the last known-good R2 binary if compilation fails.
-TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"
-if [ -e "$TEMP_EXEC" ] || [ -L "$TEMP_EXEC" ]; then
-    echo "ERROR: Temporary build path already exists: $TEMP_EXEC"
+# Reserve an exclusive directory as the runtime user on the same filesystem
+# as the live executable. No predictable PID path or check/create race.
+if ! R2_BUILD_DIR="$(run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX")"; then
+    echo "ERROR: Could not reserve a private build directory."
     echo "R2 was NOT launched."
     exit 1
 fi
+TEMP_EXEC="$R2_BUILD_DIR/r2"
 
 run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2 \
     "$R2_SOURCE/r2.c" \
@@ -785,7 +799,7 @@ run_as_r2 gcc -std=c11 -Wall -Wextra -Werror -O2 \
 status=$?
 
 if [ $status -ne 0 ]; then
-    run_as_r2 rm -f "$TEMP_EXEC"
+    r2_build_cleanup
     echo
     echo "========================================"
     echo "ERROR: R2 compilation failed."
@@ -796,14 +810,16 @@ if [ $status -ne 0 ]; then
     exit $status
 fi
 
-if ! run_as_r2 chmod 0755 "$TEMP_EXEC" || ! run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"; then
-    run_as_r2 rm -f "$TEMP_EXEC"
+if ! run_as_r2 test -f "$TEMP_EXEC" || ! run_as_r2 test ! -L "$TEMP_EXEC" ||
+   ! run_as_r2 chmod 0755 "$TEMP_EXEC" || ! run_as_r2 mv -fT -- "$TEMP_EXEC" "$R2_EXEC"; then
+    r2_build_cleanup
     echo "ERROR: Could not atomically install the newly compiled R2 executable."
     echo "The previous executable was preserved if replacement had not completed; R2 was NOT launched."
     exit 1
 fi
 
 echo
+r2_build_cleanup
 echo "Compilation successful."
 echo "Executable updated:"
 echo "    $R2_EXEC"

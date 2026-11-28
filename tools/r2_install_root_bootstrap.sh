@@ -47,7 +47,8 @@ R2_VISION_MODEL="qwen3-vl:4b-instruct-q4_K_M"
 R2_OLLAMA_BASE_URL="http://127.0.0.1:11435"
 UNIT_DEST="/etc/systemd/system/r2-3po.service"
 OLLAMA_UNIT_DEST="/etc/systemd/system/r2-ollama.service"
-TEMP_EXEC="${R2_ROOT}/r2.new.${BASHPID}"
+R2_BUILD_DIR=""
+TEMP_EXEC=""
 
 log() { printf '[R2 installer] %s\n' "$*"; }
 fail() { log "ERROR: $*"; exit 1; }
@@ -102,7 +103,7 @@ cleanup_on_exit() {
             if [[ -n "$restore_exec" ]] &&
                run_as_r2 cp "$BACKUP_EXEC" "$restore_exec" &&
                run_as_r2 chmod 0755 "$restore_exec" &&
-               run_as_r2 mv -f "$restore_exec" "$R2_EXEC"; then
+               run_as_r2 mv -fT -- "$restore_exec" "$R2_EXEC"; then
                 NEW_EXEC_INSTALLED=0
                 log "Restored previous executable from $BACKUP_EXEC after an early installer failure."
             else
@@ -119,8 +120,12 @@ cleanup_on_exit() {
             NEW_EXEC_INSTALLED=0
         fi
     fi
-    if [[ -e "$TEMP_EXEC" || -L "$TEMP_EXEC" ]]; then
+    if [[ -n "${TEMP_EXEC:-}" ]]; then
         run_as_r2 rm -f -- "$TEMP_EXEC" || true
+    fi
+    if [[ -n "${R2_BUILD_DIR:-}" ]]; then
+        run_as_r2 rmdir -- "$R2_BUILD_DIR" ||
+            log "WARNING: could not remove temporary build directory: $R2_BUILD_DIR"
     fi
 
     # The installer stops the private model server while repairing its model
@@ -181,14 +186,14 @@ rollback_previous_executable() {
         log "WARNING: no previous executable is available to roll back to; the failed service has been stopped."
         return 1
     fi
-    local restore_exec="${R2_ROOT}/r2.restore.${BASHPID}"
-    if [[ -e "$restore_exec" || -L "$restore_exec" ]]; then
-        log "ERROR: refusing to overwrite existing rollback path: $restore_exec"
+    local restore_exec=""
+    if ! restore_exec="$(run_as_r2 mktemp "$R2_ROOT/r2.restore.XXXXXX")"; then
+        log "ERROR: could not reserve a private rollback file."
         return 1
     fi
     if ! run_as_r2 cp "$BACKUP_EXEC" "$restore_exec" ||
        ! run_as_r2 chmod 0755 "$restore_exec" ||
-       ! run_as_r2 mv -f "$restore_exec" "$R2_EXEC"; then
+       ! run_as_r2 mv -fT -- "$restore_exec" "$R2_EXEC"; then
         run_as_r2 rm -f "$restore_exec" || true
         log "ERROR: could not atomically restore the previous executable from $BACKUP_EXEC"
         return 1
@@ -316,17 +321,17 @@ run_as_r2 python3 "$MODEL_COPY_SCRIPT" --model "$R2_MODEL" \
     --destination-root "$R2_ROOT/.ollama/models" --owner r2 ||
     fail "could not prepare R2's private model store. Ensure $R2_MODEL is installed in the existing local Ollama store; no external download was attempted."
 
-# Compile to a new path first. A failed build never replaces the last known executable.
-# Make's clean target removes TARGET, so never let it remove an unexpected stale
-# file or symlink that happens to collide with a reused process ID.
-if [[ -e "$TEMP_EXEC" || -L "$TEMP_EXEC" ]]; then
-    fail "refusing existing temporary build path: $TEMP_EXEC"
-fi
+# Reserve an exclusive runtime-owned directory beside the live executable.
+# Make's clean target can only remove the candidate inside this directory.
+R2_BUILD_DIR="$(run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX")" ||
+    fail "could not reserve a private build directory."
+TEMP_EXEC="$R2_BUILD_DIR/r2"
 log "Compiling the complete C runtime..."
 # The Makefile and all C sources live in the runtime-writable tree. Compile
 # as r2 so a modified Makefile/source can never execute build commands as root.
 run_as_r2 make -C "$R2_SOURCE" clean all TARGET="$TEMP_EXEC"
-[[ -x "$TEMP_EXEC" ]] || fail "build completed without producing $TEMP_EXEC."
+[[ -f "$TEMP_EXEC" && ! -L "$TEMP_EXEC" && -x "$TEMP_EXEC" ]] ||
+    fail "build completed without producing a regular executable at $TEMP_EXEC."
 run_as_r2 chmod 0755 "$TEMP_EXEC"
 
 # Keep the newly built executable at TEMP_EXEC until the private Ollama
@@ -525,7 +530,7 @@ if [[ -e "$R2_EXEC" ]]; then
     log "Previous executable preserved at $BACKUP_EXEC"
 fi
 
-run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"
+run_as_r2 mv -fT -- "$TEMP_EXEC" "$R2_EXEC"
 NEW_EXEC_INSTALLED=1
 run_as_r2 chmod 0755 "$R2_EXEC"
 

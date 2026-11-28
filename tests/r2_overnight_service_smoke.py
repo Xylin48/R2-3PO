@@ -136,8 +136,10 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("R2_OLLAMA_NUM_GPU=20", (ROOT / "tools/r2_service_runner.sh").read_text(encoding="utf-8"))
         launcher = (ROOT / "R2_Launch_Code.sh").read_text(encoding="utf-8")
         self.assertIn("Checking the local Ollama API and required model", launcher)
-        self.assertIn('TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"', launcher)
-        self.assertIn('if [ -e "$TEMP_EXEC" ] || [ -L "$TEMP_EXEC" ]; then', launcher)
+        self.assertIn('run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX"', launcher)
+        self.assertIn('TEMP_EXEC="$R2_BUILD_DIR/r2"', launcher)
+        self.assertIn('r2_build_cleanup', launcher)
+        self.assertIn('mv -fT -- "$TEMP_EXEC" "$R2_EXEC"', launcher)
         self.assertIn("preflight_ollama_model.py", launcher)
         self.assertIn("Conversation model: llama3.1:8b", launcher)
         self.assertIn("Visual perception model: qwen3-vl:4b-instruct-q4_K_M", launcher)
@@ -176,9 +178,10 @@ class OvernightServiceTests(unittest.TestCase):
         wrapper = (ROOT / "tools/install_r2_overnight.sh").read_text(encoding="utf-8")
         self.assertIn("r2_rewards.db", source)
         self.assertIn("r2_addictions.db", source)
-        self.assertIn('TEMP_EXEC="${R2_ROOT}/r2.new.${BASHPID}"', source)
-        self.assertIn('if [[ -e "$TEMP_EXEC" || -L "$TEMP_EXEC" ]]; then', source)
-        self.assertIn('mv -f "$TEMP_EXEC" "$R2_EXEC"', source)
+        self.assertIn('run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX"', source)
+        self.assertIn('TEMP_EXEC="$R2_BUILD_DIR/r2"', source)
+        self.assertIn('mv -fT -- "$TEMP_EXEC" "$R2_EXEC"', source)
+        self.assertEqual(source.count('mv -fT -- "$restore_exec" "$R2_EXEC"'), 2)
         self.assertIn('BACKUP_EXEC="$(run_as_r2 mktemp "$R2_ROOT/r2.previous.XXXXXX")"', source)
         self.assertIn('cp "$R2_EXEC" "$BACKUP_EXEC"', source)
         self.assertIn("rollback_previous_executable() {", source)
@@ -190,7 +193,7 @@ class OvernightServiceTests(unittest.TestCase):
         self.assertIn("refusing symlinked existing executable", source)
         self.assertEqual(source.count("rollback_previous_executable || log"), 3)
         self.assertLess(source.index('cp "$R2_EXEC" "$BACKUP_EXEC"'),
-                        source.index('mv -f "$TEMP_EXEC" "$R2_EXEC"'))
+                        source.index('mv -fT -- "$TEMP_EXEC" "$R2_EXEC"'))
         self.assertLess(
             source.index('python3 "$R2_SOURCE/tools/preflight_ollama_model.py" --wait-seconds 60'),
             source.index('BACKUP_EXEC="$(run_as_r2 mktemp "$R2_ROOT/r2.previous.XXXXXX")"'),
@@ -340,6 +343,45 @@ run_as_r2() { "$@"; }
                 self.assertEqual(result.returncode, 143, result)
                 self.assertIn("stop attempted", result.stdout)
                 self.assertEqual(live.read_text(), "previous" if stop_status == 0 else "candidate")
+
+    def test_interactive_build_replacement_rejects_directory_and_cleans_candidate(self):
+        launcher = (ROOT / "R2_Launch_Code.sh").read_text(encoding="utf-8")
+        cleanup = launcher[launcher.index("r2_build_cleanup() {"):
+                           launcher.index("r2_network_cleanup() {")]
+        reserve = launcher[launcher.index('if ! R2_BUILD_DIR="$(run_as_r2 mktemp -d'):
+                           launcher.index("run_as_r2 gcc -std=c11")]
+        replace = launcher[launcher.index('if ! run_as_r2 test -f "$TEMP_EXEC"'):
+                           launcher.index('echo "Compilation successful."')]
+        for destination in ("file", "directory", "symlink-directory"):
+            with self.subTest(destination=destination), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                live = root / "r2"
+                target = root / "target"
+                target.mkdir()
+                if destination == "file":
+                    live.write_text("previous")
+                elif destination == "directory":
+                    live.mkdir()
+                else:
+                    live.symlink_to(target, target_is_directory=True)
+                script = """
+R2_ROOT="$1"
+R2_EXEC="$1/r2"
+R2_BUILD_DIR=""
+TEMP_EXEC=""
+run_as_r2() { "$@"; }
+""" + cleanup + reserve + '\nprintf candidate > "$TEMP_EXEC"\n' + replace
+                result = subprocess.run(["bash", "-c", script, "fixture", temp],
+                                        capture_output=True, text=True, timeout=5)
+                if destination == "directory":
+                    self.assertNotEqual(result.returncode, 0, result)
+                    self.assertEqual(list(live.iterdir()), [])
+                else:
+                    self.assertEqual(result.returncode, 0, result)
+                    self.assertFalse(live.is_symlink())
+                    self.assertEqual(live.read_text(), "candidate")
+                self.assertEqual(list(target.iterdir()), [])
+                self.assertEqual(list(root.glob(".r2-build.*")), [])
 
     def test_installer_restores_private_ollama_state_after_early_failure(self):
         installer = (ROOT / "tools/r2_install_root_bootstrap.sh").read_text(encoding="utf-8")

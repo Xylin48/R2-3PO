@@ -83,8 +83,10 @@ require('kill "$OBSERVER_PID"' in cleanup
         and 'wait "$OBSERVER_PID"' in cleanup
         and 'xhost -SI:localuser:r2' in cleanup,
         "observer cleanup terminates/reaps its process and revokes X access")
-require('TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"' in launcher
-        and 'mv -f "$TEMP_EXEC" "$R2_EXEC"' in launcher,
+require('run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX"' in launcher
+        and 'TEMP_EXEC="$R2_BUILD_DIR/r2"' in launcher
+        and 'mv -fT -- "$TEMP_EXEC" "$R2_EXEC"' in launcher
+        and 'r2_build_cleanup' in launcher,
         "launcher preserves the last known-good executable until a successful build")
 print("Launcher/core/module consistency smoke test passed.")
 

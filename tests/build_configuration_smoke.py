@@ -81,7 +81,7 @@ require(
     and re.search(r'^chmod 0755 "\$RUNNER_SOURCE" "\$OLLAMA_RUNNER_SOURCE"$',
                   installer, re.MULTILINE) is None
     and 'run_as_r2 chmod 0755 "$RUNNER_SOURCE" "$OLLAMA_RUNNER_SOURCE"' in installer
-    and 'run_as_r2 mv -f "$TEMP_EXEC" "$R2_EXEC"' in installer,
+    and 'run_as_r2 mv -fT -- "$TEMP_EXEC" "$R2_EXEC"' in installer,
     "writable runtime paths are not passed to privileged ownership-changing operations",
 )
 
@@ -95,9 +95,9 @@ require(
     "interactive launcher uses the same strict compiler policy",
 )
 require(
-    'TEMP_EXEC="${R2_EXEC}.tmp.${BASHPID}"' in launcher
+    'run_as_r2 mktemp -d -- "$R2_ROOT/.r2-build.XXXXXXXX"' in launcher
     and '-o "$TEMP_EXEC" \\' in launcher
-    and 'mv -f "$TEMP_EXEC" "$R2_EXEC"' in launcher
+    and 'mv -fT -- "$TEMP_EXEC" "$R2_EXEC"' in launcher
     and '-o "$R2_EXEC" \\' not in launcher,
     "interactive build preserves the last known-good executable until atomic replacement",
 )
