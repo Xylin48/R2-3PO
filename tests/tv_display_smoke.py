@@ -184,6 +184,8 @@ class TVDisplaySmoke(unittest.TestCase):
     def test_refresh_keeps_pending_tape_silent_and_hidden(self) -> None:
         display = object.__new__(TV.CRTDisplay)
         display._player = Mock()
+        display._vlc = SimpleNamespace(State=SimpleNamespace(Playing=1))
+        display._player.get_state.return_value = 1
         display._loaded_path = "/tmp/new.mp4"
         display._last_transport = None
         display._pending_vcr_seek = object()
@@ -334,7 +336,8 @@ class TVDisplaySmoke(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:
             db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=-12.5 WHERE media_path=?",
                        (media,))
-        self.assertEqual(display.read_vcr_state(), (media, "play", 0.0))
+        with self.assertRaisesRegex(ValueError, "Saved VCR position"):
+            display.read_vcr_state()
         with sqlite3.connect(self.db_path) as db:
             db.execute("UPDATE r2_tv_vcr_tapes SET position_seconds=604800 WHERE media_path=?",
                        (media,))
@@ -408,6 +411,7 @@ class TVDisplaySmoke(unittest.TestCase):
     def test_vcr_releases_its_media_reference_on_success_and_failure(self) -> None:
         display = object.__new__(TV.CRTDisplay)
         display._player = Mock()
+        display._player.play.return_value = 0
         display._vlc_instance = Mock()
         display.root = Mock()
         media = display._vlc_instance.media_new.return_value
@@ -447,6 +451,73 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertIsNone(display._player)
         self.assertIsNone(display._vlc_instance)
 
+    def test_corrupt_tv_selection_and_missing_tape_position_are_not_defaults(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        for power, kind, value in ((4294967297, "input", 1), (1, "unknown", 1),
+                                    (1, "rf", 1), (1, "vcr", 2), (1, "input", 4294967297)):
+            self.set_state(power, kind, value)
+            with self.assertRaisesRegex(ValueError, "Stored TV selection"):
+                display.read_state()
+        self.set_state(1, "vcr", 1)
+        self.assertEqual(display.read_state(), (1, "vcr", 1, None))
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("UPDATE r2_tv_vcr_state SET cassette_path='/tmp/missing.mp4',transport='play' WHERE id=1")
+        with self.assertRaisesRegex(ValueError, "Saved VCR position row is missing"):
+            display.read_vcr_state()
+
+    def test_failed_vlc_load_cannot_publish_a_replacement_tape(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Mock()
+        display._player.play.return_value = -1
+        display._vlc_instance = Mock()
+        display._loaded_path = "/tmp/old.mp4"
+        display._last_transport = "play"
+        display._pending_vcr_seek = object()
+        display.root = Mock()
+        with self.assertRaisesRegex(RuntimeError, "VLC rejected"):
+            display._prepare_media("/tmp/new.mp4", 50.0, "play", True)
+        self.assertIsNone(display._loaded_path)
+        self.assertIsNone(display._last_transport)
+        self.assertIsNone(display._pending_vcr_seek)
+        display._player.audio_set_mute.assert_called_with(True)
+        display._player.stop.assert_called_once()
+        display.root.after.assert_not_called()
+        display._vlc_instance.media_new.return_value.release.assert_called_once()
+
+    def test_async_seek_must_reach_saved_position_before_play(self) -> None:
+        display = object.__new__(TV.CRTDisplay)
+        display._player = Mock()
+        display._player.play.return_value = 0
+        display._player.is_seekable.return_value = 1
+        display._player.set_time.return_value = None
+        display._player.get_time.side_effect = [0, 10000, 42500]
+        display._vlc_instance = Mock()
+        display.root = Mock()
+        display.feedback = Mock()
+        display.read_display_snapshot = lambda: ((1, "vcr", 1, None),
+                                                 ("/tmp/movie.mp4", "play", 42.5))
+        display._prepare_media("/tmp/movie.mp4", 42.5, "play", True)
+        for _ in range(2):
+            display.root.after.call_args.args[1]()
+            self.assertIsNotNone(display._pending_vcr_seek)
+            self.assertIsNone(display._last_transport)
+            self.assertNotIn(call(False), display._player.audio_set_mute.call_args_list)
+        display.root.after.call_args.args[1]()
+        self.assertIsNone(display._pending_vcr_seek)
+        self.assertEqual(display._last_transport, "play")
+        display._player.set_time.assert_called_once_with(42500)
+        display._player.audio_set_mute.assert_called_with(False)
+        # A definite seek rejection abandons the load rather than exposing
+        # the wrong position or marking the transport as playing.
+        display._player.set_time.return_value = -1
+        display._prepare_media("/tmp/movie.mp4", 42.5, "play", True)
+        display.root.after.call_args.args[1]()
+        self.assertIsNone(display._pending_vcr_seek)
+        self.assertIsNone(display._loaded_path)
+        self.assertIsNone(display._last_transport)
+        display._player.audio_set_mute.assert_called_with(True)
+        display.feedback.configure.assert_called()
+
     def test_vcr_initialization_is_muted_and_paused_before_seek(self) -> None:
         events = []
 
@@ -455,7 +526,11 @@ class TVDisplaySmoke(unittest.TestCase):
             def audio_set_mute(self, muted): events.append(("mute", muted))
             def play(self): events.append(("play",)); return 0
             def set_pause(self, paused): events.append(("pause", paused))
-            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+            def is_seekable(self): return 1
+            def get_time(self): return self.position
+            def set_time(self, milliseconds):
+                self.position = milliseconds
+                events.append(("seek", milliseconds))
 
         class FakeInstance:
             def media_new(self, path): return SimpleNamespace(release=lambda: None)
@@ -476,7 +551,7 @@ class TVDisplaySmoke(unittest.TestCase):
 
         self.assertLess(events.index(("mute", True)), events.index(("play",)))
         self.assertLess(events.index(("pause", 1)), events.index(("seek", 42500)))
-        self.assertEqual(events[-1], ("pause", 1))
+        self.assertEqual(events[-2:], [("pause", 1), ("mute", True)])
 
     def test_vcr_play_resumes_only_after_saved_position_is_applied(self) -> None:
         events = []
@@ -486,7 +561,11 @@ class TVDisplaySmoke(unittest.TestCase):
             def audio_set_mute(self, muted): events.append(("mute", muted))
             def play(self): events.append(("play",)); return 0
             def set_pause(self, paused): events.append(("pause", paused))
-            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+            def is_seekable(self): return 1
+            def get_time(self): return self.position
+            def set_time(self, milliseconds):
+                self.position = milliseconds
+                events.append(("seek", milliseconds))
 
         class FakeInstance:
             def media_new(self, path): return SimpleNamespace(release=lambda: None)
@@ -508,7 +587,7 @@ class TVDisplaySmoke(unittest.TestCase):
         self.assertLess(events.index(("mute", True)), events.index(("play",)))
         self.assertLess(events.index(("seek", 42500)), events.index(("mute", False)))
         self.assertLess(events.index(("seek", 42500)), events.index(("pause", 0)))
-        self.assertEqual(events[-1], ("pause", 0))
+        self.assertEqual(events[-2:], [("pause", 0), ("mute", False)])
 
     def test_delayed_vlc_callback_uses_latest_reality_state(self) -> None:
         events = []
@@ -518,7 +597,11 @@ class TVDisplaySmoke(unittest.TestCase):
             def audio_set_mute(self, muted): events.append(("mute", muted))
             def play(self): events.append(("play",)); return 0
             def set_pause(self, paused): events.append(("pause", paused))
-            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+            def is_seekable(self): return 1
+            def get_time(self): return self.position
+            def set_time(self, milliseconds):
+                self.position = milliseconds
+                events.append(("seek", milliseconds))
 
         class FakeInstance:
             def media_new(self, path): return SimpleNamespace(release=lambda: None)
@@ -542,7 +625,7 @@ class TVDisplaySmoke(unittest.TestCase):
 
         self.assertIn(("seek", 80000), events)
         self.assertIn(("mute", True), events)
-        self.assertEqual(events[-1], ("pause", 0))
+        self.assertEqual(events[-2:], [("pause", 0), ("mute", True)])
 
     def test_vcr_pending_seek_is_retried_and_superseded_by_exact_load(self) -> None:
         events = []
@@ -553,7 +636,11 @@ class TVDisplaySmoke(unittest.TestCase):
             def audio_set_mute(self, muted): pass
             def play(self): events.append(("play",)); return 0
             def set_pause(self, paused): events.append(("pause", paused))
-            def set_time(self, milliseconds): events.append(("seek", milliseconds))
+            def is_seekable(self): return 1
+            def get_time(self): return self.position
+            def set_time(self, milliseconds):
+                self.position = milliseconds
+                events.append(("seek", milliseconds))
 
         display = object.__new__(TV.CRTDisplay)
         display._player = Player()

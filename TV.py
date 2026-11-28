@@ -22,6 +22,10 @@ SOCKET_PATH = Path(os.environ.get("R2_TV_SOCKET", "/home/x/R2_Home/R2/tv-control
 MEDIA_DIR = Path(os.environ.get("R2_VCR_MEDIA_DIR", "/home/x/R2_Home/VCR_Tapes"))
 POLL_MS = 1000
 POSITION_SAVE_SECONDS = 5
+VCR_SEEK_TIMEOUT_SECONDS = 15
+# VLC reports media time in milliseconds; allow small decoder/keyframe drift
+# rather than treating mere seek submission as proof of resumed playback.
+VCR_SEEK_TOLERANCE_MS = 250
 VCR_PATH_MAX_BYTES = os.pathconf("/", "PC_PATH_MAX") - 1
 MEDIA_EXTENSIONS = (
     ".avi", ".mkv", ".mp4", ".m4v", ".mov", ".mpeg", ".mpg", ".wmv",
@@ -45,11 +49,13 @@ def send_control_command(command: str) -> str:
     allowed = {"display opened", "display closed", "power on", "power off", "vcr play", "vcr pause", "vcr stop", "vcr eject"}
     valid = command in allowed
     valid = valid or (
-        command.startswith("input ") and command[6:].isdigit()
+        command.startswith("input ") and command[6:].isascii()
+        and len(command[6:]) == 1 and command[6:].isdecimal()
         and 1 <= int(command[6:]) <= 4
     )
     valid = valid or (
-        command.startswith("tune ") and command[5:].isdigit()
+        command.startswith("tune ") and command[5:].isascii()
+        and 1 <= len(command[5:]) <= 2 and command[5:].isdecimal()
         and 2 <= int(command[5:]) <= 13
     )
     if command.startswith("vcr insert "):
@@ -107,8 +113,8 @@ def send_control_command(command: str) -> str:
             total += len(chunk)
         if total >= 16384:
             raise RuntimeError("R2 control response exceeded the 16 KiB safety limit")
-        response = b"".join(chunks).decode("utf-8", errors="replace")
-    if not response.startswith("OK"):
+        response = b"".join(chunks).decode("utf-8")
+    if response != "OK" and not response.startswith("OK "):
         raise RuntimeError(response or "R2 returned no response")
     return response
 
@@ -244,7 +250,13 @@ class CRTDisplay:
         ).fetchone()
         if row is None:
             raise RuntimeError("TV state row is missing")
-        power, kind, value = int(row[0]), str(row[1]), int(row[2])
+        power, kind, value = row
+        if (type(power) is not int or power not in (0, 1)
+                or type(kind) is not str or kind not in ("input", "rf", "vcr")
+                or type(value) is not int
+                or not (1 <= value <= 4 if kind == "input" else
+                        2 <= value <= 13 if kind == "rf" else value == 1)):
+            raise ValueError("Stored TV selection is invalid")
         device = None
         if kind == "rf":
             match = db.execute(
@@ -252,14 +264,16 @@ class CRTDisplay:
                 "WHERE connected=1 AND connection_kind='rf' AND port=? LIMIT 1",
                 (value,),
             ).fetchone()
-            device = str(match[0]) if match else None
+            device = match[0] if match else None
         elif kind == "input" and value > 1:
             match = db.execute(
                 "SELECT name FROM r2_tv_devices "
                 "WHERE connected=1 AND connection_kind='input' AND port=? LIMIT 1",
                 (value,),
             ).fetchone()
-            device = str(match[0]) if match else None
+            device = match[0] if match else None
+        if device is not None and (type(device) is not str or not device or "\0" in device):
+            raise ValueError("Stored TV device identity is invalid")
         return power, kind, value, device
 
     def read_vcr_state(self) -> tuple[str | None, str, float]:
@@ -275,26 +289,30 @@ class CRTDisplay:
         ).fetchone()
         if row is None:
             raise RuntimeError("VCR state row is missing")
-        path = str(row[0]) if row[0] else None
-        transport = str(row[1])
-        position = 0.0
-        if path:
-            tape = db.execute(
-                "SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=?",
-                (path,),
-            ).fetchone()
-            if tape:
-                try:
-                    saved_position = float(tape[0])
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ValueError("Saved VCR position is invalid") from exc
-                if not math.isfinite(saved_position):
-                    raise ValueError("Saved VCR position is not finite")
-                # Match the validated control protocol: malformed legacy
-                # values must not overflow VLC's millisecond seek.
-                if saved_position > 604800:
-                    raise ValueError("Saved VCR position exceeds the supported range")
-                position = max(0.0, saved_position)
+        path, transport = row
+        if path is not None and (type(path) is not str or not path or
+                                 any(c in path for c in "\r\n\0")):
+            raise ValueError("Stored VCR cassette identity is invalid")
+        if type(transport) is not str or transport not in ("play", "pause", "stop"):
+            raise ValueError("Stored VCR transport is invalid")
+        if path is None:
+            if transport != "stop":
+                raise ValueError("Stored VCR transport requires a cassette")
+            return None, transport, 0.0
+        tape = db.execute(
+            "SELECT position_seconds FROM r2_tv_vcr_tapes WHERE media_path=? COLLATE BINARY",
+            (path,),
+        ).fetchone()
+        if tape is None:
+            raise ValueError("Saved VCR position row is missing")
+        if type(tape[0]) not in (int, float):
+            raise ValueError("Saved VCR position is invalid")
+        try:
+            position = float(tape[0])
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("Saved VCR position is invalid") from exc
+        if not math.isfinite(position) or not 0 <= position <= 604800:
+            raise ValueError("Saved VCR position is outside the supported range")
         return path, transport, position
 
     def read_display_snapshot(self) -> tuple[tuple[int, str, int, str | None],
@@ -337,29 +355,50 @@ class CRTDisplay:
         self._vlc_error_shown = False
         return True
 
+    def _abandon_vcr_load(self) -> None:
+        # A failed or superseded load cannot retain the identity of the old
+        # tape or leave a delayed callback applying to replacement media.
+        self._pending_vcr_seek = None
+        self._loaded_path = None
+        self._last_transport = None
+        if self._player is not None:
+            try:
+                self._player.audio_set_mute(True)
+                self._player.stop()
+            except (OSError, RuntimeError):
+                pass
+
     def _prepare_media(self, path: str, position: float, transport: str,
                        audible: bool) -> None:
         if not self._ensure_player():
             return
-        media = self._vlc_instance.media_new(path)
-        if media is None:
-            raise RuntimeError("VLC could not open the selected tape")
+        self._pending_vcr_seek = None
+        self._loaded_path = None
+        self._last_transport = None
         try:
             self._player.audio_set_mute(True)
-            self._player.set_media(media)
-        finally:
-            # The player retains its own reference to the selected media.
-            media.release()
-        # Initialize silently; the selected source must not become audible
-        # until its saved position has been submitted to the player.
+            media = self._vlc_instance.media_new(path)
+            if media is None:
+                raise RuntimeError("VLC could not open the selected tape")
+            try:
+                self._player.set_media(media)
+            finally:
+                # The player retains its own reference to the selected media.
+                media.release()
+            if self._player.play() != 0:
+                raise RuntimeError("VLC rejected the selected tape")
+            self._player.set_pause(1)
+        except (OSError, RuntimeError):
+            self._abandon_vcr_load()
+            raise
         self._loaded_path = path
-        self._last_transport = None
         seek_request = object()
         self._pending_vcr_seek = seek_request
-        self._player.play()
-        self._player.set_pause(1)
+        seek_target = None
+        seek_deadline = time.monotonic() + VCR_SEEK_TIMEOUT_SECONDS
 
         def seek_and_apply() -> None:
+            nonlocal seek_target
             if self._player is None or self._pending_vcr_seek is not seek_request:
                 return
             # The transport may have changed while VLC initialized. Re-read
@@ -374,14 +413,35 @@ class CRTDisplay:
                 self.root.after(500, seek_and_apply)
                 return
             if current_path != path:
-                self.root.after(500, seek_and_apply)
+                self._abandon_vcr_load()
                 return
-            audible_now = bool(power and kind == "input" and value == 1)
-            self._player.set_time(int(current_position * 1000))
-            self._player.audio_set_mute(not (audible_now and current_transport == "play"))
-            self._player.set_pause(0 if current_transport == "play" else 1)
-            self._last_transport = current_transport
-            self._pending_vcr_seek = None
+            try:
+                target = int(current_position * 1000)
+                if seek_target != target:
+                    if not self._player.is_seekable() and target != 0:
+                        if time.monotonic() >= seek_deadline:
+                            raise RuntimeError("VLC could not seek to the saved tape position")
+                        self.root.after(100, seek_and_apply)
+                        return
+                    # VLC 3 returns None; newer versions can return an error.
+                    result = self._player.set_time(target)
+                    if result is not None and result < 0:
+                        raise RuntimeError("VLC rejected the saved tape position")
+                    seek_target = target
+                actual = self._player.get_time()
+                if actual < 0 or abs(actual - seek_target) > VCR_SEEK_TOLERANCE_MS:
+                    if time.monotonic() >= seek_deadline:
+                        raise RuntimeError("VLC did not reach the saved tape position")
+                    self.root.after(100, seek_and_apply)
+                    return
+                audible_now = bool(power and kind in ("input", "vcr") and value == 1)
+                self._player.set_pause(0 if current_transport == "play" else 1)
+                self._player.audio_set_mute(not (audible_now and current_transport == "play"))
+                self._last_transport = current_transport
+                self._pending_vcr_seek = None
+            except (OSError, RuntimeError, ValueError, OverflowError) as exc:
+                self._abandon_vcr_load()
+                self.feedback.configure(text=f"VCR playback unavailable: {exc}", fg="#e0b0a0")
 
         self.root.after(500, seek_and_apply)
 
@@ -391,13 +451,13 @@ class CRTDisplay:
         now = time.monotonic()
         if not force and now - self._last_position_save < POSITION_SAVE_SECONDS:
             return
-        milliseconds = self._player.get_time()
-        if milliseconds >= 0:
-            try:
+        try:
+            milliseconds = self._player.get_time()
+            if milliseconds >= 0:
                 send_control_command(f"vcr tape-position {milliseconds / 1000:.3f}|{self._loaded_path}")
                 self._last_position_save = now
-            except (OSError, RuntimeError, ValueError):
-                pass
+        except (OSError, RuntimeError, ValueError):
+            pass
 
     def sync_vcr_player(self, path: str | None, transport: str, position: float,
                         audible: bool) -> None:
@@ -414,13 +474,15 @@ class CRTDisplay:
         elif (path and self._player and self._pending_vcr_seek is None
               and transport != self._last_transport):
             self._save_vcr_position(force=True)
-            self._player.audio_set_mute(not (audible and transport == "play"))
+            self._player.audio_set_mute(True)
             if transport == "play":
-                if self._player.play() < 0:
-                    self._player.set_pause(0)
+                if self._player.play() != 0:
+                    self._last_transport = None
+                    raise RuntimeError("VLC rejected playback")
             else:
                 self._player.set_pause(1)
             self._last_transport = transport
+            self._player.audio_set_mute(not (audible and transport == "play"))
         self._save_vcr_position()
 
     def _send_media_event(self, action: str, path: str) -> bool:
@@ -533,7 +595,7 @@ class CRTDisplay:
             tv_state, vcr_state = self.read_display_snapshot()
             power, kind, value, device = tv_state
             tape_path, transport, position = vcr_state
-            audible = bool(power and kind == "input" and value == 1)
+            audible = bool(power and kind in ("input", "vcr") and value == 1)
             if self._player and not (audible and tape_path == self._loaded_path
                                      and transport == self._last_transport == "play"
                                      and self._pending_vcr_seek is None):
@@ -547,7 +609,9 @@ class CRTDisplay:
             ready_to_play = bool(tape_path and tape_path == self._loaded_path
                                  and transport == self._last_transport == "play"
                                  and self._pending_vcr_seek is None
-                                 and self._player is not None)
+                                 and self._player is not None
+                                 and self._vlc is not None
+                                 and self._player.get_state() == self._vlc.State.Playing)
             if not power:
                 headline = "TV OFF"
                 source = "Standby"
