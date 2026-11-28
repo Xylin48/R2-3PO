@@ -37,7 +37,9 @@ for name in ("R2_GAMEBOY_CONSOLE", "R2_GAMEBOY_EXECUTABLE", "R2_GAMEBOY_ROOT", "
 for runner in (launcher, service):
     assert 'R2_GAMEBOY_EXECUTABLE="${R2_GAMEBOY_CONSOLE:-${R2_GAMEBOY_EXECUTABLE:-}}"' in runner
     assert 'R2_GAMEBOY_CONSOLE="$R2_GAMEBOY_EXECUTABLE"' in runner
-    assert 'realpath -- "$R2_GAMEBOY_EXECUTABLE"' in runner
+    assert 'realpath -m -- "$R2_GAMEBOY_EXECUTABLE"' in runner
+    assert 'realpath -m -- "$R2_GAMEBOY_ROOT"' in runner
+    assert 'R2_GAMEBOY_DIR="$R2_GAMEBOY_ROOT"' in runner
 assert 'R2_GAMEBOY_ROOT="$R2_ROOT/Devices/GameBoyAdvance"' in launcher
 assert '"R2_GAMEBOY_ROOT=$R2_GAMEBOY_ROOT"' in service
 assert "execv(device, argv)" in handler

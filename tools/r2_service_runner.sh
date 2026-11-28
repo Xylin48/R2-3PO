@@ -12,7 +12,7 @@ if [[ -z "${R2_GAMEBOY_ROOT:-}" ]]; then
     elif [[ -n "$R2_GAMEBOY_EXECUTABLE" ]]; then
         # Resolve the actual script (including relative paths and symlinks),
         # matching GameBoyAdvance.py's Path(__file__).resolve().parent.
-        if ! GAMEBOY_RESOLVED="$(realpath -- "$R2_GAMEBOY_EXECUTABLE")"; then
+        if ! GAMEBOY_RESOLVED="$(realpath -m -- "$R2_GAMEBOY_EXECUTABLE")"; then
             echo "ERROR: Could not resolve configured Game Boy executable." >&2
             exit 1
         fi
@@ -21,7 +21,12 @@ if [[ -z "${R2_GAMEBOY_ROOT:-}" ]]; then
         R2_GAMEBOY_ROOT="$R2_ROOT/Devices/GameBoyAdvance"
     fi
 fi
-R2_GAMEBOY_DIR="${R2_GAMEBOY_DIR:-$R2_GAMEBOY_ROOT}"
+# Root is authoritative; normalize it before any later working-directory change.
+if ! R2_GAMEBOY_ROOT="$(realpath -m -- "$R2_GAMEBOY_ROOT")"; then
+    echo "ERROR: Could not normalize Game Boy device root." >&2
+    exit 1
+fi
+R2_GAMEBOY_DIR="$R2_GAMEBOY_ROOT"
 R2_GAMEBOY_EXECUTABLE="${R2_GAMEBOY_EXECUTABLE:-$R2_GAMEBOY_ROOT/GameBoyAdvance}"
 # The runtime may change working directories; keep the selected script absolute.
 if ! R2_GAMEBOY_EXECUTABLE="$(realpath -m -- "$R2_GAMEBOY_EXECUTABLE")"; then
