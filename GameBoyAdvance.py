@@ -83,114 +83,145 @@ def _table_columns(db: sqlite3.Connection, schema: str, table: str) -> list[str]
             db.execute(f'PRAGMA {schema}.table_info("{table}")').fetchall()]
 
 
+def _quoted_columns(columns: list[str]) -> str:
+    return ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+
+
+def _copy_legacy_row(db: sqlite3.Connection, table: str, columns: list[str],
+                     values: list[Any], key: str, identity: Any) -> None:
+    # Table and key identifiers are fixed internal names. Values (including
+    # the exact legacy payload) are always bound, not interpolated.
+    quoted = _quoted_columns(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    inserted = db.execute(
+        f'INSERT INTO main."{table}" ({quoted}) VALUES ({placeholders})', values,
+    )
+    if identity is None and key == "id":
+        identity = inserted.lastrowid
+    actual = db.execute(
+        f'SELECT {quoted} FROM main."{table}" WHERE "{key}"=?', (identity,),
+    ).fetchone()
+    if (inserted.rowcount != 1 or identity is None or actual is None
+            or tuple(actual) != tuple(values)):
+        raise sqlite3.IntegrityError(f"Legacy {table} row was not copied exactly.")
+
+
 def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
     """Import old state tables from gameboy.db without deleting source data.
 
     Earlier releases kept cartridge, console state, inventory, and event history
     together in gameboy.db. Current releases split state into State/console_state.db.
-    This additive import is idempotent and transactional; the original tables are
-    deliberately retained in the old database as a recovery copy.
+    Existing destination state/inventory rows own their identity; events retain
+    both histories when IDs collide. The source tables remain a recovery copy.
     """
     migration_key = f"split_legacy_gameboy_db_v1:{DB_PATH.resolve()}"
     db.execute(
         "CREATE TABLE IF NOT EXISTS console_migrations ("
         "migration_key TEXT PRIMARY KEY, completed_at TEXT NOT NULL)"
     )
-    if db.execute(
-        "SELECT 1 FROM console_migrations WHERE migration_key=?", (migration_key,)
-    ).fetchone():
-        return
-
-    legacy_tables = {
-        table for table in ("console_state", "console_events", "cartridge_inventory")
-        if db.execute(
-            "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone()
-    }
-    # A fresh cartridge-only DB must not be marked as migrated; an older combined
-    # DB may be restored into this path later and still needs its one-time import.
-    if not legacy_tables:
-        return
-
     db.execute("BEGIN IMMEDIATE")
     try:
-        for table in ("console_state", "cartridge_inventory"):
-            exists = db.execute(
+        if db.execute(
+            "SELECT 1 FROM console_migrations WHERE migration_key=?", (migration_key,)
+        ).fetchone():
+            db.commit()
+            return
+
+        legacy_tables = {
+            table for table in ("console_state", "console_events", "cartridge_inventory")
+            if db.execute(
                 "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
                 (table,),
             ).fetchone()
-            if not exists:
+        }
+        # Fresh cartridge-only databases do not receive a migration marker.
+        if not legacy_tables:
+            db.commit()
+            return
+
+        for table, key in (("console_state", "id"), ("cartridge_inventory", "filename")):
+            if table not in legacy_tables:
                 continue
             source_columns = set(_table_columns(db, "cartridge", table))
             target_columns = _table_columns(db, "main", table)
             common = [name for name in target_columns if name in source_columns]
-            if not common:
-                continue
-            quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in common)
-            db.execute(
-                f'INSERT OR IGNORE INTO main."{table}" ({quoted}) '
-                f'SELECT {quoted} FROM cartridge."{table}"'
-            )
+            if key not in common:
+                raise sqlite3.IntegrityError(f"Legacy {table} lacks its {key} identity.")
+            quoted = _quoted_columns(common)
+            for row in db.execute(f'SELECT {quoted} FROM cartridge."{table}"'):
+                identity = row[key]
+                if identity is None:
+                    raise sqlite3.IntegrityError(f"Legacy {table} has a missing {key} identity.")
+                # Preserve established destination state and physical location
+                # rather than overwriting them with the older recovery copy.
+                if db.execute(
+                    f'SELECT 1 FROM main."{table}" WHERE "{key}"=?', (identity,),
+                ).fetchone():
+                    continue
+                _copy_legacy_row(db, table, common, [row[name] for name in common],
+                                 key, identity)
 
-        table = "console_events"
-        exists = db.execute(
-            "SELECT 1 FROM cartridge.sqlite_master WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone()
-        if exists:
-            source_columns = _table_columns(db, "cartridge", table)
-            target_columns = _table_columns(db, "main", table)
+        if "console_events" in legacy_tables:
+            source_columns = _table_columns(db, "cartridge", "console_events")
+            target_columns = _table_columns(db, "main", "console_events")
             common = [name for name in target_columns
                       if name in source_columns and name != "id"]
-            if all(name in source_columns and name in target_columns
-                   for name in ("timestamp", "context", "event_type", "summary")):
-                has_id = "id" in source_columns
-                order = "id" if has_id else "timestamp"
-                source_rows = db.execute(
-                    f'SELECT * FROM cartridge."console_events" ORDER BY {order}'
-                )
-                for row in source_rows:
-                    source_id = row["id"] if has_id else None
-                    if source_id is not None:
-                        existing = db.execute(
-                            "SELECT * FROM main.console_events WHERE id=?", (source_id,)
-                        ).fetchone()
-                        if existing is not None:
-                            same = all(existing[name] == row[name] for name in common)
-                            if same:
-                                continue
-                            # Preserve both histories if the old ID collides with
-                            # a different event already recorded in the new DB.
-                            columns = common
-                            values = [row[name] for name in columns]
-                            quoted = ", ".join('"' + name.replace('"', '""') + '"'
-                                               for name in columns)
-                            placeholders = ", ".join("?" for _ in columns)
-                            db.execute(
-                                f'INSERT INTO main.console_events ({quoted}) '
-                                f'VALUES ({placeholders})', values
-                            )
-                            continue
-                        columns = ["id"] + common
-                        values = [source_id] + [row[name] for name in common]
-                    else:
-                        columns = common
-                        values = [row[name] for name in common]
-                    quoted = ", ".join('"' + name.replace('"', '""') + '"'
-                                       for name in columns)
-                    placeholders = ", ".join("?" for _ in columns)
-                    db.execute(
-                        f'INSERT INTO main.console_events ({quoted}) VALUES ({placeholders})',
-                        values,
-                    )
+            if not all(name in common for name in ("timestamp", "context", "event_type", "summary")):
+                raise sqlite3.IntegrityError("Legacy console_events lacks required event fields.")
+            has_id = "id" in source_columns
+            order = "id" if has_id else "timestamp"
+            # Allocate collision IDs beyond BOTH histories. A remap must not
+            # occupy an unrelated source event's original, unused ID.
+            largest_id = db.execute("SELECT COALESCE(MAX(id),0) FROM main.console_events").fetchone()[0]
+            if has_id:
+                invalid_id = db.execute(
+                    "SELECT 1 FROM cartridge.console_events WHERE id IS NOT NULL "
+                    "AND typeof(id)!='integer' LIMIT 1"
+                ).fetchone()
+                if invalid_id:
+                    raise sqlite3.IntegrityError("Legacy console event identity is not an integer.")
+                duplicate_id = db.execute(
+                    "SELECT id FROM cartridge.console_events WHERE id IS NOT NULL "
+                    "GROUP BY id HAVING COUNT(*)>1 LIMIT 1"
+                ).fetchone()
+                if duplicate_id:
+                    raise sqlite3.IntegrityError("Legacy console event identity is duplicated.")
+                source_max = db.execute("SELECT COALESCE(MAX(id),0) FROM cartridge.console_events").fetchone()[0]
+                largest_id = max(largest_id, source_max, 0)
+            for row in db.execute(f'SELECT * FROM cartridge.console_events ORDER BY {order}'):
+                source_id = row["id"] if has_id else None
+                if source_id is not None:
+                    existing = db.execute(
+                        "SELECT * FROM main.console_events WHERE id=?", (source_id,),
+                    ).fetchone()
+                    if existing is not None and all(existing[name] == row[name] for name in common):
+                        continue
+                else:
+                    existing = None
+                if source_id is None or existing is not None:
+                    if largest_id >= 9223372036854775807:
+                        raise sqlite3.IntegrityError("Legacy console event ID space is exhausted.")
+                    largest_id += 1
+                    destination_id = largest_id
+                else:
+                    destination_id = source_id
+                _copy_legacy_row(db, "console_events", ["id"] + common,
+                                 [destination_id] + [row[name] for name in common],
+                                 "id", destination_id)
 
-        db.execute(
+        completed_at = utc_now()
+        marker = db.execute(
             "INSERT INTO console_migrations(migration_key, completed_at) VALUES(?,?)",
-            (migration_key, utc_now()),
+            (migration_key, completed_at),
         )
+        actual_marker = db.execute(
+            "SELECT migration_key, completed_at FROM console_migrations WHERE migration_key=?",
+            (migration_key,),
+        ).fetchone()
+        if marker.rowcount != 1 or actual_marker is None or tuple(actual_marker) != (migration_key, completed_at):
+            raise sqlite3.IntegrityError("Legacy console migration marker was not recorded exactly.")
         db.commit()
-    except Exception:
+    except BaseException:
         db.rollback()
         raise
 
@@ -198,6 +229,15 @@ def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
 def connect() -> sqlite3.Connection:
     ensure_dirs()
     db = sqlite3.connect(STATE_DB_PATH, timeout=5.0)
+    try:
+        _initialize_connection(db)
+        return db
+    except BaseException:
+        db.close()
+        raise
+
+
+def _initialize_connection(db: sqlite3.Connection) -> None:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
     # Cartridge insertion/ejection updates the attached gameboy.db and the
@@ -208,7 +248,6 @@ def connect() -> sqlite3.Connection:
     # WAL database cannot be safely switched (for example, active readers).
     main_mode = db.execute("PRAGMA main.journal_mode=DELETE").fetchone()[0]
     if main_mode.lower() != "delete":
-        db.close()
         raise sqlite3.OperationalError(
             f"Console state journal remains {main_mode}; cross-file commit is unsafe"
         )
@@ -217,7 +256,6 @@ def connect() -> sqlite3.Connection:
     db.execute("ATTACH DATABASE ? AS cartridge", (str(DB_PATH),))
     cartridge_mode = db.execute("PRAGMA cartridge.journal_mode=DELETE").fetchone()[0]
     if cartridge_mode.lower() != "delete":
-        db.close()
         raise sqlite3.OperationalError(
             f"Cartridge journal remains {cartridge_mode}; cross-file commit is unsafe"
         )
@@ -314,11 +352,10 @@ def connect() -> sqlite3.Connection:
         if name not in columns:
             db.execute(f"ALTER TABLE console_events ADD COLUMN {name} {declaration}")
     # Import old combined-database state before creating a default state row.
-    # If State/console_state.db already has a real row, INSERT OR IGNORE preserves it.
+    # An existing destination state row remains authoritative.
     _migrate_legacy_combined_database(db)
     db.execute("INSERT OR IGNORE INTO console_state(id, power_state) VALUES (1, 'off')")
     db.commit()
-    return db
 
 
 def event_payload(db: sqlite3.Connection, event_id: int) -> tuple | None:

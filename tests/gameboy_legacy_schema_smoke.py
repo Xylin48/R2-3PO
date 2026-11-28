@@ -53,6 +53,9 @@ def main() -> int:
             VALUES (1, '2023-01-01T00:00:00+00:00', 'system', 'legacy_combined_boot',
                     'legacy combined event retained', 'source database history');
             INSERT INTO console_events(id, timestamp, context, event_type, summary, details)
+            VALUES (2, '2023-01-01T01:00:00+00:00', 'system', 'legacy_combined_event_2',
+                    'legacy event with a non-colliding adjacent ID', 'source database history');
+            INSERT INTO console_events(id, timestamp, context, event_type, summary, details)
             VALUES (7, '2023-01-02T00:00:00+00:00', 'system', 'legacy_combined_event_7',
                     'legacy event with non-colliding ID', 'source database history');
 
@@ -124,8 +127,14 @@ def main() -> int:
             assert combined_event["summary"] == "legacy combined event retained"
             assert combined_event["verified"] == 0 and combined_event["life_log_synced"] == 0
             assert db.execute(
-                "SELECT COUNT(*) FROM console_events WHERE event_type='legacy_combined_event_7'"
-            ).fetchone()[0] == 1
+                "SELECT id FROM console_events WHERE event_type='legacy_combined_event_7'"
+            ).fetchone()[0] == 7
+            assert db.execute(
+                "SELECT id FROM console_events WHERE event_type='legacy_combined_event_2'"
+            ).fetchone()[0] == 2
+            assert db.execute(
+                "SELECT id FROM console_events WHERE event_type='legacy_combined_boot'"
+            ).fetchone()[0] > 7
 
 
             old_cartridge = db.execute(
@@ -226,6 +235,55 @@ def main() -> int:
                 assert migrated.execute(
                     "SELECT count(*) FROM cartridge.console_events"
                 ).fetchone()[0] == 2
+
+    # Ignored/rewritten target rows and a rewritten migration marker must
+    # roll back the entire import, preserving both source and target history.
+    for trigger in (
+        "CREATE TRIGGER break_import BEFORE INSERT ON console_events "
+        "BEGIN SELECT RAISE(IGNORE); END",
+        "CREATE TRIGGER break_import AFTER INSERT ON console_events "
+        "BEGIN UPDATE console_events SET summary='rewritten' WHERE id=NEW.id; END",
+        "CREATE TRIGGER break_import BEFORE INSERT ON cartridge_inventory "
+        "BEGIN SELECT RAISE(IGNORE); END",
+        "CREATE TRIGGER break_import AFTER INSERT ON console_migrations "
+        "BEGIN UPDATE console_migrations SET completed_at='wrong'; END",
+    ):
+        with tempfile.TemporaryDirectory(prefix="r2-gameboy-migration-rollback-") as temp:
+            device = Path(temp) / "device"
+            os.environ["R2_GAMEBOY_ROOT"] = str(device)
+            os.environ["R2_GAMEBOY_DB"] = str(device / "gameboy.db")
+            spec = importlib.util.spec_from_file_location("r2_gameboy_rollback", CONSOLE)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            with closing(module.connect()) as target:
+                target.execute(trigger)
+                target.commit()
+            with closing(sqlite3.connect(device / "gameboy.db")) as source:
+                source.executescript("""
+                    CREATE TABLE console_events (
+                        id INTEGER PRIMARY KEY, timestamp TEXT, context TEXT,
+                        event_type TEXT, summary TEXT
+                    );
+                    INSERT INTO console_events VALUES (3,'2020-01-01','system','legacy','exact event');
+                    CREATE TABLE cartridge_inventory (filename TEXT PRIMARY KEY);
+                    INSERT INTO cartridge_inventory VALUES ('Old.gba');
+                """)
+            try:
+                with closing(module.connect()):
+                    raise AssertionError("Corrupt legacy import was accepted")
+            except sqlite3.IntegrityError:
+                pass
+            with closing(sqlite3.connect(device / "State" / "console_state.db")) as target:
+                assert target.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == 0
+                assert target.execute("SELECT COUNT(*) FROM cartridge_inventory").fetchone()[0] == 0
+                assert target.execute("SELECT COUNT(*) FROM console_migrations").fetchone()[0] == 0
+                target.execute("DROP TRIGGER break_import")
+                target.commit()
+            with closing(module.connect()) as migrated:
+                assert tuple(migrated.execute("SELECT id,summary FROM console_events").fetchone()) == (3, "exact event")
+                assert migrated.execute("SELECT filename FROM cartridge_inventory").fetchone()[0] == "Old.gba"
+                assert migrated.execute("SELECT COUNT(*) FROM console_migrations").fetchone()[0] == 1
 
     print("Legacy Game Boy cartridge/state schemas preserve existing data and accept new writes.")
     return 0
