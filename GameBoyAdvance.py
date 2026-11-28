@@ -19,7 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -320,21 +320,33 @@ def connect() -> sqlite3.Connection:
     return db
 
 
+def event_payload(db: sqlite3.Connection, event_id: int) -> tuple | None:
+    row = db.execute(
+        "SELECT timestamp,context,event_type,summary,details,game_title,session_id,"
+        "evidence_source,verified,life_log_synced FROM console_events WHERE id=?",
+        (event_id,),
+    ).fetchone()
+    return tuple(row) if row is not None else None
+
+
 def record_event(db: sqlite3.Connection, context: str, event_type: str,
                  summary: str, details: str | None = None,
                  game_title: str | None = None, session_id: str | None = None,
                  evidence_source: str | None = None, verified: bool = False,
-                 *, commit: bool = True) -> None:
-    inserted = db.execute(
-        "INSERT INTO console_events(timestamp,context,event_type,summary,details,game_title,session_id,"
-        "evidence_source,verified,life_log_synced) VALUES(?,?,?,?,?,?,?,?,?,0)",
-        (utc_now(), context, event_type, summary, details, game_title, session_id,
-         evidence_source, 1 if verified else 0),
-    )
-    if inserted.rowcount != 1:
-        raise sqlite3.IntegrityError(f"Console event {event_type} was not recorded.")
-    if commit:
-        db.commit()
+                 *, commit: bool = True) -> int:
+    expected = (utc_now(), context, event_type, summary, details, game_title,
+                session_id, evidence_source, 1 if verified else 0, 0)
+    with (db if commit else nullcontext()):
+        inserted = db.execute(
+            "INSERT INTO console_events(timestamp,context,event_type,summary,details,game_title,session_id,"
+            "evidence_source,verified,life_log_synced) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            expected,
+        )
+        event_id = inserted.lastrowid
+        if (inserted.rowcount != 1 or event_id is None or event_id <= 0
+                or event_payload(db, event_id) != expected):
+            raise sqlite3.IntegrityError(f"Console event {event_type} was not recorded exactly.")
+    return event_id
 
 
 def record_verified_game_event(db: sqlite3.Connection, event_type: str,
@@ -355,10 +367,9 @@ def record_verified_game_event(db: sqlite3.Connection, event_type: str,
             raise ValueError("Event summary/details are empty or too long.")
         if not evidence_source or not evidence_source.startswith("adapter:"):
             raise ValueError("A game adapter evidence source is required.")
-        record_event(db, "virtual", event_type, summary, details,
-                     row["cartridge_title"], row["session_id"],
-                     evidence_source=evidence_source, verified=True)
-        return int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return record_event(db, "virtual", event_type, summary, details,
+                            row["cartridge_title"], row["session_id"],
+                            evidence_source=evidence_source, verified=True)
 
 
 def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -377,13 +388,20 @@ def pending_verified_events(db: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def acknowledge_verified_event(db: sqlite3.Connection, event_id: int) -> bool:
-    cursor = db.execute(
-        "UPDATE console_events SET life_log_synced=1 "
-        "WHERE id=? AND context='virtual' AND verified=1 AND life_log_synced=0",
-        (event_id,),
-    )
-    db.commit()
-    return cursor.rowcount == 1
+    with db:
+        if not db.in_transaction:
+            db.execute("BEGIN IMMEDIATE")
+        previous = event_payload(db, event_id)
+        if previous is None or previous[1] != "virtual" or previous[-2:] != (1, 0):
+            return False
+        cursor = db.execute(
+            "UPDATE console_events SET life_log_synced=1 "
+            "WHERE id=? AND context='virtual' AND verified=1 AND life_log_synced=0",
+            (event_id,),
+        )
+        if cursor.rowcount != 1 or event_payload(db, event_id) != previous[:-1] + (1,):
+            raise sqlite3.IntegrityError("Verified event acknowledgement was not recorded exactly.")
+    return True
 
 
 def process_start_ticks(pid: int) -> int | None:

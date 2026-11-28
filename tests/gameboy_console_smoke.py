@@ -259,6 +259,54 @@ def main() -> int:
         assert pending[0]["context"] == "virtual"
         assert pending[0]["verified"] is True
         assert pending[0]["evidence_source"] == "adapter:test-mario"
+        # A successful SQLite step is not proof that the exact adapter event
+        # survived its trigger or that acknowledgement changed only delivery state.
+        original_event = module.event_payload(device_db, event_id)
+        for mutation in (
+            "UPDATE console_events SET life_log_synced=0 WHERE id=NEW.id;",
+            "UPDATE console_events SET summary='rewritten' WHERE id=NEW.id;",
+            "UPDATE console_events SET evidence_source='adapter:other' WHERE id=NEW.id;",
+            "DELETE FROM console_events WHERE id=NEW.id;",
+        ):
+            device_db.execute(
+                "CREATE TRIGGER mutate_ack AFTER UPDATE OF life_log_synced ON console_events "
+                f"BEGIN {mutation} END"
+            )
+            try:
+                module.acknowledge_verified_event(device_db, event_id)
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("Rewritten acknowledgement was accepted")
+            finally:
+                device_db.execute("DROP TRIGGER mutate_ack")
+            assert module.event_payload(device_db, event_id) == original_event
+            assert module.pending_verified_events(device_db) == pending
+
+        before_count = device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0]
+        for mutation in (
+            "UPDATE console_events SET summary='rewritten' WHERE id=NEW.id;",
+            "UPDATE console_events SET verified=0 WHERE id=NEW.id;",
+            "UPDATE console_events SET life_log_synced=1 WHERE id=NEW.id;",
+            "DELETE FROM console_events WHERE id=NEW.id;",
+        ):
+            device_db.execute(
+                "CREATE TRIGGER mutate_event AFTER INSERT ON console_events "
+                f"WHEN NEW.event_type='coin_collected' BEGIN {mutation} END"
+            )
+            try:
+                module.record_verified_game_event(
+                    device_db, "coin_collected", "Another coin.", "Counter increased.",
+                    "adapter:test-mario",
+                )
+            except sqlite3.IntegrityError:
+                pass
+            else:
+                raise AssertionError("Rewritten adapter event was accepted")
+            finally:
+                device_db.execute("DROP TRIGGER mutate_event")
+            assert device_db.execute("SELECT COUNT(*) FROM console_events").fetchone()[0] == before_count
+            assert module.pending_verified_events(device_db) == pending
         assert module.acknowledge_verified_event(device_db, event_id) is True
         assert module.pending_verified_events(device_db) == []
         device_db.close()
