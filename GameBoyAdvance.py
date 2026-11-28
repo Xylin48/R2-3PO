@@ -433,8 +433,31 @@ def state_row(db: sqlite3.Connection) -> sqlite3.Row:
         "FROM console_state AS s CROSS JOIN cartridge.cartridge_slot AS c "
         "WHERE s.id=1 AND c.id=1"
     ).fetchone()
-    assert row is not None
+    if row is None:
+        raise sqlite3.IntegrityError("Console state or cartridge slot is missing.")
     return row
+
+
+def require_console_state(db: sqlite3.Connection, previous: sqlite3.Row,
+                          **changes: Any) -> None:
+    fields = ("power_state", "emulator_pid", "emulator_start_ticks",
+              "game_started_at", "session_id", "cartridge_path",
+              "cartridge_title", "cartridge_inserted_at")
+    expected = {key: previous[key] for key in fields}
+    expected.update(changes)
+    actual = state_row(db)
+    if any(actual[key] != value for key, value in expected.items()):
+        raise sqlite3.IntegrityError("Console state transition was not recorded exactly.")
+
+
+def require_inventory_location(db: sqlite3.Connection, filename: str,
+                               location: str, updated_at: str) -> None:
+    actual = db.execute(
+        "SELECT filename,location,updated_at FROM cartridge_inventory "
+        "WHERE filename=? COLLATE NOCASE", (filename,),
+    ).fetchone()
+    if actual is None or tuple(actual) != (filename, location, updated_at):
+        raise sqlite3.IntegrityError("Cartridge location transition was not recorded exactly.")
 
 
 def reconcile(db: sqlite3.Connection) -> sqlite3.Row:
@@ -458,6 +481,8 @@ def reconcile(db: sqlite3.Connection) -> sqlite3.Row:
                 "Detected by checking the stored process ID and Linux process start time.",
                 title, session_id, commit=False,
             )
+            require_console_state(db, row, power_state="off", emulator_pid=None,
+                                  emulator_start_ticks=None, game_started_at=None, session_id=None)
     return state_row(db)
 
 
@@ -543,17 +568,21 @@ def move_cartridge(db: sqlite3.Connection, filename: str, location: str) -> dict
     if not filename or Path(filename).name != filename or filename in {".", ".."}:
         return {"ok": False, "message": "Use a cartridge filename, not a path.", **status_data(db)}
     sync_cartridge_inventory(db)
-    current = db.execute("SELECT location,title FROM cartridge_inventory WHERE filename=? COLLATE NOCASE", (filename,)).fetchone()
+    current = db.execute("SELECT filename,location,title FROM cartridge_inventory WHERE filename=? COLLATE NOCASE", (filename,)).fetchone()
     if current is None:
         return {"ok": False, "message": f"No known cartridge named '{filename}'.", **status_data(db)}
+    filename = current["filename"]
     if (CARTRIDGES / filename).is_symlink():
         return {"ok": False, "message": "A linked ROM is not a physical loose cartridge; its historical inventory record remains preserved.", **status_data(db)}
     slot = db.execute("SELECT rom_path FROM cartridge.cartridge_slot WHERE id=1").fetchone()
     if slot and slot["rom_path"] and Path(slot["rom_path"]).name.casefold() == filename.casefold():
         return {"ok": False, "message": "That cartridge is inserted. Eject it before moving it.", **status_data(db)}
+    updated_at = utc_now()
     with db:
-        db.execute("UPDATE cartridge_inventory SET location=?,updated_at=? WHERE filename=? COLLATE NOCASE", (destination, utc_now(), filename))
+        db.execute("UPDATE cartridge_inventory SET location=?,updated_at=? WHERE filename=? COLLATE NOCASE", (destination, updated_at, filename))
         record_event(db, "physical", "cartridge_moved", f"R2 put the {current['title']} cartridge in {destination}.", f"Filename={filename}; destination={destination}.", current["title"], commit=False)
+        require_inventory_location(db, filename, destination, updated_at)
+        require_console_state(db, row)
     return {"ok": True, "message": f"Moved {current['title']} cartridge to {destination}.", **status_data(db)}
 
 
@@ -670,6 +699,8 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
             record_event(db, "physical", "console_powered_on_empty",
                          "R2 powered on the Game Boy Advance with no cartridge inserted.",
                          commit=False)
+            require_console_state(db, row, power_state="on", emulator_pid=None,
+                                  emulator_start_ticks=None, game_started_at=None, session_id=None)
         return {"ok": True, "message": "Console powered on. The cartridge slot is empty; no emulator was launched.",
                 **status_data(db)}
     proc = None
@@ -704,12 +735,13 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
         ticks = process_start_ticks(proc.pid)
         if ticks is None:
             raise ValueError("mGBA started but its process identity could not be verified.")
+        started_at = utc_now()
         with db:
             updated = db.execute(
                 "UPDATE console_state SET power_state='on', emulator_pid=?, emulator_start_ticks=?, "
                 "game_started_at=?, session_id=? WHERE id=1 AND power_state='off' "
                 "AND EXISTS (SELECT 1 FROM cartridge.cartridge_slot WHERE id=1 AND rom_path=?)",
-                (proc.pid, ticks, utc_now(), session_id, cartridge),
+                (proc.pid, ticks, started_at, session_id, cartridge),
             )
             if updated.rowcount != 1:
                 raise sqlite3.IntegrityError("Console or cartridge changed while mGBA was starting.")
@@ -721,6 +753,9 @@ def power_on(db: sqlite3.Connection) -> dict[str, Any]:
                          f"An emulated game session began: {title}.",
                          "This is an in-game context; it is not a claim that game events are physical-world events.",
                          title, session_id, commit=False)
+            require_console_state(db, row, power_state="on", emulator_pid=proc.pid,
+                                  emulator_start_ticks=ticks, game_started_at=started_at,
+                                  session_id=session_id)
     except (OSError, ValueError, sqlite3.Error) as exc:
         message = str(exc)
         if proc is not None and proc.poll() is None:
@@ -801,6 +836,8 @@ def power_off(db: sqlite3.Connection) -> dict[str, Any]:
                          f"The emulated session for {title} ended when the console was powered off.",
                          "The console did not issue an in-game save command.",
                          title, session_id, commit=False)
+        require_console_state(db, row, power_state="off", emulator_pid=None,
+                              emulator_start_ticks=None, game_started_at=None, session_id=None)
     return {"ok": True, "message": "Console powered off. No in-game save command or save state was issued.",
             **status_data(db)}
 
@@ -818,21 +855,25 @@ def insert_cartridge(db: sqlite3.Connection, name: str) -> dict[str, Any]:
     except (ValueError, OSError) as exc:
         return {"ok": False, "message": str(exc), **status_data(db)}
     sync_cartridge_inventory(db)
-    inventory = db.execute("SELECT location FROM cartridge_inventory WHERE filename=? COLLATE NOCASE", (path.name,)).fetchone()
-    if inventory is None:
-        return {"ok": False, "message": "Cartridge is not registered in R2's inventory.", **status_data(db)}
+    inventory = db.execute("SELECT filename,location FROM cartridge_inventory WHERE filename=? COLLATE NOCASE", (path.name,)).fetchone()
+    if inventory is None or inventory["filename"] != path.name:
+        return {"ok": False, "message": "Cartridge is not registered under its exact filename in R2's inventory.", **status_data(db)}
     if inventory["location"] != "pockets":
         return {"ok": False, "message": f"The {read_rom_title(path)} cartridge is in {inventory['location']}, not R2's pockets. Retrieve it first.", **status_data(db)}
     title = read_rom_title(path)
+    inserted_at = utc_now()
     with db:
         db.execute(
             "UPDATE cartridge.cartridge_slot SET rom_path=?, rom_title=?, inserted_at=? WHERE id=1",
-            (str(path), title, utc_now()),
+            (str(path), title, inserted_at),
         )
-        db.execute("UPDATE cartridge_inventory SET location='slot',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), path.name))
+        db.execute("UPDATE cartridge_inventory SET location='slot',updated_at=? WHERE filename=? COLLATE NOCASE", (inserted_at, path.name))
         record_event(db, "physical", "cartridge_inserted",
                      f"R2 inserted the {title} cartridge.",
                      f"ROM filename: {path.name}", title, commit=False)
+        require_inventory_location(db, path.name, "slot", inserted_at)
+        require_console_state(db, row, cartridge_path=str(path), cartridge_title=title,
+                              cartridge_inserted_at=inserted_at)
     return {"ok": True, "message": f"Inserted cartridge: {title}.",
             **status_data(db)}
 
@@ -847,10 +888,15 @@ def eject_cartridge(db: sqlite3.Connection) -> dict[str, Any]:
     if not row["cartridge_path"]:
         return {"ok": False, "message": "The cartridge slot is already empty.", **status_data(db)}
     filename = Path(row["cartridge_path"]).name
+    sync_cartridge_inventory(db)
+    updated_at = utc_now()
     with db:
         db.execute("UPDATE cartridge.cartridge_slot SET rom_path=NULL, rom_title=NULL, inserted_at=NULL WHERE id=1")
-        db.execute("UPDATE cartridge_inventory SET location='pockets',updated_at=? WHERE filename=? COLLATE NOCASE", (utc_now(), filename))
+        db.execute("UPDATE cartridge_inventory SET location='pockets',updated_at=? WHERE filename=? COLLATE NOCASE", (updated_at, filename))
         record_event(db, "physical", "cartridge_ejected", f"R2 removed the {title} cartridge and is carrying it in his pockets.", f"Filename={filename}; destination=pockets.", title, commit=False)
+        require_inventory_location(db, filename, "pockets", updated_at)
+        require_console_state(db, row, cartridge_path=None, cartridge_title=None,
+                              cartridge_inserted_at=None)
     return {"ok": True, "message": f"Ejected {title}. The cartridge slot is now empty.",
             **status_data(db)}
 

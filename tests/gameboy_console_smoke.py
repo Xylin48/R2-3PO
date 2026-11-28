@@ -73,6 +73,28 @@ def reject_event_and_run(root: Path, emulator: Path, event_type: str,
             state_db.execute("DROP TRIGGER reject_event")
 
 
+def reject_rewritten_state(root: Path, emulator: Path, database: Path,
+                           trigger: str, *args: str) -> None:
+    with sqlite3.connect(database) as db:
+        db.execute(trigger)
+    try:
+        env = os.environ.copy()
+        env["R2_GAMEBOY_ROOT"] = str(root)
+        env["R2_MGBA_EXECUTABLE"] = str(emulator)
+        result = subprocess.run(
+            [sys.executable, str(CONSOLE), "--json", *args],
+            text=True, capture_output=True, env=env, timeout=10,
+        )
+        assert result.returncode != 0, (args, result.stdout)
+        assert "transition was not recorded exactly" in result.stdout + result.stderr, (
+            args, result.stdout, result.stderr
+        )
+    finally:
+        with sqlite3.connect(database) as db:
+            db.execute("DROP TRIGGER rewrite_state")
+
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="r2-gameboy-test-") as temp:
         root = Path(temp) / "device"
@@ -105,6 +127,13 @@ def main() -> int:
             assert state_db.execute(
                 "SELECT power_state FROM console_state WHERE id=1"
             ).fetchone()[0] == "off"
+
+        # Rewriting the power state after its UPDATE must roll back the event.
+        reject_rewritten_state(root, emulator, root / "State" / "console_state.db",
+                               "CREATE TRIGGER rewrite_state AFTER UPDATE OF power_state ON console_state "
+                               "WHEN NEW.power_state='on' BEGIN UPDATE console_state SET power_state='off' WHERE id=1; END",
+                               "power", "on")
+        assert run(root, emulator, "status")["power_state"] == "off"
 
         # Make a small valid-looking loose GBA ROM with a title in its header.
         rom = bytearray(0x200)
@@ -165,6 +194,11 @@ def main() -> int:
             assert state_db.execute(
                 "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
             ).fetchone()[0] == "pockets"
+        reject_rewritten_state(root, emulator, root / "State" / "console_state.db",
+                               "CREATE TRIGGER rewrite_state AFTER UPDATE OF location ON cartridge_inventory "
+                               "WHEN NEW.location='shelf' BEGIN UPDATE cartridge_inventory SET location='box' WHERE filename=NEW.filename; END",
+                               "move", "Mario.gba", "shelf")
+        assert next(item for item in run(root, emulator, "list") if item["filename"] == "Mario.gba")["location"] == "pockets"
         moved = run(root, emulator, "move", "Mario.gba", "shelf")
         assert moved["ok"] is True
         result = run(root, emulator, "insert", "Mario.gba", expect_ok=False)
@@ -181,6 +215,12 @@ def main() -> int:
             assert state_db.execute(
                 "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
             ).fetchone()[0] == "pockets"
+        reject_rewritten_state(root, emulator, root / "gameboy.db",
+                               "CREATE TRIGGER rewrite_state AFTER UPDATE OF rom_path ON cartridge_slot "
+                               "WHEN NEW.rom_path IS NOT NULL BEGIN UPDATE cartridge_slot SET rom_title='wrong' WHERE id=1; END",
+                               "insert", "Mario.gba")
+        assert run(root, emulator, "status")["cartridge_inserted"] is False
+        assert next(item for item in run(root, emulator, "list") if item["filename"] == "Mario.gba")["location"] == "pockets"
         result = run(root, emulator, "insert", "Mario.gba")
         assert result["cartridge_inserted"] is True
         assert result["cartridge_title"].strip() == "TEST MARIO"
@@ -333,6 +373,12 @@ def main() -> int:
             assert state_db.execute(
                 "SELECT location FROM cartridge_inventory WHERE filename='Mario.gba'"
             ).fetchone()[0] == "slot"
+        reject_rewritten_state(root, emulator, root / "gameboy.db",
+                               "CREATE TRIGGER rewrite_state AFTER UPDATE OF rom_path ON cartridge_slot "
+                               "WHEN NEW.rom_path IS NULL BEGIN UPDATE cartridge_slot SET rom_path=OLD.rom_path WHERE id=1; END",
+                               "eject")
+        assert run(root, emulator, "status")["cartridge_inserted"] is True
+        assert next(item for item in run(root, emulator, "list") if item["filename"] == "Mario.gba")["location"] == "slot"
         run(root, emulator, "eject")
         result = run(root, emulator, "status")
         assert result["power_state"] == "off"
