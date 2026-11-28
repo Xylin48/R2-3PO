@@ -2276,6 +2276,59 @@ int64_t r2_log_world_event(const char *object_or_device,
 /* ------------------------------------------------------------
  * GENERIC ACTIVITY SESSION TRACKER
  * ------------------------------------------------------------ */
+/* The event and duration-bearing row are one receipt. Verify both before
+ * committing, including the original start identity on end. */
+static int log_activity_receipt_matches_locked(
+    int64_t activity_id, const char *key, const char *name,
+    const char *started_utc, const char *started_local,
+    sqlite3_int64 started_epoch, sqlite3_int64 started_monotonic,
+    int64_t start_event_id, int64_t end_event_id,
+    const char *ended_utc, const char *ended_local, sqlite3_int64 ended_epoch,
+    sqlite3_int64 duration_ms, const char *state, const char *reason,
+    const char *summary, const char *details)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(log_db,
+        "SELECT 1 FROM r2_log_activity_sessions a "
+        "JOIN r2_log_events e ON e.id=?1 "
+        "WHERE a.id=?2 AND a.activity_key COLLATE BINARY=?3 "
+        "AND a.activity_name COLLATE BINARY=?4 "
+        "AND a.started_utc COLLATE BINARY=?5 AND a.started_local COLLATE BINARY=?6 "
+        "AND a.started_epoch=?7 AND a.start_monotonic_ms=?8 AND a.start_event_id=?9 "
+        "AND a.end_event_id IS ?10 AND a.ended_utc COLLATE BINARY IS ?11 "
+        "AND a.ended_local COLLATE BINARY IS ?12 AND a.ended_epoch IS ?13 "
+        "AND a.duration_ms IS ?14 AND a.last_verified_state COLLATE BINARY IS ?15 "
+        "AND a.stop_reason COLLATE BINARY IS ?16 AND a.status=?17 "
+        "AND e.category='media' AND e.event_type=?18 AND e.summary COLLATE BINARY=?19 "
+        "AND e.details COLLATE BINARY=?20 AND e.source COLLATE BINARY=?3 "
+        "AND EXISTS (SELECT 1 FROM r2_log_events WHERE id=a.start_event_id)",
+        -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 1, end_event_id > 0 ? end_event_id : start_event_id);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 2, activity_id);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 3, key);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 4, name);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 5, started_utc);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 6, started_local);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 7, started_epoch);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 8, started_monotonic);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(st, 9, start_event_id);
+    if (rc == SQLITE_OK) rc = end_event_id > 0 ? sqlite3_bind_int64(st, 10, end_event_id) : sqlite3_bind_null(st, 10);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 11, ended_utc);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 12, ended_local);
+    if (rc == SQLITE_OK) rc = end_event_id > 0 ? sqlite3_bind_int64(st, 13, ended_epoch) : sqlite3_bind_null(st, 13);
+    if (rc == SQLITE_OK) rc = duration_ms >= 0 ? sqlite3_bind_int64(st, 14, duration_ms) : sqlite3_bind_null(st, 14);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 15, state);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 16, reason);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 17, end_event_id > 0 ? "ended" : "active");
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 18, end_event_id > 0 ? "activity_ended" : "activity_started");
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 19, summary);
+    if (rc == SQLITE_OK) rc = bind_optional_text(st, 20, details);
+    int matches = rc == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW &&
+        sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return matches;
+}
+
 int64_t r2_log_activity_start(const char *activity_key,
                               const char *activity_name,
                               const char *details)
@@ -2322,6 +2375,8 @@ int64_t r2_log_activity_start(const char *activity_key,
         summary, event_details, activity_key);
 
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
+    sqlite3_int64 started_epoch = (sqlite3_int64)time(NULL);
+    sqlite3_int64 started_monotonic = (sqlite3_int64)r2_log_elapsed_ms();
     rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
         "INSERT INTO r2_log_activity_sessions "
         "(activity_key,activity_name,started_utc,started_local,started_epoch,"
@@ -2331,12 +2386,17 @@ int64_t r2_log_activity_start(const char *activity_key,
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 2, activity_name, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 3, utc, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 4, local, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 5, (sqlite3_int64)time(NULL));
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 6, (sqlite3_int64)r2_log_elapsed_ms());
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 5, started_epoch);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 6, started_monotonic);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int64(statement, 7, (sqlite3_int64)event_id);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    int64_t activity_id = saved ? sqlite3_last_insert_rowid(log_db) : -1;
+    saved = saved && activity_id > 0 && log_activity_receipt_matches_locked(
+        activity_id, activity_key, activity_name, utc, local, started_epoch,
+        started_monotonic, event_id, 0, NULL, NULL, 0, -1, NULL, NULL,
+        summary, event_details);
     int result = log_finish_write(saved);
     pthread_mutex_unlock(&log_lock);
     if (result != 0) return -1;
@@ -2354,13 +2414,14 @@ int64_t r2_log_activity_end(const char *activity_key,
                             const char *details)
 {
     sqlite3_stmt *statement = NULL;
-    char *activity_name = NULL, *start_local = NULL;
+    char *activity_name = NULL, *start_local = NULL, *start_utc = NULL;
     char utc[40], local[48];
     char *event_details = NULL, *summary = NULL;
     const char *state_text = valid_text(last_verified_state) ? last_verified_state : "unknown";
     const char *reason_text = valid_text(stop_reason) ? stop_reason : "unknown";
     sqlite3_int64 activity_id = 0;
     sqlite3_int64 started_epoch = 0, started_monotonic = 0, start_session = 0;
+    sqlite3_int64 start_event_id = 0;
     sqlite3_int64 ended_epoch = (sqlite3_int64)time(NULL);
     sqlite3_int64 duration_ms = -1;
     int rc;
@@ -2374,21 +2435,25 @@ int64_t r2_log_activity_end(const char *activity_key,
         return -1;
     }
     rc = sqlite3_prepare_v2(log_db,
-        "SELECT a.activity_name,a.started_local,a.started_epoch,a.start_monotonic_ms,e.session_id,a.id "
+        "SELECT a.activity_name,a.started_local,a.started_utc,a.started_epoch,"
+        "a.start_monotonic_ms,e.session_id,a.id,a.start_event_id "
         "FROM r2_log_activity_sessions a LEFT JOIN r2_log_events e ON e.id=a.start_event_id "
         "WHERE a.activity_key=? AND a.status='active' ORDER BY a.id DESC LIMIT 1", -1, &statement, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(statement, 1, activity_key, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     if (rc == SQLITE_ROW) {
-        const char *fields[2];
-        if (log_read_text_fields(statement, 0, 2, fields) == 0) {
-            activity_name = strdup(fields[0] ? fields[0] : "unknown activity");
-            start_local = strdup(fields[1] ? fields[1] : "unknown");
+        const char *fields[3];
+        if (log_read_text_fields(statement, 0, 3, fields) == 0 &&
+            fields[0] && fields[1] && fields[2]) {
+            activity_name = strdup(fields[0]);
+            start_local = strdup(fields[1]);
+            start_utc = strdup(fields[2]);
         }
-        started_epoch = sqlite3_column_int64(statement, 2);
-        started_monotonic = sqlite3_column_int64(statement, 3);
-        start_session = sqlite3_column_int64(statement, 4);
-        activity_id = sqlite3_column_int64(statement, 5);
+        started_epoch = sqlite3_column_int64(statement, 3);
+        started_monotonic = sqlite3_column_int64(statement, 4);
+        start_session = sqlite3_column_int64(statement, 5);
+        activity_id = sqlite3_column_int64(statement, 6);
+        start_event_id = sqlite3_column_int64(statement, 7);
     }
     sqlite3_finalize(statement);
     statement = NULL;
@@ -2403,7 +2468,7 @@ int64_t r2_log_activity_end(const char *activity_key,
     }
 
     int64_t event_id = -1;
-    if (activity_id > 0 && activity_name && start_local &&
+    if (activity_id > 0 && start_event_id > 0 && activity_name && start_local && start_utc &&
         asprintf(&summary, "R2 ended activity '%s'; last verified state: %s; stop reason: %s.",
                  activity_name, state_text, reason_text) >= 0 &&
         asprintf(&event_details,
@@ -2416,10 +2481,6 @@ int64_t r2_log_activity_end(const char *activity_key,
         event_id = log_insert_event_locked(R2_LOG_MEDIA, "activity_ended",
                                            summary, event_details, activity_key);
     }
-    free(summary);
-    free(event_details);
-    free(activity_name);
-    free(start_local);
     timestamp_pair(utc, sizeof(utc), local, sizeof(local));
     rc = event_id <= 0 ? SQLITE_ERROR : sqlite3_prepare_v2(log_db,
         "UPDATE r2_log_activity_sessions SET ended_utc=?,ended_local=?,ended_epoch=?,"
@@ -2441,7 +2502,17 @@ int64_t r2_log_activity_end(const char *activity_key,
     if (rc == SQLITE_OK) rc = sqlite3_step(statement);
     int saved = rc == SQLITE_DONE && sqlite3_changes(log_db) == 1;
     sqlite3_finalize(statement);
+    saved = saved && log_activity_receipt_matches_locked(
+        activity_id, activity_key, activity_name, start_utc, start_local,
+        started_epoch, started_monotonic, start_event_id, event_id,
+        utc, local, ended_epoch, duration_ms, state_text, reason_text,
+        summary, event_details);
     int result = log_finish_write(saved);
+    free(summary);
+    free(event_details);
+    free(activity_name);
+    free(start_local);
+    free(start_utc);
     pthread_mutex_unlock(&log_lock);
     return result == 0 ? event_id : -1;
 }

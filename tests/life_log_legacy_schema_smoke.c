@@ -246,6 +246,45 @@ int main(void)
     assert(r2_log_location_transition("home", 1) < 0);
     assert(welcome_attempts == 1);
     assert(scalar(writer, "SELECT welcome_pending FROM r2_log_location_state WHERE id=1;") == 1);
+    /* Successful steps can still rewrite an activity receipt. Both event and
+       session must survive unchanged, or the entire transaction rolls back. */
+    event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
+    const char *start_mutations[] = {
+        "CREATE TRIGGER mutate_activity AFTER INSERT ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_activity_sessions SET activity_name='changed' WHERE id=NEW.id; END;",
+        "CREATE TRIGGER mutate_activity AFTER INSERT ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_events SET summary='changed' WHERE id=NEW.start_event_id; END;",
+        "CREATE TRIGGER mutate_activity AFTER INSERT ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_activity_sessions SET duration_ms=1 WHERE id=NEW.id; END;"
+    };
+    for (size_t i = 0; i < sizeof(start_mutations)/sizeof(start_mutations[0]); ++i) {
+        assert(sqlite3_exec(writer, start_mutations[i], NULL, NULL, NULL) == SQLITE_OK);
+        assert(r2_log_activity_start("receipt-fixture", "Exact activity", "Exact details") < 0);
+        assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events;") == event_count);
+        assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                              "WHERE activity_key='receipt-fixture';") == 0);
+        assert(sqlite3_exec(writer, "DROP TRIGGER mutate_activity;", NULL, NULL, NULL) == SQLITE_OK);
+    }
+    assert(r2_log_activity_start("receipt-fixture", "Exact activity", "Exact details") > 0);
+    event_count = scalar(writer, "SELECT COUNT(*) FROM r2_log_events;");
+    const char *end_mutations[] = {
+        "CREATE TRIGGER mutate_activity AFTER UPDATE OF end_event_id ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_activity_sessions SET status='active' WHERE id=NEW.id; END;",
+        "CREATE TRIGGER mutate_activity AFTER UPDATE OF end_event_id ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_activity_sessions SET started_epoch=1 WHERE id=NEW.id; END;",
+        "CREATE TRIGGER mutate_activity AFTER UPDATE OF end_event_id ON r2_log_activity_sessions "
+        "BEGIN UPDATE r2_log_events SET details='changed' WHERE id=NEW.end_event_id; END;"
+    };
+    for (size_t i = 0; i < sizeof(end_mutations)/sizeof(end_mutations[0]); ++i) {
+        assert(sqlite3_exec(writer, end_mutations[i], NULL, NULL, NULL) == SQLITE_OK);
+        assert(r2_log_activity_end("receipt-fixture", "ready", "fixture", "Exact end details") < 0);
+        assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_events;") == event_count);
+        assert(scalar(writer, "SELECT COUNT(*) FROM r2_log_activity_sessions "
+                              "WHERE activity_key='receipt-fixture' AND status='active' AND end_event_id IS NULL;") == 1);
+        assert(sqlite3_exec(writer, "DROP TRIGGER mutate_activity;", NULL, NULL, NULL) == SQLITE_OK);
+    }
+    assert(r2_log_activity_end("receipt-fixture", "ready", "fixture", "Exact end details") > 0);
+
     assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) > 0);
     assert(r2_log_activity_start("restart-fixture", "Restart fixture", NULL) < 0);
     assert(sqlite3_exec(writer,
