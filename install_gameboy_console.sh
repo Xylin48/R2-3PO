@@ -7,19 +7,47 @@ POCKET_DIR="${R2_POCKET_DIR:-/home/x/R2_Home/Pockets}"
 DESKTOP_DIR="${R2_DESKTOP_DIR:-/home/x/.local/share/applications}"
 MGBA_PATH="${R2_MGBA_EXECUTABLE:-/usr/games/mgba-qt}"
 
-mkdir -p "$TARGET_DIR/Cartridges" "$TARGET_DIR/Saves" "$TARGET_DIR/State" "$POCKET_DIR" "$DESKTOP_DIR"
+# A launcher must use an absolute executable path even if installation was
+# requested relative to the invoking shell's working directory.
+TARGET_DIR="$(python3 - "$TARGET_DIR" <<'PY'
+import sys
+from pathlib import Path
+print(Path(sys.argv[1]).resolve())
+PY
+)"
+LAUNCHER_TMP="$(mktemp)"
+trap 'rm -f -- "$LAUNCHER_TMP"' EXIT
+# Render the desktop file before touching the installed device. Desktop Entry
+# string escaping and Exec-token quoting are separate from shell/sed syntax.
+python3 - "$SOURCE_DIR/GameBoyAdvance.desktop" "$TARGET_DIR/GameBoyAdvance" "$LAUNCHER_TMP" <<'PY'
+import sys
+from pathlib import Path
+template, executable, output = sys.argv[1:]
+if "=" in executable or any(not 32 <= ord(ch) <= 126 for ch in executable):
+    raise SystemExit("Game Boy launcher path cannot be represented in a Desktop Entry Exec executable.")
+reserved = " \"'\\><~|&;$*?#()\x60"
+value = executable.replace("%", "%%")
+if any(ch in reserved for ch in executable):
+    value = '"' + "".join("\\" + ch if ch in '"\\$\x60' else ch for ch in value) + '"'
+    value = value.replace("\\", "\\\\")
+lines = Path(template).read_text(encoding="utf-8").splitlines()
+if sum(line.startswith("Exec=") for line in lines) != 1:
+    raise SystemExit("Game Boy desktop template must have exactly one Exec entry.")
+Path(output).write_text("\n".join("Exec=" + value if line.startswith("Exec=") else line
+                                  for line in lines) + "\n", encoding="utf-8")
+PY
+
+mkdir -p -- "$TARGET_DIR/Cartridges" "$TARGET_DIR/Saves" "$TARGET_DIR/State" "$POCKET_DIR" "$DESKTOP_DIR"
 # Catch syntax problems before replacing the installed console executable.
 python3 -m py_compile "$SOURCE_DIR/GameBoyAdvance.py"
-install -m 0755 "$SOURCE_DIR/GameBoyAdvance.py" "$TARGET_DIR/GameBoyAdvance"
+install -m 0755 -- "$SOURCE_DIR/GameBoyAdvance.py" "$TARGET_DIR/GameBoyAdvance"
 test -x "$TARGET_DIR/GameBoyAdvance"
 
-# Keep a desktop-entry copy in R2's portable pocket filesystem as requested,
-# as well as the standard applications directory for normal desktop launching.
-sed "s|^Exec=.*$|Exec=$TARGET_DIR/GameBoyAdvance|" \
-  "$SOURCE_DIR/GameBoyAdvance.desktop" > "$DESKTOP_DIR/GameBoyAdvance.desktop"
-install -m 0644 "$DESKTOP_DIR/GameBoyAdvance.desktop" "$POCKET_DIR/GameBoyAdvance.desktop"
-grep -Fx "Exec=$TARGET_DIR/GameBoyAdvance" "$DESKTOP_DIR/GameBoyAdvance.desktop" >/dev/null
-grep -Fx "Exec=$TARGET_DIR/GameBoyAdvance" "$POCKET_DIR/GameBoyAdvance.desktop" >/dev/null
+# Keep identical desktop-entry copies in the pocket and application directory.
+install -m 0644 -- "$LAUNCHER_TMP" "$DESKTOP_DIR/GameBoyAdvance.desktop"
+install -m 0644 -- "$LAUNCHER_TMP" "$POCKET_DIR/GameBoyAdvance.desktop"
+cmp -s -- "$LAUNCHER_TMP" "$DESKTOP_DIR/GameBoyAdvance.desktop"
+cmp -s -- "$LAUNCHER_TMP" "$POCKET_DIR/GameBoyAdvance.desktop"
 
 # Verify the actual emulator path without silently substituting another binary.
 if [[ -x "$MGBA_PATH" ]]; then
@@ -58,6 +86,6 @@ Installed R2's Game Boy Advance console:
 
 No cartridge is assumed to be owned or inserted. Once mGBA is installed,
 verify the configured path with:
-  R2_MGBA_EXECUTABLE="$MGBA_PATH" "$TARGET_DIR/GameBoyAdvance" --json verify
-The external emulator remains at $MGBA_PATH by default.
 EOF
+printf '  R2_MGBA_EXECUTABLE=%q %q --json verify\n' "$MGBA_PATH" "$TARGET_DIR/GameBoyAdvance"
+printf 'The external emulator remains at %s by default.\n' "$MGBA_PATH"
