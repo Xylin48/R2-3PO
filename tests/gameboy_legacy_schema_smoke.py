@@ -282,8 +282,36 @@ def main() -> int:
                 target.commit()
             with closing(module.connect()) as migrated:
                 assert tuple(migrated.execute("SELECT id,summary FROM console_events").fetchone()) == (3, "exact event")
-                assert migrated.execute("SELECT filename FROM cartridge_inventory").fetchone()[0] == "Old.gba"
+                assert tuple(migrated.execute(
+                    "SELECT filename,title,location,discovered_at,updated_at FROM cartridge_inventory"
+                ).fetchone()) == ("Old.gba", "", "pockets", "", "")
                 assert migrated.execute("SELECT COUNT(*) FROM console_migrations").fetchone()[0] == 1
+
+    # A fresh destination must preserve all supplied legacy metadata while
+    # using neutral defaults only for columns absent from the source.
+    with tempfile.TemporaryDirectory(prefix="r2-gameboy-partial-inventory-") as temp:
+        device = Path(temp) / "device"
+        device.mkdir()
+        os.environ["R2_GAMEBOY_ROOT"] = str(device)
+        os.environ["R2_GAMEBOY_DB"] = str(device / "gameboy.db")
+        with closing(sqlite3.connect(device / "gameboy.db")) as source:
+            source.executescript("""
+                CREATE TABLE cartridge_inventory (
+                    filename TEXT PRIMARY KEY, title TEXT, location TEXT, updated_at TEXT
+                );
+                INSERT INTO cartridge_inventory VALUES ('Known.gba','Original title','shelf','old timestamp');
+            """)
+        spec = importlib.util.spec_from_file_location("r2_gameboy_partial_inventory", CONSOLE)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for _ in range(2):
+            with closing(module.connect()) as db:
+                assert tuple(db.execute(
+                    "SELECT filename,title,location,discovered_at,updated_at FROM cartridge_inventory"
+                ).fetchone()) == ("Known.gba", "Original title", "shelf", "", "old timestamp")
+                assert db.execute("SELECT COUNT(*) FROM cartridge_inventory").fetchone()[0] == 1
+                assert db.execute("SELECT COUNT(*) FROM console_migrations").fetchone()[0] == 1
 
     print("Legacy Game Boy cartridge/state schemas preserve existing data and accept new writes.")
     return 0

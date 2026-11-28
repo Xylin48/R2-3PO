@@ -158,8 +158,22 @@ def _migrate_legacy_combined_database(db: sqlite3.Connection) -> None:
                     f'SELECT 1 FROM main."{table}" WHERE "{key}"=?', (identity,),
                 ).fetchone():
                     continue
-                _copy_legacy_row(db, table, common, [row[name] for name in common],
-                                 key, identity)
+                columns = list(common)
+                values = [row[name] for name in columns]
+                if table == "cartridge_inventory":
+                    # Older combined databases may contain only the filename.
+                    # Use the same neutral metadata as an upgraded state DB,
+                    # even when the destination has fresh NOT NULL columns
+                    # without defaults. Never replace a field present in the
+                    # source with an inferred value.
+                    for name, default in (
+                        ("title", ""), ("location", "pockets"),
+                        ("discovered_at", ""), ("updated_at", ""),
+                    ):
+                        if name not in source_columns:
+                            columns.append(name)
+                            values.append(default)
+                _copy_legacy_row(db, table, columns, values, key, identity)
 
         if "console_events" in legacy_tables:
             source_columns = _table_columns(db, "cartridge", "console_events")
